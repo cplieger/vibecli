@@ -8,44 +8,58 @@ import (
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
-// TestIncompatibility pins the two directional floor checks and the named
-// remediation in each failure message: the server must meet the client's
-// minimum server revision, and the client must meet the server's minimum
-// client revision. Values are exercised around the current 4/3 floors so a
-// future floor raise re-runs meaningful boundaries.
-func TestIncompatibility(t *testing.T) {
-	cases := []struct {
-		name                                                   string
-		serverRev, serverMinClient, clientRev, clientMinServer int
-		wantSubstr                                             string // "" = compatible
+// TestRun_delegatesToTheEngineRule pins that the gate's verdict IS the
+// engine's verdict, in both directions and at the exclusive boundary. The
+// local reason-string comparator this replaced could drift from the engine's
+// rule silently (nothing asserted they agreed); after delegation the only
+// thing worth pinning here is that run() routes the engine's answer without
+// inverting or swallowing it. The engine owns the rule's own table plus a
+// runtime-floor agreement test.
+func TestRun_delegatesToTheEngineRule(t *testing.T) {
+	cases := map[string]struct {
+		clientRev, clientMinServer int
+		wantCompatible             bool
 	}{
-		{name: "current pairing compatible", serverRev: 4, serverMinClient: 3, clientRev: 4, clientMinServer: 3},
-		{name: "skew within floors compatible", serverRev: 5, serverMinClient: 3, clientRev: 4, clientMinServer: 4},
-		{
-			name: "server below client floor", serverRev: 3, serverMinClient: 3, clientRev: 5, clientMinServer: 4,
-			wantSubstr: "bump go.mod",
-		},
-		{
-			name: "client below server floor", serverRev: 5, serverMinClient: 5, clientRev: 4, clientMinServer: 3,
-			wantSubstr: "bump the Dockerfile ARG",
-		},
-		{name: "equal at both floors compatible", serverRev: 3, serverMinClient: 3, clientRev: 3, clientMinServer: 3},
+		"current pairing":                    {terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, true},
+		"client exactly at the server floor": {terminal.MinSupportedClientWireVersion, terminal.MinSupportedClientWireVersion, true},
+		"client below the server floor":      {terminal.MinSupportedClientWireVersion - 1, terminal.MinSupportedClientWireVersion, false},
+		"client demands a newer server":      {terminal.WireProtocolVersion, terminal.WireProtocolVersion + 1, false},
+		"client demands exactly this server": {terminal.WireProtocolVersion, terminal.WireProtocolVersion, true},
+		"future client revision is accepted": {terminal.WireProtocolVersion + 3, terminal.MinSupportedClientWireVersion, true},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := incompatibility(tc.serverRev, tc.serverMinClient, tc.clientRev, tc.clientMinServer)
-			if tc.wantSubstr == "" {
-				if got != "" {
-					t.Errorf("incompatibility(%d,%d,%d,%d) = %q, want compatible",
-						tc.serverRev, tc.serverMinClient, tc.clientRev, tc.clientMinServer, got)
-				}
-				return
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(tc.clientRev, tc.clientMinServer, &stdout, &stderr)
+			engineSaysCompatible := terminal.WirePairIncompatibility(
+				terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion,
+				tc.clientRev, tc.clientMinServer,
+			) == ""
+			if engineSaysCompatible != tc.wantCompatible {
+				t.Fatalf("engine verdict for (%d,%d) = compatible:%v, test expected %v; the engine's rule changed and this table is stale",
+					tc.clientRev, tc.clientMinServer, engineSaysCompatible, tc.wantCompatible)
 			}
-			if got == "" || !strings.Contains(got, tc.wantSubstr) {
-				t.Errorf("incompatibility(%d,%d,%d,%d) = %q, want reason containing %q",
-					tc.serverRev, tc.serverMinClient, tc.clientRev, tc.clientMinServer, got, tc.wantSubstr)
+			if gateCompatible := code == 0; gateCompatible != engineSaysCompatible {
+				t.Errorf("run(%d,%d) exit %d (compatible:%v) but the engine says compatible:%v; the gate does not follow the engine's rule",
+					tc.clientRev, tc.clientMinServer, code, gateCompatible, engineSaysCompatible)
 			}
 		})
+	}
+}
+
+// TestRun_failureNamesBothPins keeps the remediation useful: the engine's
+// reason says WHICH half is behind, and this repo must add which pin to move
+// (build-layout knowledge the engine deliberately does not carry).
+func TestRun_failureNamesBothPins(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run(terminal.WireProtocolVersion, terminal.WireProtocolVersion+1, &stdout, &stderr); code != 1 {
+		t.Fatalf("run() = %d, want exit 1 for a violated floor", code)
+	}
+	out := stderr.String()
+	for _, want := range []string{"go.mod", "Dockerfile ARG", "static-src/package.json"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stderr = %q, want it to name the %q pin", out, want)
+		}
 	}
 }
 

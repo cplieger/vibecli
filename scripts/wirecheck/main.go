@@ -1,10 +1,11 @@
 // Command wirecheck asserts wire-protocol compatibility between the Go
 // server half (the web-terminal-engine module go.mod pins) and the served
-// TS client half (the Dockerfile-ARG-pinned npm artifact), using the
-// engine's exported compatibility floors. The Dockerfile's wire-floor gate
-// extracts the client's constants from the vendored artifact and passes
-// them as flags; this program supplies the Go side from the engine's public
-// API — no source scraping on the Go half.
+// TS client half (the Dockerfile-ARG-pinned npm artifact). The compatibility
+// RULE is the engine's (terminal.WirePairIncompatibility — the same verdict
+// its runtime handshake reaches, so this gate can never disagree with the
+// close-4002 refusal); this program supplies the Go side from the engine's
+// public constants and the client side from flags the Dockerfile's wire-floor
+// gate extracts from the vendored artifact.
 //
 // Exit 0: the pairing is declared-compatible. Exit 1: a declared floor is
 // violated — the pairing would refuse at first connect with close code 4002,
@@ -33,13 +34,20 @@ func main() {
 // returns the process exit code main hands to os.Exit — the contract the
 // Dockerfile consumes: 0 declared-compatible, 1 floor violated (fail the
 // build), 2 usage error (missing/non-positive flag values).
+//
+// The flags are validated here rather than left to the engine's comparator so
+// a missing extraction is reported as the usage error it is (exit 2, "fix the
+// gate") instead of a compatibility verdict (exit 1, "bump a pin").
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	if clientRev <= 0 || clientMinServer <= 0 {
 		fmt.Fprintln(stderr, "wirecheck: -client-rev and -client-min-server are required positive integers")
 		return 2
 	}
-	if reason := incompatibility(terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, clientRev, clientMinServer); reason != "" {
-		fmt.Fprintf(stderr, "ERROR wire-floor-mismatch: %s\n", reason)
+	if reason := terminal.WirePairIncompatibility(
+		terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion,
+		clientRev, clientMinServer,
+	); reason != "" {
+		fmt.Fprintf(stderr, "ERROR wire-floor-mismatch: %s\n%s\n", reason, remediation())
 		return 1
 	}
 	fmt.Fprintf(stdout, "wirecheck ok: server wire rev %d (min client %d) <-> client wire rev %d (min server %d)\n",
@@ -47,19 +55,9 @@ func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// incompatibility returns "" when the declared floors admit the pairing in
-// both directions, or a human-readable reason naming the violated floor and
-// which pin to move.
-func incompatibility(serverRev, serverMinClient, clientRev, clientMinServer int) string {
-	if serverRev < clientMinServer {
-		return fmt.Sprintf(
-			"Go engine wire revision %d is below the npm client's minimum supported server revision %d (bump go.mod's web-terminal-engine)",
-			serverRev, clientMinServer)
-	}
-	if clientRev < serverMinClient {
-		return fmt.Sprintf(
-			"npm client wire revision %d is below the Go engine's minimum supported client revision %d (bump the Dockerfile ARG + static-src/package.json engine pins)",
-			clientRev, serverMinClient)
-	}
-	return ""
+// remediation names this repo's two engine pins. Which pin to move is build-
+// layout knowledge the engine deliberately does not carry, so the app supplies
+// it alongside the engine's reason.
+func remediation() string {
+	return "fix: bump go.mod's web-terminal-engine (Go half) or the Dockerfile ARG + static-src/package.json engine pins (TS half) so both halves resolve to a compatible pair"
 }

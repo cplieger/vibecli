@@ -496,9 +496,10 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
-//     403 — subject to the skip list below (/ws, the SSE stream, /api/health,
-//     and the token-bearing /api/sessions/ subtree emit no access lines).
-//     WithClientIP is
+//     403 — subject to the skip list below (/ws, the SSE stream, and
+//     /api/health emit no access lines) and the WithPathFunc redaction (the
+//     token-bearing /api/sessions/ subtree logs its route template, never a
+//     session id). WithClientIP is
 //     passed the TRUSTED_PROXIES set (parseTrustedProxies) as the `client_ip`
 //     field's trusted-proxy ranges: unset/empty ⇒ trust nothing, so `client_ip`
 //     is the unspoofable socket peer and X-Forwarded-For is ignored — the
@@ -544,11 +545,24 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			webhttp.WithSkipPaths("/ws", "/api/sessions/events", "/api/health"),
 			// DELETE /api/sessions/{id} and PUT /api/sessions/{id}/title embed
 			// the FULL session id (the /ws attach/resume capability token that
-			// routes.go truncates to safeID before logging); skip their access
-			// lines so a live token never reaches log-read consumers. The
-			// exact-path create/list lines (POST/GET /api/sessions) are kept.
-			webhttp.WithSkipFunc(func(r *http.Request) bool {
-				return strings.HasPrefix(r.URL.Path, "/api/sessions/")
+			// routes.go truncates to safeID before logging). Their access
+			// lines are KEPT, with the recorded path rewritten to the
+			// token-free route template via WithPathFunc, so operators keep
+			// method/status/duration/request_id/client_ip for title updates,
+			// deletes, and rejected subtree requests without a live token
+			// ever reaching log-read consumers (webhttp records the
+			// "(path-redaction-failed)" placeholder — never the raw path —
+			// if this mapping breaks). The exact-path create/list lines
+			// (POST/GET /api/sessions) miss the prefix and log unchanged.
+			webhttp.WithPathFunc(func(r *http.Request) string {
+				p := r.URL.Path
+				if !strings.HasPrefix(p, "/api/sessions/") {
+					return p
+				}
+				if strings.HasSuffix(p, "/title") {
+					return "/api/sessions/{id}/title"
+				}
+				return "/api/sessions/{id}"
 			}),
 			webhttp.WithClientIP(trustedProxies...),
 		),

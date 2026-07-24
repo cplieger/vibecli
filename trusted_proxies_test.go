@@ -223,13 +223,16 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 	}
 }
 
-// TestBuildHandlerSkipsAccessLogForStreams pins the WithSkipPaths wiring in
+// TestBuildHandlerSkipsAccessLogForStreams pins the access-log wiring in
 // buildHandler: the long-lived streams (/ws and the /api/sessions/events SSE)
-// must emit NO access-log line (a per-open line records a misleading
-// status/duration for a connection that lives for hours), while a normal
-// request still produces one. A regression dropping WithSkipPaths would flood
-// the access log with one misleading line per reconnect and pass every other
-// test. Serial: swaps the process-global default logger (buildHandler binds
+// and the /api/health probe must emit NO access-log line, the token-bearing
+// /api/sessions/ subtree must emit lines whose recorded path is the
+// token-free route template (WithPathFunc — a raw session id must never
+// appear), and normal requests still log their real path. A regression
+// dropping WithSkipPaths would flood the access log with one misleading line
+// per reconnect; a regression dropping WithPathFunc would leak live session
+// tokens to log-read consumers; both pass every other test. Serial: swaps
+// the process-global default logger (buildHandler binds
 // WithLogger(slog.Default()) at construction).
 func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	var buf bytes.Buffer
@@ -247,20 +250,31 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	mux.HandleFunc("/probe", ok)
 
 	h := buildHandler(mux, nil, "default-src 'self'", nil)
-	for _, path := range []string{"/ws", "/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/health", "/api/sessions", "/probe"} {
+	for _, path := range []string{"/ws", "/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe"} {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, http.NoBody))
 	}
 
 	log := buf.String()
-	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events", "path=/api/sessions/live-token-1234/title", "path=/api/health"} {
+	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events", "path=/api/health"} {
 		if strings.Contains(log, skipped) {
-			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream, probe, and token-bearing session lines out)", log, skipped)
+			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream and probe lines out)", log, skipped)
 		}
+	}
+	for _, token := range []string{"live-token-1234", "live-token-5678"} {
+		if strings.Contains(log, token) {
+			t.Errorf("access log = %q, must never carry the raw session token %q (WithPathFunc must rewrite the subtree's recorded path)", log, token)
+		}
+	}
+	if !strings.Contains(log, "path=/api/sessions/{id}/title") {
+		t.Errorf("access log = %q, want a template-path access line for the title route (the subtree's telemetry is kept, redacted)", log)
+	}
+	if !strings.Contains(log, "path=/api/sessions/{id}") {
+		t.Errorf("access log = %q, want a template-path access line for the id route (the subtree's telemetry is kept, redacted)", log)
 	}
 	if !strings.Contains(log, "path=/probe") {
 		t.Errorf("access log = %q, want an access line for the normal request path=/probe (the skip list must not swallow everything)", log)
 	}
 	if !strings.Contains(log, "path=/api/sessions ") {
-		t.Errorf("access log = %q, want a kept access line for the exact path /api/sessions (main.go documents create/list lines as kept; a skip predicate widened to the bare /api/sessions prefix would silently drop them)", log)
+		t.Errorf("access log = %q, want a kept access line with the REAL path for the exact /api/sessions create/list routes (they miss the subtree prefix and must not be rewritten)", log)
 	}
 }

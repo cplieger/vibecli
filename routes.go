@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -105,16 +104,18 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 		}
 		// The engine logs the session's full argv as the "command" attr when
 		// the process starts (Handler.ensureStarted), and deps.cmd carries
-		// the operator's KIRO_CLI_CHAT_ARGS values — so the engine's logger
-		// is routed through commandRedactingHandler, which withholds that
-		// value the same way main.go's startup line logs only
-		// chat_args_count.
-		sessionLogger := slog.New(commandRedactingHandler{slog.Default().Handler()}).With("session", safeID)
+		// the operator's KIRO_CLI_CHAT_ARGS values — a value-bearing flag
+		// there could hold a credential from a compose interpolation mistake
+		// (CWE-532) — so the engine is told to record the fixed "[redacted]"
+		// marker instead (WithCommandLogValue), the same way main.go's own
+		// startup line logs only chat_args_count.
+		sessionLogger := slog.Default().With("session", safeID)
 		return terminal.NewHandler(deps.cmd,
 			terminal.WithWorkDir(deps.workDir),
 			terminal.WithScrollbackCapacity(5000),
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
+			terminal.WithCommandLogValue("[redacted]"),
 			// A session whose process dies within seconds of spawn is the
 			// kiro-cli-missing/broken signature (the sign-in guard exits 1
 			// when the binary is absent or login fails instantly). The
@@ -183,59 +184,6 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	mux.HandleFunc("/api/health", handleHealth(deps))
 
 	return mgr, cspPolicy, nil
-}
-
-// commandRedacted is the placeholder a redacted command attribute value is
-// replaced with: the key survives as a launch marker, the argv is withheld.
-const commandRedacted = "[redacted]"
-
-// commandRedactingHandler wraps a slog.Handler and replaces the value of any
-// top-level "command" attribute with "[redacted]" before delegating. The
-// factory in registerRoutes hands the engine this wrapper because
-// web-terminal-engine (v3.0.4) logs the session's full argv slice as the
-// command attr at process start (Handler.ensureStarted), and deps.cmd carries
-// the operator's KIRO_CLI_CHAT_ARGS values — a value-bearing flag there could
-// hold a credential from a compose interpolation mistake, which main.go's own
-// startup line already guards against by logging only chat_args_count
-// (CWE-532). Redacting here keeps the app's log boundary consistent without
-// changing the engine.
-type commandRedactingHandler struct {
-	slog.Handler
-}
-
-// Handle clones the record, replacing the value of any top-level "command"
-// attribute with the redaction placeholder before delegating.
-//
-//nolint:gocritic // Handle's signature is fixed by the slog.Handler interface; r cannot be a pointer.
-func (h commandRedactingHandler) Handle(ctx context.Context, r slog.Record) error {
-	clone := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key == "command" {
-			a.Value = slog.StringValue(commandRedacted)
-		}
-		clone.AddAttrs(a)
-		return true
-	})
-	return h.Handler.Handle(ctx, clone)
-}
-
-// WithAttrs redacts eagerly and rewraps: an attr pre-bound via Logger.With
-// never flows through Handle's record clone, and the derived handler must
-// keep guarding subsequent records.
-func (h commandRedactingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	redacted := make([]slog.Attr, len(attrs))
-	for i, a := range attrs {
-		if a.Key == "command" {
-			a.Value = slog.StringValue(commandRedacted)
-		}
-		redacted[i] = a
-	}
-	return commandRedactingHandler{h.Handler.WithAttrs(redacted)}
-}
-
-// WithGroup rewraps the delegated handler so redaction survives grouping.
-func (h commandRedactingHandler) WithGroup(name string) slog.Handler {
-	return commandRedactingHandler{h.Handler.WithGroup(name)}
 }
 
 // handleHealth returns the /api/health readiness handler. It reflects, in

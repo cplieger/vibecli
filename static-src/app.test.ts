@@ -47,6 +47,25 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(document.activeElement).toBe(reload);
 }
 
+// Locate the real inline bootstrap watchdog in static/index.html: the only
+// inline <script> that is neither the importmap nor the src-bearing module
+// loader. Resolve from INIT_CWD (set by the npm/npx launcher to the real
+// static-src directory) so the fixture is found even when the runner changes
+// process.cwd() — Stryker's dry run executes inside its .stryker-tmp sandbox,
+// where a cwd-relative read ENOENTs. Every watchdog test obtains the source
+// through this single helper so fixture discovery cannot drift per test.
+function readWatchdogSource(): string {
+  const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
+  const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
+  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
+    (match) => !/src\s*=/i.test(match[1] ?? "") && !/importmap/i.test(match[1] ?? ""),
+  );
+  expect(scripts).toHaveLength(1);
+  const source = scripts[0]?.[2] ?? "";
+  expect(source).toContain("Bootstrap watchdog");
+  return source;
+}
+
 // Evaluate the inline bootstrap watchdog, capturing the window listener(s) it
 // registers and removing them when the calling test finishes: isolate is
 // false, so window is shared across this file's tests, and a leaked
@@ -212,20 +231,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // code) are pinned to one contract from a single source. Mirrors how
     // routes_test.go independently re-extracts the same inline scripts for
     // the CSP hash check.
-    // Resolve from INIT_CWD (set by the npm/npx launcher to the real
-    // static-src directory) so the fixture is found even when the runner
-    // changes process.cwd() — Stryker's dry run executes inside its
-    // .stryker-tmp sandbox, where a cwd-relative read ENOENTs.
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    // The watchdog is the only inline <script> that is neither the importmap
-    // nor the src-bearing module loader.
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    expect(scripts).toHaveLength(1);
-    const watchdogSource = scripts[0]?.[2] ?? "";
-    expect(watchdogSource).toContain("Bootstrap watchdog");
+    const watchdogSource = readWatchdogSource();
 
     // Recreate index.html's static body: the terminal root plus the pristine
     // loading overlay (role=status, .bar child, no fade).
@@ -259,12 +265,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog stands down when the overlay is already fading out (booted terminal)", () => {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    evaluateWatchdog(scripts[0]?.[2] ?? "");
+    evaluateWatchdog(readWatchdogSource());
 
     const root = document.createElement("div");
     root.id = "terminal";
@@ -291,12 +292,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog does not clobber an overlay showFatal already converted", () => {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    evaluateWatchdog(scripts[0]?.[2] ?? "");
+    evaluateWatchdog(readWatchdogSource());
 
     const root = document.createElement("div");
     root.id = "terminal";
@@ -328,12 +324,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog ignores a non-script resource error (e.g. an image failing to load)", () => {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    evaluateWatchdog(scripts[0]?.[2] ?? "");
+    evaluateWatchdog(readWatchdogSource());
 
     const root = document.createElement("div");
     root.id = "terminal";
@@ -358,12 +349,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog fires on an uncaught runtime error (module evaluation failure)", () => {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    evaluateWatchdog(scripts[0]?.[2] ?? "");
+    evaluateWatchdog(readWatchdogSource());
 
     const root = document.createElement("div");
     root.id = "terminal";
@@ -392,12 +378,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog stands down after createTerminal has built UI inside #terminal", () => {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
-    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
-      (m) => !/src\s*=/i.test(m[1] ?? "") && !/importmap/i.test(m[1] ?? ""),
-    );
-    const watchdogSource = scripts[0]?.[2] ?? "";
+    const watchdogSource = readWatchdogSource();
 
     // Booted page: createTerminal built its UI inside #terminal; the overlay
     // is still pristine (first frame not yet rendered, no fade).

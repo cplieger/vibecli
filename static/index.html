@@ -111,6 +111,9 @@
         }
       }
       @media (prefers-reduced-motion: reduce) {
+        #loading {
+          transition-duration: 0.01ms;
+        }
         #loading .bar::before {
           animation-duration: 0.01ms;
           animation-iteration-count: 1;

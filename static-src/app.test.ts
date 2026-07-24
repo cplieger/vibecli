@@ -167,6 +167,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const reload = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
     const overlay = document.createElement("div");
     overlay.id = "loading";
+    overlay.setAttribute("role", "status"); // mirror index.html's static markup
+    overlay.setAttribute("aria-label", "Loading");
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    overlay.appendChild(bar);
     document.body.appendChild(overlay);
 
     await expect(import("./app.js")).rejects.toThrow(
@@ -248,13 +253,17 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     document.body.appendChild(overlay);
 
     // Evaluate the watchdog (via the leak-guarding helper), then simulate the
-    // failure it exists for: a <script> element (e.g. /app.js) firing a load
-    // error on window.
+    // failure it exists for: a <script> element (e.g. /app.js) firing a
+    // NON-bubbling error event on itself, the way real resource load errors
+    // fire. Dispatching on the attached element -- not window -- means only
+    // the watchdog's capture-phase window listener can see the event, so this
+    // test pins the load-bearing `, true` capture flag in index.html: with it
+    // removed (bubble phase), the event never reaches the watchdog and this
+    // test fails.
     evaluateWatchdog(watchdogSource);
     const scriptEl = document.createElement("script");
-    const errorEvent = new Event("error");
-    Object.defineProperty(errorEvent, "target", { value: scriptEl });
-    window.dispatchEvent(errorEvent);
+    document.body.appendChild(scriptEl);
+    scriptEl.dispatchEvent(new Event("error"));
 
     expectFatalOverlayShape(overlay);
     const description = overlay.querySelector("#bootstrap-failure-message");
@@ -262,6 +271,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // aria-modal made true: the watchdog inerts the terminal root, exactly
     // like showFatal.
     expect(root.hasAttribute("inert")).toBe(true);
+    // The watchdog's Reload button must actually reload -- the same contract
+    // the app.ts "offers a working reload action" test pins for showFatal. A
+    // dead click listener would leave a dead-end recovery CTA on the only
+    // actionable element left.
+    const reloadSpy = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
+    overlay.querySelector("button")?.click();
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
   });
 
   it("watchdog stands down when the overlay is already fading out (booted terminal)", () => {

@@ -63,12 +63,14 @@ func TestRun_failureNamesBothPins(t *testing.T) {
 	}
 }
 
-// TestRun_exitCodeContract pins the process exit codes and output streams the
-// Dockerfile wire-floor gate consumes — the package comment's documented
-// contract (0 compatible, 1 floor violated, 2 usage error). incompatibility()
-// alone cannot pin this: a wiring regression in main/run (an inverted
-// reason check, a swapped exit code, output on the wrong stream) would pass
-// TestIncompatibility and silently neuter or break the image build gate.
+// TestRun_exitCodeContract pins the process exit codes and output streams that
+// are this program's own contract (0 compatible, 1 floor violated, 2 usage
+// error). The Dockerfile's gate observes only zero vs non-zero (see run's doc
+// comment), so these codes are the contract for direct invocation and for this
+// test. TestRun_delegatesToTheEngineRule alone cannot pin them: it checks only
+// the compatible-vs-not verdict, so a wiring regression in main/run (an
+// inverted reason check, a swapped exit code, output on the wrong stream)
+// would pass it and silently neuter or break the image build gate.
 // Client-side values are derived from the engine's exported constants, never
 // hardcoded, so the cases track a future floor raise automatically.
 func TestRun_exitCodeContract(t *testing.T) {

@@ -130,9 +130,9 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	// The returned factory builds one kiro-cli chat session per tab: an
-	// independent PTY-backed
-	// process (deps.cmd = kiro-cli chat) with its own VT screen and scrollback, so
-	// opening a tab launches a fresh instance. Scrollback 5000 covers a /chat
+	// independent PTY-backed process (deps.cmd = kiro-cli chat) with its own
+	// VT screen and scrollback, so opening a tab launches a fresh instance.
+	// Scrollback 5000 covers a /chat
 	// transcript restore on reconnect (matches the client store's retained-line
 	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
 	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive the

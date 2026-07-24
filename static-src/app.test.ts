@@ -56,6 +56,10 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("aria-describedby")).toBe("bootstrap-failure-message");
   // The pristine loading bar is always replaced by the dialog content.
   expect(overlay.querySelector(".bar")).toBeNull();
+  // ...and so is the pre-JS status announcement: replaceChildren() drops every
+  // pristine child, so the live region's "Starting the terminal" text cannot
+  // survive next to the failure message.
+  expect(overlay.querySelector(".loading-status")).toBeNull();
   const reload = overlay.querySelector("button");
   expect(reload?.type).toBe("button");
   expect(reload?.textContent).toBe("Reload");
@@ -120,8 +124,9 @@ function appendTerminalRoot({ booted = false } = {}): HTMLElement {
   return root;
 }
 
-// index.html's pristine pre-JS #loading overlay (role=status + .bar child):
-// the exact state both showFatal and the watchdog key their behavior on.
+// index.html's pristine pre-JS #loading overlay (role=status, with its two
+// children: the aria-hidden .bar and the .loading-status announcement): the
+// exact state both showFatal and the watchdog key their behavior on.
 // fade: the kernel's first-frame fade-out has begun.
 function appendPristineOverlay({ fade = false } = {}): HTMLElement {
   const overlay = document.createElement("div");
@@ -134,6 +139,12 @@ function appendPristineOverlay({ fade = false } = {}): HTMLElement {
   const bar = document.createElement("div");
   bar.className = "bar";
   overlay.appendChild(bar);
+  // index.html's readable content for the role=status region (the bar is
+  // aria-hidden); both fatal builders replaceChildren() it away.
+  const status = document.createElement("p");
+  status.className = "loading-status";
+  status.textContent = "Starting the terminal\u2026";
+  overlay.appendChild(status);
   document.body.appendChild(overlay);
   return overlay;
 }
@@ -397,10 +408,18 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
     expect(THEME["--accent"]).toBe(ACCENT_HSL);
     const html = readStaticAsset("index.html");
-    // critical CSS (#loading) and the noscript fallback
-    expect(
-      [...html.matchAll(new RegExp(ACCENT_HSL.replace(/[()%.]/g, "\\$&"), "g"))].length,
-    ).toBeGreaterThanOrEqual(2);
+    // The two declaration sites, asserted individually and bounded to their own
+    // rule: a match COUNT cannot distinguish a declaration from the file's own
+    // doc comment (which spells the same literal), so a single-site drift would
+    // still clear a >= 2 bound. The [^}]* bound keeps each assertion inside the
+    // named rule rather than matching the accent later in the stylesheet.
+    const escapedAccent = ACCENT_HSL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // #loading critical CSS (the pre-JS overlay, which cannot read the JS theme):
+    expect(html).toMatch(new RegExp(`#loading\\s*\\{[^}]*--accent:\\s*${escapedAccent}\\s*;`));
+    // the no-JS fallback message:
+    expect(html).toMatch(
+      new RegExp(`\\.noscript-fallback\\s*\\{[^}]*color:\\s*${escapedAccent}\\s*;`),
+    );
     // installed-PWA chrome: meta and manifest must agree, in hex form
     expect(html).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
     const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));

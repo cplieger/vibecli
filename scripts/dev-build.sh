@@ -75,6 +75,12 @@ cp "$UI_DIR/package.json" "$UI_PKG/package.json"
   done
 
 printf '[3/6] tsc: app -> static/app.js (resolves @cplieger/web-terminal-ui)\n'
+# Drop the previous emit first so the assertion after step [4/6] observes THIS
+# run's output: static/app.js is gitignored but persistent, so an outDir/rootDir
+# change would otherwise leave a stale file that satisfies the check. The vendor
+# dirs below already get the same treatment via rm -rf. (The image build is
+# immune: .dockerignore keeps static/*.js out of the build context.)
+rm -f static/app.js
 "$TSC" --project static-src/tsconfig.json
 
 printf '[4/6] tsc: engine + UI libs -> static/vendor/\n'

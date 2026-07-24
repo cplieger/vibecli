@@ -18,8 +18,8 @@ github.com/cplieger/toolbelt/v2 v2.2.4 h1:F5x27x3LZdjrdYgCWVVX9Hl7qjU4Dz2rPu1gMC
 github.com/cplieger/toolbelt/v2 v2.2.4/go.mod h1:1ZZbPSt1MgdBGrGjCUlauz+kUuZo9eiw+sPHb86YZcE=
 github.com/cplieger/web-terminal-engine/v3 v3.0.4 h1:gSi+TXjp5OPd4deAK3aXpqgCfveuzr8aKe+XK4i/U/k=
 github.com/cplieger/web-terminal-engine/v3 v3.0.4/go.mod h1:dPy4me+rBOvthCYvUvuSKIhoV4TqgT7qxeL/lQe93Mk=
-github.com/cplieger/webhttp v1.14.0 h1:yW5dnGWtCpAkYUEe9TDTw/NtzywHXJ4H1VbZjrtupAY=
-github.com/cplieger/webhttp v1.14.0/go.mod h1:RYtweYFUohqE5DIOt06Ypr0j9VHXjxSPBLIG3vM0H44=
+github.com/cplieger/webhttp v1.15.0 h1:VJhxfsVbw2mGKVDgLtTIK9znq7hEU4yYWKO5JQ/pDeo=
+github.com/cplieger/webhttp v1.15.0/go.mod h1:RYtweYFUohqE5DIOt06Ypr0j9VHXjxSPBLIG3vM0H44=
 github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
 github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
 github.com/expr-lang/expr v1.17.8 h1:W1loDTT+0PQf5YteHSTpju2qfUfNoBt4yw9+wOEU9VM=

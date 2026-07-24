@@ -255,10 +255,15 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	}
 
 	log := buf.String()
-	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events", "path=/api/health"} {
+	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events"} {
 		if strings.Contains(log, skipped) {
-			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream and probe lines out)", log, skipped)
+			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream lines out)", log, skipped)
 		}
+	}
+	// A HEALTHY probe logs at Debug (ProbeLogLevel), which the Info-level
+	// handler above drops — so no /api/health line lands in the stream.
+	if strings.Contains(log, "path=/api/health") {
+		t.Errorf("access log = %q, want no healthy-probe line at the default level (ProbeLogLevel maps 2xx to Debug)", log)
 	}
 	for _, token := range []string{"live-token-1234", "live-token-5678"} {
 		if strings.Contains(log, token) {
@@ -276,5 +281,33 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	}
 	if !strings.Contains(log, "path=/api/sessions ") {
 		t.Errorf("access log = %q, want a kept access line with the REAL path for the exact /api/sessions create/list routes (they miss the subtree prefix and must not be rewritten)", log)
+	}
+}
+
+// TestBuildHandlerFailingProbeSurfaces pins the other half of the
+// ProbeLogLevel contract: a FAILING /api/health probe (the readiness 503 when
+// kiro-cli is broken or missing) must land in the shipped log stream at
+// Error — the silent-skip idiom this replaced hid exactly that signal.
+// Serial: swaps the process-global default logger.
+func TestBuildHandlerFailingProbeSurfaces(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	h := buildHandler(mux, nil, "default-src 'self'", nil)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/health", http.NoBody))
+
+	log := buf.String()
+	if !strings.Contains(log, "path=/api/health") {
+		t.Errorf("access log = %q, want the failing probe's access line (a 503 health check must not be silent)", log)
+	}
+	if !strings.Contains(log, "level=ERROR") {
+		t.Errorf("access log = %q, want the failing probe at Error (ProbeLogLevel maps 5xx to Error)", log)
 	}
 }

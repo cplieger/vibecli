@@ -496,10 +496,11 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
-//     403 — subject to the skip list below (/ws, the SSE stream, and
-//     /api/health emit no access lines) and the WithPathFunc redaction (the
-//     token-bearing /api/sessions/ subtree logs its route template, never a
-//     session id). WithClientIP is
+//     403 — subject to the skip list below (/ws and the SSE stream emit no
+//     access lines), the ProbeLogLevel policy (/api/health logs at Debug
+//     when healthy, Warn/Error when failing), and the WithPathFunc redaction
+//     (the token-bearing /api/sessions/ subtree logs its route template,
+//     never a session id). WithClientIP is
 //     passed the TRUSTED_PROXIES set (parseTrustedProxies) as the `client_ip`
 //     field's trusted-proxy ranges: unset/empty ⇒ trust nothing, so `client_ip`
 //     is the unspoofable socket peer and X-Forwarded-For is ignored — the
@@ -542,7 +543,16 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 	return webhttp.Chain(mux,
 		webhttp.Logging(
 			webhttp.WithLogger(slog.Default()),
-			webhttp.WithSkipPaths("/ws", "/api/sessions/events", "/api/health"),
+			webhttp.WithSkipPaths("/ws", "/api/sessions/events"),
+			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
+			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
+			// at Debug (out of the shipped stream, visible under
+			// KWEB_LOG_LEVEL=debug) while a FAILING probe — the readiness
+			// 503 when kiro-cli is broken — surfaces at Warn/Error with its
+			// status and request id. The streams above stay fully skipped:
+			// one open-to-close line per WebSocket/SSE would be misleading
+			// by shape, not merely noisy.
+			webhttp.ProbeLogLevel("/api/health"),
 			// DELETE /api/sessions/{id} and PUT /api/sessions/{id}/title embed
 			// the FULL session id (the /ws attach/resume capability token that
 			// routes.go truncates to safeID before logging). Their access

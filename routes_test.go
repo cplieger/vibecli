@@ -296,6 +296,8 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 		{"X-Content-Type-Options", "nosniff"},
 		{"X-Frame-Options", "DENY"},
 		{"Referrer-Policy", "strict-origin-when-cross-origin"},
+		{"Cross-Origin-Opener-Policy", "same-origin"},
+		{"Permissions-Policy", "camera=(), microphone=(), geolocation=()"},
 	} {
 		if got := rec.Header().Get(tc.header); got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.header, got, tc.want)
@@ -324,6 +326,28 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 		if !strings.Contains(servedCSP, want) {
 			t.Errorf("CSP = %q, want it to contain %q", servedCSP, want)
 		}
+	}
+}
+
+// TestAPINoStore pins that the token-bearing JSON surface is uncacheable while
+// static assets keep their own policy. GET /api/sessions returns live session
+// ids, which are the /ws attach/resume capability tokens the logging layer
+// deliberately keeps out of logs; without no-store the browser persists one to
+// its on-disk cache and an intermediary proxy may serve the list from cache.
+func TestAPINoStore(t *testing.T) {
+	mux, _, csp := mustRegisterRoutes(t, newTestDeps(true))
+	h := buildHandler(mux, nil, csp, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, terminal.SessionsPath, http.NoBody))
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control on %s = %q, want %q (session ids are capability tokens)", terminal.SessionsPath, got, "no-store")
+	}
+
+	srec := httptest.NewRecorder()
+	h.ServeHTTP(srec, httptest.NewRequest(http.MethodGet, "/index.html", http.NoBody))
+	if got := srec.Header().Get("Cache-Control"); got != "no-cache, must-revalidate" {
+		t.Errorf("Cache-Control on a static asset = %q, want kiroCacheControl's policy (the API gate must not leak onto static)", got)
 	}
 }
 
@@ -610,6 +634,22 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("remote peer: status = %d, want 403 (body %s)", rec.Code, rec.Body.String())
+	}
+	// The refusal speaks the standard webhttp error envelope with an empty
+	// code, the dialect CONTRIBUTING requires of every app-owned error
+	// response (the tools-installing 503 is asserted the same way). A
+	// hand-crafted http.Error body would still be a 403 and pass every other
+	// assertion, silently forking the app's error contract for the one gate a
+	// remote caller actually reaches.
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("remote peer: Content-Type = %q, want application/json (webhttp.WriteError envelope)", ct)
+	}
+	var denied webhttp.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &denied); err != nil {
+		t.Fatalf("remote peer: body %q is not the standard envelope: %v", rec.Body.String(), err)
+	}
+	if !strings.Contains(denied.Error, "loopback-only") || denied.Code != "" {
+		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message with an empty code", denied.Error, denied.Code)
 	}
 
 	// Loopback peer: served. The fresh engine has an empty manifest, so

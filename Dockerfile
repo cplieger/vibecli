@@ -109,9 +109,20 @@ COPY required-tools.txt ./
 # runtime refresh re-runs the same check before every swap.
 ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/latest/download/tool-catalog.json
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
+# This is the SAME module go.mod requires (the runtime engine that re-verifies
+# required-tools.txt before every catalog swap), pinned a second time here to
+# select the build-time `toolcatalog verify` binary. The toolbelt-pin-gate in
+# the RUN below asserts the two pins are equal, so the build gate and the
+# runtime gate can never become different verifiers — same fail-loud treatment
+# the engine/UI/tsc pin pairs get against static-src/package.json.
 ARG TOOLBELT_TOOLCATALOG_VERSION=v2.2.4
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
+    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
+    if [ "$TOOLBELT_GOMOD" != "$TOOLBELT_TOOLCATALOG_VERSION" ]; then \
+      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v2 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
+    fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
     go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
@@ -226,6 +237,10 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
 RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -name '*.ts') && \
+    { [ "${#ui_ts[@]}" -gt 0 ] \
+      || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
+    { [ -n "$(find static-src/node_modules/@cplieger/web-terminal-engine/src -maxdepth 1 -name '*.ts' -print -quit)" ] \
+      || { echo "ERROR engine-src-empty: no *.ts under the vendored @cplieger/web-terminal-engine src tree (tarball layout changed?)" >&2; exit 1; }; } && \
     /tmp/package/lib/tsc --project static-src/tsconfig.json && \
     /tmp/package/lib/tsc \
         --module ESNext \
@@ -244,7 +259,13 @@ RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/
         --rootDir static-src/node_modules/@cplieger/web-terminal-ui/src \
         --skipLibCheck \
         --strict \
-        "${ui_ts[@]}"
+        "${ui_ts[@]}" && \
+    for emitted in static/app.js \
+        static/vendor/cplieger-web-terminal-engine/index.js \
+        static/vendor/cplieger-web-terminal-ui/index.js \
+        static/vendor/cplieger-web-terminal-ui/presets.js; do \
+      [ -s "$emitted" ] || { echo "ERROR tsc-emit-missing: $emitted is absent or empty after the tsc steps; static/index.html's script and importmap targets would 404 at runtime (outDir/rootDir or vendored src layout drift?)" >&2; exit 1; }; \
+    done
 
 # Concatenate the UI package's per-feature CSS splits into the served bundle
 # (canonical recipe: scripts/css-bundle.sh, shared with scripts/dev-build.sh).
@@ -307,8 +328,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # baked into the image: the server's toolbelt engine installs them from
 # the /config/tools.json manifest (schema v2) against the image-baked
 # catalog. First boot seeds disabled templates (gopls,
-# typescript-language-server, pyright, gh) — enable one by flipping
-# "disabled": false and restarting, or through the loopback tools API.
+# typescript-language-server, pyright, rust-analyzer, gh) — enable one by
+# flipping "disabled": false and restarting, or through the loopback tools API.
 # This keeps the image
 # ~32 MB slimmer and free of the daily LSP-bump rebuild churn.
 

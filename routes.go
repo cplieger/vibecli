@@ -74,70 +74,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	}
 	mux.Handle("/", staticSrv)
 
-	// factory builds one kiro-cli chat session per tab: an independent PTY-backed
-	// process (deps.cmd = kiro-cli chat) with its own VT screen and scrollback, so
-	// opening a tab launches a fresh instance. Scrollback 5000 covers a /chat
-	// transcript restore on reconnect (matches the client store's retained-line
-	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
-	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive the
-	// classifier) even though no browser tab claims focus (design 7.2);
-	// web-terminal-server deliberately does NOT use this, since a generic
-	// shell/editor wants real focus reporting.
-	//
-	// No TERM_PROGRAM override here: the engine now advertises TERM_PROGRAM=
-	// iTerm.app (>= 3.6.6), which puts kiro-cli in its OSC 9;4 progress allowlist
-	// (driving the tab's "working" dot) and enables DEC 2026 synchronized output.
-	// That is the same identity web-terminal-server gets, so web-terminal-kiro inherits it
-	// from the engine rather than pinning its own (it formerly set WezTerm; both
-	// unlock kiro-cli, and iTerm.app additionally covers other agents like Claude
-	// Code). Anything the engine can't render (inline images) is consumed silently.
-	factory := func(id string) *terminal.Handler {
-		start := time.Now()
-		// The session id doubles as the /ws attach + resume capability token,
-		// so only the engine's LogID-truncated form is ever bound to a
-		// logger: the full value would hand terminal access to anyone with
-		// log-read access and network reach. LogID is the engine's own
-		// definition (one fleet-wide answer for how much of a session token
-		// may be logged), test-pinned there.
-		safeID := terminal.LogID(id)
-		// The engine logs the session's full argv as the "command" attr when
-		// the process starts (Handler.ensureStarted), and deps.cmd carries
-		// the operator's KIRO_CLI_CHAT_ARGS values — a value-bearing flag
-		// there could hold a credential from a compose interpolation mistake
-		// (CWE-532) — so the engine is told to record the fixed "[redacted]"
-		// marker instead (WithCommandLogValue), the same way main.go's own
-		// startup line logs only chat_args_count.
-		sessionLogger := slog.Default().With("session", safeID)
-		return terminal.NewHandler(deps.cmd,
-			terminal.WithWorkDir(deps.workDir),
-			terminal.WithScrollbackCapacity(5000),
-			terminal.WithKeepUnfocused(),
-			terminal.WithLogger(sessionLogger),
-			terminal.WithCommandLogValue("[redacted]"),
-			// A session whose process dies within seconds of spawn is the
-			// kiro-cli-missing/broken signature (the sign-in guard exits 1
-			// when the binary is absent or login fails instantly). The
-			// engine logs child exit at Info by design; this app-level hook
-			// raises the fast-death case to Warn so a broken install on the
-			// persistent volume is visible to operators, not only in the PTY.
-			// Gated on deps.ready: an app-initiated shutdown (SIGTERM
-			// pre-drain, or the Serve-error path) clears readiness before
-			// mgr.Shutdown cancels the child processes, whose killed/canceled
-			// wait errors would otherwise fire this warning as a false
-			// broken-install alert on every deploy. Only spontaneous early
-			// exits while still serving are promoted to Warn; intentional
-			// shutdowns keep the engine's normal INFO exit record.
-			terminal.WithOnProcessExit(func(err error) {
-				if err != nil && deps.ready.Ready() && time.Since(start) < 10*time.Second {
-					sessionLogger.Warn("session process exited almost immediately after start; kiro-cli may be missing or broken",
-						"error", err,
-						"hint", "check /api/health and the kiro-cli install under /config/tools/bin")
-				}
-			}),
-		)
-	}
-
-	mgr := terminal.NewSessionManager(factory,
+	mgr := terminal.NewSessionManager(newSessionFactory(deps),
 		terminal.WithManagerLogger(slog.Default()),
 		terminal.WithStatusClassifier(classifyStatus),
 	)
@@ -182,6 +119,79 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	mux.HandleFunc("/api/health", handleHealth(deps))
 
 	return mgr, cspPolicy, nil
+}
+
+// newSessionFactory builds the per-session handler factory the session manager
+// calls once per tab: one independent PTY-backed kiro-cli chat process with its
+// own VT screen and scrollback. It owns three session-scoped policies — the
+// LogID-truncated per-session logger (the session id is the /ws attach/resume
+// capability token), the WithCommandLogValue argv redaction (deps.cmd carries
+// operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
+// surfaces a broken kiro-cli install.
+func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
+	// The returned factory builds one kiro-cli chat session per tab: an
+	// independent PTY-backed
+	// process (deps.cmd = kiro-cli chat) with its own VT screen and scrollback, so
+	// opening a tab launches a fresh instance. Scrollback 5000 covers a /chat
+	// transcript restore on reconnect (matches the client store's retained-line
+	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
+	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive the
+	// classifier) even though no browser tab claims focus (design 7.2);
+	// web-terminal-server deliberately does NOT use this, since a generic
+	// shell/editor wants real focus reporting.
+	//
+	// No TERM_PROGRAM override here: the engine now advertises TERM_PROGRAM=
+	// iTerm.app (>= 3.6.6), which puts kiro-cli in its OSC 9;4 progress allowlist
+	// (driving the tab's "working" dot) and enables DEC 2026 synchronized output.
+	// That is the same identity web-terminal-server gets, so web-terminal-kiro inherits it
+	// from the engine rather than pinning its own (it formerly set WezTerm; both
+	// unlock kiro-cli, and iTerm.app additionally covers other agents like Claude
+	// Code). Anything the engine can't render (inline images) is consumed silently.
+	return func(id string) *terminal.Handler {
+		start := time.Now()
+		// The session id doubles as the /ws attach + resume capability token,
+		// so only the engine's LogID-truncated form is ever bound to a
+		// logger: the full value would hand terminal access to anyone with
+		// log-read access and network reach. LogID is the engine's own
+		// definition (one fleet-wide answer for how much of a session token
+		// may be logged), test-pinned there.
+		safeID := terminal.LogID(id)
+		// The engine logs the session's full argv as the "command" attr when
+		// the process starts (Handler.ensureStarted), and deps.cmd carries
+		// the operator's KIRO_CLI_CHAT_ARGS values — a value-bearing flag
+		// there could hold a credential from a compose interpolation mistake
+		// (CWE-532) — so the engine is told to record the fixed "[redacted]"
+		// marker instead (WithCommandLogValue), the same way main.go's own
+		// startup line logs only chat_args_count.
+		sessionLogger := slog.Default().With("session", safeID)
+		return terminal.NewHandler(deps.cmd,
+			terminal.WithWorkDir(deps.workDir),
+			terminal.WithScrollbackCapacity(5000),
+			terminal.WithKeepUnfocused(),
+			terminal.WithLogger(sessionLogger),
+			terminal.WithCommandLogValue("[redacted]"),
+			// A session whose process dies within seconds of spawn is the
+			// kiro-cli-missing/broken signature (the sign-in guard exits 1
+			// when the binary is absent or login fails instantly). The
+			// engine logs child exit at Info by design; this app-level hook
+			// raises the fast-death case to Warn so a broken install on the
+			// persistent volume is visible to operators, not only in the PTY.
+			// Gated on deps.ready: an app-initiated shutdown (SIGTERM
+			// pre-drain, or the Serve-error path) clears readiness before
+			// mgr.Shutdown cancels the child processes, whose killed/canceled
+			// wait errors would otherwise fire this warning as a false
+			// broken-install alert on every deploy. Only spontaneous early
+			// exits while still serving are promoted to Warn; intentional
+			// shutdowns keep the engine's normal INFO exit record.
+			terminal.WithOnProcessExit(func(err error) {
+				if err != nil && deps.ready.Ready() && time.Since(start) < 10*time.Second {
+					sessionLogger.Warn("session process exited almost immediately after start; kiro-cli may be missing or broken",
+						"error", err,
+						"hint", "check /api/health and the kiro-cli install under /config/tools/bin")
+				}
+			}),
+		)
+	}
 }
 
 // handleHealth returns the /api/health readiness handler. It reflects, in
@@ -343,13 +353,22 @@ func buildCSPPolicy(sub fs.FS) (string, error) {
 // the engine's WithCreateGate contract. The inner gate (the create rate
 // limit) applies once syncing is over. The 503 speaks the standard
 // webhttp.WriteError envelope with an empty code, like every app-owned
-// error response here (the two 403 gates); /api/health's
+// error response here (the two 403 gates), plus a Retry-After hint, like the
+// inner rate limit's 429; /api/health's
 // {status, reason} document is a health-probe contract, not an error.
 func composeGate(inner func(http.Handler) http.Handler, syncing func() bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		gated := inner(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if syncing() && r.Method == http.MethodPost && r.URL.Path == terminal.SessionsPath {
+				// Retry-After matches the inner rate limit's 429 contract
+				// (webhttp.SessionCreateRateLimit sets it too), so both arms of
+				// this gate tell a client, a proxy, and the UI's retry logic when
+				// to come back instead of leaving them to poll blind. A fixed
+				// short hint: convergence has no predictable remaining time (the
+				// only bound is toolbelt's 30-minute job timeout), so a cheap
+				// re-poll beats an HTTP-date the server cannot honestly compute.
+				w.Header().Set("Retry-After", "5")
 				webhttp.WriteError(w, r, http.StatusServiceUnavailable, "", "tools installing")
 				return
 			}

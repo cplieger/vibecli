@@ -27,6 +27,23 @@ const THEME = {
   "--status-input": "oklch(78% 0.15 95deg)",
 };
 
+// The brand accent is declared independently in app.ts's createTerminal
+// theme, index.html's pre-JS critical CSS (which cannot read the JS theme),
+// index.html's <meta name="theme-color">, and manifest.json's theme_color.
+// No shared code home is possible across a TS module, embedded HTML, and a
+// static JSON manifest, so the parity test below IS the synchronizing
+// mitigation: it pins the two equivalent spellings of one color across all
+// four sites.
+const ACCENT_HSL = "hsl(263.1683 100% 80%)"; // === ACCENT_HEX
+const ACCENT_HEX = "#c099ff";
+
+// Read a static asset next to static-src, resolving from INIT_CWD for the same
+// reason readWatchdogSource() does (a runner may change process.cwd()).
+function readStaticAsset(name: string): string {
+  const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
+  return readFileSync(resolve(sourceRoot, `../static/${name}`), "utf8");
+}
+
 // The fatal-overlay alertdialog contract duplicated (by necessity) between
 // showFatal (app.ts) and the inline pre-module bootstrap watchdog
 // (static/index.html). Both builders are asserted through this single helper
@@ -91,6 +108,51 @@ function evaluateWatchdog(source: string): void {
   }
 }
 
+// index.html's pristine pre-JS #terminal root. booted: createTerminal has
+// built its UI inside it (the watchdog's booted-root stand-down).
+function appendTerminalRoot({ booted = false } = {}): HTMLElement {
+  const root = document.createElement("div");
+  root.id = "terminal";
+  if (booted) {
+    root.appendChild(document.createElement("div")); // the built UI
+  }
+  document.body.appendChild(root);
+  return root;
+}
+
+// index.html's pristine pre-JS #loading overlay (role=status + .bar child):
+// the exact state both showFatal and the watchdog key their behavior on.
+// fade: the kernel's first-frame fade-out has begun.
+function appendPristineOverlay({ fade = false } = {}): HTMLElement {
+  const overlay = document.createElement("div");
+  overlay.id = "loading";
+  overlay.setAttribute("role", "status");
+  overlay.setAttribute("aria-label", "Loading");
+  if (fade) {
+    overlay.classList.add("fade");
+  }
+  const bar = document.createElement("div");
+  bar.className = "bar";
+  overlay.appendChild(bar);
+  document.body.appendChild(overlay);
+  return overlay;
+}
+
+// The synthetic window "error" event the watchdog keys on: `target` for a
+// resource load failure, `error` for an uncaught runtime error. (The
+// capture-flag test deliberately dispatches on a real attached element
+// instead, so the event can only reach the capture-phase window listener.)
+function dispatchWindowError({ target, error }: { target?: unknown; error?: unknown } = {}): void {
+  const event = new Event("error");
+  if (target !== undefined) {
+    Object.defineProperty(event, "target", { value: target });
+  }
+  if (error !== undefined) {
+    Object.defineProperty(event, "error", { value: error });
+  }
+  window.dispatchEvent(event);
+}
+
 describe("web-terminal-kiro bootstrap (app.ts)", () => {
   beforeEach(() => {
     // resetModules so each dynamic import re-runs app.ts top-level code. Mock
@@ -108,9 +170,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("builds the terminal with the agent preset and theme when #loading is absent", async () => {
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
+    const root = appendTerminalRoot();
 
     await import("./app.js");
 
@@ -122,9 +182,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("passes the #loading element to createTerminal when it is present", async () => {
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
+    const root = appendTerminalRoot();
     const loading = document.createElement("div");
     loading.id = "loading";
     document.body.appendChild(loading);
@@ -140,14 +198,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("surfaces an alert dialog on the #loading overlay when #terminal is missing but #loading exists", async () => {
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status"); // mirror index.html's static markup
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const overlay = appendPristineOverlay();
 
     await expect(import("./app.js")).rejects.toThrow(
       "web-terminal-kiro: missing #terminal root element",
@@ -165,14 +216,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("offers a working reload action when startup fails", async () => {
     const reload = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status"); // mirror index.html's static markup
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const overlay = appendPristineOverlay();
 
     await expect(import("./app.js")).rejects.toThrow(
       "web-terminal-kiro: missing #terminal root element",
@@ -185,18 +229,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("reveals the #loading overlay with an error message and rethrows when createTerminal throws", async () => {
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
-    const loading = document.createElement("div");
-    loading.id = "loading";
-    loading.classList.add("fade");
-    loading.setAttribute("role", "status"); // mirror index.html's static markup
-    loading.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    loading.appendChild(bar);
-    document.body.appendChild(loading);
+    const root = appendTerminalRoot();
+    const loading = appendPristineOverlay({ fade: true });
     createTerminalMock.mockImplementationOnce(() => {
       throw new Error("kernel boom");
     });
@@ -215,9 +249,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("rethrows the original error without touching the DOM when createTerminal throws and #loading is absent", async () => {
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
+    appendTerminalRoot();
     createTerminalMock.mockImplementationOnce(() => {
       throw new Error("kernel boom no overlay");
     });
@@ -240,17 +272,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     // Recreate index.html's static body: the terminal root plus the pristine
     // loading overlay (role=status, .bar child, no fade).
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status");
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
 
     // Evaluate the watchdog (via the leak-guarding helper), then simulate the
     // failure it exists for: a <script> element (e.g. /app.js) firing a
@@ -283,23 +306,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog stands down when the overlay is already fading out (booted terminal)", () => {
     evaluateWatchdog(readWatchdogSource());
 
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status");
-    overlay.setAttribute("aria-label", "Loading");
-    overlay.classList.add("fade"); // first frame rendered; fade-out under way
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay({ fade: true }); // first frame rendered; fade-out under way
 
     const scriptEl = document.createElement("script");
-    const errorEvent = new Event("error");
-    Object.defineProperty(errorEvent, "target", { value: scriptEl });
-    window.dispatchEvent(errorEvent);
+    dispatchWindowError({ target: scriptEl });
 
     expect(overlay.getAttribute("role")).toBe("status");
     expect(overlay.querySelector(".bar")).not.toBeNull();
@@ -310,9 +321,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog does not clobber an overlay showFatal already converted", () => {
     evaluateWatchdog(readWatchdogSource());
 
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
+    appendTerminalRoot();
     // Recreate the post-showFatal overlay: bar replaced by the dialog content.
     const overlay = document.createElement("div");
     overlay.id = "loading";
@@ -328,9 +337,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     document.body.appendChild(overlay);
 
     const scriptEl = document.createElement("script");
-    const errorEvent = new Event("error");
-    Object.defineProperty(errorEvent, "target", { value: scriptEl });
-    window.dispatchEvent(errorEvent);
+    dispatchWindowError({ target: scriptEl });
 
     // showFatal's branch-specific message survives; the watchdog's generic
     // failed-to-load text never replaces it.
@@ -342,22 +349,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog ignores a non-script resource error (e.g. an image failing to load)", () => {
     evaluateWatchdog(readWatchdogSource());
 
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status");
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    appendTerminalRoot();
+    const overlay = appendPristineOverlay();
 
     const imgEl = document.createElement("img");
-    const errorEvent = new Event("error"); // plain Event: no .error property
-    Object.defineProperty(errorEvent, "target", { value: imgEl });
-    window.dispatchEvent(errorEvent);
+    dispatchWindowError({ target: imgEl }); // plain Event: no .error property
 
     expect(overlay.getAttribute("role")).toBe("status");
     expect(overlay.querySelector(".bar")).not.toBeNull();
@@ -367,24 +363,12 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog fires on an uncaught runtime error (module evaluation failure)", () => {
     evaluateWatchdog(readWatchdogSource());
 
-    const root = document.createElement("div");
-    root.id = "terminal";
-    document.body.appendChild(root);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status");
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
 
     // A runtime error surfaces as an error event on window with .error set
     // and a non-element target; recreate that shape.
-    const errorEvent = new Event("error");
-    Object.defineProperty(errorEvent, "error", { value: new Error("evaluate boom") });
-    Object.defineProperty(errorEvent, "target", { value: window });
-    window.dispatchEvent(errorEvent);
+    dispatchWindowError({ target: window, error: new Error("evaluate boom") });
 
     expectFatalOverlayShape(overlay);
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
@@ -398,27 +382,28 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     // Booted page: createTerminal built its UI inside #terminal; the overlay
     // is still pristine (first frame not yet rendered, no fade).
-    const root = document.createElement("div");
-    root.id = "terminal";
-    root.appendChild(document.createElement("div")); // the built UI
-    document.body.appendChild(root);
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "status");
-    overlay.setAttribute("aria-label", "Loading");
-    const bar = document.createElement("div");
-    bar.className = "bar";
-    overlay.appendChild(bar);
-    document.body.appendChild(overlay);
+    const root = appendTerminalRoot({ booted: true });
+    const overlay = appendPristineOverlay();
 
     evaluateWatchdog(watchdogSource);
-    const errorEvent = new Event("error");
-    Object.defineProperty(errorEvent, "error", { value: new Error("stray runtime error") });
-    window.dispatchEvent(errorEvent);
+    dispatchWindowError({ error: new Error("stray runtime error") });
 
     // The watchdog must NOT hijack a booted terminal's overlay.
     expect(overlay.getAttribute("role")).toBe("status");
     expect(overlay.querySelector(".bar")).not.toBeNull();
     expect(root.hasAttribute("inert")).toBe(false);
+  });
+
+  it("declares one brand accent across app.ts, index.html and manifest.json", () => {
+    expect(THEME["--accent"]).toBe(ACCENT_HSL);
+    const html = readStaticAsset("index.html");
+    // critical CSS (#loading) and the noscript fallback
+    expect(
+      [...html.matchAll(new RegExp(ACCENT_HSL.replace(/[()%.]/g, "\\$&"), "g"))].length,
+    ).toBeGreaterThanOrEqual(2);
+    // installed-PWA chrome: meta and manifest must agree, in hex form
+    expect(html).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
+    const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
+    expect((manifest as { theme_color: string }).theme_color).toBe(ACCENT_HEX);
   });
 });

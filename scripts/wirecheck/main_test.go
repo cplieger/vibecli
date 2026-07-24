@@ -114,7 +114,7 @@ func TestRun_exitCodeContract(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			got := run(tc.clientRev, tc.clientMinServer, &stdout, &stderr)
 			if got != tc.wantCode {
-				t.Errorf("run(%d, %d) = %d, want exit code %d (the Dockerfile gate branches on it)",
+				t.Errorf("run(%d, %d) = %d, want exit code %d (the build gate fails on any non-zero; the distinct codes are this program's own contract)",
 					tc.clientRev, tc.clientMinServer, got, tc.wantCode)
 			}
 			if tc.wantStdout == "" {

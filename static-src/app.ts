@@ -28,8 +28,14 @@ import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 // path createTerminal never ran, so the remove is a harmless no-op.
 // Mirrored by the inline bootstrap watchdog in static/index.html, which builds
 // the same alertdialog shape for app.js load failures (before this module can
-// run) and stands down once the pristine .bar child is gone -- keep the two in
-// sync when changing this shape.
+// run) -- keep the two in sync when changing this shape. The watchdog stands
+// down while ANY of its three guards holds: the pristine .bar child is gone,
+// the overlay is fading out, or #terminal already has built children. Only the
+// first is this function's responsibility: the replaceChildren below is what
+// drops the .bar, and that is what stops the watchdog from overwriting the
+// specific message set here with its generic "failed to load" text when the
+// rethrown error reaches its capture-phase window listener. app.test.ts pins
+// both builders through one shared shape helper.
 function showFatal(overlay: HTMLElement, message: string): void {
   overlay.classList.remove("fade");
   // alertdialog, not alert: the overlay carries an interactive Reload button
@@ -91,6 +97,12 @@ try {
     // deliberate pin of that same formula, kept so the edge stays low-saturation
     // even if the library's derivation formula changes.
     theme: {
+      // This accent literal is mirrored in three static assets that cannot read
+      // this object: static/index.html's <meta name="theme-color"> (#c099ff is
+      // this same colour) and its #loading critical CSS (--accent plus the
+      // .noscript-fallback colour), and static/manifest.json's theme_color.
+      // index.html carries the matching note; change all of them together or the
+      // installed-PWA chrome and the pre-JS overlay drift from the app accent.
       "--accent": "hsl(263.1683 100% 80%)",
       "--tab-hover-bg": "hsl(263.1683 100% 80% / 16%)",
       "--tab-active-bg": "hsl(263.1683 100% 80% / 32%)",
@@ -101,7 +113,7 @@ try {
       // the defaults): violet = thinking, green = done, yellow = action
       // required. One declared family -- 78% lightness / 0.15 chroma, only the
       // hue carries the state -- sitting at the pastel accent's own level
-      // (#c099ff is ~oklch(76% 0.13 296deg)). The violet hue's sRGB ceiling at
+      // (#c099ff is ~oklch(76% 0.147 301deg)). The violet hue's sRGB ceiling at
       // 78% L is C~0.132, so browsers gamut-map the declared 0.15 down to the
       // max-chroma pastel violet (~#c4a3ff); that clamp is deliberate ("the
       // most saturated violet available at the family's lightness"). Green
@@ -110,9 +122,12 @@ try {
       // working<->done lightness spread (pale lime vs green); state separation
       // rides the ring/motion/shape cues, never lightness or hue alone.
       // Hue alone never carries state (pulse/ring/shape per WCAG 1.4.1):
-      // working is a bare disc emitting a live ripple ping; input freezes
-      // that ping as a static ring; done stays the plain disc. Ripple and
-      // ring derive from their own token inside the library CSS.
+      // working is a ringed disc emitting a live ripple ping off that ring;
+      // input freezes that exact silhouette (ringed disc, no motion); done
+      // is the bare ringless disc. Under prefers-reduced-motion the library
+      // punches working's disc into a donut, so all three stay distinct by
+      // shape with no motion at all. Ripple and ring derive from their own
+      // token inside the library CSS.
       "--status-working": "oklch(78% 0.15 300deg)",
       "--status-done": "oklch(78% 0.15 150deg)",
       "--status-input": "oklch(78% 0.15 95deg)",

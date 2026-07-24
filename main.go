@@ -489,11 +489,30 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 		"hint", `enable gopls (Go), typescript-language-server (TypeScript), or pyright (Python): set "disabled": false in /config/tools.json and restart, or use the loopback tools API`)
 }
 
+// apiNoStore marks the JSON API surface uncacheable. GET /api/sessions returns
+// live session ids, and a session id is the /ws attach + resume capability
+// token — the same value routes.go's LogID truncates before logging and
+// WithPathFunc keeps out of the access log. Neither the engine's REST handler
+// nor webhttp's JSON helpers set Cache-Control, so today that response is
+// stored by the browser's disk cache (a live token persisted to disk,
+// outliving the tab) and is heuristically cacheable by a caching reverse proxy
+// — the README's recommended deployment shape. Gated on the /api/ prefix so
+// the static surface keeps kiroCacheControl's ETag/immutable policy untouched;
+// the SSE handler sets its own Cache-Control: no-cache downstream, which wins.
+func apiNoStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // buildHandler wraps the route mux in web-terminal-kiro's middleware stack via
 // webhttp.Chain. Chain(h, A, B, C, D) == A(B(C(D(h)))), so the first entry is
 // the outermost wrapper; a request flows Logging -> Recoverer ->
-// SecurityHeaders -> host allowlist -> CrossOriginProtection -> mux, and the
-// response unwinds the other way.
+// SecurityHeaders -> apiNoStore -> host allowlist -> CrossOriginProtection ->
+// mux, and the response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
@@ -521,7 +540,13 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
 //     so the access line records the 500, not the recorder's default 200).
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
-//     Referrer-Policy) plus the app's hash-pinned Content-Security-Policy
+//     Referrer-Policy) plus Cross-Origin-Opener-Policy: same-origin (severs
+//     window.opener for any cross-origin page a session opens from an OSC 8 /
+//     autolinked URL taken from untrusted child output, making the vendored
+//     UI's rel="noopener noreferrer" a defence-in-depth pair rather than the
+//     only tabnabbing guard), a Permissions-Policy denying the browser
+//     features a terminal never uses (camera, microphone, geolocation), and
+//     the app's hash-pinned Content-Security-Policy
 //     (csp, built fail-loud by buildCSPPolicy from the embedded index.html —
 //     the same script-src sha256 pinning web-terminal-server ships, closing
 //     the family-drift gap where this app served the same embedded-static +
@@ -530,6 +555,12 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //     web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
+//   - apiNoStore — Cache-Control: no-store on the /api/ surface. GET
+//     /api/sessions returns live session ids, which are the /ws attach/resume
+//     capability tokens the logging layer above deliberately keeps out of logs;
+//     without this the same token is written to the browser's on-disk HTTP
+//     cache and is heuristically cacheable by an intermediary proxy. Scoped to
+//     the /api/ prefix so the static surface keeps kiroCacheControl's policy.
 //   - hostPolicy.Middleware — the KWEB_ALLOWED_HOSTS exact-host check
 //     (webhttp.HostPolicy; see parseAllowedHosts for the DNS-rebinding
 //     rationale). Placed before CrossOriginProtection because rebinding makes
@@ -572,14 +603,31 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 					return p
 				}
 				if strings.HasSuffix(p, "/title") {
-					return "/api/sessions/{id}/title"
+					return terminal.SessionsSubtreePath + "{id}/title"
 				}
-				return "/api/sessions/{id}"
+				return terminal.SessionsSubtreePath + "{id}"
 			}),
 			webhttp.WithClientIP(trustedProxies...),
 		),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.Default())),
-		webhttp.SecurityHeaders(webhttp.WithCSP(csp)),
+		webhttp.SecurityHeaders(
+			webhttp.WithCSP(csp),
+			// Cross-Origin-Opener-Policy: same-origin severs window.opener for
+			// any cross-origin page a session opens. The terminal renders
+			// clickable OSC 8 hyperlinks and server-stamped autolinks straight
+			// out of untrusted child output, so a session can be induced to
+			// open an attacker page; the vendored UI already passes
+			// rel="noopener noreferrer" on every anchor and window.open, and
+			// this header makes that tabnabbing guarantee independent of the
+			// Renovate-bumped web-terminal-ui/engine pins. Permissions-Policy
+			// denies the browser features a terminal never uses (same values
+			// subflux ships). Both are ignored on a non-secure origin
+			// (plain-HTTP LAN bind) and active on localhost / behind a
+			// TLS-terminating proxy — the README's recommended deployment.
+			webhttp.WithCOOP("same-origin"),
+			webhttp.WithPermissionsPolicy("camera=(), microphone=(), geolocation=()"),
+		),
+		apiNoStore,
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)

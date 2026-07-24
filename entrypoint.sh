@@ -19,6 +19,32 @@ kiro_cli_version() {
   timeout --signal=TERM --kill-after=5s 10s "$1" --version 2>/dev/null | awk 'NR==1{print $NF; exit}'
 }
 
+# Fatal boot error: log it, then throttle the restart:unless-stopped crash loop
+# (an immediate exit would hot-spin the container) before failing. $2 carries
+# any extra structured fields, already formatted.
+fatal() {
+  printf 'level=error msg="%s" %scomponent=entrypoint\n' "$1" "${2:+$2 }" >&2
+  sleep 10
+  exit 1
+}
+
+# Tighten one /config-resident directory to the conventional 0700. mkdir -p
+# creates new dirs umask-wide (root umask 022 -> 0755) and leaves an existing
+# dir's mode alone; these dirs live on the /config host bind mount, where a
+# wider mode lets other host users traverse them and read secret-adjacent
+# material (~/.ssh keys and known_hosts, ~/.kiro/settings/mcp.json tokens,
+# ~/.local install state, $HOME's .gitconfig/.netrc/credential stores). A
+# symlink is refused rather than followed (its target may be outside the
+# mount). The directory travels in a dir= field, matching how the rest of this
+# file reports variable data (marker=, path=, token=).
+harden_config_dir() {
+  if [ -L "$1" ]; then
+    printf 'level=warn msg="refusing to chmod symlinked config directory" dir="%s" component=entrypoint\n' "$1" >&2
+  elif ! chmod 700 "$1"; then
+    printf 'level=warn msg="failed to tighten config directory permissions" dir="%s" component=entrypoint\n' "$1" >&2
+  fi
+}
+
 # kiro-cli is pinned via Renovate against the public install manifest at
 # https://desktop-release.q.us-east-1.amazonaws.com/index.json. Bumping
 # the version literal triggers a reinstall on next container start (see
@@ -45,54 +71,14 @@ KIRO_CLI_SHA256="2e35416019a8681586772dc5b0c32539d1712e1469280dbf8cd4bdedc751ea1
 KIRO_CLI_SHA256_ARM64="37063826dd73d888bb068974e7f1d552cd44a0eaf47d2b9b06c31d48830ee104" # kiro-cli 2.14.1
 
 mkdir -p "$TOOLS/bin" "$HOME/.local/bin" "$HOME/.ssh" "$HOME/.kiro" \
-  || {
-    printf 'level=error msg="failed to create config directories (is /config mounted and writable?)" component=entrypoint\n' >&2
-    # Throttle the restart:unless-stopped crash loop: without a mounted,
-    # writable /config every boot fails instantly, and an immediate exit
-    # would hot-spin the container.
-    sleep 10
-    exit 1
-  }
+  || fatal 'failed to create config directories (is /config mounted and writable?)'
 
-# Tighten ~/.ssh to the OpenSSH-conventional 0700. mkdir -p creates new dirs
-# umask-wide (root umask 022 -> 0755) and leaves an existing dir's mode alone;
-# the dir lives on the /config host bind mount, where a wider mode lets other
-# host users traverse it and read non-key files (known_hosts, config).
-if [ -L "$HOME/.ssh" ]; then
-  printf 'level=warn msg="refusing to chmod symlinked ~/.ssh directory" component=entrypoint\n' >&2
-elif ! chmod 700 "$HOME/.ssh"; then
-  printf 'level=warn msg="failed to tighten ~/.ssh permissions" component=entrypoint\n' >&2
-fi
-
-# Tighten ~/.kiro the same way: it holds kiro-cli settings including
-# mcp.json (remote-server URLs and tokens per the MCP docs) and lives on
-# the same /config host bind mount, where the umask-wide 0755 dir plus
-# 0644 files let other host users read secret material. Same symlink
-# guard as ~/.ssh above.
-if [ -L "$HOME/.kiro" ]; then
-  printf 'level=warn msg="refusing to chmod symlinked ~/.kiro directory" component=entrypoint\n' >&2
-elif ! chmod 700 "$HOME/.kiro"; then
-  printf 'level=warn msg="failed to tighten ~/.kiro permissions" component=entrypoint\n' >&2
-fi
-
-# Tighten ~/.local the same way: the mkdir above creates it umask-wide, and
-# kiro-cli's upstream install.sh persists state under it on the same /config
-# host bind mount. Same symlink guard as ~/.ssh above.
-if [ -L "$HOME/.local" ]; then
-  printf 'level=warn msg="refusing to chmod symlinked ~/.local directory" component=entrypoint\n' >&2
-elif ! chmod 700 "$HOME/.local"; then
-  printf 'level=warn msg="failed to tighten ~/.local permissions" component=entrypoint\n' >&2
-fi
-
-# Tighten $HOME itself the same way: mkdir -p above creates /config/home
-# umask-wide (0755), and it holds non-dotdir secret-adjacent files
-# (.gitconfig, .netrc, .bash_history, git credential stores) on the same
-# /config host bind mount. Same symlink guard as ~/.ssh above.
-if [ -L "$HOME" ]; then
-  printf 'level=warn msg="refusing to chmod symlinked home directory" component=entrypoint\n' >&2
-elif ! chmod 700 "$HOME"; then
-  printf 'level=warn msg="failed to tighten home directory permissions" component=entrypoint\n' >&2
-fi
+# Tighten the /config-resident dirs created above (see harden_config_dir for
+# why, and for the symlink guard).
+harden_config_dir "$HOME/.ssh"
+harden_config_dir "$HOME/.kiro"
+harden_config_dir "$HOME/.local"
+harden_config_dir "$HOME"
 
 # mkdir -p succeeds when the directories already exist — even on a read-only
 # bind mount — so it is NOT proof that /config is writable. Prove it with a
@@ -100,9 +86,7 @@ fi
 # unwritable persistent volume) instead of limping into an install that
 # cannot update the readiness marker.
 if ! probe=$(mktemp "$TOOLS/.write-probe.XXXXXX") || ! rm -f "$probe"; then
-  printf 'level=error msg="/config/tools is not writable (read-only bind mount?)" component=entrypoint\n' >&2
-  sleep 10
-  exit 1
+  fatal '/config/tools is not writable (read-only bind mount?)'
 fi
 
 # Readiness marker consumed by the Go server's /api/health (main.go reads
@@ -113,10 +97,21 @@ fi
 KIRO_CLI_READY_MARKER="$TOOLS/.kiro-cli-ready"
 export KIRO_CLI_READY_MARKER
 if ! rm -f "$KIRO_CLI_READY_MARKER"; then
-  printf 'level=error msg="failed to clear stale kiro-cli readiness marker" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
-  sleep 10
-  exit 1
+  fatal 'failed to clear stale kiro-cli readiness marker' "marker=\"$KIRO_CLI_READY_MARKER\""
 fi
+
+# Sweep staged-but-unpromoted kiro-cli binaries out of $HOME/.local/bin. Called
+# from install_kiro_cli's failure EXIT path; a sweep failure is not fatal there
+# (the install already failed and the caller warns) but MUST be visible: the
+# staging dir is on PATH and on the persistent /config volume, so a surviving
+# staged binary stays reachable by bare-name resolution (the README's
+# `docker exec ... kiro-cli`) at a version the pin does not control -- the same
+# residue the pre-reinstall quarantine below treats as fatal.
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via trap
+sweep_staged_kiro_cli() {
+  rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term" && return 0
+  printf 'level=warn msg="failed to sweep staged kiro-cli binaries after a failed install; an unpinned binary may remain reachable via bare-name PATH resolution" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+}
 
 install_kiro_cli() (
   printf 'level=info msg="installing kiro-cli" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
@@ -147,7 +142,7 @@ install_kiro_cli() (
   # e.g. the README's `docker exec ... kiro-cli mcp add` -- the unpinned-binary
   # exposure the pre-reinstall quarantine below exists to close. A success
   # exit (rc=0) skips the sweep; promotion already consumed the staged files.
-  trap 'rc=$?; rm -rf "$tmpdir"; [ -z "$install_log" ] || rm -f "$install_log"; [ "$rc" -eq 0 ] || rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"' EXIT
+  trap 'rc=$?; rm -rf "$tmpdir"; [ -z "$install_log" ] || rm -f "$install_log"; [ "$rc" -eq 0 ] || sweep_staged_kiro_cli' EXIT
   zip="$tmpdir/kirocli.zip"
 
   if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
@@ -269,10 +264,7 @@ if needs_kiro_cli_install; then
   if ! rm -f \
     "$BIN" "$TOOLS/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-term" \
     "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
-    printf 'level=error msg="failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH" path="%s" component=entrypoint\n' "$BIN" >&2
-    # Same crash-loop throttle as the other fatal boot errors above.
-    sleep 10
-    exit 1
+    fatal 'failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH' "path=\"$BIN\""
   fi
   if ! install_kiro_cli; then
     printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
@@ -333,11 +325,24 @@ fi
 # so a broken kiro-cli shows as `unhealthy` in `docker ps` + the monitoring
 # probe with no restart loop. If ever run under Swarm/k8s, wire /api/health to a
 # readinessProbe, not a livenessProbe, to keep it loop-free.
-if [ -x "$BIN" ] && [ "$(kiro_cli_version "$BIN")" = "$KIRO_CLI_VERSION" ]; then
+# Resolve the on-disk version ONCE: a second probe here would add another 10s
+# to the foreground boot allowance the Dockerfile HEALTHCHECK comment sums.
+kiro_cli_installed=""
+if [ -x "$BIN" ]; then
+  kiro_cli_installed=$(kiro_cli_version "$BIN")
+fi
+if [ "$kiro_cli_installed" = "$KIRO_CLI_VERSION" ]; then
   printf 'level=info msg="kiro-cli verified at pinned version; publishing readiness marker" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
   if ! touch "$KIRO_CLI_READY_MARKER"; then
     printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
   fi
+else
+  # Withholding the marker is otherwise a silent signal: /api/health answers 503
+  # and the container sits `unhealthy` forever (readiness, not liveness) with no
+  # reason in Loki. Log the observed version so a wedged --version (timeout) is
+  # distinguishable from a missing binary or a genuine version mismatch.
+  printf 'level=warn msg="kiro-cli not verified at pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" installed=%s pinned=%s component=entrypoint\n' \
+    "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
 fi
 
 # OS packages (APT_PACKAGES env, e.g. "python3 gcc libc6-dev"). apt state

@@ -68,7 +68,7 @@ done
 cp "$UI_DIR/package.json" "$UI_PKG/package.json"
 # The UI ships a nested src tree (src/kernel/, src/features/) since v3, so copy
 # recursively, preserving subdirectories and excluding tests.
-(cd "$UI_DIR/src" && find . -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name 'fc-strict-setup.ts' -print0) \
+(cd "$UI_DIR/src" && find . -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0) \
   | while IFS= read -r -d '' f; do
     mkdir -p "$UI_PKG/src/$(dirname "$f")"
     cp "$UI_DIR/src/$f" "$UI_PKG/src/$f"
@@ -88,6 +88,18 @@ mapfile -t ui_ts < <(find "$UI_PKG/src" -name '*.ts')
 "$TSC" --module ESNext --target ESNext --moduleResolution bundler \
   --outDir static/vendor/cplieger-web-terminal-ui \
   --rootDir "$UI_PKG/src" --skipLibCheck --strict "${ui_ts[@]}"
+# Assert the emit produced every module static/index.html loads: a tsconfig
+# outDir/rootDir change or a lib src-layout move otherwise yields a clean
+# build whose page 404s at runtime.
+for emitted in static/app.js \
+  static/vendor/cplieger-web-terminal-engine/index.js \
+  static/vendor/cplieger-web-terminal-ui/index.js \
+  static/vendor/cplieger-web-terminal-ui/presets.js; do
+  [ -s "$emitted" ] || {
+    printf 'error: expected emit is absent or empty: %s (outDir/rootDir or lib src layout drift?)\n' "$emitted" >&2
+    exit 1
+  }
+done
 
 printf '[5/6] fonts (Monaspace Nerd Font, cached) + CSS bundle (from UI package)\n'
 # Single source of truth: the Dockerfile's Renovate-managed NERDFONT_* ARGs.

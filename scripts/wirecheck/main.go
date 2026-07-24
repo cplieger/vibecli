@@ -31,13 +31,22 @@ func main() {
 }
 
 // run performs the wire-floor gate against the engine's exported constants and
-// returns the process exit code main hands to os.Exit — the contract the
-// Dockerfile consumes: 0 declared-compatible, 1 floor violated (fail the
-// build), 2 usage error (missing/non-positive flag values).
+// returns the process exit code main hands to os.Exit: 0 declared-compatible,
+// 1 floor violated (fail the build), 2 usage error (missing/non-positive flag
+// values).
+//
+// The Dockerfile's gate observes only zero vs non-zero: it invokes this via
+// `go run`, which reports its OWN exit status 1 for ANY non-zero program exit
+// (it prints "exit status 2" to stderr but does not propagate the 2). So the
+// three-way code is the contract for direct invocation and
+// TestRun_exitCodeContract; in a build log the two failures are told apart by
+// their stderr line, not by the code — never add an `[ $? -eq 2 ]` branch to
+// the build step.
 //
 // The flags are validated here rather than left to the engine's comparator so
-// a missing extraction is reported as the usage error it is (exit 2, "fix the
-// gate") instead of a compatibility verdict (exit 1, "bump a pin").
+// a missing extraction is reported as the usage error it is (exit 2, the
+// "required positive integers" line, "fix the gate") instead of a
+// compatibility verdict (exit 1, "bump a pin").
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	if clientRev <= 0 || clientMinServer <= 0 {
 		fmt.Fprintln(stderr, "wirecheck: -client-rev and -client-min-server are required positive integers")

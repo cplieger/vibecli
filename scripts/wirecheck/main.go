@@ -16,6 +16,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
@@ -25,16 +26,25 @@ func main() {
 	clientRev := flag.Int("client-rev", 0, "client WIRE_PROTOCOL_VERSION from the vendored npm artifact")
 	clientMinServer := flag.Int("client-min-server", 0, "client MIN_SUPPORTED_SERVER_WIRE_VERSION from the vendored npm artifact")
 	flag.Parse()
-	if *clientRev <= 0 || *clientMinServer <= 0 {
-		fmt.Fprintln(os.Stderr, "wirecheck: -client-rev and -client-min-server are required positive integers")
-		os.Exit(2)
+	os.Exit(run(*clientRev, *clientMinServer, os.Stdout, os.Stderr))
+}
+
+// run performs the wire-floor gate against the engine's exported constants and
+// returns the process exit code main hands to os.Exit — the contract the
+// Dockerfile consumes: 0 declared-compatible, 1 floor violated (fail the
+// build), 2 usage error (missing/non-positive flag values).
+func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
+	if clientRev <= 0 || clientMinServer <= 0 {
+		fmt.Fprintln(stderr, "wirecheck: -client-rev and -client-min-server are required positive integers")
+		return 2
 	}
-	if reason := incompatibility(terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, *clientRev, *clientMinServer); reason != "" {
-		fmt.Fprintf(os.Stderr, "ERROR wire-floor-mismatch: %s\n", reason)
-		os.Exit(1)
+	if reason := incompatibility(terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, clientRev, clientMinServer); reason != "" {
+		fmt.Fprintf(stderr, "ERROR wire-floor-mismatch: %s\n", reason)
+		return 1
 	}
-	fmt.Printf("wirecheck ok: server wire rev %d (min client %d) <-> client wire rev %d (min server %d)\n",
-		terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, *clientRev, *clientMinServer)
+	fmt.Fprintf(stdout, "wirecheck ok: server wire rev %d (min client %d) <-> client wire rev %d (min server %d)\n",
+		terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion, clientRev, clientMinServer)
+	return 0
 }
 
 // incompatibility returns "" when the declared floors admit the pairing in

@@ -34,6 +34,7 @@ import (
 	"github.com/cplieger/envx"
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/toolbelt/v2"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 	"github.com/cplieger/webhttp"
 )
 
@@ -512,10 +513,11 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //     is its successor. Skips the long-lived streams (/ws and the
 //     /api/sessions/events SSE) so neither emits a misleading open-time access
 //     line; the request id is still minted, echoed, and threaded on those paths.
-//     Also skips /api/health so the every-30s Docker HEALTHCHECK probe emits no
-//     routine access line (the same probe-noise skip web-terminal-server applies
-//     to its /healthz), and the whole /api/sessions/ subtree via WithSkipFunc
-//     below, whose paths embed the full session capability token.
+//     /api/health is NOT skipped: ProbeLogLevel keeps the every-30s Docker
+//     HEALTHCHECK probe's healthy 2xx at Debug (out of the shipped stream)
+//     and promotes a failing probe to Warn/Error; the token-bearing
+//     /api/sessions/ subtree stays logged with its recorded path rewritten
+//     to the route template via WithPathFunc below.
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
 //     so the access line records the 500, not the recorder's default 200).
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
@@ -543,7 +545,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 	return webhttp.Chain(mux,
 		webhttp.Logging(
 			webhttp.WithLogger(slog.Default()),
-			webhttp.WithSkipPaths("/ws", "/api/sessions/events"),
+			webhttp.WithSkipPaths(terminal.WSPath, terminal.SessionEventsPath),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
 			// at Debug (out of the shipped stream, visible under
@@ -566,7 +568,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// (POST/GET /api/sessions) miss the prefix and log unchanged.
 			webhttp.WithPathFunc(func(r *http.Request) string {
 				p := r.URL.Path
-				if !strings.HasPrefix(p, "/api/sessions/") {
+				if !strings.HasPrefix(p, terminal.SessionsSubtreePath) {
 					return p
 				}
 				if strings.HasSuffix(p, "/title") {

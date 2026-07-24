@@ -142,6 +142,6 @@ done
 
 sh scripts/css-bundle.sh "$UI_DIR/css" static/style.css
 
-printf '[6/6] go build (CGO off, linux/amd64 host = container arch)\n'
+printf '[6/6] go build (CGO off, host arch = image arch)\n'
 CGO_ENABLED=0 go build -trimpath -o web-terminal-kiro-dev-bin .
 printf 'OK -> %s/web-terminal-kiro-dev-bin (%s)\n' "$(pwd)" "$(du -h web-terminal-kiro-dev-bin | cut -f1)"

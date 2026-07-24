@@ -33,9 +33,11 @@ repo, not this one.
 Observability is slog-only: webhttp's `Logging` middleware (wired in
 `buildHandler` with `WithClientIP()`) emits a structured access-log line per
 request (method/path/status/duration_ms/request_id/client_ip), except on the
-long-lived streams (`/ws`, `/api/sessions/events`) and the `/api/health`
-probe, which are deliberately skipped (the request id is still minted and
-echoed there). The session-token-bearing `/api/sessions/{id}` paths ARE
+long-lived streams (`/ws`, `/api/sessions/events`), which are deliberately
+skipped (the request id is still minted and echoed there); the `/api/health`
+probe logs at Debug while healthy (out of the default info stream) and
+surfaces at Warn/Error when the probe fails, via webhttp's `ProbeLogLevel`.
+The session-token-bearing `/api/sessions/{id}` paths ARE
 logged, with the recorded path rewritten to the token-free route template
 (`/api/sessions/{id}`, `/api/sessions/{id}/title`) via webhttp's
 `WithPathFunc`, so their telemetry survives without a live token ever

@@ -15,7 +15,7 @@ A minimal browser terminal for the **Kiro CLI**: run `kiro-cli` in a browser tab
 
 Web Terminal for Kiro gives each browser tab its own `kiro-cli` session over a live PTY stream and renders kiro-cli's real terminal UI verbatim, the way an SSH session would, with no chat layer, history store, or translation in between.
 
-What sets it apart from a typical browser terminal: the screen is **real browser text, not a canvas**, so scrolling and text selection are native; it is **touch-first with multiple tabs**, as usable on a phone as on a laptop; and sessions **survive sleep and network drops**: the screen and scrollback are replayed on reconnect, so you never lose your place.
+Three things set it apart from a typical browser terminal. The screen is **real browser text, not a canvas**, so scrolling and text selection are native. It is **touch-first with multiple tabs**, as usable on a phone as on a laptop. And sessions **survive sleep and network drops**: the screen and scrollback are replayed on reconnect, so you never lose your place.
 
 Published as a multi-arch (amd64 + arm64) container image on **GHCR** (`ghcr.io/cplieger/web-terminal-kiro`) and **Docker Hub** (`cplieger/web-terminal-kiro`).
 
@@ -47,24 +47,24 @@ Open <http://localhost:9848>. On first launch, kiro-cli walks you through sign-i
 
 Web Terminal for Kiro runs as root so `git`, `gh`, and SSH work; don't add a `user:` line, and expect files under the mounts to be root-owned on the host.
 
-## Configuration
+## Configuration reference
 
 The image ships working defaults; most setups only pick a port and a volume.
 
-| Variable | Default | Purpose |
+| Variable | Description | Default |
 | --- | --- | --- |
-| `KWEB_ADDR` | `:9848` | Listen address (`host:port`). |
-| `KWEB_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive; slog offset syntax like `warn+1` also parses). `debug` surfaces diagnostic traces such as the unrecognized-notification line that explains stuck tab-status dots after a kiro-cli version bump. An unparseable value falls back to `info` with a startup warning. |
-| `KWEB_WORK_DIR` | `/workspace` | Directory each terminal session starts in (must exist). |
-| `KWEB_CONFIG_DIR` | `/config` | Persistent config directory (kiro-cli home, tool state). When the directory does not exist the tool-provisioning engine is skipped with a warning; terminal sessions still run (the case when running bare `go run` outside the image). |
-| `KIRO_CLI_PATH` | `kiro-cli` | Path to the kiro-cli binary each session launches (resolved via `PATH` when bare). A missing binary reports inside the terminal at session start; the server keeps serving. |
-| `KIRO_CLI_CHAT_ARGS` | _(unset)_ | Extra launch flags appended to every session's `kiro-cli chat` command, whitespace-separated (for example `--effort high` or `--v3`). Handy for opting into kiro-cli features ahead of the image's defaults. |
-| `TOOL_CATALOG_REFRESH` | `24h` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. |
-| `TOOL_CATALOG_URL` | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. |
-| `TOOL_CATALOG_PATH` | `/app/tool-catalog.json` | Image-baked tool catalog used at first boot and when offline, until a successfully fetched catalog replaces it. |
-| `KIRO_CLI_READY_MARKER` | _(unset)_ | Image-internal: the entrypoint sets it to the marker file it writes once kiro-cli is verified runnable, and `/api/health` reports starting (503) while the marker is absent. Leave unset outside the container. |
-| `TRUSTED_PROXIES` | _(unset)_ | Reverse-proxy CIDRs / bare IPs whose `X-Forwarded-For` the access log trusts to resolve `client_ip`. See [Behind a reverse proxy](#behind-a-reverse-proxy). |
-| `KWEB_ALLOWED_HOSTS` | _(unset)_ | Comma-separated exact hostnames/IPs the server answers for (e.g. `localhost,192.168.1.5,webterm.example.com`); a request with any other `Host` header is rejected. Requests made from inside the container itself (loopback socket peer with a loopback `Host`) are always admitted, so the image's healthcheck and in-container tools clients keep working under any allowlist. This blocks DNS-rebinding attacks, which can reach even a loopback- or LAN-bound terminal through your own browser, so set it for any long-running deployment (unset accepts every `Host` and logs a startup warning). |
+| `KWEB_ADDR` | Listen address (`host:port`). | `:9848` |
+| `KWEB_LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
+| `KWEB_WORK_DIR` | Directory each terminal session starts in (must exist). | `/workspace` |
+| `KWEB_CONFIG_DIR` | Persistent config directory (kiro-cli home, tool state). When it does not exist, tool provisioning is skipped with a warning; terminal sessions still run. | `/config` |
+| `KIRO_CLI_PATH` | Path to the kiro-cli binary each session launches (resolved via `PATH` when bare). A missing binary reports inside the terminal at session start; the server keeps serving. | `/config/tools/bin/kiro-cli` (set by the image; bare `kiro-cli` outside the container) |
+| `KIRO_CLI_CHAT_ARGS` | Extra launch flags appended to every session's `kiro-cli chat` command, whitespace-separated (for example `--effort high` or `--v3`). Handy for opting into kiro-cli features ahead of the image's defaults. Flag values never reach the logs — the startup line records only a flag count. | _(unset)_ |
+| `TOOL_CATALOG_REFRESH` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. | `24h` |
+| `TOOL_CATALOG_URL` | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact |
+| `TOOL_CATALOG_PATH` | Image-baked tool catalog used at first boot and when offline, until a successfully fetched catalog replaces it. | `/app/tool-catalog.json` |
+| `KIRO_CLI_READY_MARKER` | Image-internal: the entrypoint sets it to the marker file it writes once kiro-cli is verified runnable, and `/api/health` reports starting (503) while the marker is absent. Leave unset outside the container. | _(unset)_ |
+| `TRUSTED_PROXIES` | Reverse-proxy CIDRs / bare IPs whose `X-Forwarded-For` the access log trusts to resolve `client_ip`. See [Behind a reverse proxy](#behind-a-reverse-proxy). | _(unset)_ |
+| `KWEB_ALLOWED_HOSTS` | Comma-separated exact hostnames/IPs the server answers for (e.g. `localhost,192.168.1.5,webterm.example.com`); any other `Host` header is rejected. This blocks DNS rebinding, which can reach even a loopback- or LAN-bound terminal through your own browser, so set it for any long-running deployment; unset accepts every `Host` and logs a startup warning. Requests from inside the container itself are always admitted, so the healthcheck and in-container tools clients keep working. | _(unset)_ |
 
 - **Port:** `9848` (HTTP + WebSocket).
 - **Volumes:** `/config` persists kiro-cli auth/tokens, installed tools, settings, and `~/.ssh` + git config; `/workspace` is your repositories / working directory.
@@ -78,21 +78,9 @@ Everything kiro-cli stores lives under `/config` and survives container recreati
 
 ### Behind a reverse proxy
 
-Web Terminal for Kiro has no built-in authentication, so the cleanest way to expose it is to let a reverse proxy terminate TLS and require a login. A minimal [Caddy](https://caddyserver.com) config adds HTTP Basic auth in front of the terminal:
+Web Terminal for Kiro has no built-in authentication, so the cleanest way to expose it is to let a reverse proxy terminate TLS and require a login: HTTP Basic auth at minimum, forward auth (Authentik, oauth2-proxy, Caddy forward-auth) for real single sign-on. The proxy needs no special handling beyond passing WebSocket upgrades through, which mainstream proxies do by default. Pair it with a published port bound to loopback (`127.0.0.1:9848:9848`) so the only route in is through the proxy.
 
-```caddyfile
-webterm.example.com {
-    basic_auth {
-        # generate the hash with: caddy hash-password
-        alice $2a$14$...
-    }
-    reverse_proxy 127.0.0.1:9848
-}
-```
-
-For real single sign-on, use forward auth (Authentik, oauth2-proxy) instead of Basic auth; Caddy proxies the terminal's WebSocket transparently either way. Pair this with a published port bound to loopback (`127.0.0.1:9848:9848`) so the only route in is through the proxy.
-
-Behind a proxy, also set `TRUSTED_PROXIES` so the access log records the real client. By default (`TRUSTED_PROXIES` unset) the log uses the direct socket peer and ignores any `X-Forwarded-For` header, so the logged IP cannot be spoofed; that's the correct choice when Web Terminal for Kiro is directly exposed. When a proxy sits in front, the socket peer is the proxy, not the user, so set `TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (e.g. `TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the log then resolves the real client from a trusted `X-Forwarded-For`. Only a request whose socket peer is inside the set has its `X-Forwarded-For` trusted (spoof-safe); a malformed entry is logged and skipped rather than aborting startup.
+Behind a proxy, also set `TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (e.g. `TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the access log then resolves the real client from a trusted `X-Forwarded-For` instead of logging the proxy as the peer. Unset (the default), the log records the direct socket peer and ignores `X-Forwarded-For`, so the logged IP cannot be spoofed; that is the right choice when the terminal is directly exposed. Only a request whose socket peer is inside the set has its `X-Forwarded-For` trusted, and a malformed entry is logged and skipped rather than aborting startup.
 
 ## Features
 
@@ -127,7 +115,7 @@ Because Web Terminal for Kiro drives kiro-cli's own terminal UI directly, every 
 ## Tools
 
 Web Terminal for Kiro ships kiro-cli, `git`, and base utilities. Everything else is
-declared in `/config/tools.json` — a small manifest the built-in tools engine
+declared in `/config/tools.json`, a small manifest the built-in tools engine
 (the [`toolbelt`](https://github.com/cplieger/toolbelt) library) reconciles against
 on boot: enabled entries are installed into `/config/tools/` (persisting across
 restarts), disabled entries wait as templates, removed installs are cleaned up.
@@ -141,7 +129,7 @@ the GitHub CLI, all disabled. Flip the ones you want and restart:
 {
   "version": 2,
   "tools": {
-    "gopls":                      { "disabled": true },   // Go — set false to install (pulls the Go toolchain)
+    "gopls":                      { "disabled": true },   // Go: set false to install (pulls the Go toolchain)
     "typescript-language-server": { "disabled": false },  // TypeScript LSP: enabled, installs on restart (pulls node)
     "pyright":                    { "disabled": true },   // Python LSP
     "rust-analyzer":              { "disabled": true },   // Rust LSP
@@ -152,30 +140,24 @@ the GitHub CLI, all disabled. Flip the ones you want and restart:
 
 Enabled language servers land on `PATH`, where kiro-cli's [code
 intelligence](https://kiro.dev/docs/cli/code-intelligence/) picks them up:
-run `/code init` once per workspace inside a session (writes
-`.kiro/settings/lsp.json` and starts the detected languages' servers), then
-the agent gets LSP-backed navigation, rename, and diagnostics; `/code status`
-shows which servers it found.
+run `/code init` once per workspace inside a session; `/code status` shows
+which servers it found.
 
 Install knowledge (download URLs, checksums, dependencies) comes from a
-catalog of ~700 tools compiled from the mise and aqua registries, as they release, by
-[tool-catalog](https://github.com/cplieger/tool-catalog) — a template carries
+catalog of ~700 tools compiled from the mise and aqua registries by
+[tool-catalog](https://github.com/cplieger/tool-catalog); a template carries
 no install commands, so it never goes stale. The server refreshes the catalog
-at boot and every `TOOL_CATALOG_REFRESH` (default `24h`; `off` disables the
-schedule), re-verifying the required tool set before a fetched catalog
-replaces the current one and keeping the last good catalog on any failure; an
-image-baked copy covers first boots offline. `TOOL_CATALOG_URL` points the
-refresh elsewhere (forks, mirrors), and
-`POST localhost:9848/api/tools/catalog/refresh` triggers one on demand
-(`GET /api/tools/catalog` reports what is loaded and where it came from).
-Dependencies auto-adopt: enabling `typescript-language-server` installs
-`node` and the `typescript` package with it, no extra manifest entries
-needed. Language servers are picked up by kiro-cli's code intelligence
-automatically; the boot log warns when none is enabled. While tools install,
-the web UI and health endpoint stay reachable and only new-session creation
-waits, so the first session always sees the finished PATH.
+at boot and every `TOOL_CATALOG_REFRESH`, keeps the last good catalog on any
+failure, and uses an image-baked copy for offline first boots.
+`GET localhost:9848/api/tools/catalog` reports what is loaded and where it
+came from; `POST .../api/tools/catalog/refresh` forces a refresh (both
+loopback-only). Dependencies auto-adopt: enabling `typescript-language-server`
+installs `node` and the `typescript` package with it, no extra manifest
+entries needed. While tools install, the web UI and health endpoint stay
+reachable and only new-session creation waits, so the first session always
+sees the finished PATH.
 
-**Add more tools by name.** Any catalog name works as a bare entry — the engine
+**Add more tools by name.** Any catalog name works as a bare entry; the engine
 fills in the rest:
 
 ```jsonc
@@ -205,20 +187,6 @@ curl -s -X POST  localhost:9848/api/tools -d '{"name": "ripgrep"}'         # add
 
 OS packages are not manifest entries: set `APT_PACKAGES="gcc python3 ..."` on
 the container and the entrypoint installs them at each start.
-
-## How it fits together
-
-```text
-kiro-cli chat                          one PTY-backed process per browser tab
-   │  PTY
-web-terminal-engine (Go)               PTY bridge + VT screen buffer + wire protocol
-   │  via terminal.NewSessionManager
-web-terminal-kiro server (this app)    HTTP + WebSocket, the kiro-cli install, access log
-   │  binary wire protocol over WebSocket
-web-terminal-engine + web-terminal-ui  renderer + touch UI, running in your browser
-```
-
-Web Terminal for Kiro is deliberately small: an HTTP + WebSocket server around the engine, the kiro-cli install, and a structured access log. Everything terminal-related lives in the shared web-terminal libraries.
 
 ## Related projects
 

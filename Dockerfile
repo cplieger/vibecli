@@ -159,7 +159,10 @@ ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.5.1
 # suite), not a version-string equality — asserted mechanically by the
 # wire-floor gate after the vendor fetch below. Renovate moves the
 # ARG+package.json pins in one grouped PR on the routine path; this gate
-# catches the human bypass.
+# catches the human bypass. The tsc compiler pair (ARG TS_VERSION vs
+# static-src/package.json's @typescript/native pin) is asserted for the same
+# dev/prod-parity reason: the served bundle must be compiled by the same tsc
+# version local dev typechecked against.
 COPY static-src/package.json static-src/package.json
 RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p' static-src/package.json) && \
     UI_NPM=$(sed -n 's|.*"@cplieger/web-terminal-ui": "\([^"]*\)".*|\1|p' static-src/package.json) && \
@@ -170,6 +173,11 @@ RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p
     fi && \
     if [ "$UI_NPM" != "$CPLIEGER_WEB_TERMINAL_UI_VERSION" ]; then \
       echo "ERROR ui-pin-mismatch: static-src/package.json pins @cplieger/web-terminal-ui ${UI_NPM} but Dockerfile ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=${CPLIEGER_WEB_TERMINAL_UI_VERSION}" >&2; exit 1; \
+    fi && \
+    TSC_NPM=$(sed -n 's|.*"@typescript/native": "npm:typescript@\([^"]*\)".*|\1|p' static-src/package.json) && \
+    : "${TSC_NPM:?pin-gate: no @typescript/native pin found in static-src/package.json}" && \
+    if [ "$TSC_NPM" != "$TS_VERSION" ]; then \
+      echo "ERROR tsc-pin-mismatch: static-src/package.json pins @typescript/native npm:typescript@${TSC_NPM} but Dockerfile ARG TS_VERSION=${TS_VERSION}" >&2; exit 1; \
     fi && \
     mkdir -p static-src/node_modules/@cplieger/web-terminal-engine static-src/node_modules/@cplieger/web-terminal-ui && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/engine.tgz "https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-${CPLIEGER_WEB_TERMINAL_ENGINE_VERSION}.tgz" && \

@@ -84,6 +84,16 @@ elif ! chmod 700 "$HOME/.local"; then
   printf 'level=warn msg="failed to tighten ~/.local permissions" component=entrypoint\n' >&2
 fi
 
+# Tighten $HOME itself the same way: mkdir -p above creates /config/home
+# umask-wide (0755), and it holds non-dotdir secret-adjacent files
+# (.gitconfig, .netrc, .bash_history, git credential stores) on the same
+# /config host bind mount. Same symlink guard as ~/.ssh above.
+if [ -L "$HOME" ]; then
+  printf 'level=warn msg="refusing to chmod symlinked home directory" component=entrypoint\n' >&2
+elif ! chmod 700 "$HOME"; then
+  printf 'level=warn msg="failed to tighten home directory permissions" component=entrypoint\n' >&2
+fi
+
 # mkdir -p succeeds when the directories already exist — even on a read-only
 # bind mount — so it is NOT proof that /config is writable. Prove it with a
 # create+remove probe and fail fast (the documented behavior for an

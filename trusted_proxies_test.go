@@ -225,10 +225,11 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 
 // TestBuildHandlerSkipsAccessLogForStreams pins the access-log wiring in
 // buildHandler: the long-lived streams (/ws and the /api/sessions/events SSE)
-// and the /api/health probe must emit NO access-log line, the token-bearing
-// /api/sessions/ subtree must emit lines whose recorded path is the
-// token-free route template (WithPathFunc — a raw session id must never
-// appear), and normal requests still log their real path. A regression
+// must emit NO access-log line; a healthy /api/health probe is suppressed at
+// the default Info level while a failing probe still emits at Warn/Error.
+// The token-bearing /api/sessions/ subtree must emit lines whose recorded
+// path is the token-free route template (WithPathFunc — a raw session id
+// must never appear), and normal requests still log their real path. A regression
 // dropping WithSkipPaths would flood the access log with one misleading line
 // per reconnect; a regression dropping WithPathFunc would leak live session
 // tokens to log-read consumers; both pass every other test. Serial: swaps

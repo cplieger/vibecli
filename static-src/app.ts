@@ -106,10 +106,13 @@ try {
       // max-chroma pastel violet (~#c4a3ff); that clamp is deliberate ("the
       // most saturated violet available at the family's lightness"). Green
       // (~#67d283) and yellow (~#d6b529) are in gamut and render as declared.
+      // The single-lightness family deliberately drops the library defaults'
+      // working<->done lightness spread (pale lime vs green); state separation
+      // rides the ring/motion/shape cues, never lightness or hue alone.
       // Hue alone never carries state (pulse/ring/shape per WCAG 1.4.1):
-      // working and input share one ringed silhouette -- live pulses, blocked
-      // is frozen -- and done stays the bare disc. Both rings derive from
-      // their own token inside the library CSS.
+      // working is a bare disc emitting a live ripple ping; input freezes
+      // that ping as a static ring; done stays the plain disc. Ripple and
+      // ring derive from their own token inside the library CSS.
       "--status-working": "oklch(78% 0.15 300deg)",
       "--status-done": "oklch(78% 0.15 150deg)",
       "--status-input": "oklch(78% 0.15 95deg)",

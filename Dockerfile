@@ -335,13 +335,24 @@ COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
 WORKDIR /workspace
 EXPOSE 9848
 
-# start-period covers the entrypoint's worst-case FOREGROUND path before the
-# server binds: kiro-cli download (curl --max-time 300) + install.sh (120, +15
-# kill-after) + version/settings probes (~120: three --version checks plus five
-# settings calls at 10s each, +5s kill-after) + optional APT_PACKAGES (600, +30
-# kill-after) ≈ 1185s, so the 20m start-period still covers the worst case.
-# The same derived budget drives tests/image-smoke.conf's
-# SMOKE_TIMEOUT (1260) — move both together whenever a foreground timeout
+# start-period is the SELECTED startup tolerance for the entrypoint's blocking
+# FOREGROUND path before the server binds; it satisfies the smoke-harness
+# sizing rule (tests/image-smoke.conf SMOKE_TIMEOUT 1260 = 1200 + two 30s
+# probe intervals). The derivation below sums the explicit foreground timeout
+# ALLOWANCES only — it is not a ceiling: untimed local work (sha-256
+# verification, unzip; the binary promotion is an O(1) same-filesystem rename)
+# runs outside the sums. Single-attempt allowance-sum: kiro-cli download (curl
+# --max-time 300) + install.sh (120, +15 kill-after) + version/settings probes
+# (~120: three --version checks plus five settings calls at 10s each, +5s
+# kill-after) + optional APT_PACKAGES (600, +30 kill-after) ≈ 1185s — covered
+# by the 20m start-period. The download also runs with --retry 3, and curl
+# treats an operation timeout as transient (retryable), so the download leg's
+# allowance is 4×300s + 3×5s retry delay = 1215s, making the retry-inflated
+# allowance-sum ≈ 2100s with APT_PACKAGES (≈ 1470s without) — NOT covered by
+# the 20m start-period or SMOKE_TIMEOUT. Resolving that gap is a pending
+# maintainer decision (bound the retries, raise both budgets in lockstep
+# (~36m / 2220), drop --retry, or accept the exposure). Keep this comment and
+# tests/image-smoke.conf's header in lockstep whenever a foreground timeout
 # changes. Tool installs
 # converge in the background AFTER bind (only session creation waits on
 # them), so /api/health is reachable throughout that window — it reports the

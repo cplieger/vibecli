@@ -495,7 +495,10 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 // response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
-//     status, including a recovered 500 and a cross-origin 403. WithClientIP is
+//     status on logged routes, including a recovered 500 and a cross-origin
+//     403 — subject to the skip list below (/ws, the SSE stream, /api/health,
+//     and the token-bearing /api/sessions/ subtree emit no access lines).
+//     WithClientIP is
 //     passed the TRUSTED_PROXIES set (parseTrustedProxies) as the `client_ip`
 //     field's trusted-proxy ranges: unset/empty ⇒ trust nothing, so `client_ip`
 //     is the unspoofable socket peer and X-Forwarded-For is ignored — the
@@ -528,7 +531,8 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 //     rationale). Placed before CrossOriginProtection because rebinding makes
 //     Origin and Host agree, so the origin check alone cannot reject it; kept
 //     inside SecurityHeaders so even a rejected host gets the baseline headers
-//     and an access-log line. An inactive policy (env unset/blank) collapses
+//     and — on logged routes — an access-log line. An inactive policy (env
+//     unset/blank) collapses
 //     to a pass-through per the library's off-contract.
 //   - CrossOriginProtection — the stdlib cross-origin/CSRF guard, kept
 //     innermost (its long-standing position directly in front of the routes) so

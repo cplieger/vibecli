@@ -287,7 +287,7 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 // status for the tab activity dots: "Response complete" at the end of an agent
 // turn latches the done (green) state, and "Permission required" when a tool
 // call is blocked on approval latches the needs-input (amber) state (confirmed
-// against the pinned 2.13.1 build's kiro-cli-chat notifier strings — the
+// against the pinned 2.14.1 build's kiro-cli-chat notifier strings — the
 // strings live in the kiro-cli-chat sidecar binary, not the kiro-cli
 // dispatcher, so re-verify both strings there after every kiro-cli bump, in
 // the same PR as the pin move). A new

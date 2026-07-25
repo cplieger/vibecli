@@ -525,6 +525,23 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(true);
   });
 
+  it("aborts boot from the fatal handoff marker independently of dialog ARIA", async () => {
+    // The test above drives the REAL watchdog, which sets both the marker and
+    // role=alertdialog, so it stays green if app.ts regresses to the old ARIA
+    // predicate. This isolates the protocol: a pristine role=status overlay
+    // carrying only data-bootstrap-fatal must still abort the boot.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    overlay.setAttribute("data-bootstrap-fatal", "");
+
+    await expect(import("./app.js")).rejects.toThrow(
+      "bootstrap watchdog already reported a fatal resource failure",
+    );
+
+    expect(createTerminalMock).not.toHaveBeenCalled();
+    expectPristineOverlayUntouched(overlay, root);
+  });
+
   it("watchdog ignores a failed non-stylesheet <link> (e.g. an icon)", () => {
     // Icon and manifest links 404 in the wild; they must never raise the
     // fatal dialog, which is why the guard tests rel, not just the element.

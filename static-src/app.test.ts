@@ -88,6 +88,9 @@ function readStaticAsset(name: string): string {
 // breaks the shared shape fails here.
 function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("role")).toBe("alertdialog");
+  // The handoff marker both builders set: the app -> watchdog and watchdog -> app
+  // stand-downs both key on it, so neither depends on the other's DOM shape.
+  expect(overlay.hasAttribute("data-bootstrap-fatal")).toBe(true);
   expect(overlay.getAttribute("aria-modal")).toBe("true");
   expect(overlay.getAttribute("aria-label")).toBe("Web Terminal for Kiro startup failure");
   expect(overlay.getAttribute("aria-describedby")).toBe("bootstrap-failure-message");
@@ -494,6 +497,28 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(true);
   });
 
+  it("watchdog sweep ignores a failed stylesheet whose media query does not match", () => {
+    // A non-matching-media stylesheet (print-only here) never applies to the
+    // current rendering, so a null .sheet is its normal state and its failure
+    // is not fatal: index.html's post-registration sweep gates the
+    // re-dispatch on window.matchMedia(link.media).matches. Without that gate
+    // a print stylesheet raises the fatal dialog over a perfectly healthy
+    // screen render, and no test pins it.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    linkEl.media = "print"; // no href: happy-dom must not attempt a real fetch
+    document.head.appendChild(linkEl);
+    onTestFinished(() => {
+      linkEl.remove(); // beforeEach only clears <body>
+    });
+
+    evaluateWatchdog(readWatchdogSource());
+
+    expectPristineOverlayUntouched(overlay, root);
+  });
+
   it("does not boot over the watchdog's fatal stylesheet dialog", async () => {
     // The second half of the stylesheet flow the test above stops short of: a
     // failed /style.css does NOT prevent /app.js from evaluating, so app.ts
@@ -539,6 +564,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     );
 
     expect(createTerminalMock).not.toHaveBeenCalled();
+    expectPristineOverlayUntouched(overlay, root);
+  });
+
+  it("watchdog sweep ignores a disabled stylesheet", () => {
+    // A disabled stylesheet is not applied, so a null .sheet is its normal
+    // state rather than a load failure: index.html's sweep gates the
+    // re-dispatch on !link.disabled. happy-dom does not reflect the disabled
+    // content attribute onto the IDL property, so set the property directly --
+    // the same surface a browser exposes and scripts toggle.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    linkEl.disabled = true;
+    document.head.appendChild(linkEl);
+    onTestFinished(() => {
+      linkEl.remove(); // beforeEach only clears <body>
+    });
+
+    evaluateWatchdog(readWatchdogSource());
+
     expectPristineOverlayUntouched(overlay, root);
   });
 

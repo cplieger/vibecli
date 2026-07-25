@@ -141,7 +141,8 @@
          (WCAG 4.1.3). Same clip technique web-terminal-ui's kernel announcer uses
          (src/kernel/a11y.ts hideVisually). Both fatal builders replaceChildren(),
          so it is gone by the time the overlay becomes the alertdialog. */
-      #loading .loading-status {
+      #loading .loading-status,
+      .visually-hidden {
         position: absolute;
         inline-size: 1px;
         block-size: 1px;
@@ -182,9 +183,17 @@
     </style>
   </head>
   <body>
+    <!-- The served shell is an empty JS-built app: without these two lines the
+     document has no heading and no landmark at all (createTerminal builds
+     role="log" + the hidden input, and the library's only heading is the <h2>
+     inside its fatal panel). The h1 is heading-navigation's single anchor and
+     the parent level for that h2; #terminal is a <main> so AT can jump to the
+     terminal region. Keep the h1 OUTSIDE #terminal: createTerminal appends
+     into the root and its fatal path clears it. -->
+    <h1 class="visually-hidden">Web Terminal for Kiro</h1>
     <!-- createTerminal() (in /app.js) builds the entire terminal UI inside this
      root element; the loading overlay is a sibling so it is never cleared. -->
-    <div id="terminal"></div>
+    <main id="terminal"></main>
     <div id="loading" role="status" aria-label="Loading">
       <div class="bar" aria-hidden="true"></div>
       <p class="loading-status">Starting the terminal…</p>
@@ -221,7 +230,13 @@
           // BOOTED terminal's invisible (opacity:0, pointer-events:none)
           // overlay into a focus-stealing alertdialog. app.js's own showFatal
           // replaces the bar before it throws.
-          if (!overlay || !overlay.querySelector(".bar") || overlay.classList.contains("fade")) return;
+          if (
+            !overlay ||
+            overlay.hasAttribute("data-bootstrap-fatal") ||
+            !overlay.querySelector(".bar") ||
+            overlay.classList.contains("fade")
+          )
+            return;
           // Stand down once createTerminal has built the UI inside #terminal:
           // boot progressed past module load/eval, so a later uncaught error
           // is a runtime error, not a bootstrap failure. Without this, a

@@ -29,18 +29,24 @@ import { createTerminal } from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 
 // Reveal the #loading overlay as a modal alert dialog with a fatal message.
-// remove("fade") undoes any fade-out createTerminal began; on the missing-root
-// path createTerminal never ran, so the remove is a harmless no-op.
+// remove("fade") is unconditional normalization, not a race fix: it guarantees the
+// dialog is opaque and hit-testable (.fade sets opacity:0 + pointer-events:none)
+// however the overlay arrived. It is a no-op on both call sites today -- the UI
+// kernel only ever adds .fade from ASYNCHRONOUS callbacks (dismissLoadingOverlay,
+// reached via markReady from a screen frame / font settle / close handler, or from
+// the setupFeatures continuation), so a synchronous createTerminal throw cannot have
+// faded anything by the time this catch runs, and on the missing-root path
+// createTerminal never ran at all.
 // Mirrored by the inline bootstrap watchdog in static/index.html, which builds
 // the same alertdialog shape for app.js load failures (before this module can
-// run) -- keep the two in sync when changing this shape. The watchdog stands
-// down while ANY of its three guards holds: the pristine .bar child is gone,
-// the overlay is fading out, or #terminal already has built children. Only the
-// first is this function's responsibility: the replaceChildren below is what
-// drops the .bar, and that is what stops the watchdog from overwriting the
-// specific message set here with its generic "failed to load" text when the
-// rethrown error reaches its capture-phase window listener. app.test.ts pins
-// both builders through one shared shape helper.
+// run) -- keep the two in sync when changing this shape: the shared shape
+// helper in app.test.ts pins every attribute of it, including the
+// data-bootstrap-fatal marker both builders set. That marker is what stops the
+// watchdog from overwriting the specific message set here with its generic
+// "failed to load" text when the rethrown error reaches its capture-phase
+// window listener; its other stand-down guards (absent overlay, the pristine
+// .bar already replaced, a fade-out under way, #terminal already carrying built
+// children) are not this function's responsibility.
 function showFatal(overlay: HTMLElement, message: string): void {
   overlay.classList.remove("fade");
   // alertdialog, not alert: the overlay carries an interactive Reload button
@@ -53,6 +59,11 @@ function showFatal(overlay: HTMLElement, message: string): void {
   description.id = "bootstrap-failure-message";
   description.textContent = message;
   overlay.setAttribute("role", "alertdialog");
+  // Same handoff marker the index.html watchdog sets: 'a fatal bootstrap dialog owns
+  // this overlay'. Set here too so the watchdog's stand-down is explicit rather than
+  // resting on replaceChildren having dropped the .bar when the rethrow reaches its
+  // capture-phase listener.
+  overlay.setAttribute("data-bootstrap-fatal", "");
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-label", "Web Terminal for Kiro startup failure");
   overlay.setAttribute("aria-describedby", description.id);

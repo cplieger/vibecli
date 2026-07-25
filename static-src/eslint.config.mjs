@@ -21,6 +21,15 @@ export default [
       "**/.next/**",
       "**/.cache/**",
       "**/coverage/**",
+      // Stryker's sandbox + report output and the Kiro skill scratch trees. All are
+      // gitignored, but ESLint flat config does not read .gitignore (and no longer
+      // ignores dot-directories by default), so a leftover sandbox (an interrupted
+      // mutation run never cleans it up) or a review run makes `npm run lint:eslint`
+      // fail on hundreds of copied, @ts-nocheck-stamped files. .prettierignore and
+      // vitest.config.ts exclude the same trees for the same reason.
+      "**/.stryker-tmp/**",
+      "**/reports/**",
+      "**/.code-review/**",
       // Minified / generated source
       "**/*.min.*",
       "**/*.gen.ts",

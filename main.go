@@ -261,7 +261,9 @@ func main() {
 		toolsState:      tools.state,
 	})
 	if err != nil {
-		slog.Error("route registration failed", "error", err)
+		slog.Error("route registration failed; the embedded static tree is unusable",
+			"error", err,
+			"hint", "this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block; rebuild the image (go generate ./... plus the Dockerfile static build). The container will crash-loop under its restart policy until it is rebuilt.")
 		tools.close()
 		os.Exit(1)
 	}
@@ -501,7 +503,7 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 // the SSE handler sets its own Cache-Control: no-cache downstream, which wins.
 func apiNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		if strings.HasPrefix(r.URL.Path, apiPrefix) {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
@@ -585,7 +587,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// status and request id. The streams above stay fully skipped:
 			// one open-to-close line per WebSocket/SSE would be misleading
 			// by shape, not merely noisy.
-			webhttp.ProbeLogLevel("/api/health"),
+			webhttp.ProbeLogLevel(healthPath),
 			// DELETE /api/sessions/{id} and PUT /api/sessions/{id}/title embed
 			// the FULL session id (the /ws attach/resume capability token that
 			// routes.go truncates to safeID before logging). Their access

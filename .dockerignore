@@ -3,6 +3,11 @@ static/*.js
 static/*.js.map
 static/wire/
 static/*.test.js
+# The CSS bundle is generated inside the builder by scripts/css-bundle.sh; keep
+# a local dev copy (and any mktemp sibling left by a SIGKILLed run) out of the
+# build context so nothing unpinned reaches `COPY . ./` and go:embed.
+static/style.css
+static/style.css.*
 
 
 # Local-dev Go workspace (resolves the unpublished engine via a replace);

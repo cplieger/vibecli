@@ -45,7 +45,7 @@ func TestCSPStyleHashMatchesEmbeddedInlineStyle(t *testing.T) {
 	// "token appears somewhere" and a "style-src has some sha256" check -- so
 	// presence anywhere is not enough; the directive itself is the contract.
 	var styleDirective string
-	for _, directive := range strings.Split(csp, ";") {
+	for directive := range strings.SplitSeq(csp, ";") {
 		directive = strings.TrimSpace(directive)
 		if strings.HasPrefix(directive, "style-src ") {
 			styleDirective = directive
@@ -92,4 +92,23 @@ func TestInlineStyleHashIsByteExact(t *testing.T) {
 			}
 		})
 	}
+
+	// The non-ASCII fold hazard inlineStyleHash's own comment documents: a
+	// unicode-aware fold can CHANGE a rune's byte length (U+0130 folds to the
+	// 1-byte 'i'), sliding every index computed on the folded copy off the
+	// original bytes so the scanner hashes the wrong content. Every case above
+	// is pure ASCII, where bytes.ToLower and the index-preserving ASCII fold
+	// agree, so only content carrying such a rune tells the two apart.
+	t.Run("length-changing unicode keeps the byte indices aligned", func(t *testing.T) {
+		const unicodeContent = "\n  body { content: '\u0130' }\n"
+		sum := sha256.Sum256([]byte(unicodeContent))
+		wantUnicode := "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+		got, err := inlineStyleHash([]byte("<html><style>" + unicodeContent + "</style></html>"))
+		if err != nil {
+			t.Fatalf("inlineStyleHash: %v", err)
+		}
+		if got != wantUnicode {
+			t.Errorf("inlineStyleHash = %s, want %s (a length-changing unicode fold slides the content indices and hashes the wrong bytes)", got, wantUnicode)
+		}
+	})
 }

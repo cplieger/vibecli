@@ -154,8 +154,10 @@ came from; `POST .../api/tools/catalog/refresh` forces a refresh (both
 loopback-only). Dependencies auto-adopt: enabling `typescript-language-server`
 installs `node` and the `typescript` package with it, no extra manifest
 entries needed. While tools install, the web UI and health endpoint stay
-reachable and only new-session creation waits, so the first session always
-sees the finished PATH.
+reachable and only new-session creation waits, so the first session sees the
+finished PATH. If provisioning fails, sessions are not blocked: creation is
+allowed anyway, the failure is logged, and `/api/health` reports
+`"tools": "degraded"`.
 
 **Add more tools by name.** Any catalog name works as a bare entry; the engine
 fills in the rest:

@@ -163,6 +163,20 @@ func logContains(records *capture.Recorder, s string) bool {
 	return false
 }
 
+// captureTextLog swaps the process-global default logger for a text handler
+// writing into the returned buffer and restores the previous logger on
+// cleanup. buildHandler binds WithLogger(slog.Default()) at CONSTRUCTION, so
+// the capture must be installed before the handler is built; and because the
+// default logger is process-global, callers must not use t.Parallel.
+func captureTextLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
 // TestBuildHandlerClientIPThreading proves the trusted-proxy set is threaded
 // into webhttp.WithClientIP and drives the access log's client_ip field
 // end-to-end through the production middleware chain (buildHandler). Two
@@ -195,12 +209,7 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			prev := slog.Default()
-			// Capture the access line: buildHandler wires WithLogger(slog.Default())
-			// at construction, so set the default logger before building it.
-			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-			t.Cleanup(func() { slog.SetDefault(prev) })
+			buf := captureTextLog(t)
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
@@ -236,10 +245,7 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 // the process-global default logger (buildHandler binds
 // WithLogger(slog.Default()) at construction).
 func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureTextLog(t)
 
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -291,10 +297,7 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 // Error — the silent-skip idiom this replaced hid exactly that signal.
 // Serial: swaps the process-global default logger.
 func TestBuildHandlerFailingProbeSurfaces(t *testing.T) {
-	var buf bytes.Buffer
-	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	buf := captureTextLog(t)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, _ *http.Request) {

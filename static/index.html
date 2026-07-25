@@ -104,6 +104,12 @@
         filter: drop-shadow(
           0 0 4px color-mix(in oklch, currentColor 55%, transparent)
         );
+        /* Deliberately NOT one of the library's easing tokens: --ease-standard
+           /--ease-enter/--ease-exit are all asymmetric (they settle at one
+           end), which reads as a stutter on a looping indeterminate sweep.
+           This is the symmetric ease-in-out-cubic the sweep needs; like the
+           --ease-exit value above, it is inlined because .wt-root tokens are
+           unreachable from this pre-JS block. */
         animation: kweb-loading-slide 1.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
       }
       @keyframes kweb-loading-slide {
@@ -210,7 +216,15 @@
           // frozen, message-less page.
           const bootedRoot = document.getElementById("terminal");
           if (bootedRoot && bootedRoot.firstElementChild) return;
-          if (!(e.target instanceof HTMLScriptElement) && !e.error) return;
+          // A failed <link rel="stylesheet"> is as fatal as a failed module:
+          // /style.css carries .wt-viewport/.term-output layout, so without it
+          // createTerminal builds an unstyled, unusable terminal (and measures
+          // cell metrics against unstyled text). Restricted to rel="stylesheet":
+          // icon/manifest links 404 in the wild and must NOT raise the dialog.
+          const failedStylesheet =
+            e.target instanceof HTMLLinkElement && e.target.rel === "stylesheet";
+          if (!(e.target instanceof HTMLScriptElement) && !failedStylesheet && !e.error)
+            return;
           // alertdialog, not alert: the overlay carries an interactive Reload
           // button and moves focus into it, the alertdialog interaction model
           // (APG) -- same treatment as showFatal in app.ts. The role plus the
@@ -237,7 +251,7 @@
           // Match showFatal (app.ts): move focus to the recovery CTA; the
           // page content never loaded and Reload is the only actionable
           // element left (the alertdialog pattern's initial focus).
-          reload.focus();
+          reload.focus({ focusVisible: true });
         },
         true,
       );

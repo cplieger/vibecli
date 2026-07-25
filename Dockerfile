@@ -391,12 +391,15 @@ EXPOSE 9848
 # verification, unzip; the binary promotion is an O(1) same-filesystem rename)
 # runs outside the sums. Single-attempt allowance-sum: kiro-cli download (curl
 # --max-time 300) + install.sh (120, +15 kill-after) + version/settings probes
-# (~120: three --version checks plus five settings calls at 10s each, +5s
-# kill-after) + optional APT_PACKAGES (600, +30 kill-after) ≈ 1185s — covered
-# by the 20m start-period. The download also runs with --retry 3, and curl
+# (135: three --version checks plus SIX settings calls — the five applied after
+# promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
+# assertion — at 10s each, +5s kill-after) + optional APT_PACKAGES (600, +30
+# kill-after) = 1200s — exactly the 20m start-period, so it is covered with NO
+# margin: any added foreground timeout crosses it. The download also runs with
+# --retry 3, and curl
 # treats an operation timeout as transient (retryable), so the download leg's
 # allowance is 4×300s + 3×5s retry delay = 1215s, making the retry-inflated
-# allowance-sum ≈ 2100s with APT_PACKAGES (≈ 1470s without) — NOT covered by
+# allowance-sum ≈ 2115s with APT_PACKAGES (≈ 1485s without) — NOT covered by
 # the 20m start-period or SMOKE_TIMEOUT. Resolving that gap is a pending
 # maintainer decision (bound the retries, raise both budgets in lockstep
 # (~36m / 2220), drop --retry, or accept the exposure). Keep this comment and

@@ -12,12 +12,30 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/toolbelt/v2/httpapi"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 	"github.com/cplieger/webhttp"
+)
+
+// App-owned route paths. Every engine route comes from the engine's exported
+// terminal.* path constants (WSPath, SessionsPath, SessionsSubtreePath,
+// SessionEventsPath); these are the surfaces this app mounts itself, named
+// once so a mount, a handler's declared base path, and the middleware policy
+// that keys on the same path cannot drift apart across files.
+const (
+	// apiPrefix scopes the JSON API surface apiNoStore marks uncacheable.
+	apiPrefix = "/api/"
+	// healthPath is the readiness route; buildHandler's ProbeLogLevel policy
+	// must name the same path the mux registers, or a healthy probe stops
+	// being demoted to Debug and a failing one stops being promoted.
+	healthPath = apiPrefix + "health"
+	// toolsPath is the loopback tools API mount; httpapi.Handler is told the
+	// same base path so its own routing matches where it is mounted.
+	toolsPath = apiPrefix + "tools"
 )
 
 type routeDeps struct {
@@ -92,6 +110,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// cannot drift from web-terminal-server on tuning, path, or envelope. The
 	// topology lives in the engine, the throttle policy in webhttp; this app
 	// just composes the two.
+	//
 	// The create gate composes two layers: the fleet-standard create
 	// rate limit (inner), and — checked before it while the tools boot convergence runs —
 	// a 503 that keeps the FIRST kiro-cli session from spawning before
@@ -114,12 +133,12 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// Config-file edits + restart remain the primary toggle path; this
 	// API is the no-restart alternative.
 	if deps.tools != nil {
-		toolsAPI := loopbackOnly(httpapi.Handler(deps.tools, "/api/tools"))
-		mux.Handle("/api/tools", toolsAPI)
-		mux.Handle("/api/tools/", toolsAPI)
+		toolsAPI := loopbackOnly(httpapi.Handler(deps.tools, toolsPath))
+		mux.Handle(toolsPath, toolsAPI)
+		mux.Handle(toolsPath+"/", toolsAPI)
 	}
 
-	mux.HandleFunc("/api/health", handleHealth(deps))
+	mux.HandleFunc(healthPath, handleHealth(deps))
 
 	return mgr, cspPolicy, nil
 }
@@ -132,9 +151,6 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// The returned factory builds one kiro-cli chat session per tab: an
-	// independent PTY-backed process (deps.cmd = kiro-cli chat) with its own
-	// VT screen and scrollback, so opening a tab launches a fresh instance.
 	// Scrollback 5000 covers a /chat
 	// transcript restore on reconnect (matches the client store's retained-line
 	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
@@ -242,6 +258,14 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	}
 }
 
+// unrecognizedNotifyOnce promotes the FIRST unrecognized OSC 9 notification of
+// the process to Warn, so a kiro-cli notification-wording drift is visible in the
+// DEFAULT (info) log stream instead of only under KWEB_LOG_LEVEL=debug. Bounded to
+// one line per process: a build that legitimately emits some other notification
+// cannot flood the shipped stream, and the Debug trace below still records every
+// occurrence.
+var unrecognizedNotifyOnce sync.Once
+
 // classifyStatus maps kiro-cli's OSC 9 notification text to a latched session
 // status for the tab activity dots: "Response complete" at the end of an agent
 // turn latches the done (green) state, and "Permission required" when a tool
@@ -265,12 +289,18 @@ func classifyStatus(msg string) (string, bool) {
 		// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
 		// tool-approval. If a kiro-cli bump reworded "Response complete"/"Permission
 		// required", every notification lands here and the per-tab status dots
-		// silently stop latching. This Debug line is the only runtime trace of that
-		// drift (invisible at the default info level; set KWEB_LOG_LEVEL=debug to
-		// diagnose a "status dots stopped working" report after a version bump).
+		// silently stop latching. The FIRST occurrence warns (visible at the
+		// default info level, bounded to one line per process); the Debug line
+		// records every occurrence, so KWEB_LOG_LEVEL=debug is what shows the
+		// full set of unrecognized strings after a version bump.
 		// msg is safe to log raw: the engine's sanitizeNotification strips
 		// every runesafe-unsafe rune (C0/C1 controls, Bidi controls, U+2028/29)
 		// and rune-caps the text before the classifier ever sees it.
+		unrecognizedNotifyOnce.Do(func() {
+			slog.Warn("unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)",
+				"message", msg,
+				"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update classifyStatus; set KWEB_LOG_LEVEL=debug for every occurrence`)
+		})
 		slog.Debug("unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)", "message", msg)
 		return "", false
 	}

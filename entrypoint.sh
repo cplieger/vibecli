@@ -114,6 +114,18 @@ if ! probe=$(mktemp "$TOOLS/.write-probe.XXXXXX") || ! rm -f "$probe"; then
   fatal '/config/tools is not writable (read-only bind mount?)'
 fi
 
+# Best-effort: drop boot-time temp artifacts orphaned by a hard container kill
+# (a stage dir from install_kiro_cli, or a write probe removed as part of its
+# own test). Both are covered on every ordinary path -- the installer's EXIT
+# trap and the probe's own rm -- so this only catches SIGKILL residue. Swept
+# unconditionally, not just on the reinstall path: a kill that landed after the
+# binary was promoted leaves the pinned version on disk, so the next boot needs
+# no install and would otherwise never revisit the orphan, leaving tens of MB
+# on the persistent /config volume until the next version bump. Off PATH, so
+# this is disk hygiene, not an integrity gate; it stays ahead of any install so
+# a fresh stage dir is never swept.
+rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
+
 # Readiness marker consumed by the Go server's /api/health (main.go reads
 # KIRO_CLI_READY_MARKER; routes.go Stats it). Initialized BEFORE any fallible
 # provisioning work and cleared here so a marker left by a previous boot can
@@ -301,10 +313,6 @@ if needs_kiro_cli_install; then
     "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
     fatal 'failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH' "path=\"$BIN\""
   fi
-  # Best-effort: drop private stage dirs orphaned by a hard container kill (the
-  # installer's EXIT trap covers every ordinary path). They are off PATH, so
-  # this is disk hygiene, not an integrity gate.
-  rm -rf "$TOOLS"/.kiro-cli-stage.* 2>/dev/null || true
   if ! install_kiro_cli; then
     printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
     # Belt-and-braces: the installer ran with HOME pointed at the private stage, so it
@@ -442,7 +450,12 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     if [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ && "$pkg" != *- ]]; then
       apt_pkgs+=("$pkg")
     else
-      printf 'level=warn msg="skipping invalid APT_PACKAGES token" token="%s" component=entrypoint\n' "$pkg" >&2
+      # The rejected token is untrusted env content: strip non-printable bytes
+      # and neutralize the quote that would close the logfmt field, then bound
+      # the length so one bad token cannot dominate the log line.
+      safe_pkg=${pkg//[![:print:]]/?}
+      safe_pkg=${safe_pkg//\"/\'}
+      printf 'level=warn msg="skipping invalid APT_PACKAGES token" token="%.64s" component=entrypoint\n' "$safe_pkg" >&2
     fi
   done
   set +f

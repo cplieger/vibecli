@@ -34,8 +34,42 @@ const THEME = {
 // static JSON manifest, so the parity test below IS the synchronizing
 // mitigation: it pins the two equivalent spellings of one color across all
 // four sites.
-const ACCENT_HSL = "hsl(263.1683 100% 80%)"; // === ACCENT_HEX
+const ACCENT_HSL = "hsl(263.1683 100% 80%)";
 const ACCENT_HEX = "#c099ff";
+
+// Mechanical link between the two spellings of the ONE accent: without this,
+// updating the HSL sites alone leaves meta/manifest on the old hex and the
+// parity test below still passes.
+function hslToHex(hsl: string): string {
+  const m = /^hsl\(([\d.]+) ([\d.]+)% ([\d.]+)%\)$/.exec(hsl);
+  if (!m) {
+    throw new Error(`unparseable hsl: ${hsl}`);
+  }
+  const h = Number(m[1]);
+  const s = Number(m[2]) / 100;
+  const l = Number(m[3]) / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const hp = h / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  const [r1, g1, b1]: [number, number, number] =
+    hp < 1
+      ? [c, x, 0]
+      : hp < 2
+        ? [x, c, 0]
+        : hp < 3
+          ? [0, c, x]
+          : hp < 4
+            ? [0, x, c]
+            : hp < 5
+              ? [x, 0, c]
+              : [c, 0, x];
+  const m0 = l - c / 2;
+  const to = (v: number) =>
+    Math.round((v + m0) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${to(r1)}${to(g1)}${to(b1)}`;
+}
 
 // Read a static asset next to static-src. Resolve from INIT_CWD (set by the
 // npm/npx launcher to the real static-src directory) so the fixture is found
@@ -125,6 +159,12 @@ function appendTerminalRoot({ booted = false } = {}): HTMLElement {
   return root;
 }
 
+// The watchdog's stand-down guards read index.html's REAL markup (a .bar
+// child, no .fade) while appendPristineOverlay() re-creates that markup by
+// hand, so pin the hand-built fixture to the served file: if index.html's
+// overlay ever loses the .bar (or #terminal ships a pre-JS child), the
+// watchdog silently never fires in production while every watchdog test
+// below still passes against its own fabricated overlay.
 // index.html's pristine pre-JS #loading overlay (role=status, with its two
 // children: the aria-hidden .bar and the .loading-status announcement): the
 // exact state both showFatal and the watchdog key their behavior on.
@@ -349,6 +389,24 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(false);
   });
 
+  it("watchdog stands down when the overlay has already been removed after boot", () => {
+    evaluateWatchdog(readWatchdogSource());
+
+    // Post-boot steady state: the kernel removed #loading on transitionend, so
+    // a later uncaught runtime error reaches the capture-phase listener with no
+    // overlay in the document at all. The watchdog must return without touching
+    // anything (and without throwing inside the error listener).
+    const root = appendTerminalRoot({ booted: true });
+
+    expect(() =>
+      dispatchWindowError({ error: new Error("post-boot runtime error") }),
+    ).not.toThrow();
+
+    expect(document.getElementById("loading")).toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(root.hasAttribute("inert")).toBe(false);
+  });
+
   it("watchdog does not clobber an overlay showFatal already converted", () => {
     evaluateWatchdog(readWatchdogSource());
 
@@ -391,6 +449,45 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(overlay.querySelector("button")).toBeNull();
   });
 
+  it("watchdog fires on a failed <link rel=stylesheet> (/style.css)", () => {
+    // /style.css is render-critical, not cosmetic: it carries
+    // .wt-root.wt-viewport's fixed/inset layout and the .term-output scroll
+    // container, so a 404 leaves an unstyled, unusable terminal while /app.js
+    // still loads and createTerminal still succeeds -- no throw ever reaches
+    // app.ts's catch. The watchdog is the only thing that can surface it.
+    evaluateWatchdog(readWatchdogSource());
+
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    linkEl.href = "/style.css";
+    dispatchWindowError({ target: linkEl }); // plain Event: no .error property
+
+    expectFatalOverlayShape(overlay);
+    expect(root.hasAttribute("inert")).toBe(true);
+  });
+
+  it("watchdog ignores a failed non-stylesheet <link> (e.g. an icon)", () => {
+    // Icon and manifest links 404 in the wild; they must never raise the
+    // fatal dialog, which is why the guard tests rel, not just the element.
+    evaluateWatchdog(readWatchdogSource());
+
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+
+    const iconEl = document.createElement("link");
+    iconEl.rel = "icon";
+    iconEl.href = "/icon-192.png";
+    dispatchWindowError({ target: iconEl });
+
+    expect(overlay.getAttribute("role")).toBe("status");
+    expect(overlay.querySelector(".bar")).not.toBeNull();
+    expect(overlay.querySelector("button")).toBeNull();
+    expect(root.hasAttribute("inert")).toBe(false);
+  });
+
   it("watchdog fires on an uncaught runtime error (module evaluation failure)", () => {
     evaluateWatchdog(readWatchdogSource());
 
@@ -426,6 +523,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
+    expect(hslToHex(ACCENT_HSL)).toBe(ACCENT_HEX);
     expect(THEME["--accent"]).toBe(ACCENT_HSL);
     const html = readStaticAsset("index.html");
     // The two declaration sites, asserted individually and bounded to their own
@@ -444,5 +542,26 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(html).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
     const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
     expect((manifest as { theme_color: string }).theme_color).toBe(ACCENT_HEX);
+  });
+
+  it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
+    // Drop the external stylesheet link before parsing: happy-dom fetches
+    // <link rel=stylesheet> hrefs off a parsed document, which would make this
+    // assertion attempt a real HTTP request. The guards below live entirely in
+    // the markup.
+    const html = readStaticAsset("index.html").replace(
+      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
+      "",
+    );
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const overlay = doc.getElementById("loading");
+    // The guards the watchdog keys on, read from the served file rather than
+    // from appendPristineOverlay()'s hand-built copy.
+    expect(overlay?.getAttribute("role")).toBe("status");
+    expect(overlay?.querySelector(".bar")).not.toBeNull();
+    expect(overlay?.classList.contains("fade")).toBe(false);
+    // ...and the booted-root guard's pre-JS precondition: #terminal is empty
+    // until createTerminal builds into it.
+    expect(doc.getElementById("terminal")?.firstElementChild ?? null).toBeNull();
   });
 });

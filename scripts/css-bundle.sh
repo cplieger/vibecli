@@ -19,11 +19,23 @@ trap 'exit 1' HUP INT TERM
 css_root=$(realpath "$css_dir")
 # The per-entry regular-file guard below cannot protect the MANIFEST
 # itself: opening a FIFO for the loop redirect blocks the build forever,
-# the same crafted-tarball class the entry guard closes. [ -f ] follows
-# symlinks, matching the entry semantics (in-tree symlink to a regular
-# file passes; symlink to a FIFO refuses).
-if [ ! -f "${css_dir}/MANIFEST" ]; then
-  printf 'css-bundle: MANIFEST is missing or not a regular file, refusing: %s\n' "${css_dir}/MANIFEST" >&2
+# the same crafted-tarball class the entry guard closes. Resolved and
+# contained under css_root on the SAME terms as an entry (in-tree symlink
+# to a regular file passes; symlink to a FIFO, or out of the css dir,
+# refuses), so a crafted css/MANIFEST symlink cannot redirect the read.
+manifest=$(realpath -e "${css_dir}/MANIFEST") || {
+  printf 'css-bundle: MANIFEST does not resolve, refusing: %s\n' "${css_dir}/MANIFEST" >&2
+  exit 1
+}
+case "$manifest" in
+  "${css_root}"/*) ;;
+  *)
+    printf 'css-bundle: MANIFEST resolves outside css dir, refusing: %s\n' "$manifest" >&2
+    exit 1
+    ;;
+esac
+if [ ! -f "$manifest" ]; then
+  printf 'css-bundle: MANIFEST is not a regular file, refusing: %s\n' "$manifest" >&2
   exit 1
 fi
 while IFS= read -r line || [ -n "$line" ]; do
@@ -54,12 +66,16 @@ while IFS= read -r line || [ -n "$line" ]; do
     printf 'css-bundle: MANIFEST entry is not a regular file, refusing: %s\n' "$line" >&2
     exit 1
   fi
+  # A member without a trailing newline would otherwise fuse its last line
+  # into the next member's first; CSS is whitespace-insensitive between
+  # rules, so an unconditional separator is free.
   cat "$entry" >>"$tmp"
-done <"${css_dir}/MANIFEST"
+  printf '\n' >>"$tmp"
+done <"$manifest"
 # An empty or fully-commented MANIFEST (a truncated/mis-published UI tarball)
 # would otherwise install an empty bundle that nothing downstream catches.
 [ -s "$tmp" ] || {
-  printf 'css-bundle: assembled bundle is empty (empty or fully-commented MANIFEST?): %s\n' "${css_dir}/MANIFEST" >&2
+  printf 'css-bundle: assembled bundle is empty (empty or fully-commented MANIFEST?): %s\n' "$manifest" >&2
   exit 1
 }
 mv "$tmp" "$out"

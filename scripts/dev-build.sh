@@ -136,8 +136,11 @@ done
 
 printf '[5/6] fonts (Monaspace Nerd Font, cached) + CSS bundle (from UI package)\n'
 # Single source of truth: the Dockerfile's Renovate-managed NERDFONT_* ARGs.
-FONT_VER="$(sed -n 's/^ARG NERDFONT_VERSION=//p' Dockerfile)"
-FONT_SHA256="$(sed -n 's/^ARG NERDFONT_SHA256=//p' Dockerfile)"
+# Stop at whitespace or a `#` trailer: the repo's other manually-bumped sha
+# pins (GO_SHA256_*, TOOL_CATALOG_SHA256) carry a `# <name> <version>`
+# Renovate anchor, and swallowing one here would feed garbage to sha256sum.
+FONT_VER="$(sed -n 's/^ARG NERDFONT_VERSION=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
+FONT_SHA256="$(sed -n 's/^ARG NERDFONT_SHA256=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
 : "${FONT_VER:?failed to parse NERDFONT_VERSION from Dockerfile}"
 : "${FONT_SHA256:?failed to parse NERDFONT_SHA256 from Dockerfile}"
 # Key the cache dir by version AND integrity pin so a NERDFONT_VERSION bump —

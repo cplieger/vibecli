@@ -357,6 +357,17 @@ func TestAPINoStore(t *testing.T) {
 	if got := srec.Header().Get("Cache-Control"); got != "no-cache, must-revalidate" {
 		t.Errorf("Cache-Control on a static asset = %q, want kiroCacheControl's policy (the API gate must not leak onto static)", got)
 	}
+
+	// An unknown non-API path is the only response nothing downstream decorates
+	// (webhttp.StaticHandler sets Cache-Control for KNOWN assets only, then falls
+	// through to a 404), so it is the one place the /api/ scoping is observable:
+	// the known-asset check above passes even with apiNoStore's prefix guard
+	// deleted, because the static handler overwrites the header on its way out.
+	nrec := httptest.NewRecorder()
+	h.ServeHTTP(nrec, httptest.NewRequest(http.MethodGet, "/no-such-asset", http.NoBody))
+	if got := nrec.Header().Get("Cache-Control"); got != "" {
+		t.Errorf("Cache-Control on an unknown non-API path = %q, want none (the no-store gate is /api/-scoped)", got)
+	}
 }
 
 // TestCSPScriptHashesMatchEmbeddedInlineScripts is the anti-drift guard for
@@ -383,20 +394,38 @@ func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
 	scriptRE := regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script\s*>`)
 	srcRE := regexp.MustCompile(`(?i)(^|[\s/])src\s*=`)
 
-	found := 0
+	var oracle []string
 	for _, m := range scriptRE.FindAllSubmatch(indexHTML, -1) {
 		if srcRE.Match(m[1]) {
 			continue // external script (/app.js), covered by 'self'
 		}
-		found++
 		sum := sha256.Sum256(m[2])
 		token := "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 		if !strings.Contains(csp, token) {
 			t.Errorf("CSP is missing the hash for an inline script.\ncontent=%q\nwant token %s\nCSP: %s", m[2], token, csp)
 		}
+		oracle = append(oracle, token)
 	}
-	if found < 1 {
-		t.Fatalf("oracle found %d inline scripts in index.html, want >= 1 (the importmap); the regexp or the file changed", found)
+	if len(oracle) < 1 {
+		t.Fatalf("oracle found %d inline scripts in index.html, want >= 1 (the importmap); the regexp or the file changed", len(oracle))
+	}
+	// Pin the tokens to the script-src DIRECTIVE and require it to equal 'self'
+	// plus the SPACE-SEPARATED token list, the way the style side does. A
+	// policy-wide Contains check per token cannot see the separator: index.html
+	// carries two inline scripts, so joining their hashes with "" instead of " "
+	// leaves both tokens as substrings of the policy and every assertion above
+	// stays green, while the browser parses one unknown source expression,
+	// blocks the inline importmap, and the page loads no ES modules at all.
+	var scriptDirective string
+	for directive := range strings.SplitSeq(csp, ";") {
+		directive = strings.TrimSpace(directive)
+		if strings.HasPrefix(directive, "script-src ") {
+			scriptDirective = directive
+			break
+		}
+	}
+	if want := "script-src 'self' " + strings.Join(oracle, " "); scriptDirective != want {
+		t.Errorf("CSP script directive = %q, want %q\nCSP: %s", scriptDirective, want, csp)
 	}
 }
 

@@ -14,6 +14,7 @@ static-src/coverage/
 
 
 static/style.css
+static/style.css.*
 
 # Kiro skill artifacts (code-review, refactor, steering-maintenance, judgement)
 **/.code-review/

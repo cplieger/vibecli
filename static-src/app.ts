@@ -67,7 +67,13 @@ function showFatal(overlay: HTMLElement, message: string): void {
   document.getElementById("terminal")?.setAttribute("inert", "");
   // Move focus to the recovery CTA: the page content is gone and Reload is the
   // only actionable element left (the alertdialog pattern's initial focus).
-  reload.focus();
+  // focusVisible asks the UA to paint the ring for this SCRIPT-initiated focus:
+  // the family convention is :focus-visible only (web-terminal-ui
+  // 10-primitives.css:47) and script focus does not match it after a pointer
+  // load, so the dialog's only control would otherwise be focused with no
+  // visible indicator. Ignored by engines that do not support the option, and it
+  // does not reintroduce a ring after a tap.
+  reload.focus({ focusVisible: true });
 }
 
 const loading = document.getElementById("loading");

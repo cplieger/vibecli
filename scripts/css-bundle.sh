@@ -39,11 +39,13 @@ if [ ! -f "$manifest" ]; then
   exit 1
 fi
 # Counts the members actually assembled, solely so an empty or fully-commented
-# MANIFEST (which never enters the loop, so [ -s "$tmp" ] cannot tell it from a
-# real bundle now that the separator below writes a newline per member) is
-# refused at the bottom. Each member's OWN non-emptiness is enforced per-entry
-# inside the loop: an aggregate "at least one member had bytes" test passes a
-# truncated tarball in which one required feature stylesheet is zero bytes.
+# MANIFEST (which never enters the loop) is refused at the bottom. Counting is
+# what makes that check honest now that the separator below writes a newline per
+# member: a bundle whose members are ALL zero bytes still looks non-empty on
+# disk, so [ -s "$tmp" ] would pass it. Each member's OWN non-emptiness is
+# enforced per-entry inside the loop: an aggregate "at least one member had
+# bytes" test passes a truncated tarball in which one required feature
+# stylesheet is zero bytes.
 member_count=0
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in '' | \#*) continue ;; esac

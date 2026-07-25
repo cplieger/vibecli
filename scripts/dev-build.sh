@@ -47,8 +47,8 @@ done
 # the destructive overlay. Mirror each copy loop's own exclusions (matched on
 # the basename, so a checkout path containing 'fuzz' is not itself excluded) so
 # preflight and execution cannot drift.
-[ -n "$(find "$ENGINE_DIR/web/src" -maxdepth 1 -type f -name '*.ts' \
-  ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
+[ -n "$(find "$ENGINE_DIR/web/src" -type d -name 'test-helpers' -prune -o \
+  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
   printf 'error: engine-src-empty: no eligible *.ts under %s (wrong ENGINE_DIR or src layout change?)\n' \
     "$ENGINE_DIR/web/src" >&2
   exit 1
@@ -86,12 +86,21 @@ printf '[2/6] overlay local engine + UI TS into the bundler-resolved packages\n'
 rm -rf "$ENGINE_PKG/src" "$UI_PKG/src"
 mkdir -p "$ENGINE_PKG/src" "$UI_PKG/src"
 cp "$ENGINE_DIR/web/package.json" "$ENGINE_PKG/package.json"
-for f in "$ENGINE_DIR"/web/src/*.ts; do
-  # Match the basename, not the full path: ENGINE_DIR is user-overridable
-  # and a checkout path containing 'fuzz' must not skip every source file.
-  case "${f##*/}" in *.test.ts | *fuzz* | *fc-strict-setup*) continue ;; esac
-  cp "$f" "$ENGINE_PKG/src/"
-done
+# Recursive, matching the UI loop below: the engine's src tree is flat today, but a
+# future nested module must not be silently dropped (the emit assertions only check
+# index.js, so the miss would surface as a runtime 404, not a build failure).
+# Match the basename, not the full path: ENGINE_DIR is user-overridable and a
+# checkout path containing 'fuzz' must not skip every source file. src/test-helpers/
+# is pruned as a directory: recursion would otherwise pull test-support modules
+# (which carry no *.test.ts basename) into the vendor emit and make the dev build
+# depend on test-only code typechecking under --strict. The published tarball
+# excludes them, so this keeps the local overlay matching what the image gets.
+(cd "$ENGINE_DIR/web/src" && find . -type d -name 'test-helpers' -prune -o \
+  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0) \
+  | while IFS= read -r -d '' f; do
+    mkdir -p "$ENGINE_PKG/src/$(dirname "$f")"
+    cp "$ENGINE_DIR/web/src/$f" "$ENGINE_PKG/src/$f"
+  done
 cp "$UI_DIR/package.json" "$UI_PKG/package.json"
 # The UI ships a nested src tree (src/kernel/, src/features/) since v3, so copy
 # recursively, preserving subdirectories and excluding tests.
@@ -112,9 +121,12 @@ rm -f static/app.js
 
 printf '[4/6] tsc: engine + UI libs -> static/vendor/\n'
 rm -rf static/vendor/cplieger-web-terminal-engine static/vendor/cplieger-web-terminal-ui
+# Compile the whole overlaid engine tree (flat today; recursive so a future nested
+# engine module is not silently dropped, matching the UI handling below).
+mapfile -t engine_ts < <(find "$ENGINE_PKG/src" -name '*.ts')
 "$TSC" --module ESNext --target ESNext --moduleResolution bundler \
   --outDir static/vendor/cplieger-web-terminal-engine \
-  --rootDir "$ENGINE_PKG/src" --skipLibCheck --strict "$ENGINE_PKG/src"/*.ts
+  --rootDir "$ENGINE_PKG/src" --skipLibCheck --strict "${engine_ts[@]}"
 # Compile the whole nested UI src tree (index.ts + presets.ts + kernel/ +
 # features/); find collects every .ts (the overlay already excluded tests).
 mapfile -t ui_ts < <(find "$UI_PKG/src" -name '*.ts')

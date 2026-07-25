@@ -126,6 +126,19 @@ fi
 # a fresh stage dir is never swept.
 rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
 
+# Same hygiene argument, applied to the one residue class the sweep above omits:
+# binaries an EARLIER image version staged into $HOME/.local/bin (that install ran with
+# the real HOME; the current one stages off-PATH under $TOOLS). The reinstall path's
+# quarantine only reaches them when this boot installs, so a container already at the
+# pin would otherwise carry them until the next version bump -- tens of MB on /config,
+# and an unpinned binary one PATH-shadow behind the canonical one. Warn, don't exit:
+# the pinned binary is present and leads PATH here, so this is hygiene, not an
+# integrity gate (the fatal treatment stays on the reinstall paths below).
+if ! rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" \
+  "$HOME/.local/bin/kiro-cli-term"; then
+  printf 'level=warn msg="failed to sweep legacy kiro-cli staging residue; a shadowed unpinned binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+fi
+
 # Readiness marker consumed by the Go server's /api/health (main.go reads
 # KIRO_CLI_READY_MARKER; routes.go Stats it). Initialized BEFORE any fallible
 # provisioning work and cleared here so a marker left by a previous boot can
@@ -308,9 +321,13 @@ if needs_kiro_cli_install; then
   if [ -e "$BIN" ] || [ -e "$HOME/.local/bin/kiro-cli" ]; then
     printf 'level=info msg="quarantining stale kiro-cli binaries (canonical and legacy staging) before reinstall" path="%s" component=entrypoint\n' "$BIN" >&2
   fi
+  # Glob rather than an explicit name list: an installer that resolves its
+  # prefix via getpwuid writes whatever dispatcher set THAT version ships, so a
+  # name added upstream must still be quarantined. "$BIN" is covered by the
+  # first pattern.
   if ! rm -f \
-    "$BIN" "$TOOLS/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-term" \
-    "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
+    "$TOOLS/bin/kiro-cli"* \
+    "$HOME/.local/bin/kiro-cli"*; then
     fatal 'failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH' "path=\"$BIN\""
   fi
   if ! install_kiro_cli; then
@@ -327,7 +344,7 @@ if needs_kiro_cli_install; then
     # (web UI up, terminal errors) — only the integrity cleanup failing exits,
     # with fatal's 10s crash-loop throttle. rm -f is a no-op when nothing was
     # written there, which is the normal path.
-    if ! rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
+    if ! rm -f "$HOME/.local/bin/kiro-cli"*; then
       fatal 'failed to sweep legacy staging dir after a failed install; refusing to leave an unpinned binary reachable via bare-name PATH resolution' "dir=\"$HOME/.local/bin\""
     fi
   fi
@@ -494,14 +511,21 @@ fi
 # Hardcode dark theme. kiro-cli's "default" diff preset resolves
 # added-line bg to #00FF00 through the truecolor path — unreadable.
 # Pinning both baseTheme and diffPreset to "dark" avoids this.
-theme_file="$HOME/.kiro/settings/kiro_cli_theme.json"
+theme_dir="$HOME/.kiro/settings"
+theme_file="$theme_dir/kiro_cli_theme.json"
 theme_tmp=''
-if ! mkdir -p "$(dirname "$theme_file")" \
+if ! mkdir -p "$theme_dir" \
   || ! theme_tmp=$(mktemp "${theme_file}.XXXXXX") \
   || ! printf '{"baseTheme":"dark","diffPreset":"dark"}\n' >"$theme_tmp" \
   || ! mv "$theme_tmp" "$theme_file"; then
   [ -z "${theme_tmp:-}" ] || rm -f "$theme_tmp"
   printf 'level=warn msg="failed to write kiro-cli theme file; diff colors may be unreadable" file="%s" component=entrypoint\n' "$theme_file" >&2
 fi
+# kiro-cli persists mcp.json (remote MCP server URLs and tokens) in this same
+# directory, so tighten it on the same terms as the /config dirs hardened at the
+# top of this file: the mkdir -p above creates it umask-wide (root umask 022 ->
+# 0755), and only the 0700 ~/.kiro parent is stopping traversal today. Guarded on
+# existence so a failed mkdir does not emit a second, redundant warning.
+[ ! -d "$theme_dir" ] || harden_config_dir "$theme_dir"
 
 exec /app/web-terminal-kiro

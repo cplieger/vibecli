@@ -26,7 +26,9 @@ A browser tab here is an interactive shell with access to your files under `/wor
 - put it behind an authenticating reverse proxy (Caddy forward-auth, oauth2-proxy, Authentik, …), and/or
 - keep the published port on loopback or a private network.
 
-The server logs a warning at startup when it binds a non-loopback address.
+Neither of those covers DNS rebinding: a malicious page in your own browser can point its own hostname at `127.0.0.1` (or your LAN IP) and drive even a loopback-bound terminal, because the request then arrives from your own machine with a matching `Origin`. Also set [`KWEB_ALLOWED_HOSTS`](#configuration-reference) to the exact hostnames you reach it by — the `Host` allowlist is the check that rejects a rebound request.
+
+The server logs a warning at startup when it binds a non-loopback address, and another when `KWEB_ALLOWED_HOSTS` is unset.
 
 ## Run
 
@@ -35,6 +37,7 @@ The server logs a warning at startup when it binds a non-loopback address.
 services:
   web-terminal-kiro:
     image: ghcr.io/cplieger/web-terminal-kiro:latest
+    container_name: web-terminal-kiro
     ports:
       - "9848:9848"
     volumes:
@@ -53,7 +56,7 @@ The image ships working defaults; most setups only pick a port and a volume.
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `KWEB_ADDR` | Listen address (`host:port`). | `:9848` |
+| `KWEB_ADDR` | Listen address (`host:port`). Leave the host part empty (or use `0.0.0.0`) so the bind still covers loopback: the image's healthcheck probes `127.0.0.1` on the port taken from this value, so pinning the bind to a single non-loopback interface reports the container `unhealthy` even while it serves normally. Restrict reachability with the published port (`127.0.0.1:9848:9848`) or a reverse proxy instead. | `:9848` |
 | `KWEB_LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
 | `KWEB_WORK_DIR` | Directory each terminal session starts in (must exist). | `/workspace` |
 | `KWEB_CONFIG_DIR` | Persistent config directory (kiro-cli home, tool state). When it does not exist, tool provisioning is skipped with a warning; terminal sessions still run. | `/config` |
@@ -62,6 +65,7 @@ The image ships working defaults; most setups only pick a port and a volume.
 | `TOOL_CATALOG_REFRESH` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. | `24h` |
 | `TOOL_CATALOG_URL` | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact |
 | `TOOL_CATALOG_PATH` | Image-baked tool catalog used at first boot and when offline, until a successfully fetched catalog replaces it. | `/app/tool-catalog.json` |
+| `APT_PACKAGES` | OS packages `apt-get install`ed at every container start, whitespace-separated (for example `"gcc python3 libc6-dev"`). apt state lives in the ephemeral container layer, not `/config`, so it is re-applied on each start. Plain package names only: a token that is not a bare Debian package name — a `pkg=version` pin, `pkg:arch`, `pkg/release`, or a trailing `-` — is skipped with a warning in the container log, and an install failure warns without blocking startup. | _(unset)_ |
 | `KIRO_CLI_READY_MARKER` | Image-internal: the entrypoint sets it to the marker file it writes once kiro-cli is verified runnable, and `/api/health` reports starting (503) while the marker is absent. Leave unset outside the container. | _(unset)_ |
 | `TRUSTED_PROXIES` | Reverse-proxy CIDRs / bare IPs whose `X-Forwarded-For` the access log trusts to resolve `client_ip`. See [Behind a reverse proxy](#behind-a-reverse-proxy). | _(unset)_ |
 | `KWEB_ALLOWED_HOSTS` | Comma-separated exact hostnames/IPs the server answers for (e.g. `localhost,192.168.1.5,webterm.example.com`); any other `Host` header is rejected. This blocks DNS rebinding, which can reach even a loopback- or LAN-bound terminal through your own browser, so set it for any long-running deployment; unset accepts every `Host` and logs a startup warning. Requests that are loopback on both ends (a loopback client address _and_ a loopback `Host`, e.g. `127.0.0.1:9848` or `localhost:9848`) are always admitted, so the healthcheck and in-container tools clients keep working; addressing the container by any other name still needs that name in the list. | _(unset)_ |

@@ -43,8 +43,24 @@
       }
       #loading[role="alertdialog"] {
         flex-direction: column;
+        /* Keep the ONLY recovery affordance reachable. This is a fixed
+           inset:0 box with centred content, so at small viewport heights (a
+           short landscape window, a large user font size) the message and the
+           Reload button overflow BOTH ends of an unscrollable box. `safe
+           center` degrades the centring to start-alignment exactly when the
+           content overflows and overflow-y makes the remainder reachable; a UA
+           without `safe` drops the declaration and keeps today's centring. The
+           insets honour this page's viewport-fit=cover (the UI bundle does the
+           same for its own chrome via --safe-top/--safe-bottom), so the button
+           never sits under a notch or the home-indicator gesture strip. */
+        justify-content: safe center;
         gap: 1rem;
-        padding: 1rem;
+        padding: max(1rem, env(safe-area-inset-top))
+          max(1rem, env(safe-area-inset-right))
+          max(1rem, env(safe-area-inset-bottom))
+          max(1rem, env(safe-area-inset-left));
+        overflow-y: auto;
+        overscroll-behavior: contain;
         font-family: system-ui, -apple-system, sans-serif;
         text-align: center;
       }
@@ -235,6 +251,10 @@
           description.textContent =
             "Web Terminal for Kiro failed to load. Check your connection and reload the page.";
           overlay.setAttribute("role", "alertdialog");
+          // Explicit handoff token for /app.js: app.ts keys its boot-abort on
+          // this marker, not on the ARIA role, so changing the dialog's a11y
+          // shape cannot silently sever the handoff.
+          overlay.setAttribute("data-bootstrap-fatal", "");
           overlay.setAttribute("aria-modal", "true");
           overlay.setAttribute("aria-label", "Web Terminal for Kiro startup failure");
           overlay.setAttribute("aria-describedby", description.id);
@@ -255,6 +275,25 @@
         },
         true,
       );
+      // Late-registration reconciliation: the <link rel="stylesheet"> this
+      // watchdog guards lives in <head>, so its error event is queued when that
+      // fetch settles -- which for a fast 404 is BEFORE this script runs (a
+      // classic script is blocked by a pending stylesheet, and the parser spins
+      // the event loop, running the already-queued error task, before resuming).
+      // The listener above would then never see it, so the stylesheet branch
+      // would silently never fire. The same script-blocking rule makes the
+      // state decidable here: every same-document stylesheet has settled by
+      // now, so a null .sheet means it FAILED, not "still loading". Re-dispatch
+      // it through the one listener so there stays exactly one dialog builder.
+      for (const link of document.querySelectorAll('link[rel~="stylesheet"]')) {
+        if (
+          !link.sheet &&
+          !link.disabled &&
+          (!link.media || window.matchMedia(link.media).matches)
+        ) {
+          link.dispatchEvent(new Event("error"));
+        }
+      }
     </script>
     <script
       type="module"

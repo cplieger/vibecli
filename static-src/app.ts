@@ -7,10 +7,15 @@
 // whole terminal UI inside the #terminal root element with the agent-shell
 // feature set (presetAgentTabbed: tabs + activity monitor + touch toolbar +
 // context menu + clipboard + scroll-to-bottom + predictive echo + connection
-// banner + animations). web-terminal-kiro is an agent shell, so it wants the activity
-// monitor (per-tab working/done/needs-input dots); a generic terminal would use
-// the plain presetTabbed, which is label-only. Each browser tab drives its own
-// independent kiro-cli chat session
+// banner + animations). presetAgentTabbed and presetTabbed ship the SAME
+// features -- the library's buildTabbed always includes the activity monitor --
+// and differ only in two agent-shell tunings: preferInputTitle (kiro-cli emits a
+// non-empty but useless OSC 0/2 title, so each tab's label follows the latest
+// submitted line) and presumeReports (every session here IS an agent that will
+// report OSC 9;4, so the activity dot shows from tab creation instead of popping
+// in once the agent has booted far enough to first report). A generic shell
+// would use presetTabbed, whose dot stays hidden until a session actually
+// reports. Each browser tab drives its own independent kiro-cli chat session
 // over the shared server; kiro-cli's TUI is rendered verbatim through the raw PTY
 // stream.
 //
@@ -98,10 +103,10 @@ if (!root) {
 // inerted. Booting anyway would hand that dialog to createTerminal as
 // `loading`; the UI kernel fades and REMOVES it on first frame while nothing
 // un-inerts #terminal, leaving an inert, unstyled page with no Reload
-// affordance. role="alertdialog" is the watchdog-to-app handoff signal (the
-// one attribute both fatal builders set and the pristine overlay never has),
-// so treat it as bootstrap already having failed and stop here.
-if (loading?.getAttribute("role") === "alertdialog") {
+// affordance. data-bootstrap-fatal is the watchdog-to-app handoff signal: an
+// explicit protocol marker rather than the dialog's ARIA role, so changing
+// the fatal surface's a11y shape cannot silently sever this handoff.
+if (loading?.hasAttribute("data-bootstrap-fatal")) {
   throw new Error(
     "web-terminal-kiro: bootstrap watchdog already reported a fatal resource failure",
   );

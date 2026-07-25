@@ -256,9 +256,10 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
 RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -name '*.ts') && \
+    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -name '*.ts') && \
     { [ "${#ui_ts[@]}" -gt 0 ] \
       || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
-    { [ -n "$(find static-src/node_modules/@cplieger/web-terminal-engine/src -maxdepth 1 -name '*.ts' -print -quit)" ] \
+    { [ "${#engine_ts[@]}" -gt 0 ] \
       || { echo "ERROR engine-src-empty: no *.ts under the vendored @cplieger/web-terminal-engine src tree (tarball layout changed?)" >&2; exit 1; }; } && \
     /tmp/package/lib/tsc --project static-src/tsconfig.json && \
     /tmp/package/lib/tsc \
@@ -269,7 +270,7 @@ RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/
         --rootDir static-src/node_modules/@cplieger/web-terminal-engine/src \
         --skipLibCheck \
         --strict \
-        static-src/node_modules/@cplieger/web-terminal-engine/src/*.ts && \
+        "${engine_ts[@]}" && \
     /tmp/package/lib/tsc \
         --module ESNext \
         --target ESNext \

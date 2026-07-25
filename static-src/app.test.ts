@@ -105,6 +105,17 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(document.activeElement).toBe(reload);
 }
 
+// The inverse of expectFatalOverlayShape: the watchdog stood down, so the
+// pristine pre-JS overlay is untouched and #terminal was never inerted. Shared
+// by every stand-down test so the negative contract cannot drift or be
+// asserted only partially.
+function expectPristineOverlayUntouched(overlay: HTMLElement, root: HTMLElement): void {
+  expect(overlay.getAttribute("role")).toBe("status");
+  expect(overlay.querySelector(".bar")).not.toBeNull();
+  expect(overlay.querySelector("button")).toBeNull();
+  expect(root.hasAttribute("inert")).toBe(false);
+}
+
 // Locate the real inline bootstrap watchdog in static/index.html: the only
 // inline <script> that is neither the importmap nor the src-bearing module
 // loader. readStaticAsset supplies the shared INIT_CWD fixture-location policy,
@@ -159,12 +170,6 @@ function appendTerminalRoot({ booted = false } = {}): HTMLElement {
   return root;
 }
 
-// The watchdog's stand-down guards read index.html's REAL markup (a .bar
-// child, no .fade) while appendPristineOverlay() re-creates that markup by
-// hand, so pin the hand-built fixture to the served file: if index.html's
-// overlay ever loses the .bar (or #terminal ships a pre-JS child), the
-// watchdog silently never fires in production while every watchdog test
-// below still passes against its own fabricated overlay.
 // index.html's pristine pre-JS #loading overlay (role=status, with its two
 // children: the aria-hidden .bar and the .loading-status announcement): the
 // exact state both showFatal and the watchdog key their behavior on.
@@ -383,10 +388,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const scriptEl = document.createElement("script");
     dispatchWindowError({ target: scriptEl });
 
-    expect(overlay.getAttribute("role")).toBe("status");
-    expect(overlay.querySelector(".bar")).not.toBeNull();
-    expect(overlay.querySelector("button")).toBeNull();
-    expect(root.hasAttribute("inert")).toBe(false);
+    expectPristineOverlayUntouched(overlay, root);
   });
 
   it("watchdog stands down when the overlay has already been removed after boot", () => {
@@ -438,15 +440,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog ignores a non-script resource error (e.g. an image failing to load)", () => {
     evaluateWatchdog(readWatchdogSource());
 
-    appendTerminalRoot();
+    const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
 
     const imgEl = document.createElement("img");
     dispatchWindowError({ target: imgEl }); // plain Event: no .error property
 
-    expect(overlay.getAttribute("role")).toBe("status");
-    expect(overlay.querySelector(".bar")).not.toBeNull();
-    expect(overlay.querySelector("button")).toBeNull();
+    expectPristineOverlayUntouched(overlay, root);
   });
 
   it("watchdog fires on a failed <link rel=stylesheet> (/style.css)", () => {
@@ -464,6 +464,31 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     linkEl.rel = "stylesheet";
     linkEl.href = "/style.css";
     dispatchWindowError({ target: linkEl }); // plain Event: no .error property
+
+    expectFatalOverlayShape(overlay);
+    expect(root.hasAttribute("inert")).toBe(true);
+  });
+
+  it("watchdog surfaces a stylesheet that failed before the listener was registered", () => {
+    // The race the sweep exists for: <link rel=stylesheet> is in <head>, and a
+    // classic inline script is blocked while a stylesheet is pending, so for a
+    // fast local 404 the UA has already queued (and the parser already run) the
+    // link's error task before this end-of-<body> script registers its
+    // listener. Resource error events do not bubble and are never replayed, so
+    // the listener alone can never see it -- the stylesheet branch would
+    // silently never fire in exactly the common case. Here the failed link is
+    // already in the document and NO error event is dispatched at all, so only
+    // the post-registration sweep can raise the dialog.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet"; // no href: happy-dom must not attempt a real fetch
+    document.head.appendChild(linkEl);
+    onTestFinished(() => {
+      linkEl.remove(); // beforeEach only clears <body>
+    });
+
+    evaluateWatchdog(readWatchdogSource());
 
     expectFatalOverlayShape(overlay);
     expect(root.hasAttribute("inert")).toBe(true);
@@ -513,10 +538,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     iconEl.href = "/icon-192.png";
     dispatchWindowError({ target: iconEl });
 
-    expect(overlay.getAttribute("role")).toBe("status");
-    expect(overlay.querySelector(".bar")).not.toBeNull();
-    expect(overlay.querySelector("button")).toBeNull();
-    expect(root.hasAttribute("inert")).toBe(false);
+    expectPristineOverlayUntouched(overlay, root);
   });
 
   it("watchdog fires on an uncaught runtime error (module evaluation failure)", () => {
@@ -548,9 +570,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     dispatchWindowError({ error: new Error("stray runtime error") });
 
     // The watchdog must NOT hijack a booted terminal's overlay.
-    expect(overlay.getAttribute("role")).toBe("status");
-    expect(overlay.querySelector(".bar")).not.toBeNull();
-    expect(root.hasAttribute("inert")).toBe(false);
+    expectPristineOverlayUntouched(overlay, root);
   });
 
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
@@ -576,6 +596,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
+    // Why this test exists: the watchdog's stand-down guards read index.html's
+    // REAL markup (a .bar child, no .fade) while appendPristineOverlay()
+    // re-creates that markup by hand. If index.html's overlay ever loses the
+    // .bar (or #terminal ships a pre-JS child), the watchdog silently never
+    // fires in production while every watchdog test above still passes against
+    // its own fabricated overlay -- so pin the hand-built fixture to the
+    // served file here.
     // Drop the external stylesheet link before parsing: happy-dom fetches
     // <link rel=stylesheet> hrefs off a parsed document, which would make this
     // assertion attempt a real HTTP request. The guards below live entirely in
@@ -590,6 +617,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // from appendPristineOverlay()'s hand-built copy.
     expect(overlay?.getAttribute("role")).toBe("status");
     expect(overlay?.querySelector(".bar")).not.toBeNull();
+    expect(overlay?.querySelector(".bar")?.getAttribute("aria-hidden")).toBe("true");
+    expect(overlay?.querySelector(".loading-status")?.textContent).toContain(
+      "Starting the terminal",
+    );
     expect(overlay?.classList.contains("fade")).toBe(false);
     // ...and the booted-root guard's pre-JS precondition: #terminal is empty
     // until createTerminal builds into it.

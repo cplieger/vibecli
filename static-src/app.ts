@@ -59,8 +59,11 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // whichever fatal builder claimed this overlay first keeps it. Load-bearing
   // for the missing-#terminal-root branch below, which runs BEFORE app.ts's
   // data-bootstrap-fatal abort and would otherwise replaceChildren() over a
-  // watchdog dialog already on screen -- discarding its Reload button while
-  // leaving its Tab-trap listener bound to that now-detached node.
+  // watchdog dialog already on screen -- discarding its Reload button while its
+  // own document-scoped Tab trap stays live (the overlay it guards is still
+  // connected, only its children were replaced), so every Tab would first
+  // refocus that detached button as a no-op before this dialog's trap refocuses
+  // the live one.
   if (overlay.hasAttribute("data-bootstrap-fatal")) {
     return;
   }

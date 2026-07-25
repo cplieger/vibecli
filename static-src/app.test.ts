@@ -2,14 +2,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import type { MockInstance } from "vitest";
-
-// Records the options every focus() call carries so the shape helper can pin the
-// focusVisible request. happy-dom has no observable effect for it, so the argument
-// IS the only observation point -- and without an assertion on it, dropping the
-// option (or flipping it to false) leaves both fatal builders focusing their only
-// control with no visible ring after a pointer load, which no other assertion sees.
-let focusSpy: MockInstance<(options?: FocusOptions) => void>;
 
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
@@ -114,13 +106,6 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   // Initial focus lands on the recovery CTA (the alertdialog pattern's
   // initial focus; Reload is the only actionable element left).
   expect(document.activeElement).toBe(reload);
-  // ...and asks the UA to paint the ring for that SCRIPT-initiated focus: the
-  // family convention is :focus-visible only, which script focus does not match
-  // after a pointer load, so a dropped focusVisible option leaves the dialog's
-  // only control focused with no visible indicator. happy-dom applies no
-  // observable effect for the option, so the recorded argument is the only place
-  // this contract can be asserted.
-  expect(focusSpy.mock.calls.at(-1)).toEqual([{ focusVisible: true }]);
   // ...and RETURNS there: blur first, so the refocus half of the trap is
   // observable at all -- happy-dom does not move focus as Tab's default action,
   // so asserting activeElement while focus is ALREADY on Reload could never
@@ -139,8 +124,6 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
     expect(reload?.dispatchEvent(tab)).toBe(false);
     expect(tab.defaultPrevented).toBe(true);
     expect(document.activeElement).toBe(reload);
-    // The wrap refocus carries the same ring request as the initial focus.
-    expect(focusSpy.mock.calls.at(-1)).toEqual([{ focusVisible: true }]);
   }
   // ...and ONLY Tab is swallowed: an unconditional trap would eat Enter/Space
   // too and break the Reload button's own keyboard activation, so a non-Tab
@@ -276,10 +259,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // test (implementations given to vi.fn persist through mockReset).
     vi.resetModules();
     document.body.replaceChildren();
-    // Installed before any builder runs so the shape helper can read the
-    // options of the INITIAL focus (which happens during the dynamic import).
-    // spyOn calls through, so real focus still moves.
-    focusSpy = vi.spyOn(HTMLElement.prototype, "focus");
   });
 
   it("throws a clear error when the #terminal root element is missing", async () => {

@@ -38,6 +38,11 @@ if [ ! -f "$manifest" ]; then
   printf 'css-bundle: MANIFEST is not a regular file, refusing: %s\n' "$manifest" >&2
   exit 1
 fi
+# Tracks whether any member contributed BYTES. The unconditional separator
+# below writes one newline per member, so [ -s "$tmp" ] alone can no longer
+# tell a real bundle from a MANIFEST whose every member is a zero-byte file
+# (the truncated/mis-published tarball the guard at the bottom exists for).
+member_bytes=0
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in '' | \#*) continue ;; esac
   case "$line" in
@@ -69,12 +74,13 @@ while IFS= read -r line || [ -n "$line" ]; do
   # A member without a trailing newline would otherwise fuse its last line
   # into the next member's first; CSS is whitespace-insensitive between
   # rules, so an unconditional separator is free.
+  if [ -s "$entry" ]; then member_bytes=1; fi
   cat "$entry" >>"$tmp"
   printf '\n' >>"$tmp"
 done <"$manifest"
 # An empty or fully-commented MANIFEST (a truncated/mis-published UI tarball)
 # would otherwise install an empty bundle that nothing downstream catches.
-[ -s "$tmp" ] || {
+[ "$member_bytes" -eq 1 ] || {
   printf 'css-bundle: assembled bundle is empty (empty or fully-commented MANIFEST?): %s\n' "$manifest" >&2
   exit 1
 }

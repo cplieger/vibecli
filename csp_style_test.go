@@ -15,8 +15,8 @@ import (
 // content with a regexp (a different implementation from inlineStyleHash's byte
 // scanner, so agreement is a genuine cross-check) and asserts the sha256 of that
 // content is exactly what style-src pins in the assembled CSP. The hash is
-// computed from the embed,
-// never hardcoded, so the test tracks index.html automatically.
+// computed from the embed, never hardcoded, so the test tracks index.html
+// automatically.
 func TestCSPStyleHashMatchesEmbeddedInlineStyle(t *testing.T) {
 	indexHTML, err := staticFS.ReadFile("static/index.html")
 	if err != nil {

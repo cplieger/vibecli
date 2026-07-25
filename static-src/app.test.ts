@@ -562,6 +562,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(overlay?.classList.contains("fade")).toBe(false);
     // ...and the booted-root guard's pre-JS precondition: #terminal is empty
     // until createTerminal builds into it.
-    expect(doc.getElementById("terminal")?.firstElementChild ?? null).toBeNull();
+    const terminalRoot = doc.getElementById("terminal");
+    expect(terminalRoot).not.toBeNull();
+    expect(terminalRoot?.firstElementChild).toBeNull();
   });
 });

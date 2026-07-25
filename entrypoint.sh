@@ -453,7 +453,10 @@ if [ -n "${APT_PACKAGES:-}" ]; then
       # The rejected token is untrusted env content: strip non-printable bytes
       # and neutralize the quote that would close the logfmt field, then bound
       # the length so one bad token cannot dominate the log line.
-      safe_pkg=${pkg//[![:print:]]/?}
+      # Backslash is logfmt's escape character; double it before neutralizing
+      # controls and quotes so the field's closing quote cannot be escaped.
+      safe_pkg=${pkg//\\/\\\\}
+      safe_pkg=${safe_pkg//[![:print:]]/?}
       safe_pkg=${safe_pkg//\"/\'}
       printf 'level=warn msg="skipping invalid APT_PACKAGES token" token="%.64s" component=entrypoint\n' "$safe_pkg" >&2
     fi

@@ -358,15 +358,18 @@ func TestAPINoStore(t *testing.T) {
 		t.Errorf("Cache-Control on a static asset = %q, want kiroCacheControl's policy (the API gate must not leak onto static)", got)
 	}
 
-	// An unknown non-API path is the only response nothing downstream decorates
-	// (webhttp.StaticHandler sets Cache-Control for KNOWN assets only, then falls
-	// through to a 404), so it is the one place the /api/ scoping is observable:
-	// the known-asset check above passes even with apiNoStore's prefix guard
-	// deleted, because the static handler overwrites the header on its way out.
+	// A non-API path nothing downstream decorates, so the /api/ scoping is
+	// actually observable: GET /ws without an Upgrade header is answered 426 by
+	// the engine's WebSocket handler, which sets no Cache-Control. Neither
+	// check above can see the guard -- /index.html is a KNOWN asset whose
+	// Cache-Control webhttp.StaticHandler overwrites on its way out, and an
+	// unknown path 404s through net/http's serveError, which since Go 1.23
+	// DELETES Cache-Control (with ETag/Last-Modified) on the error path, so it
+	// carries none whether or not apiNoStore is /api/-scoped.
 	nrec := httptest.NewRecorder()
-	h.ServeHTTP(nrec, httptest.NewRequest(http.MethodGet, "/no-such-asset", http.NoBody))
+	h.ServeHTTP(nrec, httptest.NewRequest(http.MethodGet, terminal.WSPath, http.NoBody))
 	if got := nrec.Header().Get("Cache-Control"); got != "" {
-		t.Errorf("Cache-Control on an unknown non-API path = %q, want none (the no-store gate is /api/-scoped)", got)
+		t.Errorf("Cache-Control on the non-API path %s = %q, want none (the no-store gate is /api/-scoped)", terminal.WSPath, got)
 	}
 }
 

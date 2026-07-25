@@ -134,8 +134,7 @@ rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
 # and an unpinned binary one PATH-shadow behind the canonical one. Warn, don't exit:
 # the pinned binary is present and leads PATH here, so this is hygiene, not an
 # integrity gate (the fatal treatment stays on the reinstall paths below).
-if ! rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" \
-  "$HOME/.local/bin/kiro-cli-term"; then
+if ! rm -f "$HOME/.local/bin/kiro-cli"*; then
   printf 'level=warn msg="failed to sweep legacy kiro-cli staging residue; a shadowed unpinned binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
 fi
 

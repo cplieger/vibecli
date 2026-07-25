@@ -106,6 +106,13 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   // Initial focus lands on the recovery CTA (the alertdialog pattern's
   // initial focus; Reload is the only actionable element left).
   expect(document.activeElement).toBe(reload);
+  // ...and stays there: Tab (and Shift+Tab, which this one-control dialog wraps
+  // identically) is swallowed and refocuses Reload, so keyboard users cannot
+  // walk off the only recovery surface (APG modal focus containment).
+  const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  expect(reload?.dispatchEvent(tab)).toBe(false);
+  expect(tab.defaultPrevented).toBe(true);
+  expect(document.activeElement).toBe(reload);
 }
 
 // The inverse of expectFatalOverlayShape: the watchdog stood down, so the

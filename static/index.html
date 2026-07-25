@@ -280,6 +280,15 @@
           reload.type = "button";
           reload.textContent = "Reload";
           reload.addEventListener("click", () => window.location.reload());
+          // Focus containment (APG alertdialog), mirroring showFatal in app.ts:
+          // inert-ing #terminal keeps focus out of the page, but only this wrap
+          // keeps Tab/Shift+Tab on the dialog's single control.
+          overlay.addEventListener("keydown", (event) => {
+            if (event.key === "Tab") {
+              event.preventDefault();
+              reload.focus({ focusVisible: true });
+            }
+          });
           overlay.replaceChildren(description, reload);
           // aria-modal claims the rest of the page is inert; make it true
           // (APG alertdialog focus containment; WCAG 2.4.11) -- mirrors

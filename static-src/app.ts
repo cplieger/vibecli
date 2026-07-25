@@ -75,6 +75,18 @@ function showFatal(overlay: HTMLElement, message: string): void {
   reload.addEventListener("click", () => {
     window.location.reload();
   });
+  // Focus containment (APG alertdialog): inert-ing #terminal below keeps focus
+  // OUT of the half-built terminal, but it does not make Tab/Shift+Tab cycle
+  // WITHIN the dialog -- without this, Tab walks off Reload into the browser
+  // chrome (or nothing at all in an installed standalone PWA, where this dialog
+  // is the only recovery surface). Reload is the dialog's sole control, so both
+  // directions wrap back onto it. Mirrored by the index.html watchdog.
+  overlay.addEventListener("keydown", (event) => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      reload.focus({ focusVisible: true });
+    }
+  });
   overlay.replaceChildren(description, reload);
   // aria-modal claims everything outside the dialog is inert; make it true so
   // Tab cannot reach focusables inside a partially-built terminal behind the

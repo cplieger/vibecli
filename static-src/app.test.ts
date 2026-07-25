@@ -313,6 +313,26 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).not.toHaveBeenCalled();
   });
 
+  // The other direction of the marker protocol on the missing-root path: when
+  // the index.html watchdog has ALREADY claimed #loading, showFatal's
+  // first-claim guard must leave that dialog (and its live Reload control)
+  // untouched rather than replaceChildren() over it.
+  it("preserves a watchdog-owned fatal dialog when #terminal is missing", async () => {
+    const overlay = appendPristineOverlay();
+    overlay.setAttribute("data-bootstrap-fatal", "");
+    const watchdogMessage = document.createElement("p");
+    watchdogMessage.textContent = "Watchdog failure";
+    overlay.replaceChildren(watchdogMessage);
+
+    await expect(import("./app.js")).rejects.toThrow(
+      "web-terminal-kiro: missing #terminal root element",
+    );
+
+    expect(overlay.firstElementChild).toBe(watchdogMessage);
+    expect(overlay.textContent).toBe("Watchdog failure");
+    expect(createTerminalMock).not.toHaveBeenCalled();
+  });
+
   it("offers a working reload action when startup fails", async () => {
     const reload = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
     const overlay = appendPristineOverlay();

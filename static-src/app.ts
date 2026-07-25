@@ -170,19 +170,28 @@ try {
   createTerminal(root, {
     features: presetAgentTabbed(),
     // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships the
-    // neutral defaults). Recolors hovered/active tabs, the accent icons (the
-    // mobile "+", the toggled keyboard button), and the tab activity dots
-    // (--status-*, below). Since web-terminal-ui v4 all tokens
+    // neutral defaults). Recolors the ACTIVE tab (fill/edge/label, desktop strip
+    // + mobile switcher row), the accent icons (the mobile "+", the toggled
+    // keyboard button), the hover/press fill of the mobile switch and "+"
+    // buttons, and the tab activity dots (--status-*, below). Note what
+    // --tab-hover-bg does NOT reach: both tab HOVER states use the library's own
+    // neutral lift, color-mix(in oklch, var(--tab-bg), var(--text) 15%)
+    // (30-tabs.css:98-104 desktop, 31-switcher.css:400-414 mobile rows),
+    // deliberately -- a translucent accent wash over a filled chip reads as
+    // "more transparent", not "lighter" -- so a hovered inactive tab stays grey
+    // in this theme however this token is set. Since web-terminal-ui v4 all tokens
     // live on .wt-root -- the element the theme is applied to -- so the library's
     // --tab-active-border derivation (the fill lightened + slightly desaturated)
     // already follows an overridden fill; the explicit re-declaration below is a
     // deliberate pin of that same formula, kept so the edge stays low-saturation
     // even if the library's derivation formula changes.
     theme: {
-      // This accent literal is mirrored in three static assets that cannot read
-      // this object: static/index.html's <meta name="theme-color"> (#c099ff is
-      // this same colour) and its #loading critical CSS (--accent plus the
-      // .noscript-fallback colour), and static/manifest.json's theme_color.
+      // This accent literal is mirrored in four declaration sites across the two
+      // static assets that cannot read this object: static/index.html's
+      // <meta name="theme-color"> (#c099ff is this same colour) and its #loading
+      // critical CSS (--accent plus the .noscript-fallback colour), plus
+      // static/manifest.json's theme_color. All four are pinned by app.test.ts's
+      // brand-accent parity test.
       // index.html carries the matching note; change all of them together or the
       // installed-PWA chrome and the pre-JS overlay drift from the app accent.
       "--accent": `hsl(${ACCENT_HSL_COMPONENTS})`,
@@ -218,7 +227,26 @@ try {
   });
 } catch (e) {
   if (loading) {
-    showFatal(loading, "Failed to start the terminal. Reload the page to retry.");
+    // createTerminal dispatches its async continuations -- setupFeatures().then,
+    // the document.fonts settle, connState's onGiveUp -- BEFORE the last
+    // synchronous statements it can throw from (the kernel's "Connect + focus"
+    // block: render.updateFontMetrics(), focusTerminal()). Those continuations
+    // still hold THIS node as `loading`, and each of them can reach the
+    // kernel's dismissLoadingOverlay (markReady on a first frame, a null
+    // resolveInitialSession, enterFatalStartup on a failed feature), which adds
+    // .fade (opacity:0 + pointer-events:none) and removes the node 1.5s later --
+    // deleting the only recovery affordance while #terminal stays inert forever.
+    // So hand the kernel a DETACHED node: cloneNode(false) keeps the id (so
+    // index.html's #loading critical CSS still skins the dialog) and
+    // replaceWith keeps the DOM position, while the kernel's later
+    // classList.add("fade") / remove() land on the orphan and do nothing.
+    const fatal = loading.cloneNode(false) as HTMLElement;
+    loading.replaceWith(fatal);
+    if (!fatal.isConnected) {
+      // replaceWith is a no-op on a parentless node; keep the dialog reachable.
+      document.body.appendChild(fatal);
+    }
+    showFatal(fatal, "Failed to start the terminal. Reload the page to retry.");
   }
   throw e;
 }

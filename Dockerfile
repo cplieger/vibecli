@@ -174,7 +174,7 @@ RUN mkdir -p static/vendor/fonts && \
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
 ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.0.1
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.5.1
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.0.0
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is

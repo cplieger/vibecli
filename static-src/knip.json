@@ -1,7 +1,7 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["app.ts"],
-  "project": ["**/*.ts", "!**/*.d.ts", "!node_modules/**"],
+  "project": ["**/*.ts", "**/*.mjs", "!**/*.d.ts", "!node_modules/**"],
   "ignoreDependencies": ["html-validate", "stylelint", "stylelint-config-standard"],
   "ignoreBinaries": [],
   "ignoreMembers": [],

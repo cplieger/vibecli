@@ -12,8 +12,8 @@ import (
 // TestCSPStyleHashMatchesEmbeddedInlineStyle is the anti-drift guard for the
 // style-src hardening, the mirror of TestCSPScriptHashesMatchEmbeddedInlineScripts:
 // it independently re-extracts the REAL embedded index.html's inline <style>
-// content with a regexp (a different implementation from inlineStyleHash's byte
-// scanner, so agreement is a genuine cross-check) and asserts the sha256 of that
+// content with a regexp (a different implementation from webhttp.InlineStyleHashes'
+// byte scanner, so agreement is a genuine cross-check) and asserts the sha256 of that
 // content is exactly what style-src pins in the assembled CSP. The hash is
 // computed from the embed, never hardcoded, so the test tracks index.html
 // automatically.
@@ -61,54 +61,4 @@ func TestCSPStyleHashMatchesEmbeddedInlineStyle(t *testing.T) {
 	if strings.Contains(csp, "'unsafe-inline'") {
 		t.Errorf("CSP = %q, want no 'unsafe-inline' in any directive", csp)
 	}
-}
-
-// TestInlineStyleHashIsByteExact pins the scanner's boundary contract: the hash
-// covers exactly the bytes between the open tag's '>' and '</style', with no
-// attribute text and no tag markup, which is what a browser hashes. Divergence
-// here would produce a policy that silently blocks the page's critical CSS.
-func TestInlineStyleHashIsByteExact(t *testing.T) {
-	const content = "\n  body { margin: 0 }\n"
-	sum := sha256.Sum256([]byte(content))
-	want := "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
-
-	cases := []struct {
-		name string
-		html string
-	}{
-		{"bare tag", "<html><style>" + content + "</style></html>"},
-		{"tag with attributes", `<html><style type="text/css" media="all">` + content + "</style></html>"},
-		{"uppercase tag", "<HTML><STYLE>" + content + "</STYLE></HTML>"},
-		{"spaced close tag", "<html><style>" + content + "</style ></html>"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := inlineStyleHash([]byte(tc.html))
-			if err != nil {
-				t.Fatalf("inlineStyleHash: %v", err)
-			}
-			if got != want {
-				t.Errorf("inlineStyleHash = %s, want %s (hash must cover the style content only)", got, want)
-			}
-		})
-	}
-
-	// The non-ASCII fold hazard inlineStyleHash's own comment documents: a
-	// unicode-aware fold can CHANGE a rune's byte length (U+0130 folds to the
-	// 1-byte 'i'), sliding every index computed on the folded copy off the
-	// original bytes so the scanner hashes the wrong content. Every case above
-	// is pure ASCII, where bytes.ToLower and the index-preserving ASCII fold
-	// agree, so only content carrying such a rune tells the two apart.
-	t.Run("length-changing unicode keeps the byte indices aligned", func(t *testing.T) {
-		const unicodeContent = "\n  body { content: '\u0130' }\n"
-		sum := sha256.Sum256([]byte(unicodeContent))
-		wantUnicode := "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
-		got, err := inlineStyleHash([]byte("<html><style>" + unicodeContent + "</style></html>"))
-		if err != nil {
-			t.Fatalf("inlineStyleHash: %v", err)
-		}
-		if got != wantUnicode {
-			t.Errorf("inlineStyleHash = %s, want %s (a length-changing unicode fold slides the content indices and hashes the wrong bytes)", got, wantUnicode)
-		}
-	})
 }

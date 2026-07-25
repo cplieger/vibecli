@@ -1,9 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -354,64 +351,27 @@ const cspTemplate = "default-src 'self'; " +
 	"frame-ancestors 'none'; base-uri 'none'; object-src 'none'; " +
 	"form-action 'none'"
 
-// inlineStyleHash returns the CSP source token ('sha256-…') for index.html's
-// SINGLE inline <style> block, hashing exactly the bytes between the open tag's
-// '>' and '</style' — what a browser hashes. Same fail-loud posture as the
-// script side: a missing, unterminated, or duplicated style block is an error,
-// never a silent fallback to 'unsafe-inline'. webhttp has no style equivalent of
-// InlineScriptHashes, hence the local scanner; if one ever lands there, this
-// becomes a call into it.
-func inlineStyleHash(html []byte) (string, error) {
-	const openTag = "<style"
-	// ASCII-fold in place instead of bytes.ToLower: unicode.ToLower can CHANGE
-	// the byte length (the 2-byte rune U+0130 folds to the 1-byte 'i'), sliding every
-	// index computed on the folded copy off the original bytes and silently
-	// hashes the wrong content. webhttp's csp.go solves this with its own
-	// index-preserving indexFoldASCII for exactly this reason.
-	lower := make([]byte, len(html))
-	for i, c := range html {
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		lower[i] = c
-	}
-	open := bytes.Index(lower, []byte(openTag))
-	if open < 0 {
-		return "", errors.New("no inline <style> block in index.html")
-	}
-	// "</style" cannot match openTag, so a second hit is a real second block.
-	if bytes.Contains(lower[open+len(openTag):], []byte(openTag)) {
-		return "", errors.New("more than one inline <style> block in index.html")
-	}
-	gt := bytes.IndexByte(html[open:], '>')
-	if gt < 0 {
-		return "", errors.New("unterminated <style> open tag in index.html")
-	}
-	start := open + gt + 1
-	end := bytes.Index(lower[start:], []byte("</style"))
-	if end < 0 {
-		return "", errors.New("unterminated inline <style> block in index.html")
-	}
-	sum := sha256.Sum256(html[start : start+end])
-	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'", nil
-}
-
 // buildCSPPolicy reads index.html from sub, hashes every inline <script> in it
-// (via webhttp.InlineScriptHashes — the byte-precise scanner that hashes
-// exactly the content a browser hashes) plus its single inline <style> block,
-// and assembles the full CSP string.
+// (via webhttp.InlineScriptHashes) plus its single inline <style> block (via
+// webhttp.InlineStyleHashes) — both the byte-precise scanners that hash exactly
+// the content a browser hashes — and assembles the full CSP string.
 // web-terminal-kiro's index.html carries TWO inline scripts -- the importmap
 // and the bootstrap watchdog (the script-load-failure alertdialog) -- both
 // hashed; the external /app.js module is covered by script-src 'self'. FAIL
 // LOUD: a
 // malformed build — a nil FS, an unreadable index.html, zero inline scripts, or
-// a missing/unterminated/duplicated <style> block
+// anything other than exactly one <style> block
 // — aborts startup rather than silently dropping the script-src or style-src
 // hardening or
 // serving a hash set that would block the importmap and break ES module
 // loading. (This ports web-terminal-server's hash-pinned CSP; web-terminal-kiro
 // previously shipped no CSP at all — the family-drift item the 2026-07
 // judgement run flagged.)
+//
+// The one-block assertion stays HERE rather than in the library: "exactly one"
+// is this app's contract about its own page, not a property of style hashing.
+// The local byte scanner this used to carry (its own index-preserving ASCII fold
+// duplicating webhttp's) is gone now that the library owns the style half too.
 func buildCSPPolicy(sub fs.FS) (string, error) {
 	if sub == nil {
 		return "", errors.New("buildCSPPolicy: nil static FS")
@@ -424,11 +384,14 @@ func buildCSPPolicy(sub fs.FS) (string, error) {
 	if len(hashes) == 0 {
 		return "", errors.New("buildCSPPolicy: no inline <script> blocks in index.html")
 	}
-	styleHash, err := inlineStyleHash(html)
-	if err != nil {
-		return "", fmt.Errorf("buildCSPPolicy: %w", err)
+	styleHashes := webhttp.InlineStyleHashes(html)
+	if len(styleHashes) != 1 {
+		return "", fmt.Errorf(
+			"buildCSPPolicy: want exactly one inline <style> block in index.html, found %d",
+			len(styleHashes),
+		)
 	}
-	return fmt.Sprintf(cspTemplate, strings.Join(hashes, " "), styleHash), nil
+	return fmt.Sprintf(cspTemplate, strings.Join(hashes, " "), styleHashes[0]), nil
 }
 
 // composeGate wraps the session-create gate with the tools-syncing

@@ -65,6 +65,78 @@ harden_config_dir() {
   fi
 }
 
+# --- legacy kiro-cli dispatcher sweep -------------------------------------------
+# Older image versions ran the upstream installer with the real HOME, so a volume
+# created by one can still hold kiro-cli dispatchers in $HOME/.local/bin. That dir is
+# on PATH (see the Dockerfile's ENV PATH), so a leftover is an UNPINNED BINARY
+# REACHABLE BY BARE NAME, not merely wasted disk. The current installer stages under
+# $TOOLS and promotes by rename, so it never writes there -- these sweeps exist for
+# pre-existing volumes and as belt-and-braces against an installer that resolves its
+# prefix via getpwuid rather than $HOME.
+#
+# Two robustness rules the earlier inline `rm -f <glob>` sites got wrong:
+#
+#   1. rm -rf, not rm -f. `rm -f` FAILS on a directory, so a stray directory named
+#      kiro-cli-anything under a swept dir turned a hygiene step into a boot failure
+#      (fatal, with its 10s crash-loop throttle) at the two reinstall sites.
+#   2. Assert the GOAL, not the ACTION. rm's exit status answers "did the unlink
+#      succeed", never "is an unpinned kiro-cli still reachable ahead of $BIN". Those
+#      come apart in BOTH directions: an unremovable non-binary (an immutable
+#      kiro-cli-notes.txt, a read-only mount) failed the old check while shadowing
+#      nothing, and anything the kiro-cli* prefix does not match (a future dispatcher
+#      name, a symlink planted under another name) passed it while shadowing the
+#      pinned binary. resolves_to_pinned_kiro_cli() checks the invariant directly, so
+#      the fatal paths now fire on the dangerous condition instead of on rm's status.
+#
+# Note PATH order makes the exposure window precise: $TOOLS/bin precedes
+# $HOME/.local/bin, so a leftover can only win bare-name resolution while $BIN is
+# ABSENT -- i.e. exactly the pre-reinstall and failed-install windows the two fatal
+# sites guard. With $BIN present nothing in $HOME/.local/bin can shadow it, which is
+# why the every-boot site stays warn-only.
+sweep_legacy_dispatchers() {
+  local dir rc=0
+  for dir in "$@"; do
+    # Never expand to /kiro-cli* on an unset/empty argument.
+    [ -n "$dir" ] || continue
+    if ! rm -rf "$dir/kiro-cli"*; then
+      rc=1
+      printf 'level=warn msg="failed to remove legacy kiro-cli residue" dir="%s" component=entrypoint\n' "$dir" >&2
+    fi
+  done
+  return "$rc"
+}
+
+# 0 when bare-name `kiro-cli` resolves to the pinned binary, or resolves to nothing
+# at all (a fresh volume, or the window right after the pre-reinstall sweep removed
+# $BIN -- nothing to shadow). 1 ONLY when it resolves somewhere else, which is the
+# condition worth failing on.
+resolves_to_pinned_kiro_cli() {
+  local resolved
+  resolved=$(command -v kiro-cli 2>/dev/null) || return 0
+  [ -n "$resolved" ] || return 0
+  [ "$resolved" = "$BIN" ] && return 0
+  printf 'level=warn msg="bare-name kiro-cli resolves to an unpinned path ahead of the pinned binary" resolved="%s" pinned="%s" component=entrypoint\n' "$resolved" "$BIN" >&2
+  return 1
+}
+
+# Warn about a rejected APT_PACKAGES token. The token is untrusted env content, so
+# bound its length first (one bad token must not dominate the log line), then strip
+# non-printable bytes and neutralize the quote that would close the logfmt field.
+# Backslash is logfmt's escape character, so double it: otherwise the field's closing
+# quote can itself be escaped. The RAW token is bounded BEFORE that doubling, because
+# truncating after it could split a `\\` pair and leave a trailing lone backslash that
+# escapes the closing quote. The bound is therefore 64 INPUT chars (at most 128
+# emitted), not 64 emitted chars. Shared by both rejection paths (grammar and
+# known-name) so the sanitizing rules cannot drift between them.
+warn_skipped_apt_token() {
+  local msg=$1 raw=$2 safe
+  safe=${raw:0:64}
+  safe=${safe//\\/\\\\}
+  safe=${safe//[![:print:]]/?}
+  safe=${safe//\"/\'}
+  printf 'level=warn msg="%s" token="%s" component=entrypoint\n' "$msg" "$safe" >&2
+}
+
 # kiro-cli is pinned via Renovate against the public install manifest at
 # https://desktop-release.q.us-east-1.amazonaws.com/index.json. Bumping
 # the version literal triggers a reinstall on next container start (see
@@ -134,8 +206,9 @@ rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
 # and an unpinned binary one PATH-shadow behind the canonical one. Warn, don't exit:
 # the pinned binary is present and leads PATH here, so this is hygiene, not an
 # integrity gate (the fatal treatment stays on the reinstall paths below).
-if ! rm -f "$HOME/.local/bin/kiro-cli"*; then
-  printf 'level=warn msg="failed to sweep legacy kiro-cli staging residue; a shadowed unpinned binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+sweep_legacy_dispatchers "$HOME/.local/bin" || true
+if ! resolves_to_pinned_kiro_cli; then
+  printf 'level=warn msg="legacy kiro-cli residue survived the boot sweep; a shadowed unpinned binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
 fi
 
 # Readiness marker consumed by the Go server's /api/health (main.go reads
@@ -191,8 +264,22 @@ install_kiro_cli() (
   trap 'rm -rf "$tmpdir" "$stage"; [ -z "$install_log" ] || rm -f "$install_log"' EXIT
   zip="$tmpdir/kirocli.zip"
 
+  # The zip is ~528 MB (2.14.1, x86_64), so a flat --max-time acted as a BANDWIDTH
+  # FLOOR rather than a hang guard: 300s killed any link slower than ~1.76 MB/s
+  # (~14 Mbit/s) mid-transfer, and since --max-time applies per attempt, the retries
+  # just repeated the same doomed transfer. A slow connection got no kiro-cli at all,
+  # not a slow one. Stall detection replaces the slowness cap: abort only when
+  # throughput stays under --speed-limit for --speed-time consecutive seconds, which
+  # is the condition we actually care about. --max-time is now an absolute backstop
+  # (3600s => a ~150 KB/s floor, ~1.2 Mbit/s; 12x lower than before), and
+  # --retry-max-time bounds the whole retry envelope so a flapping link cannot stack
+  # three hour-long attempts. NOTE the HEALTHCHECK --start-period (20m) no longer
+  # covers the worst-case window; that degrades safely because an unhealthy state
+  # never restarts this container (restart policy acts on process exit), so a very
+  # slow first boot shows unhealthy and then converges once the marker is written.
   if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-    --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 \
+    --connect-timeout 20 --speed-limit 4096 --speed-time 60 \
+    --max-time 3600 --retry 3 --retry-delay 5 --retry-max-time 5400 \
     "$zip_url" -o "$zip"; then
     printf 'level=error msg="failed to download kiro-cli zip" url="%s" component=entrypoint\n' "$zip_url" >&2
     return 1
@@ -315,8 +402,10 @@ if needs_kiro_cli_install; then
   # launch the stale CLI, contradicting the pin guarantee. With it, an install
   # failure leaves every binary absent, so new sessions hit the explicit
   # install-failed guard instead.
-  # Inability to quarantine is fatal: we cannot guarantee the pin controls
-  # what runs. rm -f is a no-op on the first-boot (nothing present) path.
+  # A failed unlink is NOT itself fatal any more; a still-reachable unpinned binary
+  # is. That distinction is the point: an unremovable non-binary shadows nothing and
+  # must not brick boot, while anything the kiro-cli* prefix misses must still be
+  # caught. rm -rf is a no-op on the first-boot (nothing present) path.
   if [ -e "$BIN" ] || [ -e "$HOME/.local/bin/kiro-cli" ]; then
     printf 'level=info msg="quarantining stale kiro-cli binaries (canonical and legacy staging) before reinstall" path="%s" component=entrypoint\n' "$BIN" >&2
   fi
@@ -324,10 +413,9 @@ if needs_kiro_cli_install; then
   # prefix via getpwuid writes whatever dispatcher set THAT version ships, so a
   # name added upstream must still be quarantined. "$BIN" is covered by the
   # first pattern.
-  if ! rm -f \
-    "$TOOLS/bin/kiro-cli"* \
-    "$HOME/.local/bin/kiro-cli"*; then
-    fatal 'failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH' "path=\"$BIN\""
+  sweep_legacy_dispatchers "$TOOLS/bin" "$HOME/.local/bin" || true
+  if ! resolves_to_pinned_kiro_cli; then
+    fatal 'an unpinned kiro-cli is still reachable by bare name after the pre-reinstall sweep; refusing to install over a shadowed binary' "path=\"$BIN\""
   fi
   if ! install_kiro_cli; then
     printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
@@ -336,15 +424,17 @@ if needs_kiro_cli_install; then
     # persistent volume, and an installer that resolves its prefix via getpwuid rather
     # than $HOME would have. Sweeping here keeps a failed install from leaving an
     # unpinned binary reachable by bare-name resolution until the NEXT boot's
-    # pre-reinstall quarantine runs. A sweep FAILURE is fatal, on the same terms
-    # as the pre-reinstall quarantine above: it is exactly the case where an
-    # installer that resolved its prefix via getpwuid left an unpinned binary on
-    # PATH for the container's lifetime. A failed install alone still degrades
-    # (web UI up, terminal errors) — only the integrity cleanup failing exits,
-    # with fatal's 10s crash-loop throttle. rm -f is a no-op when nothing was
-    # written there, which is the normal path.
-    if ! rm -f "$HOME/.local/bin/kiro-cli"*; then
-      fatal 'failed to sweep legacy staging dir after a failed install; refusing to leave an unpinned binary reachable via bare-name PATH resolution' "dir=\"$HOME/.local/bin\""
+    # pre-reinstall quarantine runs. What is fatal here is the same condition as at
+    # the pre-reinstall quarantine above: not a failed unlink, but an unpinned
+    # kiro-cli still resolving by bare name afterwards, which is exactly the case
+    # where an installer that resolved its prefix via getpwuid left one on PATH for
+    # the container's lifetime. A failed install alone still degrades (web UI up,
+    # terminal errors); only a surviving reachable binary exits, with fatal's 10s
+    # crash-loop throttle. The sweep is a no-op when nothing was written there,
+    # which is the normal path.
+    sweep_legacy_dispatchers "$HOME/.local/bin" || true
+    if ! resolves_to_pinned_kiro_cli; then
+      fatal 'an unpinned kiro-cli is still reachable by bare name after a failed install; refusing to leave it resolvable for the container lifetime' "dir=\"$HOME/.local/bin\""
     fi
   fi
 fi
@@ -453,11 +543,13 @@ fi
 # the background after the listener binds; session creation waits on it
 # so kiro-cli never scans PATH before the manifest's tools are present.
 #
-# Each token is validated against Debian package-name grammar so env
-# content cannot smuggle apt options; `apt-get update` is REQUIRED here
-# because the image deletes the package indexes at build time (a bare
-# install would fail deterministically). Warn-not-fail preserves the
-# degraded-boot posture.
+# Validation is two-stage, and the stages answer different questions:
+# the grammar rejects tokens that are not shaped like a package name (so env
+# content cannot smuggle apt options, a `pkg=version` pin, `pkg:arch`, or the
+# `pkg-` REMOVE form), while the known-name gate rejects tokens that are not
+# ACTUALLY packages. `apt-get update` is REQUIRED before either install or the
+# gate because the image deletes the package indexes at build time.
+# Warn-not-fail preserves the degraded-boot posture throughout.
 if [ -n "${APT_PACKAGES:-}" ]; then
   apt_pkgs=()
   # Word-splitting of $APT_PACKAGES is intentional; glob expansion is not
@@ -473,25 +565,73 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     if [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]*$ && "$pkg" != *- ]]; then
       apt_pkgs+=("$pkg")
     else
-      # The rejected token is untrusted env content: bound its length so one bad
-      # token cannot dominate the log line, then strip non-printable bytes and
-      # neutralize the quote that would close the logfmt field.
-      # Backslash is logfmt's escape character; double it so the field's closing
-      # quote cannot be escaped. The RAW token is bounded BEFORE that doubling:
-      # truncating after it could split a `\\` pair and leave a trailing lone
-      # backslash that escapes the closing quote. The bound is therefore 64
-      # INPUT chars (at most 128 emitted), not 64 emitted chars.
-      safe_pkg=${pkg:0:64}
-      safe_pkg=${safe_pkg//\\/\\\\}
-      safe_pkg=${safe_pkg//[![:print:]]/?}
-      safe_pkg=${safe_pkg//\"/\'}
-      printf 'level=warn msg="skipping invalid APT_PACKAGES token" token="%s" component=entrypoint\n' "$safe_pkg" >&2
+      warn_skipped_apt_token 'skipping invalid APT_PACKAGES token' "$pkg"
     fi
   done
   set +f
   if [ "${#apt_pkgs[@]}" -gt 0 ]; then
+    # Refresh the indexes on their OWN deadline, before the known-name gate that
+    # reads them. Splitting update from install also makes an exhausted deadline
+    # attributable: previously one 600s budget covered both, so a timeout could
+    # not say which half consumed it. 300s rather than a tight bound for the same
+    # reason the kiro-cli download uses stall detection: a deadline sized for a
+    # fast link is a bandwidth floor in disguise.
+    apt_update_rc=0
+    timeout --signal=TERM --kill-after=30s 300s apt-get update -qq || apt_update_rc=$?
+    if [ "$apt_update_rc" -ne 0 ]; then
+      printf 'level=warn msg="apt-get update failed; APT_PACKAGES install may fail and the known-name check is skipped" rc=%d component=entrypoint\n' "$apt_update_rc" >&2
+    fi
+
+    # Known-name gate. The grammar above is only a PROXY for "is this a real
+    # Debian package name", and apt-get has a third interpretation layer the proxy
+    # cannot express: a token containing '.', '?' or '*' that matches no literal
+    # package is retried as an UNANCHORED REGEX over every package name. Measured
+    # on apt 3.0.3 (trixie's major): `apt-get install -s -- 'jq.'` plans 337
+    # packages. So one grammar-valid operator typo (python3., libssl.) turns this
+    # install-only path into an unbounded root install into the container layer,
+    # re-run on every start. '.' cannot leave the grammar (python3.13, docker.io
+    # are real names) and apt-get has no flag to disable the fallback, so the fix
+    # is to stop handing apt anything that is not already known to be a literal
+    # package name: a token that survives this gate cannot reach the regex path.
+    #
+    # apt-cache pkgnames is the only safe oracle here. `apt-cache show`, `policy`
+    # and `showpkg` ALL regex-expand (verified: `showpkg -- 'jq.'` reports
+    # libjs-jquery.sparkline) and return rc=0 for names that do not exist, so none
+    # of them can answer "does this literal name exist".
+    #
+    # Known limit: pkgnames omits PURE VIRTUAL names (awk, provided by mawk/gawk
+    # but never a real package), so such a token is skipped here. Acceptable, and
+    # the warning says so: `apt-get install awk` fails on its own anyway, because a
+    # multi-provider virtual has no installation candidate. Naming a concrete
+    # provider is the fix in both cases, and the warning is clearer than apt's.
+    if [ "$apt_update_rc" -eq 0 ]; then
+      apt_names=$(mktemp) || apt_names=''
+      if [ -n "$apt_names" ] && apt-cache pkgnames >"$apt_names" 2>/dev/null && [ -s "$apt_names" ]; then
+        known_pkgs=()
+        for pkg in "${apt_pkgs[@]}"; do
+          if grep -qxF -- "$pkg" "$apt_names"; then
+            known_pkgs+=("$pkg")
+          else
+            warn_skipped_apt_token 'skipping unknown APT_PACKAGES token (no such package; a pure virtual package needs a concrete provider)' "$pkg"
+          fi
+        done
+        apt_pkgs=("${known_pkgs[@]}")
+      else
+        # No usable index. Skipping the gate is the correct failure mode: rejecting
+        # every token would turn a transient index problem into "none of your
+        # packages installed" plus a misleading per-token typo warning. The grammar
+        # still holds, so this degrades to the pre-gate behaviour, logged.
+        printf 'level=warn msg="apt package index unreadable; installing APT_PACKAGES without the known-name check" component=entrypoint\n' >&2
+      fi
+      [ -z "$apt_names" ] || rm -f "$apt_names"
+    fi
+  fi
+  if [ "${#apt_pkgs[@]}" -gt 0 ]; then
     printf 'level=info msg="installing OS packages" packages="%s" component=entrypoint\n' "${apt_pkgs[*]}" >&2
-    timeout --signal=TERM --kill-after=30s 600s bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends -- "$@"' _ "${apt_pkgs[@]}"
+    # Called directly rather than through `bash -c`: with update split out there is
+    # nothing left to chain, and one less shell between env content and apt is one
+    # less layer that could reinterpret a token.
+    timeout --signal=TERM --kill-after=30s 600s apt-get install -y -qq --no-install-recommends -- "${apt_pkgs[@]}"
     apt_rc=$?
     if [ "$apt_rc" -ne 0 ]; then
       # 124/137 = the 600s deadline (TERM, then the --kill-after SIGKILL
@@ -503,6 +643,10 @@ if [ -n "${APT_PACKAGES:-}" ]; then
         printf 'level=warn msg="APT_PACKAGES install failed; container continues without them" rc=%d component=entrypoint\n' "$apt_rc" >&2
       fi
     fi
+  fi
+  # Reclaim the indexes whenever this block refreshed them, whether or not anything
+  # was ultimately installed (every token may have been skipped).
+  if [ "${apt_update_rc:-1}" -eq 0 ]; then
     rm -rf /var/lib/apt/lists/*
   fi
 fi

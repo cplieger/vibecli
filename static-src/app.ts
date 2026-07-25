@@ -71,9 +71,17 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // alertdialog, not alert: the overlay carries an interactive Reload button
   // and moves focus into it, which is the alertdialog interaction model (APG).
   // The role plus the focus transition supplies the announcement, so no
-  // aria-live is needed. aria-label replaces index.html's "Loading" name so
-  // the accessible name doesn't contradict the failure it now shows; the
-  // branch-specific message is the dialog's description.
+  // aria-live is needed. The name comes from a VISIBLE title via
+  // aria-labelledby, not an invisible aria-label: APG prefers one name serving
+  // both audiences, and the sighted user previously got a bare message with no
+  // heading saying what had happened. Title text and button copy match
+  // web-terminal-ui's own renderFatalStartup() so the same event ("the terminal
+  // did not start") reads identically whichever startup phase failed; the
+  // branch-specific message stays this app's, since it is more precise than the
+  // library's generic text.
+  const title = document.createElement("h2");
+  title.id = "bootstrap-failure-title";
+  title.textContent = "Terminal failed to start";
   const description = document.createElement("p");
   description.id = "bootstrap-failure-message";
   description.textContent = message;
@@ -82,15 +90,20 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // this overlay'. Set here too so the watchdog's stand-down is explicit rather than
   // resting on replaceChildren having dropped the .bar when the rethrow reaches its
   // capture-phase listener.
+  // Stryker disable next-line StringLiteral: a marker attribute read only with
+  // hasAttribute (here, in index.html's watchdog, and in app.test.ts), so its VALUE
+  // is unobservable by construction; the empty string is the HTML convention for a
+  // boolean attribute. Any assertion on it would test the mutant, not the contract.
   overlay.setAttribute("data-bootstrap-fatal", "");
   overlay.setAttribute("aria-modal", "true");
-  overlay.setAttribute("aria-label", "Web Terminal for Kiro startup failure");
+  overlay.removeAttribute("aria-label");
+  overlay.setAttribute("aria-labelledby", title.id);
   overlay.setAttribute("aria-describedby", description.id);
   // manifest.json declares display: standalone, so an installed PWA has no browser
   // chrome; "reload the page" needs an in-page affordance (Vercel: no dead ends).
   const reload = document.createElement("button");
   reload.type = "button";
-  reload.textContent = "Reload";
+  reload.textContent = "Reload page";
   reload.addEventListener("click", () => {
     window.location.reload();
   });
@@ -113,15 +126,23 @@ function showFatal(overlay: HTMLElement, message: string): void {
         return;
       }
       event.preventDefault();
+      // Stryker disable next-line ObjectLiteral,BooleanLiteral: focusVisible is a UA
+      // RENDERING hint (paint the focus ring for this script-initiated focus) with no
+      // scriptable effect, and happy-dom models neither the option nor :focus-visible,
+      // so no test in this environment can observe either mutant. Engines that ignore
+      // the option are covered by index.html's plain :focus rule for this button.
       reload.focus({ focusVisible: true });
     },
     true,
   );
-  overlay.replaceChildren(description, reload);
+  overlay.replaceChildren(title, description, reload);
   // aria-modal claims everything outside the dialog is inert; make it true so
   // Tab cannot reach focusables inside a partially-built terminal behind the
   // opaque overlay (APG alertdialog focus containment; WCAG 2.4.11). On the
   // missing-root path there is no #terminal, so the lookup is a no-op.
+  // Stryker disable next-line StringLiteral: inert is a boolean attribute -- presence
+  // is the whole semantic, and both the tests and the browser read it that way -- so
+  // the value is unobservable. Same class as data-bootstrap-fatal above.
   document.getElementById("terminal")?.setAttribute("inert", "");
   // Move focus to the recovery CTA: the page content is gone and Reload is the
   // only actionable element left (the alertdialog pattern's initial focus).
@@ -133,6 +154,11 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // Chrome < 145, Safari < 18.4) are covered by index.html's plain :focus rule
   // for this dialog's button, which is scoped to the fatal overlay so it never
   // leaks onto terminal chrome.
+  // Stryker disable next-line ObjectLiteral,BooleanLiteral: focusVisible is a UA
+  // RENDERING hint (paint the focus ring for this script-initiated focus) with no
+  // scriptable effect, and happy-dom models neither the option nor :focus-visible,
+  // so no test in this environment can observe either mutant. Engines that ignore
+  // the option are covered by index.html's plain :focus rule for this button.
   reload.focus({ focusVisible: true });
 }
 
@@ -166,9 +192,27 @@ if (loading?.hasAttribute("data-bootstrap-fatal")) {
     "web-terminal-kiro: bootstrap watchdog already reported a fatal resource failure",
   );
 }
+// Set by the kernel's own fatal path via onFatalError below. The catch block
+// reads it to tell a kernel failure (which already rendered its own recovery
+// surface) from a preset failure that never reached the kernel; see the comment
+// there for why the distinction matters. Held on an object rather than a bare
+// `let` deliberately: the only write happens inside a closure, so TypeScript's
+// flow analysis would keep narrowing a `let` to `false` and
+// @typescript-eslint/no-unnecessary-condition would then reject the check below
+// as always-truthy. A property read after an intervening call is not narrowed.
+const kernelFatal = { reported: false };
 try {
   createTerminal(root, {
     features: presetAgentTabbed(),
+    // Observe only, never claim: returning void leaves the kernel's own
+    // "Terminal failed to start" surface in place, which is exactly what this
+    // app wants now that it no longer hand-builds one for that phase. Fires for
+    // both startup phases ("kernel-init" synchronously before the rethrow,
+    // "feature-setup" asynchronously later); the async case sets a flag nothing
+    // reads, which is harmless.
+    onFatalError: () => {
+      kernelFatal.reported = true;
+    },
     // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships the
     // neutral defaults). Recolors the ACTIVE tab (fill/edge/label, desktop strip
     // + mobile switcher row), the accent icons (the mobile "+", the toggled
@@ -226,27 +270,32 @@ try {
     ...(loading ? { loading } : {}),
   });
 } catch (e) {
-  if (loading) {
-    // createTerminal dispatches its async continuations -- setupFeatures().then,
-    // the document.fonts settle, connState's onGiveUp -- BEFORE the last
-    // synchronous statements it can throw from (the kernel's "Connect + focus"
-    // block: render.updateFontMetrics(), focusTerminal()). Those continuations
-    // still hold THIS node as `loading`, and each of them can reach the
-    // kernel's dismissLoadingOverlay (markReady on a first frame, a null
-    // resolveInitialSession, enterFatalStartup on a failed feature), which adds
-    // .fade (opacity:0 + pointer-events:none) and removes the node 1.5s later --
-    // deleting the only recovery affordance while #terminal stays inert forever.
-    // So hand the kernel a DETACHED node: cloneNode(false) keeps the id (so
-    // index.html's #loading critical CSS still skins the dialog) and
-    // replaceWith keeps the DOM position, while the kernel's later
-    // classList.add("fade") / remove() land on the orphan and do nothing.
-    const fatal = loading.cloneNode(false) as HTMLElement;
-    loading.replaceWith(fatal);
-    if (!fatal.isConnected) {
-      // replaceWith is a no-op on a parentless node; keep the dialog reachable.
-      document.body.appendChild(fatal);
-    }
-    showFatal(fatal, "Failed to start the terminal. Reload the page to retry.");
+  // This try has TWO throw sources and only one of them is the kernel's:
+  //
+  //   1. presetAgentTabbed() is evaluated as an ARGUMENT, so a preset failure
+  //      throws before createTerminal is entered. No kernel ran, nothing
+  //      captured #loading, and nothing will ever lower it -- the app still owns
+  //      the recovery surface here.
+  //   2. createTerminal itself throws. Since @cplieger/web-terminal-ui 5.0.0 the
+  //      kernel runs its own fatal path first (phase "kernel-init"): it lowers
+  //      #loading and renders "Terminal failed to start" into #terminal before
+  //      rethrowing. Building a dialog here too would put TWO recovery surfaces
+  //      on the page, the kernel's inside #terminal and this one in the #loading
+  //      slot.
+  //
+  // onFatalError is the discriminator, using the library's own contract rather
+  // than sniffing for its .wt-fatal markup. The handler only observes (returns
+  // void), so the kernel still renders its surface.
+  //
+  // Case 2 also retires a workaround: this catch used to hand showFatal a
+  // DETACHED cloneNode of #loading, because createTerminal queues async
+  // continuations (setupFeatures().then, the document.fonts settle, connState's
+  // onGiveUp) BEFORE its last throwing synchronous statements, and any of them
+  // could reach dismissLoadingOverlay and delete the app's own dialog 1.5s
+  // later. In case 1 no continuation exists, and in case 2 the dialog is the
+  // kernel's, so the clone has nothing left to protect.
+  if (!kernelFatal.reported && loading) {
+    showFatal(loading, "Failed to start the terminal. Reload the page to retry.");
   }
   throw e;
 }

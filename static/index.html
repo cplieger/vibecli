@@ -64,6 +64,22 @@
         font-family: system-ui, -apple-system, sans-serif;
         text-align: center;
       }
+      /* The fatal dialog's visible title, which is also its accessible name via
+         aria-labelledby (both builders: showFatal in app.ts and the watchdog
+         below). It lives in this critical block rather than style.css for the
+         same reason the rest of #loading does: this overlay must be styled
+         before /style.css has loaded, and a stylesheet failure is one of the
+         states it exists to report. The library's own .wt-fatal-title rules
+         cannot be reused because every .wt-fatal* rule is scoped
+         :where(.wt-root), and .wt-root does not exist when the terminal failed
+         to build. h2 defaults are reset so the heading reads as dialog copy
+         rather than document structure. */
+      #loading[role="alertdialog"] h2 {
+        margin: 0;
+        font-size: 1.125rem;
+        font-weight: 600;
+        line-height: 1.3;
+      }
       #loading[role="alertdialog"] button {
         min-inline-size: 2.75rem;
         min-block-size: 2.75rem;
@@ -274,7 +290,17 @@
           // button and moves focus into it, the alertdialog interaction model
           // (APG) -- same treatment as showFatal in app.ts. The role plus the
           // focus transition supplies the announcement, so no aria-live is
-          // needed; aria-label replaces the static "Loading" name.
+          // needed. The name comes from a VISIBLE title via aria-labelledby
+          // rather than an invisible aria-label, replacing the static "Loading"
+          // name: APG prefers one name serving both audiences, and a sighted
+          // user otherwise gets a bare message with no heading. Title text and
+          // button copy match web-terminal-ui's renderFatalStartup() and
+          // showFatal in app.ts, so all three fatal-startup dialogs read alike;
+          // the message below stays this builder's own, being more precise than
+          // the library's generic wording.
+          const title = document.createElement("h2");
+          title.id = "bootstrap-failure-title";
+          title.textContent = "Terminal failed to start";
           const description = document.createElement("p");
           description.id = "bootstrap-failure-message";
           description.textContent =
@@ -285,11 +311,12 @@
           // shape cannot silently sever the handoff.
           overlay.setAttribute("data-bootstrap-fatal", "");
           overlay.setAttribute("aria-modal", "true");
-          overlay.setAttribute("aria-label", "Web Terminal for Kiro startup failure");
+          overlay.removeAttribute("aria-label");
+          overlay.setAttribute("aria-labelledby", title.id);
           overlay.setAttribute("aria-describedby", description.id);
           const reload = document.createElement("button");
           reload.type = "button";
-          reload.textContent = "Reload";
+          reload.textContent = "Reload page";
           reload.addEventListener("click", () => window.location.reload());
           // Focus containment (APG alertdialog), mirroring showFatal in app.ts:
           // inert-ing #terminal keeps focus out of the page, but only this wrap
@@ -305,7 +332,7 @@
             },
             true,
           );
-          overlay.replaceChildren(description, reload);
+          overlay.replaceChildren(title, description, reload);
           // aria-modal claims the rest of the page is inert; make it true
           // (APG alertdialog focus containment; WCAG 2.4.11) -- mirrors
           // showFatal in app.ts, keep the two in sync.

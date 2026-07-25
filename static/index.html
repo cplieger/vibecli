@@ -136,11 +136,14 @@
           transform: translateX(250%);
         }
       }
-      /* Readable content for the role="status" region: the bar is aria-hidden, so
-         without this the live region carries no text for assistive tech to render
-         (WCAG 4.1.3). Same clip technique web-terminal-ui's kernel announcer uses
-         (src/kernel/a11y.ts hideVisually). Both fatal builders replaceChildren(),
-         so it is gone by the time the overlay becomes the alertdialog. */
+      /* The shared clip-based hide technique, now used by two elements.
+         #loading .loading-status: readable content for the role="status" region
+         (the bar is aria-hidden, so without this the live region carries no text
+         for assistive tech to render -- WCAG 4.1.3); both fatal builders
+         replaceChildren(), so it is gone by the time the overlay becomes the
+         alertdialog. .visually-hidden: the document's <h1>, which is PERMANENT --
+         a body-level sibling no builder clears. Same technique web-terminal-ui's
+         kernel announcer uses (src/kernel/a11y.ts hideVisually). */
       #loading .loading-status,
       .visually-hidden {
         position: absolute;

@@ -264,10 +264,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
       "web-terminal-kiro: missing #terminal root element",
     );
 
-    // The index.html watchdog only acts while the pristine .bar is present;
-    // showFatal replacing the children (asserted inside the shape helper) is
-    // what stops it from clobbering this message when the rethrown error
-    // reaches the window error listener.
+    // showFatal sets data-bootstrap-fatal (asserted inside the shape helper),
+    // and that marker -- not the replaced .bar -- is what stands the
+    // index.html watchdog down when the rethrown error reaches its
+    // capture-phase window listener, so it cannot clobber this message.
     expectFatalOverlayShape(overlay);
     const description = overlay.querySelector("#bootstrap-failure-message");
     expect(description?.textContent).toContain("Web Terminal for Kiro failed to start");
@@ -416,7 +416,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     evaluateWatchdog(readWatchdogSource());
 
     appendTerminalRoot();
-    // Recreate the post-showFatal overlay: bar replaced by the dialog content.
+    // The marker-less converted overlay: this fixture deliberately omits
+    // data-bootstrap-fatal (which showFatal now always sets), so it is NOT the
+    // full post-showFatal shape -- it isolates the older missing-.bar fallback
+    // clause, complementing the marker-only stand-down test above.
     const overlay = document.createElement("div");
     overlay.id = "loading";
     overlay.setAttribute("role", "alertdialog");
@@ -564,6 +567,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     );
 
     expect(createTerminalMock).not.toHaveBeenCalled();
+    expectPristineOverlayUntouched(overlay, root);
+  });
+
+  it("watchdog stands down when a fatal dialog already owns the overlay", () => {
+    // The app -> watchdog leg of the marker protocol, mirroring "aborts boot
+    // from the fatal handoff marker independently of dialog ARIA" for the other
+    // direction: showFatal claims the overlay by setting data-bootstrap-fatal,
+    // and the rethrown error then reaches this capture-phase listener, which
+    // must NOT overwrite showFatal's branch-specific message with the generic
+    // "failed to load" text. A pristine overlay carrying only the marker
+    // isolates that clause from the replaced-.bar side effect it supersedes:
+    // with the marker guard removed the watchdog builds its dialog here.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    overlay.setAttribute("data-bootstrap-fatal", "");
+
+    evaluateWatchdog(readWatchdogSource());
+    const scriptEl = document.createElement("script");
+    document.body.appendChild(scriptEl);
+    scriptEl.dispatchEvent(new Event("error"));
+
     expectPristineOverlayUntouched(overlay, root);
   });
 

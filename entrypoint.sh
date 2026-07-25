@@ -320,9 +320,16 @@ if needs_kiro_cli_install; then
     # persistent volume, and an installer that resolves its prefix via getpwuid rather
     # than $HOME would have. Sweeping here keeps a failed install from leaving an
     # unpinned binary reachable by bare-name resolution until the NEXT boot's
-    # pre-reinstall quarantine runs. Best-effort: the install already failed.
-    rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term" \
-      || printf 'level=warn msg="failed to sweep legacy staging dir after a failed install; an unpinned binary may remain reachable via bare-name PATH resolution" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+    # pre-reinstall quarantine runs. A sweep FAILURE is fatal, on the same terms
+    # as the pre-reinstall quarantine above: it is exactly the case where an
+    # installer that resolved its prefix via getpwuid left an unpinned binary on
+    # PATH for the container's lifetime. A failed install alone still degrades
+    # (web UI up, terminal errors) — only the integrity cleanup failing exits,
+    # with fatal's 10s crash-loop throttle. rm -f is a no-op when nothing was
+    # written there, which is the normal path.
+    if ! rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
+      fatal 'failed to sweep legacy staging dir after a failed install; refusing to leave an unpinned binary reachable via bare-name PATH resolution' "dir=\"$HOME/.local/bin\""
+    fi
   fi
 fi
 

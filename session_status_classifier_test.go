@@ -1,12 +1,15 @@
 package main
 
 import (
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
@@ -52,5 +55,39 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 				terminal.StatusDone, rec.Body.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning pins the two
+// observable LOGGING behaviors of the unrecognized-notification path, which
+// TestClassifyStatus (return values only) leaves entirely unguarded: exactly the
+// FIRST unknown notification per process is promoted to Warn so a kiro-cli
+// wording drift is visible at the default info level, and EVERY occurrence stays
+// recorded at Debug for KWEB_LOG_LEVEL=debug. Without this test, deleting the
+// Warn block, moving it outside the sync.Once (log flooding on every
+// notification), or deleting the Debug trace all leave the suite green.
+//
+// The package-global sync.Once is reset before and after so the assertion does
+// not depend on whether another test already consumed it. capture.Default swaps
+// the global default logger, so this test must never call t.Parallel.
+func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T) {
+	unrecognizedNotifyOnce = sync.Once{}
+	t.Cleanup(func() { unrecognizedNotifyOnce = sync.Once{} })
+	records := capture.Default(t)
+	const message = "unrecognized kiro-cli OSC 9 notification"
+
+	got, latch := classifyStatus("New response wording")
+	if got != "" || latch {
+		t.Errorf("classifyStatus(first unknown) = (%q, %v), want (empty, false)", got, latch)
+	}
+	got, latch = classifyStatus("Another response wording")
+	if got != "" || latch {
+		t.Errorf("classifyStatus(second unknown) = (%q, %v), want (empty, false)", got, latch)
+	}
+	if got := records.CountLevel(slog.LevelWarn, message); got != 1 {
+		t.Errorf("unrecognized notification Warn count = %d, want 1 (bounded to the first occurrence per process)", got)
+	}
+	if got := records.CountLevel(slog.LevelDebug, message); got != 2 {
+		t.Errorf("unrecognized notification Debug count = %d, want 2 (every occurrence is traced)", got)
 	}
 }

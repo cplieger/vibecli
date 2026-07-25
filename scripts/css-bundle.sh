@@ -38,11 +38,13 @@ if [ ! -f "$manifest" ]; then
   printf 'css-bundle: MANIFEST is not a regular file, refusing: %s\n' "$manifest" >&2
   exit 1
 fi
-# Tracks whether any member contributed BYTES. The unconditional separator
-# below writes one newline per member, so [ -s "$tmp" ] alone can no longer
-# tell a real bundle from a MANIFEST whose every member is a zero-byte file
-# (the truncated/mis-published tarball the guard at the bottom exists for).
-member_bytes=0
+# Counts the members actually assembled, solely so an empty or fully-commented
+# MANIFEST (which never enters the loop, so [ -s "$tmp" ] cannot tell it from a
+# real bundle now that the separator below writes a newline per member) is
+# refused at the bottom. Each member's OWN non-emptiness is enforced per-entry
+# inside the loop: an aggregate "at least one member had bytes" test passes a
+# truncated tarball in which one required feature stylesheet is zero bytes.
+member_count=0
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in '' | \#*) continue ;; esac
   case "$line" in
@@ -71,17 +73,25 @@ while IFS= read -r line || [ -n "$line" ]; do
     printf 'css-bundle: MANIFEST entry is not a regular file, refusing: %s\n' "$line" >&2
     exit 1
   fi
+  # Every MANIFEST entry is an independently required build input (each is one
+  # feature's stylesheet), so a zero-byte member — the truncated or
+  # mis-published UI tarball — fails the build here instead of publishing a
+  # bundle silently missing that feature's styling.
+  if [ ! -s "$entry" ]; then
+    printf 'css-bundle: MANIFEST entry is empty, refusing: %s\n' "$line" >&2
+    exit 1
+  fi
+  member_count=$((member_count + 1))
   # A member without a trailing newline would otherwise fuse its last line
   # into the next member's first; CSS is whitespace-insensitive between
   # rules, so an unconditional separator is free.
-  if [ -s "$entry" ]; then member_bytes=1; fi
   cat "$entry" >>"$tmp"
   printf '\n' >>"$tmp"
 done <"$manifest"
 # An empty or fully-commented MANIFEST (a truncated/mis-published UI tarball)
 # would otherwise install an empty bundle that nothing downstream catches.
-[ "$member_bytes" -eq 1 ] || {
-  printf 'css-bundle: assembled bundle is empty (empty or fully-commented MANIFEST?): %s\n' "$manifest" >&2
+[ "$member_count" -gt 0 ] || {
+  printf 'css-bundle: MANIFEST lists no members (empty or fully-commented?): %s\n' "$manifest" >&2
   exit 1
 }
 mv "$tmp" "$out"

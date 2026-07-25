@@ -90,6 +90,22 @@ if (!root) {
   }
   throw new Error("web-terminal-kiro: missing #terminal root element");
 }
+// The inline watchdog in static/index.html may have already claimed the
+// #loading overlay as its fatal alertdialog -- most importantly for a failed
+// <link rel="stylesheet">, which is fatal (no /style.css means an unstyled,
+// unusable terminal) yet does NOT stop /app.js from evaluating, so control
+// reaches here with the recovery dialog already on screen and #terminal
+// inerted. Booting anyway would hand that dialog to createTerminal as
+// `loading`; the UI kernel fades and REMOVES it on first frame while nothing
+// un-inerts #terminal, leaving an inert, unstyled page with no Reload
+// affordance. role="alertdialog" is the watchdog-to-app handoff signal (the
+// one attribute both fatal builders set and the pristine overlay never has),
+// so treat it as bootstrap already having failed and stop here.
+if (loading?.getAttribute("role") === "alertdialog") {
+  throw new Error(
+    "web-terminal-kiro: bootstrap watchdog already reported a fatal resource failure",
+  );
+}
 try {
   createTerminal(root, {
     features: presetAgentTabbed(),

@@ -469,6 +469,37 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(true);
   });
 
+  it("does not boot over the watchdog's fatal stylesheet dialog", async () => {
+    // The second half of the stylesheet flow the test above stops short of: a
+    // failed /style.css does NOT prevent /app.js from evaluating, so app.ts
+    // runs with the watchdog's alertdialog already on screen and #terminal
+    // inerted. It must recognize that handoff and abort instead of passing the
+    // converted overlay to createTerminal as `loading` -- the kernel would
+    // fade and REMOVE the only Reload affordance on first frame while nothing
+    // un-inerts #terminal, leaving an inert, unstyled, message-less page.
+    evaluateWatchdog(readWatchdogSource());
+
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    linkEl.href = "/style.css";
+    dispatchWindowError({ target: linkEl });
+
+    await expect(import("./app.js")).rejects.toThrow(
+      "bootstrap watchdog already reported a fatal resource failure",
+    );
+
+    expect(createTerminalMock).not.toHaveBeenCalled();
+    // The watchdog's recovery UI survives app.ts's pass, inert included.
+    expectFatalOverlayShape(overlay);
+    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "Web Terminal for Kiro failed to load",
+    );
+    expect(root.hasAttribute("inert")).toBe(true);
+  });
+
   it("watchdog ignores a failed non-stylesheet <link> (e.g. an icon)", () => {
     // Icon and manifest links 404 in the wild; they must never raise the
     // fatal dialog, which is why the guard tests rel, not just the element.

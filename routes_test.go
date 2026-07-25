@@ -116,9 +116,10 @@ func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 }
 
 // testIndexHTML is the minimal index fixture route tests embed: it carries one
-// inline <script> (the importmap stand-in) so buildCSPPolicy — which fails
-// loud on a script-less index.html — accepts it, mirroring the real page.
-const testIndexHTML = `<!doctype html><script type="importmap">{}</script>`
+// inline <script> (the importmap stand-in) and one inline <style> so
+// buildCSPPolicy — which fails loud on a script-less or style-less index.html —
+// accepts it, mirroring the real page.
+const testIndexHTML = `<!doctype html><style>body{margin:0}</style><script type="importmap">{}</script>`
 
 // TestKiroCacheControl pins the two-branch cache POLICY handed to
 // webhttp.StaticHandler (the ETag/gzip mechanism now lives in webhttp and is
@@ -304,9 +305,12 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 		}
 	}
 	// The CSP is hash-pinned from the embedded index.html (buildCSPPolicy via
-	// webhttp.InlineScriptHashes): script-src carries 'self' plus at least one
-	// sha256 token and never 'unsafe-inline'; style-src keeps 'unsafe-inline'
-	// for the renderer's per-cell styles. This closed the family-drift gap
+	// webhttp.InlineScriptHashes + inlineStyleHash): script-src carries 'self'
+	// plus at least one sha256 token and never 'unsafe-inline'; style-src is
+	// likewise hash-pinned to the page's single loading-overlay <style>, so an
+	// injected style block or style attribute cannot obscure or spoof the
+	// terminal UI (the renderer styles via CSSOM property setters, which
+	// style-src does not govern). This closed the family-drift gap
 	// where web-terminal-kiro served the same embedded-static + inline-importmap
 	// pattern as web-terminal-server with no CSP at all.
 	servedCSP := rec.Header().Get("Content-Security-Policy")
@@ -316,11 +320,14 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 	if !strings.Contains(servedCSP, "script-src 'self' 'sha256-") {
 		t.Errorf("CSP script-src = %q, want 'self' plus a pinned sha256 token", servedCSP)
 	}
-	if strings.Contains(servedCSP, "script-src 'self' 'unsafe-inline'") {
-		t.Errorf("CSP = %q, want script-src without 'unsafe-inline'", servedCSP)
+	if !strings.Contains(servedCSP, "style-src 'self' 'sha256-") {
+		t.Errorf("CSP style-src = %q, want 'self' plus a pinned sha256 token", servedCSP)
+	}
+	if strings.Contains(servedCSP, "'unsafe-inline'") {
+		t.Errorf("CSP = %q, want no 'unsafe-inline' in any directive", servedCSP)
 	}
 	for _, want := range []string{
-		"default-src 'self'", "style-src 'self' 'unsafe-inline'",
+		"default-src 'self'",
 		"img-src 'self' data:", "connect-src 'self'", "frame-ancestors 'none'",
 	} {
 		if !strings.Contains(servedCSP, want) {
@@ -394,9 +401,11 @@ func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
 
 // TestBuildCSPPolicyFailsLoud pins the fail-loud contract: buildCSPPolicy
 // returns an error (never a silent 'unsafe-inline' degrade) when the static FS
-// is nil, index.html is missing, or index.html holds no inline <script>. A
-// production build always embeds index.html with its inline importmap, so any
-// of these means a malformed build that must abort startup.
+// is nil, index.html is missing, index.html holds no inline <script>, or its
+// inline <style> block is absent, unterminated, or duplicated. A
+// production build always embeds index.html with its inline importmap and its
+// single critical-CSS <style>, so any of these means a malformed build that must
+// abort startup.
 func TestBuildCSPPolicyFailsLoud(t *testing.T) {
 	cases := []struct {
 		name string
@@ -406,6 +415,15 @@ func TestBuildCSPPolicyFailsLoud(t *testing.T) {
 		{"missing index.html", fstest.MapFS{}},
 		{"only external scripts", fstest.MapFS{
 			"index.html": &fstest.MapFile{Data: []byte(`<html><body><script src="/app.js"></script></body></html>`)},
+		}},
+		{"no style block", fstest.MapFS{
+			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script></html>`)},
+		}},
+		{"unterminated style block", fstest.MapFS{
+			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script><style>body{margin:0}`)},
+		}},
+		{"two style blocks", fstest.MapFS{
+			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script><style>a{}</style><style>b{}</style>`)},
 		}},
 	}
 	for _, tc := range cases {

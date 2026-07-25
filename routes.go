@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -298,34 +301,72 @@ func kiroCacheControl(assetPath string) string {
 }
 
 // cspTemplate is the Content-Security-Policy applied to every response, with a
-// single %s placeholder for the script-src hash tokens. It is deliberately the
-// SAME policy shape as web-terminal-server's (both apps serve the same
-// engine/UI bundle, so their needs are identical):
+// %s placeholder for the script-src hash tokens and a second one for the
+// style-src hash token. It is deliberately the SAME policy shape as
+// web-terminal-server's (both apps serve the same engine/UI bundle, so their
+// needs are identical):
 //
-//	style-src 'unsafe-inline'  bound by index.html's inline loading-overlay
-//	                           <style> (hashable if ever tightened). The
-//	                           terminal renderer itself needs no relaxation:
-//	                           it styles via CSSOM property setters, which
-//	                           style-src does not govern
+//	style-src 'self' <hash>     index.html's single loading-overlay <style> is
+//	                            hash-pinned like the inline scripts, so an
+//	                            injected style block or style attribute cannot
+//	                            obscure or spoof the terminal UI. The renderer
+//	                            itself needs no relaxation: it styles via CSSOM
+//	                            property setters, which style-src does not
+//	                            govern, and neither the UI nor the engine
+//	                            template emits a style= attribute
 //	img-src 'self' data:        favicon/icon data URIs
 //	connect-src 'self'          same-origin HTTP + the /ws WebSocket PTY
 //	frame-ancestors 'none'      blocks clickjacking of the interactive terminal
 const cspTemplate = "default-src 'self'; " +
 	"script-src 'self' %s; " +
-	"style-src 'self' 'unsafe-inline'; " +
+	"style-src 'self' %s; " +
 	"img-src 'self' data:; font-src 'self'; connect-src 'self'; " +
 	"frame-ancestors 'none'; base-uri 'none'; object-src 'none'; " +
 	"form-action 'none'"
 
+// inlineStyleHash returns the CSP source token ('sha256-…') for index.html's
+// SINGLE inline <style> block, hashing exactly the bytes between the open tag's
+// '>' and '</style' — what a browser hashes. Same fail-loud posture as the
+// script side: a missing, unterminated, or duplicated style block is an error,
+// never a silent fallback to 'unsafe-inline'. webhttp has no style equivalent of
+// InlineScriptHashes, hence the local scanner; if one ever lands there, this
+// becomes a call into it.
+func inlineStyleHash(html []byte) (string, error) {
+	const openTag = "<style"
+	lower := bytes.ToLower(html)
+	open := bytes.Index(lower, []byte(openTag))
+	if open < 0 {
+		return "", errors.New("no inline <style> block in index.html")
+	}
+	// "</style" cannot match openTag, so a second hit is a real second block.
+	if bytes.Contains(lower[open+len(openTag):], []byte(openTag)) {
+		return "", errors.New("more than one inline <style> block in index.html")
+	}
+	gt := bytes.IndexByte(html[open:], '>')
+	if gt < 0 {
+		return "", errors.New("unterminated <style> open tag in index.html")
+	}
+	start := open + gt + 1
+	end := bytes.Index(lower[start:], []byte("</style"))
+	if end < 0 {
+		return "", errors.New("unterminated inline <style> block in index.html")
+	}
+	sum := sha256.Sum256(html[start : start+end])
+	return "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'", nil
+}
+
 // buildCSPPolicy reads index.html from sub, hashes every inline <script> in it
 // (via webhttp.InlineScriptHashes — the byte-precise scanner that hashes
-// exactly the content a browser hashes), and assembles the full CSP string.
+// exactly the content a browser hashes) plus its single inline <style> block,
+// and assembles the full CSP string.
 // web-terminal-kiro's index.html carries TWO inline scripts -- the importmap
 // and the bootstrap watchdog (the script-load-failure alertdialog) -- both
 // hashed; the external /app.js module is covered by script-src 'self'. FAIL
 // LOUD: a
-// malformed build — a nil FS, an unreadable index.html, or zero inline scripts
-// — aborts startup rather than silently dropping the script-src hardening or
+// malformed build — a nil FS, an unreadable index.html, zero inline scripts, or
+// a missing/unterminated/duplicated <style> block
+// — aborts startup rather than silently dropping the script-src or style-src
+// hardening or
 // serving a hash set that would block the importmap and break ES module
 // loading. (This ports web-terminal-server's hash-pinned CSP; web-terminal-kiro
 // previously shipped no CSP at all — the family-drift item the 2026-07
@@ -342,7 +383,11 @@ func buildCSPPolicy(sub fs.FS) (string, error) {
 	if len(hashes) == 0 {
 		return "", errors.New("buildCSPPolicy: no inline <script> blocks in index.html")
 	}
-	return fmt.Sprintf(cspTemplate, strings.Join(hashes, " ")), nil
+	styleHash, err := inlineStyleHash(html)
+	if err != nil {
+		return "", fmt.Errorf("buildCSPPolicy: %w", err)
+	}
+	return fmt.Sprintf(cspTemplate, strings.Join(hashes, " "), styleHash), nil
 }
 
 // composeGate wraps the session-create gate with the tools-syncing

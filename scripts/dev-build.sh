@@ -25,13 +25,40 @@ TSC="static-src/node_modules/.bin/tsc"
 # or a typo'd ENGINE_DIR/UI_DIR override fails cleanly instead of half-deleting
 # the installed packages (repaired only by a fresh npm install).
 for required in \
-  "$ENGINE_DIR/web/package.json" "$ENGINE_DIR/web/src" \
-  "$UI_DIR/package.json" "$UI_DIR/src" "$UI_DIR/css/MANIFEST"; do
-  [ -e "$required" ] || {
-    printf 'error: required local checkout input not found: %s\n' "$required" >&2
+  "$ENGINE_DIR/web/package.json" \
+  "$UI_DIR/package.json" "$UI_DIR/css/MANIFEST"; do
+  [ -f "$required" ] || {
+    printf 'error: required local checkout input is not a regular file: %s\n' "$required" >&2
     exit 1
   }
 done
+for required in "$ENGINE_DIR/web/src" "$UI_DIR/src"; do
+  [ -d "$required" ] || {
+    printf 'error: required local checkout source directory not found: %s\n' "$required" >&2
+    exit 1
+  }
+done
+# A src directory that EXISTS but holds no file the overlay would copy is the
+# same failure the image build gates on (engine-src-empty / ui-src-empty), and
+# it has to be caught here too: step [2/6] deletes both installed package src
+# trees before copying, so an empty (or test-only) source tree otherwise slips
+# past preflight and leaves node_modules broken — cp exits on a literal
+# unmatched *.ts, or tsc exits 1 with no input files, in both cases only after
+# the destructive overlay. Mirror each copy loop's own exclusions (matched on
+# the basename, so a checkout path containing 'fuzz' is not itself excluded) so
+# preflight and execution cannot drift.
+[ -n "$(find "$ENGINE_DIR/web/src" -maxdepth 1 -type f -name '*.ts' \
+  ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
+  printf 'error: engine-src-empty: no eligible *.ts under %s (wrong ENGINE_DIR or src layout change?)\n' \
+    "$ENGINE_DIR/web/src" >&2
+  exit 1
+}
+[ -n "$(find "$UI_DIR/src" -type f -name '*.ts' \
+  ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
+  printf 'error: ui-src-empty: no eligible *.ts under %s (wrong UI_DIR or src layout change?)\n' \
+    "$UI_DIR/src" >&2
+  exit 1
+}
 
 printf '[1/6] go.work -> local engine (replace published module with %s)\n' "$ENGINE_DIR"
 # Mirror go.mod's go directive and engine module path so neither can drift (a

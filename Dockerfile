@@ -101,13 +101,31 @@ COPY required-tools.txt ./
 # registries' MIT license texts travel INSIDE the JSON) is DATA on a
 # daily upstream cadence — the runtime engine refreshes it at boot and
 # on a schedule (TOOL_CATALOG_REFRESH), so this baked copy only serves
-# a container that has never reached the publisher. Fetched unpinned
-# (latest release; TLS + first-party): the verify pass below re-gates
-# whatever arrives, asserting every required-tools.txt name resolves to
+# a container that has never reached the publisher. Fetched from an
+# IMMUTABLE release asset and gated on TOOL_CATALOG_SHA256 before use:
+# `latest/download` was mutable, and TLS authenticates GitHub, not the
+# artifact, so a swapped release asset (compromised publisher account)
+# could replace the catalog between otherwise identical builds. That
+# matters because catalog entries carry install recipes (including the
+# `manual` shell-command source) executed by the root-running tool
+# engine. `toolcatalog verify` below is a SEMANTIC coverage gate, not an
+# authenticity one: it asserts every required-tools.txt name resolves to
 # usable install knowledge for linux amd64+arm64 — a published catalog
 # that drops a seed or migration tool FAILS THE BUILD here, and the
-# runtime refresh re-runs the same check before every swap.
-ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/latest/download/tool-catalog.json
+# runtime refresh re-runs the same check before every swap. The two
+# checks cover different threats; both run, authenticity first.
+# TOOL_CATALOG_VERSION + TOOL_CATALOG_SHA256 move together in one
+# Renovate PR (the `# tool-catalog <version>` trailer is the digest's
+# version anchor — same trailer model as the kiro-cli/golang per-arch sha
+# pins; the grouping + digest recompute rule lives in cplieger/.github's
+# default.json, never in this repo's inherited renovate.json). The
+# publisher's cadence is daily; the pin means the baked fallback is a
+# REVIEWED catalog, while the runtime refresh keeps a running container
+# current.
+# renovate: datasource=github-releases depName=cplieger/tool-catalog
+ARG TOOL_CATALOG_VERSION=v2026.07.24.1907
+ARG TOOL_CATALOG_SHA256=651d11d218a313a029d7a7ad15eedccdaa1c2c7a48aad39661c33d0684b864cb # tool-catalog v2026.07.24.1907
+ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/${TOOL_CATALOG_VERSION}/tool-catalog.json
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
 # This is the SAME module go.mod requires (the runtime engine that re-verifies
 # required-tools.txt before every catalog swap), pinned a second time here to
@@ -124,6 +142,7 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
       echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v2 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
     fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
+    printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
     go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 

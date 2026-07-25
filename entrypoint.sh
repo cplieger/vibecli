@@ -14,9 +14,29 @@ BIN="$TOOLS/bin/kiro-cli"
 # so the three call sites (install verify, drift check, readiness marker)
 # share one parse if kiro-cli ever reworks its --version output.
 kiro_cli_version() {
+  local out rc
   # --kill-after gives a TERM-resistant binary a hard second-stage deadline;
   # without it GNU timeout waits forever on a child that traps/ignores TERM.
-  timeout --signal=TERM --kill-after=5s 10s "$1" --version 2>/dev/null | awk 'NR==1{print $NF; exit}'
+  # Capture the output and the timeout STATUS separately: piping straight into
+  # awk discarded the status at the pipeline boundary (awk exits 0 even when its
+  # producer was TERMed/KILLed), so a wedged --version looked identical to a
+  # missing binary at all three call sites -- install verify reported a "wrong
+  # version" using install.sh's unrelated rc, drift reported installed=unknown,
+  # and readiness reported installed=none. One helper-level warning now gives
+  # every caller the same timeout diagnostic, while their empty-version
+  # (mismatch) handling stays exactly as it was.
+  out=$(timeout --signal=TERM --kill-after=5s 10s "$1" --version 2>/dev/null)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # 124/137 = the 10s deadline (TERM, then the --kill-after SIGKILL fallback).
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+      printf 'level=warn msg="kiro-cli --version exceeded its 10s deadline and was terminated" path="%s" rc=%d component=entrypoint\n' "$1" "$rc" >&2
+    else
+      printf 'level=warn msg="kiro-cli --version failed" path="%s" rc=%d component=entrypoint\n' "$1" "$rc" >&2
+    fi
+    return "$rc"
+  fi
+  printf '%s\n' "$out" | awk 'NR==1{print $NF; exit}'
 }
 
 # Fatal boot error: log it, then throttle the restart:unless-stopped crash loop
@@ -100,19 +120,6 @@ if ! rm -f "$KIRO_CLI_READY_MARKER"; then
   fatal 'failed to clear stale kiro-cli readiness marker' "marker=\"$KIRO_CLI_READY_MARKER\""
 fi
 
-# Sweep staged-but-unpromoted kiro-cli binaries out of $HOME/.local/bin. Called
-# from install_kiro_cli's failure EXIT path; a sweep failure is not fatal there
-# (the install already failed and the caller warns) but MUST be visible: the
-# staging dir is on PATH and on the persistent /config volume, so a surviving
-# staged binary stays reachable by bare-name resolution (the README's
-# `docker exec ... kiro-cli`) at a version the pin does not control -- the same
-# residue the pre-reinstall quarantine below treats as fatal.
-# shellcheck disable=SC2317,SC2329  # invoked indirectly via trap
-sweep_staged_kiro_cli() {
-  rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term" && return 0
-  printf 'level=warn msg="failed to sweep staged kiro-cli binaries after a failed install; an unpinned binary may remain reachable via bare-name PATH resolution" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
-}
-
 install_kiro_cli() (
   printf 'level=info msg="installing kiro-cli" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
   printf 'level=info msg="kiro-cli is proprietary AWS Content; by installing you accept the AWS Customer Agreement" license=https://kiro.dev/license/ component=entrypoint\n' >&2
@@ -121,7 +128,7 @@ install_kiro_cli() (
   # https://kiro.dev/docs/cli/installation/ ("With a zip file" section).
   # We pin the version (not /latest/) so a given image tag is reproducible,
   # and verify the sha256 before running install.sh.
-  local arch zip_url tmpdir='' zip install_log='' rc=0
+  local arch zip_url tmpdir='' zip install_log='' stage=''
   case "$(uname -m)" in
     x86_64) arch="x86_64-linux" ;;
     aarch64) arch="aarch64-linux" ;;
@@ -133,16 +140,23 @@ install_kiro_cli() (
   zip_url="https://desktop-release.q.us-east-1.amazonaws.com/${KIRO_CLI_VERSION}/kirocli-${arch}.zip"
 
   tmpdir=$(mktemp -d) || return 1
-  # Single cleanup owner for both temp resources: the function body runs in a
+  # Private staging HOME for the upstream installer. install.sh writes its
+  # dispatchers into $HOME/.local/bin, which is BOTH on the image PATH and on
+  # the persistent /config volume -- so installing with the real HOME exposed an
+  # unverified candidate by bare-name resolution (`docker exec ... kiro-cli`)
+  # for the whole validation window, and left it reachable for the container
+  # lifetime whenever cleanup failed. Staging under $TOOLS keeps the candidate
+  # off PATH entirely and on the same filesystem as $BIN, so promotion stays a
+  # rename rather than a copy.
+  stage=$(mktemp -d "$TOOLS/.kiro-cli-stage.XXXXXX") || return 1
+  # Single cleanup owner for every temp resource: the function body runs in a
   # subshell (note the `(` after the function name), so this EXIT trap fires
   # once per invocation on every return path — no per-branch rm bookkeeping.
-  # On a failure exit, also sweep any staged-but-unpromoted binaries out of
-  # $HOME/.local/bin: staging lives on the persistent /config volume AND on
-  # the image PATH, so leaving it would recreate -- via bare-name resolution,
-  # e.g. the README's `docker exec ... kiro-cli mcp add` -- the unpinned-binary
-  # exposure the pre-reinstall quarantine below exists to close. A success
-  # exit (rc=0) skips the sweep; promotion already consumed the staged files.
-  trap 'rc=$?; rm -rf "$tmpdir"; [ -z "$install_log" ] || rm -f "$install_log"; [ "$rc" -eq 0 ] || sweep_staged_kiro_cli' EXIT
+  # Removing the private stage is all the failure cleanup needed now: nothing
+  # was ever written to a PATH directory, so a cleanup failure can no longer
+  # leave an unpinned binary reachable (which is why the old sweep helper and
+  # its rc bookkeeping are gone).
+  trap 'rm -rf "$tmpdir" "$stage"; [ -z "$install_log" ] || rm -f "$install_log"' EXIT
   zip="$tmpdir/kirocli.zip"
 
   if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
@@ -178,15 +192,15 @@ install_kiro_cli() (
     return 1
   fi
 
-  # Run upstream install.sh. Don't gate on its exit code — the kiro-cli
-  # installer touches shell profiles and other side surfaces that
-  # legitimately fail in our minimal root container; what matters is
-  # whether the binary it drops at $HOME/.local/bin/kiro-cli reports
-  # the version we pinned. Capture install.sh output to a tempfile so
-  # we can surface it on failure.
-  local install_rc
+  # Run upstream install.sh against the PRIVATE staging HOME. Don't gate on its
+  # exit code — the kiro-cli installer touches shell profiles and other side
+  # surfaces that legitimately fail in our minimal root container; what matters
+  # is whether the binary it drops at $stage/.local/bin/kiro-cli reports the
+  # version we pinned. Capture install.sh output to a tempfile so we can surface
+  # it on failure.
+  local install_rc staged="$stage/.local/bin/kiro-cli"
   install_log=$(mktemp) || return 1
-  timeout --signal=TERM --kill-after=15s 120s "$tmpdir/kirocli/install.sh" --no-confirm </dev/null >"$install_log" 2>&1
+  HOME="$stage" timeout --signal=TERM --kill-after=15s 120s "$tmpdir/kirocli/install.sh" --no-confirm </dev/null >"$install_log" 2>&1
   install_rc=$?
   # 124 = TERM deadline hit, 137 = the --kill-after SIGKILL fallback fired.
   # Log deadline exhaustion distinctly so Loki shows a wedged installer
@@ -195,15 +209,15 @@ install_kiro_cli() (
     printf 'level=warn msg="install.sh exceeded its 120s deadline and was terminated" rc=%d component=entrypoint\n' "$install_rc" >&2
   fi
 
-  if [ ! -f "$HOME/.local/bin/kiro-cli" ]; then
-    printf 'level=error msg="install.sh did not produce kiro-cli binary" path="%s/.local/bin/kiro-cli" rc=%d component=entrypoint\n' \
-      "$HOME" "$install_rc" >&2
+  if [ ! -f "$staged" ]; then
+    printf 'level=error msg="install.sh did not produce kiro-cli binary" path="%s" rc=%d component=entrypoint\n' \
+      "$staged" "$install_rc" >&2
     printf 'install.sh output:\n' >&2
     cat "$install_log" >&2
     return 1
   fi
   local installed
-  installed=$(kiro_cli_version "$HOME/.local/bin/kiro-cli")
+  installed=$(kiro_cli_version "$staged")
   if [ "$installed" != "$KIRO_CLI_VERSION" ]; then
     printf 'level=error msg="installed kiro-cli reports wrong version" installed=%s wanted=%s rc=%d component=entrypoint\n' \
       "${installed:-unknown}" "$KIRO_CLI_VERSION" "$install_rc" >&2
@@ -212,15 +226,27 @@ install_kiro_cli() (
     return 1
   fi
 
+  # Enforce the pin BEFORE promotion, through the staged binary but against the
+  # REAL persisted HOME (no HOME override here): app.disableAutoupdates is the
+  # one setting the integrity story depends on — with auto-update live the binary
+  # can replace itself and invalidate the verified sha. Unlike the telemetry /
+  # notification / title preferences applied after promotion, a failure here is
+  # fatal to the install: refuse to promote a candidate whose self-replacement we
+  # could not turn off.
+  if ! timeout --signal=TERM --kill-after=5s 10s "$staged" settings app.disableAutoupdates true >/dev/null 2>&1; then
+    printf 'level=error msg="failed to disable kiro-cli auto-update; refusing to promote a binary that may replace itself and invalidate the pinned digest" setting=app.disableAutoupdates path="%s" component=entrypoint\n' "$staged" >&2
+    return 1
+  fi
+
   # Promote to the canonical /config/tools/bin/ location so PATH
   # ordering (which puts /config/tools/bin first) and any in-process
   # absolute-path references resolve to the freshly installed binary.
-  mv -f "$HOME/.local/bin/kiro-cli" "$BIN" || {
-    printf 'level=error msg="failed to promote kiro-cli binary to tools bin" src="%s/.local/bin/kiro-cli" dest="%s" component=entrypoint\n' "$HOME" "$BIN" >&2
+  mv -f "$staged" "$BIN" || {
+    printf 'level=error msg="failed to promote kiro-cli binary to tools bin" src="%s" dest="%s" component=entrypoint\n' "$staged" "$BIN" >&2
     return 1
   }
-  mv -f "$HOME/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat" 2>/dev/null || true
-  mv -f "$HOME/.local/bin/kiro-cli-term" "$TOOLS/bin/kiro-cli-term" 2>/dev/null || true
+  mv -f "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat" 2>/dev/null || true
+  mv -f "$stage/.local/bin/kiro-cli-term" "$TOOLS/bin/kiro-cli-term" 2>/dev/null || true
   printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
 )
 
@@ -244,28 +270,33 @@ needs_kiro_cli_install() {
 
 if needs_kiro_cli_install; then
   # Quarantine the stale dispatcher and its sidecars out of BOTH $TOOLS/bin
-  # and the $HOME/.local/bin staging directory BEFORE the reinstall.
-  # install_kiro_cli stages the replacement in $HOME/.local/bin and only
-  # promotes it on success, so without this a failed reinstall after
-  # version drift would leave the old, no-longer-pinned binary executable on
-  # PATH: /api/health would report unavailable (marker withheld) yet new
-  # sessions would still launch the stale CLI, contradicting the pin
-  # guarantee. Staging is swept here too: install_kiro_cli's failure EXIT
-  # trap is registered only after arch detection and mktemp -d succeed, so
-  # residue staged by an earlier boot would survive those early returns and
-  # stay reachable via bare-name PATH resolution after the canonical binary
-  # was removed. With the quarantine an install failure leaves every binary
-  # absent, so new sessions hit the explicit install-failed guard instead.
+  # and the legacy $HOME/.local/bin staging directory BEFORE the reinstall.
+  # install_kiro_cli now stages into a private, off-PATH directory under
+  # $TOOLS, but $HOME/.local/bin is on the image PATH and on the persistent
+  # /config volume, so residue staged there by an EARLIER image version must
+  # still be swept: otherwise, once the canonical binary is removed, that
+  # residue stays reachable via bare-name PATH resolution (the README's
+  # `docker exec ... kiro-cli mcp add`) at a version the pin does not control.
+  # Without the quarantine, a failed reinstall after version drift would also
+  # leave the old, no-longer-pinned binary executable on PATH: /api/health
+  # would report unavailable (marker withheld) yet new sessions would still
+  # launch the stale CLI, contradicting the pin guarantee. With it, an install
+  # failure leaves every binary absent, so new sessions hit the explicit
+  # install-failed guard instead.
   # Inability to quarantine is fatal: we cannot guarantee the pin controls
   # what runs. rm -f is a no-op on the first-boot (nothing present) path.
   if [ -e "$BIN" ] || [ -e "$HOME/.local/bin/kiro-cli" ]; then
-    printf 'level=info msg="quarantining stale kiro-cli binaries (canonical and staging) before reinstall" path="%s" component=entrypoint\n' "$BIN" >&2
+    printf 'level=info msg="quarantining stale kiro-cli binaries (canonical and legacy staging) before reinstall" path="%s" component=entrypoint\n' "$BIN" >&2
   fi
   if ! rm -f \
     "$BIN" "$TOOLS/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-term" \
     "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term"; then
     fatal 'failed to remove stale kiro-cli binaries before reinstall; refusing to leave an unpinned binary on PATH' "path=\"$BIN\""
   fi
+  # Best-effort: drop private stage dirs orphaned by a hard container kill (the
+  # installer's EXIT trap covers every ordinary path). They are off PATH, so
+  # this is disk hygiene, not an integrity gate.
+  rm -rf "$TOOLS"/.kiro-cli-stage.* 2>/dev/null || true
   if ! install_kiro_cli; then
     printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
   fi
@@ -290,10 +321,22 @@ kiro_setting() {
     # logged with rc so Loki distinguishes a wedged binary from a settings error.
     printf 'level=warn msg="kiro-cli settings call failed; dependent feature may misbehave" setting=%s value=%s rc=%d component=entrypoint\n' "$1" "$2" "$setting_rc" >&2
   fi
+  return "$setting_rc"
 }
+# Tracks whether the pin-enforcing auto-update setting is actually in force.
+# install_kiro_cli refuses to promote a binary it could not turn auto-update off
+# for, but a boot that skips the install (already at the pinned version) must
+# still re-assert it — and a failure there means the binary may replace itself,
+# so readiness is withheld below rather than merely warned about.
+kiro_cli_pin_enforced=1
 if [ -x "$BIN" ]; then
   kiro_setting telemetry.enabled false
-  kiro_setting app.disableAutoupdates true
+  # app.disableAutoupdates is not a preference: it is what keeps the running
+  # binary from replacing itself and invalidating the verified sha. Unlike the
+  # best-effort settings around it, a failure here is integrity-relevant.
+  if ! kiro_setting app.disableAutoupdates true; then
+    kiro_cli_pin_enforced=0
+  fi
   # Enable kiro-cli's OSC 9 desktop-notification escape so web-terminal-kiro's tab
   # activity monitor can classify turn-end ("Response complete") and
   # tool-approval ("Permission required") into per-tab status dots. osc9 emits
@@ -331,18 +374,25 @@ kiro_cli_installed=""
 if [ -x "$BIN" ]; then
   kiro_cli_installed=$(kiro_cli_version "$BIN")
 fi
-if [ "$kiro_cli_installed" = "$KIRO_CLI_VERSION" ]; then
-  printf 'level=info msg="kiro-cli verified at pinned version; publishing readiness marker" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
-  if ! touch "$KIRO_CLI_READY_MARKER"; then
-    printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
-  fi
-else
+if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
   # Withholding the marker is otherwise a silent signal: /api/health answers 503
   # and the container sits `unhealthy` forever (readiness, not liveness) with no
   # reason in Loki. Log the observed version so a wedged --version (timeout) is
   # distinguishable from a missing binary or a genuine version mismatch.
   printf 'level=warn msg="kiro-cli not verified at pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" installed=%s pinned=%s component=entrypoint\n' \
     "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
+elif [ "$kiro_cli_pin_enforced" -ne 1 ]; then
+  # Right version on disk, but auto-update could not be turned off: the binary
+  # may replace itself mid-session and invalidate the pinned sha, so the version
+  # just observed guarantees nothing for the container's lifetime. Withhold
+  # readiness for the same reason a version mismatch does.
+  printf 'level=warn msg="kiro-cli auto-update could not be disabled; readiness marker withheld because the binary may replace itself and invalidate the pinned digest" version=%s component=entrypoint\n' \
+    "$KIRO_CLI_VERSION" >&2
+else
+  printf 'level=info msg="kiro-cli verified at pinned version; publishing readiness marker" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
+  if ! touch "$KIRO_CLI_READY_MARKER"; then
+    printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
+  fi
 fi
 
 # OS packages (APT_PACKAGES env, e.g. "python3 gcc libc6-dev"). apt state

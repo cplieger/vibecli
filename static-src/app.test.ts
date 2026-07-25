@@ -37,8 +37,11 @@ const THEME = {
 const ACCENT_HSL = "hsl(263.1683 100% 80%)"; // === ACCENT_HEX
 const ACCENT_HEX = "#c099ff";
 
-// Read a static asset next to static-src, resolving from INIT_CWD for the same
-// reason readWatchdogSource() does (a runner may change process.cwd()).
+// Read a static asset next to static-src. Resolve from INIT_CWD (set by the
+// npm/npx launcher to the real static-src directory) so the fixture is found
+// even when the runner changes process.cwd() — Stryker's dry run executes
+// inside its .stryker-tmp sandbox, where a cwd-relative read ENOENTs. This is
+// the single fixture-location policy for every static asset the suite reads.
 function readStaticAsset(name: string): string {
   const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
   return readFileSync(resolve(sourceRoot, `../static/${name}`), "utf8");
@@ -70,14 +73,12 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
 
 // Locate the real inline bootstrap watchdog in static/index.html: the only
 // inline <script> that is neither the importmap nor the src-bearing module
-// loader. Resolve from INIT_CWD (set by the npm/npx launcher to the real
-// static-src directory) so the fixture is found even when the runner changes
-// process.cwd() — Stryker's dry run executes inside its .stryker-tmp sandbox,
-// where a cwd-relative read ENOENTs. Every watchdog test obtains the source
-// through this single helper so fixture discovery cannot drift per test.
+// loader. readStaticAsset supplies the shared INIT_CWD fixture-location policy,
+// so watchdog discovery cannot drift from the suite's other static reads. Every
+// watchdog test obtains the source through this single helper so fixture
+// discovery cannot drift per test.
 function readWatchdogSource(): string {
-  const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-  const html = readFileSync(resolve(sourceRoot, "../static/index.html"), "utf8");
+  const html = readStaticAsset("index.html");
   const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
     (match) => !/src\s*=/i.test(match[1] ?? "") && !/importmap/i.test(match[1] ?? ""),
   );
@@ -257,6 +258,25 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(true);
     const description = loading.querySelector("#bootstrap-failure-message");
     expect(description?.textContent).toContain("Failed to start the terminal");
+  });
+
+  it("surfaces the fatal dialog and rethrows when the agent preset fails", async () => {
+    const root = appendTerminalRoot();
+    const loading = appendPristineOverlay({ fade: true });
+    const failure = new Error("preset boom");
+    presetAgentTabbedMock.mockImplementationOnce(() => {
+      throw failure;
+    });
+
+    await expect(import("./app.js")).rejects.toBe(failure);
+
+    expect(createTerminalMock).not.toHaveBeenCalled();
+    expect(loading.classList.contains("fade")).toBe(false);
+    expectFatalOverlayShape(loading);
+    expect(root.hasAttribute("inert")).toBe(true);
+    expect(loading.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "Failed to start the terminal",
+    );
   });
 
   it("rethrows the original error without touching the DOM when createTerminal throws and #loading is absent", async () => {

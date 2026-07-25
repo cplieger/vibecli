@@ -106,13 +106,31 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   // Initial focus lands on the recovery CTA (the alertdialog pattern's
   // initial focus; Reload is the only actionable element left).
   expect(document.activeElement).toBe(reload);
-  // ...and stays there: Tab (and Shift+Tab, which this one-control dialog wraps
-  // identically) is swallowed and refocuses Reload, so keyboard users cannot
-  // walk off the only recovery surface (APG modal focus containment).
-  const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
-  expect(reload?.dispatchEvent(tab)).toBe(false);
-  expect(tab.defaultPrevented).toBe(true);
-  expect(document.activeElement).toBe(reload);
+  // ...and RETURNS there: blur first, so the refocus half of the trap is
+  // observable at all -- happy-dom does not move focus as Tab's default action,
+  // so asserting activeElement while focus is ALREADY on Reload could never
+  // fail. Both directions are dispatched because the guard is key-only and this
+  // one-control dialog wraps Shift+Tab identically; without the shiftKey pass a
+  // `&& !event.shiftKey` narrowing would survive (APG modal focus containment).
+  for (const shiftKey of [false, true]) {
+    reload?.blur();
+    expect(document.activeElement).not.toBe(reload);
+    const tab = new KeyboardEvent("keydown", {
+      key: "Tab",
+      shiftKey,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(reload?.dispatchEvent(tab)).toBe(false);
+    expect(tab.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(reload);
+  }
+  // ...and ONLY Tab is swallowed: an unconditional trap would eat Enter/Space
+  // too and break the Reload button's own keyboard activation, so a non-Tab
+  // keydown must pass through uncancelled.
+  const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+  expect(reload?.dispatchEvent(enter)).toBe(true);
+  expect(enter.defaultPrevented).toBe(false);
 }
 
 // The inverse of expectFatalOverlayShape: the watchdog stood down, so the

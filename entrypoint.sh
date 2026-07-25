@@ -82,6 +82,11 @@ harden_config_dir() {
 # routes.go). The feature also depends on the chat.enableNotifications +
 # chat.notificationMethod=osc9 settings set below and web-terminal-engine's
 # WithKeepUnfocused() in routes.go -- keep all four in lockstep.
+# ALSO re-verify `kiro-cli settings app.disableAutoupdates true` still succeeds: it is
+# the one settings call that is not best-effort. It gates promotion in
+# install_kiro_cli AND the readiness marker on a boot that skips the install, so a
+# renamed key or subcommand makes every container report kiro-cli unavailable
+# (unhealthy, no restart loop) rather than merely logging a warning.
 # renovate: datasource=custom.kiro-cli depName=kiro-cli
 KIRO_CLI_VERSION="2.14.1"
 KIRO_CLI_SHA256="2e35416019a8681586772dc5b0c32539d1712e1469280dbf8cd4bdedc751ea1a"
@@ -148,7 +153,10 @@ install_kiro_cli() (
   # lifetime whenever cleanup failed. Staging under $TOOLS keeps the candidate
   # off PATH entirely and on the same filesystem as $BIN, so promotion stays a
   # rename rather than a copy.
-  stage=$(mktemp -d "$TOOLS/.kiro-cli-stage.XXXXXX") || return 1
+  stage=$(mktemp -d "$TOOLS/.kiro-cli-stage.XXXXXX") || {
+    rm -rf "$tmpdir"
+    return 1
+  }
   # Single cleanup owner for every temp resource: the function body runs in a
   # subshell (note the `(` after the function name), so this EXIT trap fires
   # once per invocation on every return path — no per-branch rm bookkeeping.
@@ -299,6 +307,14 @@ if needs_kiro_cli_install; then
   rm -rf "$TOOLS"/.kiro-cli-stage.* 2>/dev/null || true
   if ! install_kiro_cli; then
     printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
+    # Belt-and-braces: the installer ran with HOME pointed at the private stage, so it
+    # should never have touched $HOME/.local/bin -- but that dir is on PATH and on the
+    # persistent volume, and an installer that resolves its prefix via getpwuid rather
+    # than $HOME would have. Sweeping here keeps a failed install from leaving an
+    # unpinned binary reachable by bare-name resolution until the NEXT boot's
+    # pre-reinstall quarantine runs. Best-effort: the install already failed.
+    rm -f "$HOME/.local/bin/kiro-cli" "$HOME/.local/bin/kiro-cli-chat" "$HOME/.local/bin/kiro-cli-term" \
+      || printf 'level=warn msg="failed to sweep legacy staging dir after a failed install; an unpinned binary may remain reachable via bare-name PATH resolution" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
   fi
 fi
 
@@ -309,9 +325,12 @@ fi
 # manifest. Letting kiro-cli silently replace itself would invalidate
 # the pinned SHA and break image-tag reproducibility.
 # kiro_setting applies one kiro-cli settings call, logging a structured warn on
-# failure (log-only breadcrumb; exit behavior unchanged — a settings failure
-# must not block boot, but a silent one leaves e.g. auto-update enabled or the
-# OSC 9 notification path off with no trail in Loki).
+# failure and RETURNING the call's rc. Boot is never blocked (no caller exits on
+# it), but the rc is not decoration: the app.disableAutoupdates caller below
+# treats a failure as integrity-relevant and withholds the readiness marker,
+# while the telemetry / notification / title callers stay best-effort. A silent
+# failure would otherwise leave e.g. auto-update enabled or the OSC 9
+# notification path off with no trail in Loki.
 kiro_setting() {
   local setting_rc
   timeout --signal=TERM --kill-after=5s 10s "$BIN" settings "$1" "$2" >/dev/null 2>&1

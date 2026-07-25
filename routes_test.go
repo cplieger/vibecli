@@ -281,7 +281,8 @@ func TestCreateRateLimit(t *testing.T) {
 // the two deliberate choices -- X-Frame-Options is the DENY default because
 // web-terminal-kiro is never embedded in a frame, and the Content-Security-Policy is the
 // hash-pinned policy buildCSPPolicy assembles from the embedded index.html
-// (asserted below: script-src pins sha256 tokens, never 'unsafe-inline').
+// (asserted below: script-src AND style-src each pin a sha256 token, and no
+// directive carries 'unsafe-inline').
 // Driven through the full production chain (buildHandler) so the assertion
 // tracks what the server actually sends.
 func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
@@ -421,6 +422,9 @@ func TestBuildCSPPolicyFailsLoud(t *testing.T) {
 		}},
 		{"unterminated style block", fstest.MapFS{
 			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script><style>body{margin:0}`)},
+		}},
+		{"unterminated style open tag", fstest.MapFS{
+			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script><style`)},
 		}},
 		{"two style blocks", fstest.MapFS{
 			"index.html": &fstest.MapFile{Data: []byte(`<html><script type="importmap">{}</script><style>a{}</style><style>b{}</style>`)},

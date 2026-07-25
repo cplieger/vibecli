@@ -333,7 +333,18 @@ const cspTemplate = "default-src 'self'; " +
 // becomes a call into it.
 func inlineStyleHash(html []byte) (string, error) {
 	const openTag = "<style"
-	lower := bytes.ToLower(html)
+	// ASCII-fold in place instead of bytes.ToLower: unicode.ToLower can CHANGE
+	// the byte length (the 2-byte rune U+0130 folds to the 1-byte 'i'), sliding every
+	// index computed on the folded copy off the original bytes and silently
+	// hashes the wrong content. webhttp's csp.go solves this with its own
+	// index-preserving indexFoldASCII for exactly this reason.
+	lower := make([]byte, len(html))
+	for i, c := range html {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		lower[i] = c
+	}
 	open := bytes.Index(lower, []byte(openTag))
 	if open < 0 {
 		return "", errors.New("no inline <style> block in index.html")

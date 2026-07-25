@@ -41,8 +41,8 @@ export default defineConfig({
 
     // app.test.ts covers web-terminal-kiro's thin bootstrap (the createTerminal() wiring); the terminal
     // logic itself is tested in @cplieger/web-terminal-ui and @cplieger/web-terminal-engine.
-    // app.test.ts covers this app-owned bootstrap; deleting, misnaming, or
-    // excluding that suite must fail rather than report green with zero tests.
+    // Deleting, misnaming, or excluding that suite must fail rather than
+    // report green with zero tests.
     passWithNoTests: false,
 
     // Require explicit imports of describe/it/expect from "vitest".

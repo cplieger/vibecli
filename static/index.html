@@ -77,7 +77,18 @@
         cursor: pointer;
         touch-action: manipulation;
       }
-      #loading[role="alertdialog"] button:focus-visible {
+      /* Plain :focus, deliberately broader than the family's :focus-visible-only
+         convention (web-terminal-ui 10-primitives.css). Both fatal builders move
+         focus to Reload with focus({ focusVisible: true }), which Samsung Internet,
+         Chrome < 145 and Safari < 18.4 ignore; script focus after a pointer load
+         does not match :focus-visible there, and because Tab is swallowed by the
+         dialog's focus wrap (and focus() on the already-focused button
+         short-circuits per the HTML focusing steps) no later keypress can repaint
+         the ring -- the only recovery control would stay focused with no visible
+         indicator for the dialog's whole life (WCAG 2.4.7). Safe to broaden HERE
+         because this dialog has exactly one control and is a dead end: the extra
+         ring can only ever appear on a click of Reload itself. */
+      #loading[role="alertdialog"] button:focus {
         outline: 2px solid currentcolor;
         outline-offset: 3px;
       }
@@ -282,13 +293,18 @@
           reload.addEventListener("click", () => window.location.reload());
           // Focus containment (APG alertdialog), mirroring showFatal in app.ts:
           // inert-ing #terminal keeps focus out of the page, but only this wrap
-          // keeps Tab/Shift+Tab on the dialog's single control.
-          overlay.addEventListener("keydown", (event) => {
-            if (event.key === "Tab") {
+          // keeps Tab/Shift+Tab on the dialog's single control. Bound on the
+          // document (capture) because a stray tap on the overlay background
+          // blurs to <body>, outside an overlay-scoped listener's reach.
+          document.addEventListener(
+            "keydown",
+            (event) => {
+              if (event.key !== "Tab" || !overlay.isConnected) return;
               event.preventDefault();
               reload.focus({ focusVisible: true });
-            }
-          });
+            },
+            true,
+          );
           overlay.replaceChildren(description, reload);
           // aria-modal claims the rest of the page is inert; make it true
           // (APG alertdialog focus containment; WCAG 2.4.11) -- mirrors

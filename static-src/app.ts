@@ -28,6 +28,13 @@
 import { createTerminal } from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 
+// The one brand accent, as bare hsl() components: the accent token and the two
+// alpha-blended tab fills in the theme below all compose from this single
+// literal, so a hue change cannot land on some of them only. The copies in
+// static/index.html and static/manifest.json (which cannot read this module) are
+// pinned by app.test.ts's brand-accent parity test instead.
+const ACCENT_HSL_COMPONENTS = "263.1683 100% 80%";
+
 // Reveal the #loading overlay as a modal alert dialog with a fatal message.
 // remove("fade") is unconditional normalization, not a race fix: it guarantees the
 // dialog is opaque and hit-testable (.fade sets opacity:0 + pointer-events:none)
@@ -48,6 +55,15 @@ import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 // .bar already replaced, a fade-out under way, #terminal already carrying built
 // children) are not this function's responsibility.
 function showFatal(overlay: HTMLElement, message: string): void {
+  // Symmetric with the index.html watchdog's own first stand-down guard:
+  // whichever fatal builder claimed this overlay first keeps it. Load-bearing
+  // for the missing-#terminal-root branch below, which runs BEFORE app.ts's
+  // data-bootstrap-fatal abort and would otherwise replaceChildren() over a
+  // watchdog dialog already on screen -- discarding its Reload button while
+  // leaving its Tab-trap listener bound to that now-detached node.
+  if (overlay.hasAttribute("data-bootstrap-fatal")) {
+    return;
+  }
   overlay.classList.remove("fade");
   // alertdialog, not alert: the overlay carries an interactive Reload button
   // and moves focus into it, which is the alertdialog interaction model (APG).
@@ -80,13 +96,24 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // WITHIN the dialog -- without this, Tab walks off Reload into the browser
   // chrome (or nothing at all in an installed standalone PWA, where this dialog
   // is the only recovery surface). Reload is the dialog's sole control, so both
-  // directions wrap back onto it. Mirrored by the index.html watchdog.
-  overlay.addEventListener("keydown", (event) => {
-    if (event.key === "Tab") {
+  // directions wrap back onto it. Bound on the DOCUMENT (capture), not on the
+  // overlay: a stray tap or click on this full-viewport dialog's own background
+  // blurs to <body>, which is NOT a descendant of the overlay, so an
+  // overlay-scoped listener stops containing Tab after the single most likely
+  // stray interaction. isConnected keeps the trap from outliving the dialog
+  // (the UI kernel removes the overlay it owns on first frame).
+  // Mirrored by the index.html watchdog.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Tab" || !overlay.isConnected) {
+        return;
+      }
       event.preventDefault();
       reload.focus({ focusVisible: true });
-    }
-  });
+    },
+    true,
+  );
   overlay.replaceChildren(description, reload);
   // aria-modal claims everything outside the dialog is inert; make it true so
   // Tab cannot reach focusables inside a partially-built terminal behind the
@@ -99,8 +126,10 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // the family convention is :focus-visible only (web-terminal-ui
   // 10-primitives.css:47) and script focus does not match it after a pointer
   // load, so the dialog's only control would otherwise be focused with no
-  // visible indicator. Ignored by engines that do not support the option, and it
-  // does not reintroduce a ring after a tap.
+  // visible indicator. Engines that ignore the option (Samsung Internet,
+  // Chrome < 145, Safari < 18.4) are covered by index.html's plain :focus rule
+  // for this dialog's button, which is scoped to the fatal overlay so it never
+  // leaks onto terminal chrome.
   reload.focus({ focusVisible: true });
 }
 
@@ -153,9 +182,9 @@ try {
       // .noscript-fallback colour), and static/manifest.json's theme_color.
       // index.html carries the matching note; change all of them together or the
       // installed-PWA chrome and the pre-JS overlay drift from the app accent.
-      "--accent": "hsl(263.1683 100% 80%)",
-      "--tab-hover-bg": "hsl(263.1683 100% 80% / 16%)",
-      "--tab-active-bg": "hsl(263.1683 100% 80% / 32%)",
+      "--accent": `hsl(${ACCENT_HSL_COMPONENTS})`,
+      "--tab-hover-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 16%)`,
+      "--tab-active-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 32%)`,
       "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
       "--tab-active-fg": "#fff",
       // Tab activity-dot vocabulary (replaces the library defaults; ui >= the

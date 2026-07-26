@@ -248,22 +248,35 @@ try {
       // the defaults): violet = thinking, green = done, yellow = action
       // required. One declared family -- 78% lightness / 0.15 chroma, only the
       // hue carries the state -- sitting at the pastel accent's own level
-      // (#c099ff is ~oklch(76% 0.147 301deg)). The violet hue's sRGB ceiling at
-      // 78% L is C~0.132, so browsers gamut-map the declared 0.15 down to the
-      // max-chroma pastel violet (~#c4a3ff); that clamp is deliberate ("the
-      // most saturated violet available at the family's lightness"). Green
-      // (~#67d283) and yellow (~#d6b529) are in gamut and render as declared.
-      // The single-lightness family deliberately drops the library defaults'
-      // working<->done lightness spread (pale lime vs green); state separation
-      // rides the ring/motion/shape cues, never lightness or hue alone.
+      // (#c099ff is ~oklch(76% 0.147 301deg)). The single-lightness family
+      // deliberately drops the library defaults' working<->done lightness spread
+      // (the defaults now separate working from done by hue, blue vs green);
+      // state separation rides the wave/ring/shape cues, never lightness or hue
+      // alone.
+      //
+      // Working is PINNED AS AN sRGB HEX while its two siblings stay in oklch,
+      // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
+      // is outside sRGB (linear blue 1.086) AND outside Display P3 (1.024), so
+      // it can never render as declared on any display we ship to: every screen
+      // shows a gamut-mapped approximation, and WHICH approximation is the
+      // browser's choice rather than ours. #c6a0ff is that approximation made
+      // explicit: it is exactly what Chromium paints for the formula on an sRGB
+      // display, deltaEOK 0.0099 from what a P3 display shows for it (a JND is
+      // ~0.02, so the pin is imperceptible on wide-gamut screens and a no-op on
+      // sRGB ones). The mathematically nearest sRGB colour is #c79eff, better by
+      // deltaEOK 0.0004, which is nothing. Green (150deg) and yellow (95deg) ARE
+      // in gamut at 0.15 chroma and render as declared (#67d283 / #d6b529), so
+      // they keep the formula.
+      //
       // Hue alone never carries state (pulse/ring/shape per WCAG 1.4.1):
-      // working is a ringed disc emitting a live ripple ping off that ring;
-      // input freezes that exact silhouette (ringed disc, no motion); done
-      // is the bare ringless disc. Under prefers-reduced-motion the library
-      // punches working's disc into a donut, so all three stay distinct by
-      // shape with no motion at all. Ripple and ring derive from their own
-      // token inside the library CSS.
-      "--status-working": "oklch(78% 0.15 300deg)",
+      // working is a disc emitting a live, soft-edged ripple WAVE that travels
+      // outward and dissolves; input is a disc inside a static hard-edged ring
+      // (so the two differ by edge quality as well as motion); done is the bare
+      // ringless disc. Under prefers-reduced-motion the library punches
+      // working's disc into a donut, so all three stay distinct by shape with
+      // no motion at all. Wave and ring derive from their own token inside the
+      // library CSS.
+      "--status-working": "#c6a0ff",
       "--status-done": "oklch(78% 0.15 150deg)",
       "--status-input": "oklch(78% 0.15 95deg)",
     },

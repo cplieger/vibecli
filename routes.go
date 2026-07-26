@@ -148,7 +148,9 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// Scrollback 5000 covers a /chat
+	// The returned factory builds one kiro-cli chat session per tab: an independent
+	// PTY-backed process (deps.cmd = kiro-cli chat) with its own VT screen and
+	// scrollback, so opening a tab launches a fresh instance. Scrollback 5000 covers a /chat
 	// transcript restore on reconnect (matches the client store's retained-line
 	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
 	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive the
@@ -186,6 +188,16 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
+			// Name each tab after the first substantial thing the user asked
+			// for. This app is the engine's session-per-CONVERSATION consumer,
+			// which is the exact shape WithInputTitle is for: kiro-cli sets no
+			// OSC window title, so without it every tab falls to the automatic
+			// ladder's cwd rung and all of them read alike ("workspace",
+			// "workspace 2", …) forever — the label carries no information at
+			// the moment it matters most, picking one tab out of several. The
+			// generic web-terminal-server deliberately leaves it off: there the
+			// foreground-process name is the better automatic label.
+			terminal.WithInputTitle(),
 			// A session whose process dies within seconds of spawn is the
 			// kiro-cli-missing/broken signature (the sign-in guard exits 1
 			// when the binary is absent or login fails instantly). The

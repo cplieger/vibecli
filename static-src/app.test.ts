@@ -417,7 +417,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("leaves the kernel's own recovery surface alone and rethrows when createTerminal throws", async () => {
     const root = appendTerminalRoot();
     const loading = appendPristineOverlay({ fade: true });
-    // Emulate web-terminal-ui >= 5.0.0's kernel-init path: report through
+    // Emulate web-terminal-ui >= 4.7.0's kernel-init path: report through
     // onFatalError (the kernel has rendered its own surface into #terminal and
     // lowered #loading by this point), then rethrow.
     createTerminalMock.mockImplementationOnce(
@@ -473,7 +473,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("still surfaces a dialog if the kernel throws WITHOUT reporting through onFatalError", async () => {
     // The fallback arm of the catch's discriminator. With the pinned
-    // web-terminal-ui (>= 5.0.0) this state is unreachable in practice -- the
+    // web-terminal-ui (>= 4.7.0) this state is unreachable in practice -- the
     // kernel's own catch always delivers onFatalError before rethrowing, inside
     // its own try, and this app's handler cannot throw -- so this pins the
     // behaviour for a kernel that regresses or a downgraded pin, where the

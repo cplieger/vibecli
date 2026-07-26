@@ -289,7 +289,7 @@ try {
   //      throws before createTerminal is entered. No kernel ran, nothing
   //      captured #loading, and nothing will ever lower it -- the app still owns
   //      the recovery surface here.
-  //   2. createTerminal itself throws. Since @cplieger/web-terminal-ui 5.0.0 the
+  //   2. createTerminal itself throws. Since @cplieger/web-terminal-ui 4.7.0 the
   //      kernel runs its own fatal path first (phase "kernel-init"): it lowers
   //      #loading and renders "Terminal failed to start" into #terminal before
   //      rethrowing. Building a dialog here too would put TWO recovery surfaces

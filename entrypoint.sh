@@ -165,8 +165,12 @@ secure_tools_dir() {
   if [ $((8#$mode & 0022)) -eq 0 ]; then
     return 0
   fi
-  [ "$arm" -eq 0 ] || tools_tree_was_writable=1
-  printf 'level=warn msg="tools directory permits group/other writes; tightening it and treating any kiro-cli it already holds as untrusted" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
+  if [ "$arm" -eq 0 ]; then
+    printf 'level=warn msg="PATH-segment directory permits group/other writes; tightening it (no kiro-cli quarantine: this tree never holds one)" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
+  else
+    tools_tree_was_writable=1
+    printf 'level=warn msg="tools directory permits group/other writes; tightening it and treating any kiro-cli it already holds as untrusted" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
+  fi
   if ! chmod go-w "$dir"; then
     printf 'level=warn msg="failed to strip group/other write bits from tools directory; verifying the resulting mode instead" dir="%s" component=entrypoint\n' "$dir" >&2
   fi
@@ -457,8 +461,14 @@ secure_tools_dir "$TOOLS/bin"
 # then runs as root, ahead of /usr/bin, with no --version or sha gate anywhere.
 # Same premise and same enforcement as $TOOLS/bin; arm=0 because these trees
 # never hold kiro-cli. Include a planted symlink (-L) the way the kiro-cli
-# binary loop below does.
-for path_dir in "$TOOLS/go/bin" "$TOOLS/runtimes/go/bin" "$TOOLS/runtimes/node/bin"; do
+# binary loop below does. Walk parent-to-child, matching the /config -> $TOOLS ->
+# $TOOLS/bin chain above: a writable PARENT lets a foreign host user replace the
+# leaf bin dir wholesale with a clean-mode tree of planted binaries, which the
+# leaf check alone would then pass. Skip-if-absent keeps fresh volumes (no legacy
+# trees) untouched.
+for path_dir in "$TOOLS/go" "$TOOLS/go/bin" \
+  "$TOOLS/runtimes" "$TOOLS/runtimes/go" "$TOOLS/runtimes/go/bin" \
+  "$TOOLS/runtimes/node" "$TOOLS/runtimes/node/bin"; do
   [ -e "$path_dir" ] || [ -L "$path_dir" ] || continue
   secure_tools_dir "$path_dir" 0
 done

@@ -783,10 +783,12 @@ func newToolsDeps(t *testing.T) *routeDeps {
 }
 
 // TestToolsAPI_LoopbackOnly pins the tools API's only boundary on this
-// unauthenticated port: the SOCKET PEER must be loopback. A remote peer
-// gets 403 regardless of headers (forwarded headers are client-controlled
-// and deliberately ignored); the in-container consumer (curl localhost)
-// passes and reads the inventory.
+// unauthenticated port: the SOCKET PEER and the Host header must BOTH be
+// loopback. A remote peer gets 403 regardless of headers (forwarded headers
+// are client-controlled and deliberately ignored), and a loopback peer
+// carrying a non-loopback Host — the DNS-rebound-page shape — is refused
+// too; the in-container consumer (curl localhost) passes and reads the
+// inventory.
 func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
@@ -850,6 +852,25 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ipv6 loopback peer: status = %d, want 200", rec.Code)
+	}
+
+	// A loopback SOCKET PEER whose Host names something else is the
+	// DNS-rebinding shape: a page on evil.example resolved to 127.0.0.1 reaches
+	// this handler with a loopback peer, and after rebinding its Origin and Host
+	// agree so CrossOriginProtection admits it. The gate must refuse on the Host
+	// half alone; without this case, deleting the loopbackHost conjunct keeps the
+	// suite green while the tools API (which executes manual install strings as
+	// root) becomes reachable from a browser. The empty and malformed Hosts pin
+	// the fail-closed path through webhttp.CanonicalHost.
+	for _, host := range []string{"evil.example", "evil.example:9848", "kiro.lan", "", "127.0.0.1:garbage"} {
+		req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
+		req.RemoteAddr = "127.0.0.1:55555"
+		req.Host = host
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("loopback peer with Host %q: status = %d, want 403 (the gate requires a loopback Host as well as a loopback peer)", host, rec.Code)
+		}
 	}
 }
 

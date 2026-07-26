@@ -223,20 +223,24 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	}
 }
 
-// kiroMarkerStatErrOnce bounds the readiness-marker stat diagnostic to one line
-// per process: /api/health is probed every 30s, so an unbounded Warn would
-// repeat forever while the fault lasts, but a marker stat that fails for any
-// reason OTHER than "not created yet" (an unmounted or read-only /config, an
-// I/O error) is an anomaly the operator cannot otherwise tell apart from the
-// expected first-boot/broken-install case, since both render as the same
-// "kiro-cli unavailable" body and the same Warn access line.
-var kiroMarkerStatErrOnce sync.Once
-
 // handleHealth returns the /api/health readiness handler. It reflects, in
 // order: listener readiness (deps.ready), the env-gated kiro-cli readiness
 // marker (deps.kiroReadyMarker; see the entrypoint), and the INFORMATIONAL
 // tools field (deps.toolsState) — tool convergence never gates readiness.
 func handleHealth(deps *routeDeps) http.HandlerFunc {
+	// kiroMarkerStatErrOnce bounds the readiness-marker stat diagnostic to one
+	// line per handler (exactly one per process in production): /api/health is
+	// probed every 30s, so an unbounded Warn would repeat forever while the
+	// fault lasts, but a marker stat that fails for any reason OTHER than "not
+	// created yet" (an unmounted or read-only /config, an I/O error) is an
+	// anomaly the operator cannot otherwise tell apart from the expected
+	// first-boot/broken-install case, since both render as the same
+	// "kiro-cli unavailable" body and the same Warn access line. The latch
+	// lives in the closure, not a package var, for the same reason
+	// newStatusClassifier's does: its lifetime is the instance the composition
+	// root wires, so a test builds a fresh handler instead of resetting package
+	// state.
+	var kiroMarkerStatErrOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
 		unready := func(reason string) {
 			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, map[string]string{

@@ -399,15 +399,17 @@ EXPOSE 9848
 # update 300, +30 kill-after; apt-get install 600, +30 kill-after) = 4830s with
 # APT_PACKAGES, 3870s without — so the 20m (1200s) start-period does NOT cover
 # even the single-attempt path. The download also runs with --retry 3 bounded by
-# --retry-max-time 5400, so the retry-inflated allowance-sum is ≈ 6630s with
-# APT_PACKAGES (≈ 5670s without). Two consequences, not one: an unhealthy state
+# --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
+# begun just under the limit still runs to --max-time 3600, putting the download
+# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10230s with
+# APT_PACKAGES (≈ 9270s without). Two consequences, not one: an unhealthy state
 # never restarts this container (restart policy acts on process exit), so a very
 # slow first boot merely shows unhealthy and converges once the marker is
 # written — but tests/image-smoke.sh FAILS the build at SMOKE_TIMEOUT, so a
 # slow-but-alive download that stall detection deliberately lets run is a red CI
 # image-smoke job with no artifact explaining why. Resolving that gap is a pending
-# maintainer decision (bound the retries, raise both budgets in lockstep
-# (~36m / 2220), drop --retry, or accept the exposure). Keep this comment and
+# maintainer decision (bound the retries, raise both budgets in lockstep to the
+# retry envelope (~171m / 10290), drop --retry, or accept the exposure). Keep this comment and
 # tests/image-smoke.conf's header in lockstep whenever a foreground timeout
 # changes. Tool installs
 # converge in the background AFTER bind (only session creation waits on

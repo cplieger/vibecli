@@ -92,7 +92,8 @@ func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T)
 }
 
 // TestClassifyStatus_logsSanitizedNotificationText pins the LOG-SAFETY half of
-// the OSC 9 coupling. classifyStatus logs the notification text raw, and its
+// the OSC 9 coupling. newStatusClassifier's mapping logs the notification text
+// raw, and its
 // comment justifies that by the engine's capture-time sanitization (runesafe
 // drops C0/DEL, C1, Bidi controls and U+2028/29 and rune-caps the text). That
 // justification is an assumption about a Renovate-bumped dependency and

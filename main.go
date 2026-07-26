@@ -682,12 +682,21 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 // the app or the engine, so a proxy that strips the upgrade headers presents
 // as a page that loads normally, a UI stuck reconnecting, and a silent log.
 func isWebSocketUpgrade(r *http.Request) bool {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return false
-	}
-	for opt := range strings.SplitSeq(r.Header.Get("Connection"), ",") {
-		if strings.EqualFold(strings.TrimSpace(opt), "upgrade") {
-			return true
+	return headerHasToken(r, "Upgrade", "websocket") &&
+		headerHasToken(r, "Connection", "upgrade")
+}
+
+// headerHasToken reports whether any field value of the named header carries
+// token as a comma-separated element, case-insensitively. Both headers are
+// comma-lists that may also arrive as repeated field lines (RFC 7230 3.2.2),
+// and the engine's websocket.Accept matches them exactly this way — so this
+// predicate must too, or the access-log skip and the actual upgrade disagree.
+func headerHasToken(r *http.Request, name, token string) bool {
+	for _, v := range r.Header.Values(name) {
+		for opt := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(opt), token) {
+				return true
+			}
 		}
 	}
 	return false

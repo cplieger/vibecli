@@ -18,6 +18,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 	"github.com/cplieger/webhttp"
@@ -570,6 +571,83 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Errorf("same-origin /ws handshake = %d, want 101 (the CSWSH guard must ACCEPT a same-origin upgrade, else the cross-origin 403 test cannot tell the origin check from a blanket rejection)", resp.StatusCode)
 	}
+}
+
+// TestSessionTitleDerivesFromInput pins terminal.WithInputTitle() in the session
+// factory's option list: send one submitted line into a session's PTY and the
+// manager must report that line as the session's title.
+//
+// This is a COMPOSITION test, and it exists because the composition is the part
+// that broke. The engine ships the deriver as an opt-in mechanism (off by
+// default, deliberately: a general-purpose terminal wants the
+// foreground-process name instead), so the whole feature reaching a user rests
+// on this app passing one option. When the client-side deriver was retired in
+// favour of the server-side one, that option was never added here — every tab
+// silently fell through to the automatic ladder's cwd rung and read "workspace"
+// forever, with no failing test anywhere. Asserting the derived title THROUGH
+// registerRoutes is the only place that catches a dropped option; a unit test
+// of the engine's deriver passes either way.
+func TestSessionTitleDerivesFromInput(t *testing.T) {
+	mux := http.NewServeMux()
+	var ready webhttp.Ready
+	ready.Set(true)
+	deps := &routeDeps{
+		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
+		ready:    &ready,
+		workDir:  "",
+		// /bin/cat stands in for kiro-cli: the deriver reads the bytes the
+		// client SENDS, so what the program does with them is irrelevant.
+		cmd: []string{"/bin/cat"},
+	}
+	mgr, csp, err := registerRoutes(mux, deps)
+	if err != nil {
+		t.Fatalf("registerRoutes: %v", err)
+	}
+	t.Cleanup(mgr.Shutdown)
+	id, err := mgr.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?session=" + id
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: srv.Client()})
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial /ws: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// One binary frame is one atomic input event (the chunk boundary the
+	// deriver's escape parser relies on). The leading byte must not be 0x00,
+	// which the wire protocol reserves for control frames.
+	const want = "name this session"
+	if err := conn.Write(ctx, websocket.MessageBinary, []byte(want+"\r")); err != nil {
+		t.Fatalf("write input frame: %v", err)
+	}
+
+	// The title is resolved on read (no status sweep needed), but the frame
+	// still has to cross the socket and reach the PTY write.
+	deadline := time.Now().Add(5 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		for _, s := range mgr.List() {
+			if s.ID == id {
+				got = s.Title
+			}
+		}
+		if got == want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("session title = %q, want %q -- terminal.WithInputTitle() is missing from the session factory, so every tab falls back to the cwd/command name", got, want)
 }
 
 // TestClassifyStatus pins the kiro-cli OSC 9 -> latched-status mapping that

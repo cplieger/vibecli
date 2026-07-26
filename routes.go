@@ -108,6 +108,16 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 			terminal.WithScrollbackCapacity(5000),
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
+			// Name each tab after the first substantial thing the user asked
+			// for. This app is the engine's session-per-CONVERSATION consumer,
+			// which is the exact shape WithInputTitle is for: kiro-cli sets no
+			// OSC window title, so without it every tab falls to the automatic
+			// ladder's cwd rung and all of them read alike ("workspace",
+			// "workspace 2", …) forever — the label carries no information at
+			// the moment it matters most, picking one tab out of several. The
+			// generic web-terminal-server deliberately leaves it off: there the
+			// foreground-process name is the better automatic label.
+			terminal.WithInputTitle(),
 			// A session whose process dies within seconds of spawn is the
 			// kiro-cli-missing/broken signature (the sign-in guard exits 1
 			// when the binary is absent or login fails instantly). The

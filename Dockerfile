@@ -98,7 +98,7 @@ COPY required-tools.txt ./
 # runtime refresh re-runs the same check before every swap.
 ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/latest/download/tool-catalog.json
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.2.7
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.2.8
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \

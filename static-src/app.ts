@@ -82,16 +82,27 @@ try {
       // the defaults): violet = thinking, green = done, yellow = action
       // required. One declared family -- 78% lightness / 0.15 chroma, only the
       // hue carries the state -- sitting at the pastel accent's own level
-      // (#c099ff is ~oklch(76% 0.13 296deg)). The violet hue's sRGB ceiling at
-      // 78% L is C~0.132, so browsers gamut-map the declared 0.15 down to the
-      // max-chroma pastel violet (~#c4a3ff); that clamp is deliberate ("the
-      // most saturated violet available at the family's lightness"). Green
-      // (~#67d283) and yellow (~#d6b529) are in gamut and render as declared.
+      // (#c099ff is ~oklch(76% 0.13 296deg)).
+      //
+      // Working is PINNED AS AN sRGB HEX while its two siblings stay in oklch,
+      // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
+      // is outside sRGB (linear blue 1.086) AND outside Display P3 (1.024), so
+      // it can never render as declared on any display we ship to: every screen
+      // shows a gamut-mapped approximation, and WHICH approximation is the
+      // browser's choice rather than ours. #c6a0ff is that approximation made
+      // explicit: it is exactly what Chromium paints for the formula on an sRGB
+      // display, deltaEOK 0.0099 from what a P3 display shows for it (a JND is
+      // ~0.02, so the pin is imperceptible on wide-gamut screens and a no-op on
+      // sRGB ones). The mathematically nearest sRGB colour is #c79eff, better by
+      // deltaEOK 0.0004, which is nothing. Green (150deg) and yellow (95deg) ARE
+      // in gamut at 0.15 chroma and render as declared (#67d283 / #d6b529), so
+      // they keep the formula.
+      //
       // Hue alone never carries state (pulse/ring/shape per WCAG 1.4.1):
       // working and input share one ringed silhouette -- live pulses, blocked
       // is frozen -- and done stays the bare disc. Both rings derive from
       // their own token inside the library CSS.
-      "--status-working": "oklch(78% 0.15 300deg)",
+      "--status-working": "#c6a0ff",
       "--status-done": "oklch(78% 0.15 150deg)",
       "--status-input": "oklch(78% 0.15 95deg)",
     },

@@ -206,7 +206,10 @@ try {
   features = presetAgentTabbed();
 } catch (e) {
   if (loading) {
-    showFatal(loading, "Failed to start the terminal. Reload the page to retry.");
+    showFatal(
+      loading,
+      "The terminal's feature set could not be built. Reload the page; if this persists the app was built incorrectly.",
+    );
   }
   throw e;
 }

@@ -69,6 +69,15 @@ fatal() {
   exit 1
 }
 
+# 0 when $1 is a dispatcher that will still work after install_kiro_cli's EXIT trap
+# deletes the staging tree: a REGULAR executable file, not a symlink. -f/-x both
+# FOLLOW symlinks, so a link into $stage passes them, is mv'd to its destination AS
+# A LINK, and dangles the moment the trap fires. Single home for the rule so the
+# four sites that depend on it cannot drift.
+is_self_contained_executable() {
+  [ ! -L "$1" ] && [ -f "$1" ] && [ -x "$1" ]
+}
+
 # Create ONE level of a persistent directory and prove the created path is a real
 # directory rather than a symlink, BEFORE anything is written to or deleted beneath
 # it. `mkdir -p a/b/c` FOLLOWS a symlink at any component, so creating a deep path in
@@ -138,8 +147,10 @@ harden_config_dir() {
 # and remember that the tree WAS writable so the caller can quarantine whatever
 # kiro-cli* files it already held. Sets tools_tree_was_writable=1 in that case.
 tools_tree_was_writable=0
+# $2 (default 1) arms the kiro-cli quarantine when the dir was writable. Pass 0
+# for a PATH segment that never holds kiro-cli.
 secure_tools_dir() {
-  local dir=$1 mode
+  local dir=$1 arm=${2:-1} mode
   if [ -L "$dir" ]; then
     fatal 'refusing to use a symlinked tools directory; its target may be outside the /config mount' "dir=\"$dir\""
   fi
@@ -154,7 +165,7 @@ secure_tools_dir() {
   if [ $((8#$mode & 0022)) -eq 0 ]; then
     return 0
   fi
-  tools_tree_was_writable=1
+  [ "$arm" -eq 0 ] || tools_tree_was_writable=1
   printf 'level=warn msg="tools directory permits group/other writes; tightening it and treating any kiro-cli it already holds as untrusted" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
   if ! chmod go-w "$dir"; then
     printf 'level=warn msg="failed to strip group/other write bits from tools directory; verifying the resulting mode instead" dir="%s" component=entrypoint\n' "$dir" >&2
@@ -376,6 +387,18 @@ esac
 if [ -L "$HOME" ]; then
   fatal 'refusing to use a symlinked HOME; its target may be outside the /config mount' "home=\"$HOME\""
 fi
+# The pattern above is a LEXICAL prefix match, so it accepts a path that only
+# looks contained: /config/../etc matches /config/* and is not a symlink, and
+# the walk below would then create .ssh / .kiro/settings under it while
+# harden_config_dir chmod 700's the target. Re-assert the boundary on the
+# RESOLVED path (-m, so a not-yet-created HOME still resolves) -- that closes
+# '..' components and a symlinked ANCESTOR in one check, which the -L test on
+# the final component alone cannot.
+home_real=$(realpath -m "$HOME" 2>/dev/null) || home_real=""
+case "$home_real" in
+  /config/?*) ;;
+  *) fatal 'HOME does not resolve beneath the /config mount' "home=\"$HOME\" resolved=\"${home_real:-unknown}\"" ;;
+esac
 
 # Create every persistent directory parent-to-child, proving each component is a real
 # directory before its child (or any file beneath it) is created. A single
@@ -424,6 +447,21 @@ harden_config_dir "$HOME"
 secure_tools_dir /config
 secure_tools_dir "$TOOLS"
 secure_tools_dir "$TOOLS/bin"
+# The Dockerfile's ENV PATH puts THREE more /config-resident dirs ahead of
+# /usr/bin for the server, its PTY sessions and the toolbelt engine:
+# $TOOLS/go/bin (GOPATH/bin, not prunable) and $TOOLS/runtimes/{go,node}/bin
+# (legacy segments kept for pre-toolbelt volumes). /config and $TOOLS keep
+# their group/other EXECUTE bits above -- secure_tools_dir strips only w -- so
+# those dirs stay traversable by a foreign host user, and a group/other-writable
+# one of them lets that user plant a `go`/`gofmt`/`node`/`npm` this container
+# then runs as root, ahead of /usr/bin, with no --version or sha gate anywhere.
+# Same premise and same enforcement as $TOOLS/bin; arm=0 because these trees
+# never hold kiro-cli. Include a planted symlink (-L) the way the kiro-cli
+# binary loop below does.
+for path_dir in "$TOOLS/go/bin" "$TOOLS/runtimes/go/bin" "$TOOLS/runtimes/node/bin"; do
+  [ -e "$path_dir" ] || [ -L "$path_dir" ] || continue
+  secure_tools_dir "$path_dir" 0
+done
 # Directory modes are only half the invariant: a kiro-cli binary that is ITSELF
 # group/other-writable can be rewritten in place with no write access to the
 # directory at all, and a symlinked $BIN points wherever its target says. In both
@@ -466,7 +504,14 @@ fi
 # on the persistent /config volume until the next version bump. Off PATH, so
 # this is disk hygiene, not an integrity gate; it stays ahead of any install so
 # a fresh stage dir is never swept.
-rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
+# `rm -rf` on an unmatched glob is already a silent no-op returning 0 (-f suppresses
+# the missing-path diagnostic), so a non-zero status here is a REAL failure -- an
+# immutable attribute, EPERM, a submount under the stage dir -- against the one
+# thing this sweep exists to protect. Warn like both sibling sweeps
+# (sweep_legacy_dispatchers, prune_superseded_kas_runtimes) instead of discarding it.
+if ! rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.*; then
+  printf 'level=warn msg="failed to remove orphaned boot-time temp artifacts; they keep occupying the /config volume" dir="%s" component=entrypoint\n' "$TOOLS" >&2
+fi
 
 # Same hygiene argument, applied to the one residue class the sweep above omits:
 # binaries an EARLIER image version staged into $HOME/.local/bin (that install ran with
@@ -606,8 +651,13 @@ install_kiro_cli() (
     printf 'level=warn msg="install.sh exceeded its 120s deadline and was terminated" rc=%d component=entrypoint\n' "$install_rc" >&2
   fi
 
-  if [ ! -f "$staged" ]; then
-    printf 'level=error msg="install.sh did not produce kiro-cli binary" path="%s" rc=%d component=entrypoint\n' \
+  # Same invariant the sidecar promotions below assert, on the one dispatcher the app
+  # cannot run without: `-f` follows symlinks, so a link into the staging tree would
+  # pass here, pass the version probe, and be moved to $BIN as a LINK -- dangling the
+  # moment the EXIT trap deletes $stage/$tmpdir, after this function logged a
+  # successful promotion.
+  if ! is_self_contained_executable "$staged"; then
+    printf 'level=error msg="install.sh did not produce a self-contained executable kiro-cli binary (absent, not executable, or a symlink whose target dies with the staging cleanup)" path="%s" rc=%d component=entrypoint\n' \
       "$staged" "$install_rc" >&2
     printf 'install.sh output:\n' >&2
     cat "$install_log" >&2
@@ -652,7 +702,7 @@ install_kiro_cli() (
   # is published over a terminal that cannot dispatch `chat`. So require the
   # shape (regular file, not a symlink, executable) rather than mere existence.
   local chat_sidecar="$stage/.local/bin/kiro-cli-chat" term_sidecar="$stage/.local/bin/kiro-cli-term"
-  if [ -L "$chat_sidecar" ] || [ ! -f "$chat_sidecar" ] || [ ! -x "$chat_sidecar" ]; then
+  if ! is_self_contained_executable "$chat_sidecar"; then
     printf 'level=error msg="install.sh produced no self-contained executable kiro-cli-chat sidecar dispatcher (upstream dispatcher set changed?); kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" component=entrypoint\n' \
       "$chat_sidecar" >&2
     return 1
@@ -667,7 +717,7 @@ install_kiro_cli() (
   # dispatcher above; an unusable one is skipped instead of promoted.
   if [ ! -e "$term_sidecar" ]; then
     printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
-  elif [ -L "$term_sidecar" ] || [ ! -f "$term_sidecar" ] || [ ! -x "$term_sidecar" ]; then
+  elif ! is_self_contained_executable "$term_sidecar"; then
     printf 'level=warn msg="install.sh produced an invalid optional kiro-cli-term sidecar dispatcher; skipping promotion" src="%s" sidecar="kiro-cli-term" component=entrypoint\n' \
       "$term_sidecar" >&2
   elif ! mv -f "$term_sidecar" "$TOOLS/bin/kiro-cli-term"; then
@@ -717,7 +767,7 @@ install_kiro_cli() (
 # for a version flag it need not support.
 kiro_cli_dispatcher_set_complete() {
   local recorded
-  if [ -L "$CHAT_SIDECAR" ] || [ ! -f "$CHAT_SIDECAR" ] || [ ! -x "$CHAT_SIDECAR" ]; then
+  if ! is_self_contained_executable "$CHAT_SIDECAR"; then
     printf 'level=warn msg="required kiro-cli-chat sidecar dispatcher is missing or not a self-contained executable; kiro-cli chat cannot dispatch" path="%s" component=entrypoint\n' \
       "$CHAT_SIDECAR" >&2
     return 1
@@ -1070,13 +1120,15 @@ fi
 theme_dir="$HOME/.kiro/settings"
 theme_file="$theme_dir/kiro_cli_theme.json"
 theme_tmp=''
-# Validate and harden this directory BEFORE the first write, not after it: mkdir -p
-# FOLLOWS a symlink at settings/, and the mktemp + mv below then create and replace a
-# FIXED-NAME file through it. kiro-cli persists mcp.json (remote MCP server URLs and
-# tokens) in this same directory, so the hardening also matters on its own terms: the
-# mkdir creates the dir umask-wide (root umask 022 -> 0755) and only the 0700 ~/.kiro
-# parent is stopping traversal today. A symlink here is fatal (its target may be
-# outside the /config mount); a failed mkdir stays a warn, because the theme is
+# Re-validate immediately before the first write here, even though the boot-time walk
+# above already created this path (make_config_dir "$HOME/.kiro/settings") and put it
+# at 0700 (harden_config_dir "$HOME/.kiro/settings") -- so the mkdir below is a no-op
+# on every normal boot and 0700 is enforced ON THIS DIRECTORY, not merely inherited
+# from the 0700 ~/.kiro parent. The re-check is deliberate defence for the write
+# itself: mkdir -p FOLLOWS a symlink at settings/, and the mktemp + mv below create
+# and replace a FIXED-NAME file through it, in the directory where kiro-cli persists
+# mcp.json (remote MCP server URLs and tokens). A symlink here is fatal (its target
+# may be outside the /config mount); a failed mkdir stays a warn, because the theme is
 # cosmetic -- unreadable diff colors, not a broken boot.
 if [ -L "$theme_dir" ]; then
   fatal 'refusing to write kiro-cli settings through a symlinked settings directory; its target may be outside the /config mount' "dir=\"$theme_dir\""

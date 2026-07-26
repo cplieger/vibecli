@@ -462,7 +462,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // test's own inert assertion below.
     expect(root.hasAttribute("inert")).toBe(true);
     expect(dialog?.querySelector("#bootstrap-failure-message")?.textContent).toContain(
-      "Failed to start the terminal",
+      "The terminal's feature set could not be built",
     );
   });
 

@@ -131,9 +131,9 @@ RUN mkdir -p static/vendor/fonts && \
 # ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
 # deemed in scope (at the cost of a manual sha bump on each engine/UI release).
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.0.7
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.2.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.6.0
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.7.0
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is

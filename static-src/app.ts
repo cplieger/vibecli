@@ -153,10 +153,9 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // 10-primitives.css `button:focus-visible` rule) and script focus does not
   // match it after a pointer load, so the dialog's only control would otherwise
   // be focused with no visible indicator. Engines that ignore the option
-  // (Samsung Internet, Chrome < 145, Safari < 18.4) are covered by
-  // index.html's plain :focus rule
-  // for this dialog's button, which is scoped to the fatal overlay so it never
-  // leaks onto terminal chrome.
+  // (Samsung Internet, Chrome < 145, Safari < 18.4) are covered by index.html's
+  // plain :focus rule for this dialog's button, which is scoped to the fatal
+  // overlay so it never leaks onto terminal chrome.
   // Stryker disable next-line ObjectLiteral,BooleanLiteral: same unobservable UA
   // rendering hint as the trap's focus call above.
   reload.focus({ focusVisible: true });

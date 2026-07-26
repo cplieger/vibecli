@@ -392,6 +392,10 @@ make_config_dir "$HOME/.local"
 make_config_dir "$HOME/.local/bin"
 make_config_dir "$HOME/.ssh"
 make_config_dir "$HOME/.kiro"
+# kiro-cli persists cli.json / mcp.json / permissions.yaml here, and the
+# kiro_setting calls below write them as root long before the theme block
+# looks at this path, so the symlink rejection has to happen in the walk.
+make_config_dir "$HOME/.kiro/settings"
 
 # mkdir -p succeeds when the directories already exist — even on a read-only
 # bind mount — so it is NOT proof that /config is writable. Prove it with a
@@ -407,6 +411,7 @@ fi
 # Tighten the /config-resident dirs created above (see harden_config_dir for
 # why, and for the symlink guard).
 harden_config_dir "$HOME/.ssh"
+harden_config_dir "$HOME/.kiro/settings"
 harden_config_dir "$HOME/.kiro"
 harden_config_dir "$HOME/.local"
 harden_config_dir "$HOME"
@@ -717,7 +722,14 @@ kiro_cli_dispatcher_set_complete() {
       "$CHAT_SIDECAR" >&2
     return 1
   fi
-  recorded=$(cat "$KIRO_CLI_INSTALL_MARKER" 2>/dev/null) || recorded=""
+  # Read the marker only when it is a plain file we own: a symlink here would
+  # let an off-mount target answer the completeness question the sidecar shape
+  # check above deliberately refuses to take on trust.
+  if [ -L "$KIRO_CLI_INSTALL_MARKER" ] || [ ! -f "$KIRO_CLI_INSTALL_MARKER" ]; then
+    recorded=""
+  else
+    recorded=$(cat "$KIRO_CLI_INSTALL_MARKER" 2>/dev/null) || recorded=""
+  fi
   if [ "$recorded" != "$KIRO_CLI_VERSION" ]; then
     printf 'level=warn msg="kiro-cli install-completion marker absent or not at the pinned version; the persisted dispatcher set was never completed by this pin" marker="%s" recorded=%s pinned=%s component=entrypoint\n' \
       "$KIRO_CLI_INSTALL_MARKER" "${recorded:-none}" "$KIRO_CLI_VERSION" >&2

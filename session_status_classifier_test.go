@@ -38,10 +38,7 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 	if _, err := mgr.Create(); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	// Clear readiness before the deferred mgr.Shutdown kills the child: the
-	// factory's fast-death hook keys on it, so this keeps a teardown kill from
-	// emitting a stray broken-install Warn into a later test's log capture.
-	t.Cleanup(func() { deps.ready.Set(false) })
+	quietTeardown(t, deps)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -123,9 +120,7 @@ func TestClassifyStatus_logsSanitizedNotificationText(t *testing.T) {
 	if _, err := mgr.Create(); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	// Clear readiness before the deferred mgr.Shutdown kills the child so a
-	// teardown kill cannot emit a stray fast-death Warn into this capture.
-	t.Cleanup(func() { deps.ready.Set(false) })
+	quietTeardown(t, deps)
 
 	const (
 		unsafeRune = "\u202e"

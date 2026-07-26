@@ -4,6 +4,11 @@
 FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# The pinned GO_VERSION tarball below defaults GOTOOLCHAIN to `local`, so a go.mod that
+# requires a newer patch than the pin would fail the build instead of fetching the
+# toolchain it asks for (a downloaded toolchain is checksum-database verified, so the
+# tarball sha gate keeps its meaning).
+ENV GOTOOLCHAIN=auto
 
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -393,23 +398,25 @@ EXPOSE 9848
 # runs outside the sums. Single-attempt allowance-sum: kiro-cli download (curl
 # --max-time 3600, the absolute backstop behind --speed-limit/--speed-time stall
 # detection) + install.sh (120, +15 kill-after) + version/settings probes
-# (135: three --version checks plus SIX settings calls — the five applied after
+# (150: four --version checks — the every-boot bare-name resolution check, the drift
+# check, install_kiro_cli's staged verify, and the readiness probe — plus SIX settings
+# calls, the five applied after
 # promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
 # assertion — at 10s each, +5s kill-after) + optional APT_PACKAGES (apt-get
-# update 300, +30 kill-after; apt-get install 600, +30 kill-after) = 4830s with
-# APT_PACKAGES, 3870s without — so the 20m (1200s) start-period does NOT cover
+# update 300, +30 kill-after; apt-get install 600, +30 kill-after) = 4845s with
+# APT_PACKAGES, 3885s without — so the 20m (1200s) start-period does NOT cover
 # even the single-attempt path. The download also runs with --retry 3 bounded by
 # --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
 # begun just under the limit still runs to --max-time 3600, putting the download
-# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10230s with
-# APT_PACKAGES (≈ 9270s without). Two consequences, not one: an unhealthy state
+# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10245s with
+# APT_PACKAGES (≈ 9285s without). Two consequences, not one: an unhealthy state
 # never restarts this container (restart policy acts on process exit), so a very
 # slow first boot merely shows unhealthy and converges once the marker is
 # written — but tests/image-smoke.sh FAILS the build at SMOKE_TIMEOUT, so a
 # slow-but-alive download that stall detection deliberately lets run is a red CI
 # image-smoke job with no artifact explaining why. Resolving that gap is a pending
 # maintainer decision (bound the retries, raise both budgets in lockstep to cover
-# the ~10230s retry envelope -- start-period ~171m (10260s), SMOKE_TIMEOUT 10320
+# the ~10245s retry envelope -- start-period ~171m (10260s), SMOKE_TIMEOUT 10320
 # per the "+ two 30s probe intervals" rule above -- drop --retry, or accept the
 # exposure). Keep this comment and
 # tests/image-smoke.conf's header in lockstep whenever a foreground timeout

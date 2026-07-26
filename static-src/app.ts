@@ -40,16 +40,12 @@ const ACCENT_HSL_COMPONENTS = "263.1683 100% 80%";
 // Reveal the #loading overlay as a modal alert dialog with a fatal message.
 // remove("fade") is unconditional normalization, not a race fix: it guarantees the
 // dialog is opaque and hit-testable (.fade sets opacity:0 + pointer-events:none)
-// however the overlay arrived. It is a no-op on both call sites that fire today --
-// but NOT because the kernel fades only from asynchronous callbacks: since
-// web-terminal-ui 4.7.0 createTerminal's OWN synchronous catch calls
-// fadeOutOverlay(opts.loading) before it rethrows (kernel.ts). It is a no-op
-// because BOTH live call sites are pre-kernel and this app builds no dialog for
-// any kernel failure: the missing-root path never calls createTerminal, and a
-// preset failure throws before createTerminal is entered. So no path reaching
-// here has had this overlay faded (and thus none has a transitionend listener or
-// 1.5s removeOverlay timer armed against it), which is also why the retired
-// detached-clone workaround is no longer needed.
+// however the overlay arrived. It is a no-op on both call sites that fire today:
+// BOTH are pre-kernel and this app builds no dialog for any kernel failure (the
+// missing-root path never calls createTerminal, and a preset failure throws
+// before createTerminal is entered), so no path reaching here has had this
+// overlay faded -- none has a transitionend listener or 1.5s removeOverlay timer
+// armed against it.
 // Mirrored by the inline bootstrap watchdog in static/index.html, which builds
 // the same alertdialog shape for app.js load failures (before this module can
 // run) -- keep the two in sync when changing this shape: the shared shape
@@ -153,18 +149,16 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // Move focus to the recovery CTA: the page content is gone and Reload is the
   // only actionable element left (the alertdialog pattern's initial focus).
   // focusVisible asks the UA to paint the ring for this SCRIPT-initiated focus:
-  // the family convention is :focus-visible only (web-terminal-ui
-  // 10-primitives.css:47) and script focus does not match it after a pointer
+  // the family convention is :focus-visible only (web-terminal-ui's
+  // 10-primitives.css `button:focus-visible` rule) and script focus does not
+  // match it after a pointer
   // load, so the dialog's only control would otherwise be focused with no
   // visible indicator. Engines that ignore the option (Samsung Internet,
   // Chrome < 145, Safari < 18.4) are covered by index.html's plain :focus rule
   // for this dialog's button, which is scoped to the fatal overlay so it never
   // leaks onto terminal chrome.
-  // Stryker disable next-line ObjectLiteral,BooleanLiteral: focusVisible is a UA
-  // RENDERING hint (paint the focus ring for this script-initiated focus) with no
-  // scriptable effect, and happy-dom models neither the option nor :focus-visible,
-  // so no test in this environment can observe either mutant. Engines that ignore
-  // the option are covered by index.html's plain :focus rule for this button.
+  // Stryker disable next-line ObjectLiteral,BooleanLiteral: same unobservable UA
+  // rendering hint as the trap's focus call above.
   reload.focus({ focusVisible: true });
 }
 

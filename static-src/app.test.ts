@@ -477,6 +477,18 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
 
+  it("rethrows the preset failure untouched when #loading is absent", async () => {
+    appendTerminalRoot();
+    const failure = new Error("preset boom no overlay");
+    presetAgentTabbedMock.mockImplementationOnce(() => {
+      throw failure;
+    });
+
+    await expect(import("./app.js")).rejects.toBe(failure);
+    expect(createTerminalMock).not.toHaveBeenCalled();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+  });
+
   it("builds the same alertdialog shape when the real index.html watchdog fires", () => {
     // Execute the REAL inline bootstrap watchdog from static/index.html (the
     // pre-module, CSP-hashed script that catches /app.js load failures before

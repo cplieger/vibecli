@@ -7,6 +7,15 @@
 
 set -u
 
+# This script's own commands must NOT resolve through /config/tools/bin. That dir leads the
+# image PATH (Dockerfile ENV PATH) and lives on the persistent bind mount, so on a volume
+# that ever permitted group/other writes -- the state secure_tools_dir exists to detect -- a
+# planted stat/chmod/curl/sha256sum there would BE the oracle every integrity check below
+# trusts. Resolve the entrypoint's tools from the image only; the session PATH (which must
+# keep the engine-managed dir first) is restored for the exec'd server at the bottom.
+SESSION_PATH="$PATH"
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 TOOLS="/config/tools"
 BIN="$TOOLS/bin/kiro-cli"
 
@@ -17,14 +26,11 @@ kiro_cli_version() {
   local out rc
   # --kill-after gives a TERM-resistant binary a hard second-stage deadline;
   # without it GNU timeout waits forever on a child that traps/ignores TERM.
-  # Capture the output and the timeout STATUS separately: piping straight into
-  # awk discarded the status at the pipeline boundary (awk exits 0 even when its
-  # producer was TERMed/KILLed), so a wedged --version looked identical to a
-  # missing binary at all three call sites -- install verify reported a "wrong
-  # version" using install.sh's unrelated rc, drift reported installed=unknown,
-  # and readiness reported installed=none. One helper-level warning now gives
-  # every caller the same timeout diagnostic, while their empty-version
-  # (mismatch) handling stays exactly as it was.
+  # Capture the output and the timeout STATUS separately: piping straight into awk
+  # loses the status at the pipeline boundary (awk exits 0 even when its producer
+  # was TERMed/KILLed), which makes a wedged --version indistinguishable from a
+  # missing binary at every call site. This warning is the only timeout diagnostic;
+  # callers keep treating an empty version as a mismatch.
   out=$(timeout --signal=TERM --kill-after=5s 10s "$1" --version 2>/dev/null)
   rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -133,11 +139,11 @@ secure_tools_dir() {
 # pre-existing volumes and as belt-and-braces against an installer that resolves its
 # prefix via getpwuid rather than $HOME.
 #
-# Two robustness rules the earlier inline `rm -f <glob>` sites got wrong:
+# Two robustness rules:
 #
 #   1. rm -rf, not rm -f. `rm -f` FAILS on a directory, so a stray directory named
-#      kiro-cli-anything under a swept dir turned a hygiene step into a boot failure
-#      (fatal, with its 10s crash-loop throttle) at the two reinstall sites.
+#      kiro-cli-anything under a swept dir would turn a hygiene step into a boot
+#      failure (fatal, with its 10s crash-loop throttle) at the two reinstall sites.
 #   2. Assert the GOAL, not the ACTION. rm's exit status answers "did the unlink
 #      succeed", never "is an unpinned kiro-cli still reachable ahead of $BIN". Those
 #      come apart in BOTH directions: an unremovable non-binary (an immutable
@@ -187,7 +193,7 @@ sweep_legacy_dispatchers() {
 # the sweeps above: nothing here is on PATH or gates integrity, and a container whose
 # runtime store cannot be tidied must still boot.
 prune_superseded_kas_runtimes() {
-  local data_home kas_dir entry name
+  local data_home kas_dir kas_real entry name
   data_home="${XDG_DATA_HOME:-}"
   if [ -z "$data_home" ]; then
     # Under set -u an unset HOME would abort the boot; a data dir we cannot locate is
@@ -197,15 +203,49 @@ prune_superseded_kas_runtimes() {
   fi
   kas_dir="$data_home/kiro-cli/kas"
   [ -d "$kas_dir" ] || return 0
+  # `-d` FOLLOWS symlinks and the rm below runs as root, so a `kiro-cli` or `kas`
+  # symlink planted on a volume that once permitted foreign writes (the same premise
+  # secure_tools_dir defends against) would redirect this sweep at an arbitrary tree
+  # and delete every entry that does not match the pin. Prove the store is a real
+  # directory resolving where it is named, or skip the prune (warn, never fatal:
+  # disk hygiene must not brick boot).
+  if [ -L "$data_home/kiro-cli" ] || [ -L "$kas_dir" ]; then
+    printf 'level=warn msg="kiro-cli data dir or its kas store is a symlink; refusing to prune through it" dir="%s" component=entrypoint\n' "$kas_dir" >&2
+    return 0
+  fi
+  kas_real=$(realpath "$kas_dir" 2>/dev/null) || kas_real=""
+  case "$kas_real" in
+    "$data_home"/kiro-cli/kas) ;;
+    *)
+      printf 'level=warn msg="kiro-cli kas store does not resolve inside the data dir; refusing to prune" dir="%s" resolved="%s" component=entrypoint\n' \
+        "$kas_dir" "${kas_real:-unknown}" >&2
+      return 0
+      ;;
+  esac
   for entry in "$kas_dir"/*; do
     # An empty store leaves the glob unexpanded.
     [ -e "$entry" ] || continue
     name="${entry##*/}"
     # One pattern covers the tree and its sibling .lock: both carry the
     # <version>-<hash> stem, and the quoted expansion keeps a version string from
-    # being read as a glob. Anything not on the pin is a superseded version.
+    # being read as a glob.
     case "$name" in
       "$KIRO_CLI_VERSION"-*) continue ;;
+    esac
+    # Only VERSION-KEYED entries are superseded runtimes. kas/ is kiro-cli's
+    # directory, not ours, so an entry with no leading numeric version component
+    # is something this pruner has never seen (a store-wide lock, an unpack
+    # scratch dir, an index) -- and deleting another program's unrecognized state
+    # on every boot is a worse failure than leaving a few MB behind. Both layouts
+    # observed today (the <version>-<hash> tree and its .lock sibling) match, so
+    # this is a no-op against the current CLI; log the skip so a layout change is
+    # visible instead of silent.
+    case "$name" in
+      [0-9]*.[0-9]*) ;;
+      *)
+        printf 'level=info msg="leaving unrecognized (non version-keyed) entry in the kiro-cli agent runtime store" entry="%s" component=entrypoint\n' "$name" >&2
+        continue
+        ;;
     esac
     if rm -rf "$entry"; then
       printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" pin=%s component=entrypoint\n' "$name" "$KIRO_CLI_VERSION" >&2
@@ -226,7 +266,9 @@ prune_superseded_kas_runtimes() {
 # launchable by sessions -- exactly the state the quarantine exists to prevent.
 resolves_to_pinned_kiro_cli() {
   local resolved resolved_version
-  resolved=$(command -v kiro-cli 2>/dev/null) || return 0
+  # Resolve against the SESSION PATH, not the entrypoint's trimmed one: this check is about
+  # what a session (or `docker exec ... kiro-cli`) resolves by bare name.
+  resolved=$(PATH="$SESSION_PATH" command -v kiro-cli 2>/dev/null) || return 0
   [ -n "$resolved" ] || return 0
   if [ "$resolved" = "$BIN" ]; then
     resolved_version=$(kiro_cli_version "$resolved")
@@ -329,6 +371,21 @@ harden_config_dir "$HOME"
 secure_tools_dir /config
 secure_tools_dir "$TOOLS"
 secure_tools_dir "$TOOLS/bin"
+# Directory modes are only half the invariant: a kiro-cli binary that is ITSELF
+# group/other-writable can be rewritten in place with no write access to the
+# directory at all, and a symlinked $BIN points wherever its target says. In both
+# cases needs_kiro_cli_install's --version probe authenticates nothing, while the
+# directory checks above stay silent. Fold those states into the same quarantine
+# the writable-tree case triggers.
+for existing in "$TOOLS/bin"/kiro-cli*; do
+  [ -e "$existing" ] || [ -L "$existing" ] || continue
+  existing_mode=$(stat -c '%a' "$existing" 2>/dev/null) || existing_mode=""
+  if [ -L "$existing" ] || [ -z "$existing_mode" ] || [ $((8#$existing_mode & 0022)) -ne 0 ]; then
+    tools_tree_was_writable=1
+    printf 'level=warn msg="kiro-cli binary on the persistent tree is a symlink or permits group/other writes; treating it as untrusted and forcing a pinned SHA-verified reinstall" path="%s" mode=%s component=entrypoint\n' \
+      "$existing" "${existing_mode:-unknown}" >&2
+  fi
+done
 if [ "$tools_tree_was_writable" -eq 1 ]; then
   # The directories are private now, but anything already inside them was
   # writable by another host user, so its --version answer proves nothing.
@@ -432,14 +489,12 @@ install_kiro_cli() (
   trap 'rm -rf "$tmpdir" "$stage"; [ -z "$install_log" ] || rm -f "$install_log"' EXIT
   zip="$tmpdir/kirocli.zip"
 
-  # The zip is ~528 MB (2.14.1, x86_64), so a flat --max-time acted as a BANDWIDTH
-  # FLOOR rather than a hang guard: 300s killed any link slower than ~1.76 MB/s
-  # (~14 Mbit/s) mid-transfer, and since --max-time applies per attempt, the retries
-  # just repeated the same doomed transfer. A slow connection got no kiro-cli at all,
-  # not a slow one. Stall detection replaces the slowness cap: abort only when
-  # throughput stays under --speed-limit for --speed-time consecutive seconds, which
-  # is the condition we actually care about. --max-time is now an absolute backstop
-  # (3600s => a ~150 KB/s floor, ~1.2 Mbit/s; 12x lower than before), and
+  # The zip is ~528 MB (2.14.1, x86_64), so a flat --max-time is a BANDWIDTH FLOOR
+  # rather than a hang guard, and it applies PER ATTEMPT, so retries only repeat the
+  # same doomed transfer. Stall detection expresses the condition we actually care
+  # about: abort only when throughput stays under --speed-limit for --speed-time
+  # consecutive seconds. --max-time is an absolute backstop only (3600s => a
+  # ~150 KB/s floor, ~1.2 Mbit/s), and
   # --retry-max-time caps the retry envelope, but only by barring the START of a new
   # attempt: one begun just under 5400s still runs to its own --max-time, so the
   # download leg's true ceiling is ~9000s rather than 5400s (see the Dockerfile
@@ -595,6 +650,13 @@ needs_kiro_cli_install() {
   return 1
 }
 
+# install_kiro_cli asserts app.disableAutoupdates through the STAGED binary
+# against the real persisted HOME and refuses to promote without it, so a
+# successful install has already put the setting in force. Remember that, so
+# the redundant re-assertion below cannot withhold readiness over a transient
+# settings flake. (install_kiro_cli's body is a subshell, so it cannot set this
+# itself -- the caller records it from the exit status.)
+kiro_cli_pin_asserted_at_install=0
 if needs_kiro_cli_install; then
   # Quarantine the stale dispatcher and its sidecars out of BOTH $TOOLS/bin
   # and the legacy $HOME/.local/bin staging directory BEFORE the reinstall.
@@ -644,6 +706,8 @@ if needs_kiro_cli_install; then
     if ! resolves_to_pinned_kiro_cli; then
       fatal 'an unpinned kiro-cli is still reachable by bare name after a failed install; refusing to leave it resolvable for the container lifetime' "dir=\"$HOME/.local/bin\""
     fi
+  else
+    kiro_cli_pin_asserted_at_install=1
   fi
 fi
 
@@ -683,7 +747,16 @@ if [ -x "$BIN" ]; then
   # binary from replacing itself and invalidating the verified sha. Unlike the
   # best-effort settings around it, a failure here is integrity-relevant.
   if ! kiro_setting app.disableAutoupdates true; then
-    kiro_cli_pin_enforced=0
+    if [ "$kiro_cli_pin_asserted_at_install" -eq 1 ]; then
+      # This boot's install already persisted the setting against the real HOME
+      # (install_kiro_cli gates promotion on it), so a failure here is a flake in
+      # a redundant re-assertion, not an unenforced pin. Warn instead of
+      # withholding readiness, which would leave a correctly pinned container
+      # answering 503 for its lifetime and fail the CI image-smoke job.
+      printf 'level=warn msg="kiro-cli auto-update re-assertion failed but this boot already enforced it before promotion; readiness retained" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
+    else
+      kiro_cli_pin_enforced=0
+    fi
   fi
   # Enable kiro-cli's OSC 9 desktop-notification escape so web-terminal-kiro's tab
   # activity monitor can classify turn-end ("Response complete") and
@@ -879,4 +952,8 @@ fi
 # existence so a failed mkdir does not emit a second, redundant warning.
 [ ! -d "$theme_dir" ] || harden_config_dir "$theme_dir"
 
+# Hand the image's PATH back so the server and its PTY sessions keep the engine-managed
+# /config/tools/bin first, as the Dockerfile ENV and the toolbelt engine expect.
+PATH="$SESSION_PATH"
+export PATH
 exec /app/web-terminal-kiro

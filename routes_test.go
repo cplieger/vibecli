@@ -757,6 +757,16 @@ func mustRegisterRoutes(t *testing.T, deps *routeDeps) (*http.ServeMux, *termina
 	return mux, mgr, csp
 }
 
+// quietTeardown clears readiness before the registered mgr.Shutdown kills the
+// session's child: the factory's fast-death hook keys on readiness, so this
+// keeps a teardown kill from emitting a stray broken-install Warn into a
+// later test's log capture. Every test that leaves a live session running
+// must call it.
+func quietTeardown(t *testing.T, deps *routeDeps) {
+	t.Helper()
+	t.Cleanup(func() { deps.ready.Set(false) })
+}
+
 // newToolsDeps builds routeDeps with a real toolbelt engine on temp dirs
 // (no catalog: search degrades, installs would fail — irrelevant here,
 // these tests exercise the HTTP boundary, not installs).
@@ -852,6 +862,26 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("ipv6 loopback peer: status = %d, want 200", rec.Code)
+	}
+
+	// The DOCUMENTED consumer shape: kiro-cli's ! escape running
+	// `curl localhost:9848/api/tools` inside the container sends the NAME
+	// localhost, not an IP literal, so loopbackHost's canonical-name arm --
+	// not its net.ParseIP arm -- is what admits it. Every other served case
+	// above uses an IP literal, so deleting that arm keeps the whole suite
+	// green while the tools API becomes unreachable from the only client it
+	// exists for. Case folding is part of the same arm's contract
+	// (webhttp.CanonicalHost lowercases), and a bare Host with no port must
+	// pass too.
+	for _, host := range []string{"localhost:9848", "localhost", "LocalHost:9848"} {
+		req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
+		req.RemoteAddr = "127.0.0.1:55555"
+		req.Host = host
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("loopback peer with Host %q: status = %d, want 200 (body %s); the in-container consumer calls localhost by name", host, rec.Code, rec.Body.String())
+		}
 	}
 
 	// A loopback SOCKET PEER whose Host names something else is the

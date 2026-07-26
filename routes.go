@@ -149,23 +149,19 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// The returned factory builds one kiro-cli chat session per tab: an independent
-	// PTY-backed process (deps.cmd = kiro-cli chat) with its own VT screen and
-	// scrollback, so opening a tab launches a fresh instance. Scrollback 5000 covers a /chat
-	// transcript restore on reconnect (matches the client store's retained-line
-	// cap). WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
-	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive the
-	// classifier) even though no browser tab claims focus (design 7.2);
-	// web-terminal-server deliberately does NOT use this, since a generic
-	// shell/editor wants real focus reporting.
+	// Scrollback 5000 covers a /chat transcript restore on reconnect (matches
+	// the client store's retained-line cap). WithKeepUnfocused pins the process
+	// to the DEC 1004 "unfocused" state so kiro-cli keeps emitting its
+	// focus-gated OSC 9 notifications (which drive the classifier) even though no
+	// browser tab claims focus; web-terminal-server deliberately does NOT use
+	// this, since a generic shell/editor wants real focus reporting.
 	//
-	// No TERM_PROGRAM override here: the engine now advertises TERM_PROGRAM=
+	// No TERM_PROGRAM override here: the engine advertises TERM_PROGRAM=
 	// iTerm.app (>= 3.6.6), which puts kiro-cli in its OSC 9;4 progress allowlist
-	// (driving the tab's "working" dot) and enables DEC 2026 synchronized output.
-	// That is the same identity web-terminal-server gets, so web-terminal-kiro inherits it
-	// from the engine rather than pinning its own (it formerly set WezTerm; both
-	// unlock kiro-cli, and iTerm.app additionally covers other agents like Claude
-	// Code). Anything the engine can't render (inline images) is consumed silently.
+	// (driving the tab's "working" dot) and enables DEC 2026 synchronized output
+	// -- the same identity web-terminal-server gets, so this app inherits it
+	// instead of pinning its own. Anything the engine can't render (inline
+	// images) is consumed silently.
 	return func(id string) *terminal.Handler {
 		start := time.Now()
 		// The session id doubles as the /ws attach + resume capability token,

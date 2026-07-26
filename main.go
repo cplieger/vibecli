@@ -581,12 +581,10 @@ func apiNoStore(next http.Handler) http.Handler {
 //     web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
-//   - apiNoStore — Cache-Control: no-store on the /api/ surface. GET
-//     /api/sessions returns live session ids, which are the /ws attach/resume
-//     capability tokens the logging layer above deliberately keeps out of logs;
-//     without this the same token is written to the browser's on-disk HTTP
-//     cache and is heuristically cacheable by an intermediary proxy. Scoped to
-//     the /api/ prefix so the static surface keeps kiroCacheControl's policy.
+//   - apiNoStore — Cache-Control: no-store on the /api/ surface (see
+//     apiNoStore for the capability-token rationale). Scoped to the /api/
+//     prefix so the static surface keeps kiroCacheControl's policy, and placed
+//     outside the host/origin gates so even a rejected request is uncacheable.
 //   - hostPolicy.Middleware — the KWEB_ALLOWED_HOSTS exact-host check
 //     (webhttp.HostPolicy; see parseAllowedHosts for the DNS-rebinding
 //     rationale). Placed before CrossOriginProtection because rebinding makes

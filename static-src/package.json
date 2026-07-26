@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "@cplieger/web-terminal-engine": "3.2.0",
-    "@cplieger/web-terminal-ui": "4.8.0"
+    "@cplieger/web-terminal-ui": "4.8.1"
   },
   "overrides": {
     "qs": "^6.15.2"

@@ -20,7 +20,8 @@ TOOLS="/config/tools"
 BIN="$TOOLS/bin/kiro-cli"
 
 # Parse the version kiro-cli reports (last field of `--version`). Centralized
-# so the three call sites (install verify, drift check, readiness marker)
+# so the four call sites (bare-name resolution check, drift check, install
+# verify, readiness marker)
 # share one parse if kiro-cli ever reworks its --version output.
 kiro_cli_version() {
   local out rc
@@ -240,13 +241,10 @@ prune_superseded_kas_runtimes() {
     # observed today (the <version>-<hash> tree and its .lock sibling) match, so
     # this is a no-op against the current CLI; log the skip so a layout change is
     # visible instead of silent.
-    case "$name" in
-      [0-9]*.[0-9]*) ;;
-      *)
-        printf 'level=info msg="leaving unrecognized (non version-keyed) entry in the kiro-cli agent runtime store" entry="%s" component=entrypoint\n' "$name" >&2
-        continue
-        ;;
-    esac
+    if [[ ! "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+      printf 'level=info msg="leaving unrecognized (non version-keyed) entry in the kiro-cli agent runtime store" entry="%s" component=entrypoint\n' "$name" >&2
+      continue
+    fi
     if rm -rf "$entry"; then
       printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" pin=%s component=entrypoint\n' "$name" "$KIRO_CLI_VERSION" >&2
     else
@@ -494,13 +492,12 @@ install_kiro_cli() (
   # same doomed transfer. Stall detection expresses the condition we actually care
   # about: abort only when throughput stays under --speed-limit for --speed-time
   # consecutive seconds. --max-time is an absolute backstop only (3600s => a
-  # ~150 KB/s floor, ~1.2 Mbit/s), and
-  # --retry-max-time caps the retry envelope, but only by barring the START of a new
-  # attempt: one begun just under 5400s still runs to its own --max-time, so the
-  # download leg's true ceiling is ~9000s rather than 5400s (see the Dockerfile
-  # HEALTHCHECK comment, kept in lockstep). NOTE the HEALTHCHECK --start-period (20m)
-  # no longer
-  # covers the worst-case window; that degrades safely because an unhealthy state
+  # ~150 KB/s floor, ~1.2 Mbit/s), and --retry-max-time caps the retry envelope,
+  # but only by barring the START of a new attempt: one begun just under 5400s
+  # still runs to its own --max-time, so the download leg's true ceiling is
+  # ~9000s rather than 5400s (see the Dockerfile HEALTHCHECK comment, kept in
+  # lockstep). NOTE the HEALTHCHECK --start-period (20m) no longer covers the
+  # worst-case window; that degrades safely because an unhealthy state
   # never restarts this container (restart policy acts on process exit), so a very
   # slow first boot shows unhealthy and then converges once the marker is written.
   if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \

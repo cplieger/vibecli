@@ -151,10 +151,10 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // focusVisible asks the UA to paint the ring for this SCRIPT-initiated focus:
   // the family convention is :focus-visible only (web-terminal-ui's
   // 10-primitives.css `button:focus-visible` rule) and script focus does not
-  // match it after a pointer
-  // load, so the dialog's only control would otherwise be focused with no
-  // visible indicator. Engines that ignore the option (Samsung Internet,
-  // Chrome < 145, Safari < 18.4) are covered by index.html's plain :focus rule
+  // match it after a pointer load, so the dialog's only control would otherwise
+  // be focused with no visible indicator. Engines that ignore the option
+  // (Samsung Internet, Chrome < 145, Safari < 18.4) are covered by
+  // index.html's plain :focus rule
   // for this dialog's button, which is scoped to the fatal overlay so it never
   // leaks onto terminal chrome.
   // Stryker disable next-line ObjectLiteral,BooleanLiteral: same unobservable UA

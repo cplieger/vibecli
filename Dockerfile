@@ -4,10 +4,10 @@
 FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-# The pinned GO_VERSION tarball below defaults GOTOOLCHAIN to `local`, so a go.mod that
-# requires a newer patch than the pin would fail the build instead of fetching the
-# toolchain it asks for (a downloaded toolchain is checksum-database verified, so the
-# tarball sha gate keeps its meaning).
+# Official Go tarballs currently set GOTOOLCHAIN=auto in $GOROOT/go.env; keep it
+# explicit here so the builder's policy does not depend on that packaged default. A
+# downloaded toolchain is checksum-database verified, so the tarball sha gate keeps
+# its meaning when go.mod requires a newer toolchain.
 ENV GOTOOLCHAIN=auto
 
 # hadolint ignore=DL3008

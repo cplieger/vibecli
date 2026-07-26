@@ -15,6 +15,7 @@ import (
 
 	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/toolbelt/v2"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 	"github.com/cplieger/webhttp"
 )
 
@@ -805,5 +806,70 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	}
 	if got := records.CountLevel(slog.LevelWarn, "boot reconcile wait failed"); got != 1 {
 		t.Errorf("log = %q, want exactly one wait-failed Warn (got %d)", records.Messages(), got)
+	}
+}
+
+// TestIsWebSocketUpgrade_requiresBothListTokens pins the access-log stream
+// predicate against the engine's own websocket.Accept parsing: both header
+// tokens are required, each may arrive in a repeated field line or a comma
+// list, matching is case- and whitespace-insensitive, and a token SUBSTRING
+// must not match. A divergence here is silent both ways — a one-sided
+// malformed handshake vanishes from the access log, or a repeated-field real
+// upgrade produces a bogus hours-long 200 access record.
+func TestIsWebSocketUpgrade_requiresBothListTokens(t *testing.T) {
+	cases := []struct {
+		name       string
+		upgrade    []string
+		connection []string
+		want       bool
+	}{
+		{name: "tokens in repeated fields are accepted case-insensitively", upgrade: []string{"h2c", " WebSocket "}, connection: []string{"keep-alive", "UPGRADE"}, want: true},
+		{name: "tokens in comma lists are accepted", upgrade: []string{"h2c, websocket"}, connection: []string{"keep-alive, upgrade"}, want: true},
+		{name: "Upgrade token alone is not a websocket handshake", upgrade: []string{"websocket"}, want: false},
+		{name: "Connection token alone is not a websocket handshake", connection: []string{"upgrade"}, want: false},
+		{name: "token substrings are rejected", upgrade: []string{"websocket-v2"}, connection: []string{"upgrader"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, terminal.WSPath, http.NoBody)
+			for _, value := range tc.upgrade {
+				req.Header.Add("Upgrade", value)
+			}
+			for _, value := range tc.connection {
+				req.Header.Add("Connection", value)
+			}
+			if got := isWebSocketUpgrade(req); got != tc.want {
+				t.Errorf("isWebSocketUpgrade(Upgrade=%q, Connection=%q) = %v, want %v", tc.upgrade, tc.connection, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHealthEndpoint_unreadableMarkerWarnsOnce pins handleHealth's
+// non-ErrNotExist marker branch and its warn-once bound: an unreadable
+// readiness marker (an unmounted or read-only /config, an I/O error) is
+// otherwise indistinguishable from the expected first-boot absent marker,
+// and an unbounded diagnostic would repeat every 30s for the life of the
+// fault. A self-referential symlink yields ELOOP deterministically, even as
+// root. Serial: capture.Default mutates the process-global default logger.
+func TestHealthEndpoint_unreadableMarkerWarnsOnce(t *testing.T) {
+	records := capture.Default(t)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "loop")
+	if err := os.Symlink("loop", marker); err != nil {
+		t.Fatalf("create self-referential marker symlink: %v", err)
+	}
+	deps := newTestDeps(true)
+	deps.kiroReadyMarker = marker
+	handler := handleHealth(deps)
+	for range 2 {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("unreadable marker status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+	}
+	if got := records.CountLevel(slog.LevelWarn, "readiness marker unreadable"); got != 1 {
+		t.Errorf("unreadable-marker Warn count = %d, want 1 for repeated probes", got)
 	}
 }

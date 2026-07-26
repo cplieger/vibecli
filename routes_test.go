@@ -1087,3 +1087,23 @@ func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
 		t.Fatal("registerRoutes returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
 	}
 }
+
+// TestComposeGate_syncingResponseIncludesRetryAfter pins the syncing 503's
+// Retry-After hint, which TestSessionCreateGate_ToolsSyncing's status and
+// body assertions leave unguarded: without the header a client, a proxy, and
+// the UI's retry logic poll blind through a tools-convergence window whose
+// only bound is toolbelt's 30-minute job timeout.
+func TestComposeGate_syncingResponseIncludesRetryAfter(t *testing.T) {
+	identity := func(next http.Handler) http.Handler { return next }
+	gated := composeGate(identity, func() bool { return true })(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("inner handler called while tools are syncing")
+	}))
+	rec := httptest.NewRecorder()
+	gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("syncing response status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("syncing response Retry-After = %q, want %q", got, "5")
+	}
+}

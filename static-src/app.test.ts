@@ -305,10 +305,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).toHaveBeenCalledWith(root, {
       features: ["preset-features"],
       theme: THEME,
-      // Observer only: the catch block reads the flag it sets to tell a kernel
-      // failure (kernel renders its own surface) from a preset failure (app
-      // still owns the surface).
-      onFatalError: expect.any(Function) as unknown as () => void,
     });
   });
 
@@ -325,7 +321,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
       features: ["preset-features"],
       theme: THEME,
       loading,
-      onFatalError: expect.any(Function) as unknown as () => void,
     });
   });
 
@@ -417,15 +412,14 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("leaves the kernel's own recovery surface alone and rethrows when createTerminal throws", async () => {
     const root = appendTerminalRoot();
     const loading = appendPristineOverlay({ fade: true });
-    // Emulate web-terminal-ui >= 4.7.0's kernel-init path: report through
-    // onFatalError (the kernel has rendered its own surface into #terminal and
-    // lowered #loading by this point), then rethrow.
-    createTerminalMock.mockImplementationOnce(
-      (_root: HTMLElement, opts: { onFatalError?: (f: unknown) => unknown }) => {
-        opts.onFatalError?.({ phase: "kernel-init", cause: new Error("kernel boom") });
-        throw new Error("kernel boom");
-      },
-    );
+    // Emulate web-terminal-ui >= 4.7.0's kernel-init path: by the time it
+    // rethrows, the kernel has rendered its own surface into #terminal and
+    // lowered #loading. createTerminal is called OUTSIDE the app's only
+    // try/catch (which wraps the preset call alone), so the throw propagates
+    // untouched and the app builds nothing.
+    createTerminalMock.mockImplementationOnce(() => {
+      throw new Error("kernel boom");
+    });
 
     await expect(import("./app.js")).rejects.toThrow("kernel boom");
 
@@ -451,10 +445,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     await expect(import("./app.js")).rejects.toBe(failure);
 
-    // The preset is evaluated as an ARGUMENT, so it throws before the kernel is
-    // entered: nothing captured #loading and nothing will ever lower it, so the
-    // app still owns the recovery surface here. No clone is needed either,
-    // because no kernel continuation exists to fade the dialog out from under us.
+    // The preset is evaluated in its own statement, inside the app's only
+    // try/catch, so it throws before createTerminal is entered: nothing captured
+    // #loading and nothing will ever lower it, so the app still owns the
+    // recovery surface here. No clone is needed either, because no kernel
+    // continuation exists to fade the dialog out from under us.
     expect(createTerminalMock).not.toHaveBeenCalled();
     const dialog = document.getElementById("loading");
     expect(dialog).toBe(loading);
@@ -469,36 +464,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(dialog?.querySelector("#bootstrap-failure-message")?.textContent).toContain(
       "Failed to start the terminal",
     );
-  });
-
-  it("still surfaces a dialog if the kernel throws WITHOUT reporting through onFatalError", async () => {
-    // The fallback arm of the catch's discriminator. With the pinned
-    // web-terminal-ui (>= 4.7.0) this state is unreachable in practice -- the
-    // kernel's own catch always delivers onFatalError before rethrowing, inside
-    // its own try, and this app's handler cannot throw -- so this pins the
-    // behaviour for a kernel that regresses or a downgraded pin, where the
-    // alternative would be a silently stuck loading overlay with no explanation.
-    //
-    // This replaces the old detached-clone test. That workaround existed because
-    // createTerminal queues async continuations (setupFeatures().then, the font
-    // settle, connState's onGiveUp) BEFORE the last synchronous statements it can
-    // throw from, and any of them could reach dismissLoadingOverlay and delete
-    // the app's own dialog ~1.5s later. It is retired because the two surviving
-    // app-owned paths cannot hit that race: a preset throw queues no
-    // continuations, and a reported kernel throw leaves the dialog to the kernel.
-    const root = appendTerminalRoot();
-    const loading = appendPristineOverlay();
-    createTerminalMock.mockImplementationOnce(() => {
-      throw new Error("unreported kernel boom");
-    });
-
-    await expect(import("./app.js")).rejects.toThrow("unreported kernel boom");
-
-    const dialog = document.getElementById("loading");
-    expect(dialog).toBe(loading);
-    expect(dialog?.isConnected).toBe(true);
-    expectFatalOverlayShape(dialog as HTMLElement);
-    expect(root.hasAttribute("inert")).toBe(true);
   });
 
   it("rethrows the original error without touching the DOM when createTerminal throws and #loading is absent", async () => {

@@ -241,7 +241,9 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 // the default Info level while a failing probe still emits at Warn/Error.
 // The token-bearing /api/sessions/ subtree must emit lines whose recorded
 // path is the token-free route template (WithPathFunc — a raw session id
-// must never appear), and normal requests still log their real path. A regression
+// must never appear) for the route shapes the server actually serves, and the
+// fail-closed placeholder for a malformed subtree path, while normal requests
+// still log their real path. A regression
 // dropping the stream skips would flood the access log with one misleading line
 // per reconnect; a regression widening them back to the whole /ws path would
 // re-hide the unlogged 426; a regression dropping WithPathFunc would leak live
@@ -261,7 +263,9 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	mux.HandleFunc("/probe", ok)
 
 	h := buildHandler(mux, nil, "default-src 'self'", nil)
-	for _, path := range []string{"/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe"} {
+	// The last entry is a MALFORMED subtree path (no such route): it must not be
+	// reported as the legitimate {id}/title route, and its token must not leak.
+	for _, path := range []string{"/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe", "/api/sessions/live-token-9012/extra/title"} {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, http.NoBody))
 	}
 	// A REAL upgrade attempt is the stream shape, so it stays skipped.
@@ -281,10 +285,20 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	if strings.Contains(log, "path=/api/health") {
 		t.Errorf("access log = %q, want no healthy-probe line at the default level (ProbeLogLevel maps 2xx to Debug)", log)
 	}
-	for _, token := range []string{"live-token-1234", "live-token-5678"} {
+	for _, token := range []string{"live-token-1234", "live-token-5678", "live-token-9012"} {
 		if strings.Contains(log, token) {
 			t.Errorf("access log = %q, must never carry the raw session token %q (WithPathFunc must rewrite the subtree's recorded path)", log, token)
 		}
+	}
+	// A malformed subtree path matches no served route, so redactSessionPath
+	// returns "" and webhttp records its fail-closed placeholder. Suffix-only
+	// matching would instead have reported it as a real title call, hiding route
+	// probing and pointing an operator at the wrong handler.
+	if !strings.Contains(log, "path=(path-redaction-failed)") {
+		t.Errorf("access log = %q, want the fail-closed placeholder for a malformed subtree path (only served route shapes may map to a template)", log)
+	}
+	if n := strings.Count(log, "path=/api/sessions/{id}/title"); n != 1 {
+		t.Errorf("access log = %q, got %d title-template lines, want exactly 1 (the malformed /extra/title path must not be classified as the title route)", log, n)
 	}
 	if !strings.Contains(log, "path=/api/sessions/{id}/title") {
 		t.Errorf("access log = %q, want a template-path access line for the title route (the subtree's telemetry is kept, redacted)", log)

@@ -223,6 +223,30 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	}
 }
 
+// kiroMarkerUnavailable reports whether the env-gated kiro-cli readiness marker
+// says kiro-cli is unusable, and is the marker half of /api/health's readiness
+// decision, extracted so handleHealth reads as top-down orchestration. An empty
+// marker (bare `go run`/tests outside the container) means "gate disabled" and
+// is never unavailable. A stat that fails for any reason OTHER than "not created
+// yet" is reported through statErrOnce, the caller-owned latch that bounds the
+// diagnostic to one line per handler instance.
+func kiroMarkerUnavailable(marker string, statErrOnce *sync.Once) bool {
+	if marker == "" {
+		return false
+	}
+	if _, err := os.Stat(marker); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			statErrOnce.Do(func() {
+				slog.Warn("kiro-cli readiness marker unreadable (not merely absent); reporting unready",
+					"marker", marker, "error", err,
+					"hint", "check that the /config volume is mounted and writable; the entrypoint writes this marker after verifying kiro-cli")
+			})
+		}
+		return true
+	}
+	return false
+}
+
 // handleHealth returns the /api/health readiness handler. It reflects, in
 // order: listener readiness (deps.ready), the env-gated kiro-cli readiness
 // marker (deps.kiroReadyMarker; see the entrypoint), and the INFORMATIONAL
@@ -263,18 +287,9 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// `restart: unless-stopped` nothing restarts on the resulting unhealthy
 		// state, so there is no restart loop; if ever run under Swarm/k8s, wire
 		// this to a readinessProbe, not a livenessProbe.
-		if deps.kiroReadyMarker != "" {
-			if _, err := os.Stat(deps.kiroReadyMarker); err != nil {
-				if !errors.Is(err, fs.ErrNotExist) {
-					kiroMarkerStatErrOnce.Do(func() {
-						slog.Warn("kiro-cli readiness marker unreadable (not merely absent); reporting unready",
-							"marker", deps.kiroReadyMarker, "error", err,
-							"hint", "check that the /config volume is mounted and writable; the entrypoint writes this marker after verifying kiro-cli")
-					})
-				}
-				unready("kiro-cli unavailable")
-				return
-			}
+		if kiroMarkerUnavailable(deps.kiroReadyMarker, &kiroMarkerStatErrOnce) {
+			unready("kiro-cli unavailable")
+			return
 		}
 		// The tools field is INFORMATIONAL: tool convergence never gates
 		// readiness (kiro-cli is the only core dependency), so monitoring

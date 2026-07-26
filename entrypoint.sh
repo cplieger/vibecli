@@ -48,20 +48,76 @@ fatal() {
   exit 1
 }
 
-# Tighten one /config-resident directory to the conventional 0700. mkdir -p
+# Enforce the conventional 0700 on one /config-resident directory. mkdir -p
 # creates new dirs umask-wide (root umask 022 -> 0755) and leaves an existing
 # dir's mode alone; these dirs live on the /config host bind mount, where a
 # wider mode lets other host users traverse them and read secret-adjacent
 # material (~/.ssh keys and known_hosts, ~/.kiro/settings/mcp.json tokens,
-# ~/.local install state, $HOME's .gitconfig/.netrc/credential stores). A
-# symlink is refused rather than followed (its target may be outside the
-# mount). The directory travels in a dir= field, matching how the rest of this
-# file reports variable data (marker=, path=, token=).
+# ~/.local install state, $HOME's .gitconfig/.netrc/credential stores). Because
+# these are credential-bearing directories rather than cosmetic hygiene, the
+# POSTCONDITION is enforced, not merely attempted: a symlink (whose target may
+# be outside the mount) is fatal, and boot fails unless the final mode has every
+# group/other bit clear. A chmod that fails on a mount with foreign permission
+# semantics is survivable ONLY when stat then proves the mode is already private.
+# The directory travels in a dir= field, matching how the rest of this file
+# reports variable data (marker=, path=, token=).
 harden_config_dir() {
-  if [ -L "$1" ]; then
-    printf 'level=warn msg="refusing to chmod symlinked config directory" dir="%s" component=entrypoint\n' "$1" >&2
-  elif ! chmod 700 "$1"; then
-    printf 'level=warn msg="failed to tighten config directory permissions" dir="%s" component=entrypoint\n' "$1" >&2
+  local dir=$1 mode
+  if [ -L "$dir" ]; then
+    fatal 'refusing to use a symlinked config directory; its target may be outside the /config mount' "dir=\"$dir\""
+  fi
+  if [ ! -d "$dir" ]; then
+    fatal 'config path is not a directory' "dir=\"$dir\""
+  fi
+  if ! chmod 700 "$dir"; then
+    printf 'level=warn msg="failed to tighten config directory permissions; verifying the existing mode instead" dir="%s" component=entrypoint\n' "$dir" >&2
+  fi
+  mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode=""
+  if [ -z "$mode" ]; then
+    fatal 'failed to read config directory mode; cannot prove it is private' "dir=\"$dir\""
+  fi
+  # 8#$mode: %a prints octal without a base prefix. 0077 = every group/other bit.
+}
+
+# --- persistent tool-tree integrity ---------------------------------------------
+# $TOOLS/bin leads PATH (see the Dockerfile's ENV PATH) and KIRO_CLI_PATH points
+# into it, so the tree HOLDING kiro-cli is part of the integrity story, not just
+# the download: needs_kiro_cli_install authenticates an already-present binary
+# only by asking it for `--version`, which a planted payload spoofs trivially. If
+# an inherited /config volume ever permitted group/other writes, another host
+# user could drop a version-spoofing executable there, skip the SHA-verified
+# reinstall, and be launched as root with access to credentials and /workspace.
+# So: refuse symlinks, strip group/other write bits, fail boot if they survive,
+# and remember that the tree WAS writable so the caller can quarantine whatever
+# kiro-cli* files it already held. Sets tools_tree_was_writable=1 in that case.
+tools_tree_was_writable=0
+secure_tools_dir() {
+  local dir=$1 mode
+  if [ -L "$dir" ]; then
+    fatal 'refusing to use a symlinked tools directory; its target may be outside the /config mount' "dir=\"$dir\""
+  fi
+  if [ ! -d "$dir" ]; then
+    fatal 'tools path is not a directory' "dir=\"$dir\""
+  fi
+  mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode=""
+  if [ -z "$mode" ]; then
+    fatal 'failed to read tools directory mode; cannot prove it is not group/other-writable' "dir=\"$dir\""
+  fi
+  # 0022 = the group and other write bits; 8#$mode because %a has no base prefix.
+  if [ $((8#$mode & 0022)) -eq 0 ]; then
+    return 0
+  fi
+  tools_tree_was_writable=1
+  printf 'level=warn msg="tools directory permits group/other writes; tightening it and treating any kiro-cli it already holds as untrusted" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
+  if ! chmod go-w "$dir"; then
+    printf 'level=warn msg="failed to strip group/other write bits from tools directory; verifying the resulting mode instead" dir="%s" component=entrypoint\n' "$dir" >&2
+  fi
+  mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode=""
+  if [ -z "$mode" ]; then
+    fatal 'failed to re-read tools directory mode after tightening' "dir=\"$dir\""
+  fi
+  if [ $((8#$mode & 0022)) -ne 0 ]; then
+    fatal 'tools directory holding the first-on-PATH kiro-cli remains group/other-writable; refusing to trust the persistent binary tree' "dir=\"$dir\" mode=$mode"
   fi
 }
 
@@ -109,15 +165,25 @@ sweep_legacy_dispatchers() {
   return 0
 }
 
-# 0 when bare-name `kiro-cli` resolves to the pinned binary, or resolves to nothing
-# at all (a fresh volume, or the window right after the pre-reinstall sweep removed
-# $BIN -- nothing to shadow). 1 ONLY when it resolves somewhere else, which is the
-# condition worth failing on.
+# 0 when bare-name `kiro-cli` resolves to the pinned binary AT the pinned version, or
+# resolves to nothing at all (a fresh volume, or the window right after the
+# pre-reinstall sweep removed $BIN -- nothing to shadow). 1 when it resolves somewhere
+# else, and equally when it resolves to $BIN but that binary is NOT the pinned version:
+# path identity alone is weaker than the property the callers rely on. If `rm -rf`
+# cannot remove a drifted canonical binary (immutable file, submount), `command -v`
+# still answers "$BIN" while a stale, no-longer-pinned CLI remains first on PATH and
+# launchable by sessions -- exactly the state the quarantine exists to prevent.
 resolves_to_pinned_kiro_cli() {
-  local resolved
+  local resolved resolved_version
   resolved=$(command -v kiro-cli 2>/dev/null) || return 0
   [ -n "$resolved" ] || return 0
-  [ "$resolved" = "$BIN" ] && return 0
+  if [ "$resolved" = "$BIN" ]; then
+    resolved_version=$(kiro_cli_version "$resolved")
+    [ "$resolved_version" = "$KIRO_CLI_VERSION" ] && return 0
+    printf 'level=warn msg="bare-name kiro-cli resolves to the pinned path but not the pinned version (unremovable stale binary?)" resolved="%s" installed=%s pinned=%s component=entrypoint\n' \
+      "$resolved" "${resolved_version:-unknown}" "$KIRO_CLI_VERSION" >&2
+    return 1
+  fi
   printf 'level=warn msg="bare-name kiro-cli resolves to an unpinned path ahead of the pinned binary" resolved="%s" pinned="%s" component=entrypoint\n' "$resolved" "$BIN" >&2
   return 1
 }
@@ -170,6 +236,19 @@ KIRO_CLI_SHA256="b144d4b1f8ca0083967fe13a5c35db18bd9543ecede6f1eec166f3b0a04f876
 # renovate: datasource=custom.kiro-cli-arm64 depName=kiro-cli-arm64
 KIRO_CLI_SHA256_ARM64="c6a090372664db8a103b5de1addcf6322a845be853d8e8f38aab9c28a6de6866" # kiro-cli 2.14.2
 
+# $HOME (/config/home) is the root of every credential-bearing tree hardened
+# below, and `mkdir -p "$HOME/.ssh"` would silently FOLLOW a symlinked $HOME to
+# a target outside the /config mount -- creating and populating the credential
+# dirs somewhere with no enforced mode. Check the boundary BEFORE any child path
+# is created: a real directory under /config, not a link.
+case "$HOME" in
+  /config/*) ;;
+  *) fatal 'HOME must resolve beneath the /config mount' "home=\"$HOME\"" ;;
+esac
+if [ -L "$HOME" ]; then
+  fatal 'refusing to use a symlinked HOME; its target may be outside the /config mount' "home=\"$HOME\""
+fi
+
 mkdir -p "$TOOLS/bin" "$HOME/.local/bin" "$HOME/.ssh" "$HOME/.kiro" \
   || fatal 'failed to create config directories (is /config mounted and writable?)'
 
@@ -190,6 +269,23 @@ harden_config_dir "$HOME/.ssh"
 harden_config_dir "$HOME/.kiro"
 harden_config_dir "$HOME/.local"
 harden_config_dir "$HOME"
+
+# Same argument one level out, for the tree that holds the first-on-PATH binary
+# rather than the credentials (see secure_tools_dir). /config is checked too: a
+# writable parent lets an attacker replace $TOOLS wholesale. Runs BEFORE any
+# sweep, version probe, or marker handling, so a spoofable binary on a
+# previously-permissive volume can never authenticate itself by --version.
+secure_tools_dir /config
+secure_tools_dir "$TOOLS"
+secure_tools_dir "$TOOLS/bin"
+if [ "$tools_tree_was_writable" -eq 1 ]; then
+  # The directories are private now, but anything already inside them was
+  # writable by another host user, so its --version answer proves nothing.
+  # Quarantine it: needs_kiro_cli_install then reinstalls from the pinned,
+  # SHA-verified archive instead of trusting what is on the volume.
+  printf 'level=warn msg="quarantining kiro-cli binaries from a previously group/other-writable tools tree; forcing a pinned SHA-verified reinstall" dir="%s" component=entrypoint\n' "$TOOLS/bin" >&2
+  sweep_legacy_dispatchers "$TOOLS/bin" || true
+fi
 
 # Best-effort: drop boot-time temp artifacts orphaned by a hard container kill
 # (a stage dir from install_kiro_cli, or a write probe removed as part of its
@@ -213,7 +309,7 @@ rm -rf "$TOOLS"/.kiro-cli-stage.* "$TOOLS"/.write-probe.* 2>/dev/null || true
 # integrity gate (the fatal treatment stays on the reinstall paths below).
 sweep_legacy_dispatchers "$HOME/.local/bin" || true
 if ! resolves_to_pinned_kiro_cli; then
-  printf 'level=warn msg="legacy kiro-cli residue survived the boot sweep; a shadowed unpinned binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+  printf 'level=warn msg="a kiro-cli other than the pinned binary at the pinned version is still reachable by bare name after the boot sweep; residue or a drifted binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
 fi
 
 # Readiness marker consumed by the Go server's /api/health (main.go reads
@@ -371,21 +467,33 @@ install_kiro_cli() (
   # bare-name resolution at a version the pin does not control. Failing here with
   # $BIN still ABSENT is the point: the caller's degraded path warns, the readiness
   # marker is withheld, and the next boot's drift check retries the install.
-  if [ ! -e "$stage/.local/bin/kiro-cli-chat" ]; then
-    printf 'level=error msg="install.sh produced no kiro-cli-chat sidecar dispatcher (upstream dispatcher set changed?); kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" component=entrypoint\n' \
-      "$stage/.local/bin/kiro-cli-chat" >&2
+  # PRESENCE is weaker than the invariant each dispatcher has to satisfy after
+  # promotion: it must still be a self-contained regular executable once the
+  # EXIT trap deletes $stage. A directory passes `mv` but cannot be executed,
+  # and a symlink into the staging tree becomes dangling the moment the trap
+  # fires -- in both cases $BIN is promoted, --version succeeds, and readiness
+  # is published over a terminal that cannot dispatch `chat`. So require the
+  # shape (regular file, not a symlink, executable) rather than mere existence.
+  local chat_sidecar="$stage/.local/bin/kiro-cli-chat" term_sidecar="$stage/.local/bin/kiro-cli-term"
+  if [ -L "$chat_sidecar" ] || [ ! -f "$chat_sidecar" ] || [ ! -x "$chat_sidecar" ]; then
+    printf 'level=error msg="install.sh produced no self-contained executable kiro-cli-chat sidecar dispatcher (upstream dispatcher set changed?); kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" component=entrypoint\n' \
+      "$chat_sidecar" >&2
     return 1
   fi
-  if ! mv -f "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat"; then
+  if ! mv -f "$chat_sidecar" "$TOOLS/bin/kiro-cli-chat"; then
     printf 'level=error msg="failed to promote the kiro-cli-chat sidecar dispatcher; kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" dest="%s" component=entrypoint\n' \
-      "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat" >&2
+      "$chat_sidecar" "$TOOLS/bin/kiro-cli-chat" >&2
     return 1
   fi
   # kiro-cli-term is optional (no session path launches it), so warn rather than
-  # fail -- but do not stay silent about it either.
-  if [ ! -e "$stage/.local/bin/kiro-cli-term" ]; then
+  # fail -- but do not stay silent about it either. Same shape check as the chat
+  # dispatcher above; an unusable one is skipped instead of promoted.
+  if [ ! -e "$term_sidecar" ]; then
     printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
-  elif ! mv -f "$stage/.local/bin/kiro-cli-term" "$TOOLS/bin/kiro-cli-term"; then
+  elif [ -L "$term_sidecar" ] || [ ! -f "$term_sidecar" ] || [ ! -x "$term_sidecar" ]; then
+    printf 'level=warn msg="install.sh produced an invalid optional kiro-cli-term sidecar dispatcher; skipping promotion" src="%s" sidecar="kiro-cli-term" component=entrypoint\n' \
+      "$term_sidecar" >&2
+  elif ! mv -f "$term_sidecar" "$TOOLS/bin/kiro-cli-term"; then
     printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
       "$TOOLS/bin/kiro-cli-term" >&2
   fi

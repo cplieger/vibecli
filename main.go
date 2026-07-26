@@ -1,8 +1,7 @@
-// Package main is web-terminal-kiro — a browser terminal wrapped around kiro-cli.
-// Each /ws connection exec's `kiro-cli chat` directly in a PTY. Server-side
-// state lives in the web-terminal-engine VT screen buffer (its vt package):
-// on reconnect, the current cell snapshot is replayed to the client. No
-// external multiplexer.
+// Package main serves Web Terminal for Kiro, a browser terminal around kiro-cli.
+// Each created session launches one `kiro-cli chat` process in a PTY; WebSocket
+// connections attach and reconnect to that session through web-terminal-engine.
+// Terminal state and scrollback remain in memory for the session lifetime.
 package main
 
 // Build inputs for `go:embed static`. The Dockerfile invokes the same
@@ -293,7 +292,17 @@ func main() {
 	// ordering rationale). webhttp.NewServer supplies the streaming-safe defaults
 	// (ReadHeaderTimeout 10s, IdleTimeout 120s, Read/WriteTimeout unset) that the
 	// hijacked /ws stream needs.
-	srv := webhttp.NewServer(buildHandler(mux, trustedProxies, cspPolicy, hostPolicy))
+	// WithErrorLog keeps net/http's OWN diagnostics (temporary accept failures,
+	// malformed requests) inside the slog stream this app documents as its only
+	// observability channel; a nil ErrorLog routes them through the legacy log
+	// package instead, with a different timestamp/level shape that Loki cannot
+	// query alongside the access log. Warn, not Error: net/http's principal
+	// accept-error path retries itself, so a transient listener hiccup should not
+	// page.
+	srv := webhttp.NewServer(
+		buildHandler(mux, trustedProxies, cspPolicy, hostPolicy),
+		webhttp.WithErrorLog(slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn)),
+	)
 	// BaseContext hands every request a context that the WithPreDrain hook below
 	// cancels on shutdown; see that hook's comment for why cancelling baseCtx
 	// (not srv.Shutdown) is what unblocks the always-open SSE stream.
@@ -612,40 +621,9 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// one open-to-close line per WebSocket/SSE would be misleading
 			// by shape, not merely noisy.
 			webhttp.ProbeLogLevel(healthPath),
-			// The session-id-bearing subtree — DELETE /api/sessions/{id},
-			// PUT /api/sessions/{id}/title, and PUT + DELETE
-			// /api/sessions/{id}/pinned-title (the engine's rename routes, which
-			// the vendored UI's tab rename calls) — embeds the FULL session id
-			// (the /ws attach/resume capability token that routes.go truncates to
-			// safeID before logging). Their access lines are KEPT, with the
-			// recorded path rewritten to the token-free route template via
-			// WithPathFunc, so operators keep
-			// method/status/duration/request_id/client_ip for title updates,
-			// renames, deletes, and rejected subtree requests without a live token
-			// ever reaching log-read consumers (webhttp records the
-			// "(path-redaction-failed)" placeholder — never the raw path —
-			// if this mapping breaks). Every template must name a route the
-			// server actually serves, or the line misreports which call was made.
-			// The exact-path create/list lines (POST/GET /api/sessions) miss the
-			// prefix and log unchanged; the SSE stream shares the prefix but
-			// carries no id, so it maps to itself (it is skip-listed above, so no
-			// line is emitted for it either way).
-			webhttp.WithPathFunc(func(r *http.Request) string {
-				p := r.URL.Path
-				if !strings.HasPrefix(p, terminal.SessionsSubtreePath) {
-					return p
-				}
-				switch {
-				case p == terminal.SessionEventsPath:
-					return p
-				case strings.HasSuffix(p, "/pinned-title"):
-					return terminal.SessionsSubtreePath + "{id}/pinned-title"
-				case strings.HasSuffix(p, "/title"):
-					return terminal.SessionsSubtreePath + "{id}/title"
-				default:
-					return terminal.SessionsSubtreePath + "{id}"
-				}
-			}),
+			// The session-id-bearing subtree logs its token-free route
+			// template instead of the raw path; see redactSessionPath.
+			webhttp.WithPathFunc(redactSessionPath),
 			webhttp.WithClientIP(trustedProxies...),
 		),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.Default())),
@@ -670,6 +648,54 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)
+}
+
+// redactSessionPath is the access log's recorded-path policy for the
+// session-id-bearing subtree — DELETE /api/sessions/{id}, PUT
+// /api/sessions/{id}/title, and PUT + DELETE /api/sessions/{id}/pinned-title
+// (the engine's rename routes, which the vendored UI's tab rename calls) —
+// each of which embeds the FULL session id (the /ws attach/resume capability
+// token that routes.go truncates to safeID before logging). Their access lines
+// are KEPT, with the recorded path rewritten to the token-free route template,
+// so operators keep method/status/duration/request_id/client_ip for title
+// updates, renames, deletes, and rejected subtree requests without a live token
+// ever reaching log-read consumers.
+//
+// Matching is EXACT-SHAPE, not suffix-based: only a single id segment, or an id
+// segment followed by exactly "title" or "pinned-title", maps to a template.
+// Every template must name a route the server actually serves, or the line
+// misreports which call was made — a suffix test would report a malformed
+// /api/sessions/{id}/extra/title as the legitimate title route and every other
+// malformed subtree path as the plain {id} route, hiding route probing from
+// access telemetry and pointing an operator diagnosing a 404 at the wrong
+// handler. Anything that is not one of the served shapes returns the empty
+// string, which webhttp records fail-closed as its
+// "(path-redaction-failed)" placeholder — never the raw path, so the token in
+// a malformed request is not leaked either.
+//
+// The exact-path create/list lines (POST/GET /api/sessions) miss the prefix and
+// log unchanged; the SSE stream shares the prefix but carries no id, so it maps
+// to itself (it is skip-listed in buildHandler, so no line is emitted for it
+// either way).
+func redactSessionPath(r *http.Request) string {
+	p := r.URL.Path
+	if !strings.HasPrefix(p, terminal.SessionsSubtreePath) {
+		return p
+	}
+	if p == terminal.SessionEventsPath {
+		return p
+	}
+	parts := strings.Split(strings.TrimPrefix(p, terminal.SessionsSubtreePath), "/")
+	switch {
+	case len(parts) == 1 && parts[0] != "":
+		return terminal.SessionsSubtreePath + "{id}"
+	case len(parts) == 2 && parts[0] != "" && parts[1] == "title":
+		return terminal.SessionsSubtreePath + "{id}/title"
+	case len(parts) == 2 && parts[0] != "" && parts[1] == "pinned-title":
+		return terminal.SessionsSubtreePath + "{id}/pinned-title"
+	default:
+		return ""
+	}
 }
 
 // isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal

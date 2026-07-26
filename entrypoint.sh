@@ -18,6 +18,20 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 TOOLS="/config/tools"
 BIN="$TOOLS/bin/kiro-cli"
+# `kiro-cli chat` -- the command every session runs -- is DISPATCHED to this sidecar,
+# so a missing, stale or unusable one breaks every terminal while `kiro-cli --version`
+# (the readiness probe) still answers correctly. It is part of the installed SET, not
+# an optional extra, which is why both the drift predicate and readiness check it.
+CHAT_SIDECAR="$TOOLS/bin/kiro-cli-chat"
+# Install-completion marker: holds the KIRO_CLI_VERSION whose FULL dispatcher set was
+# promoted. $BIN's own --version answer cannot distinguish a completed transaction
+# from a partial promotion that left the chat sidecar absent, non-executable or at an
+# older version, so the persisted-install predicate needs a fact that only a completed
+# install writes. install_kiro_cli publishes it atomically after the chat sidecar is
+# promoted and immediately BEFORE $BIN (the commit point); the pre-reinstall
+# quarantine removes it together with the binaries it describes. An inherited volume
+# from a pre-marker image therefore takes exactly one repair install.
+KIRO_CLI_INSTALL_MARKER="$TOOLS/.kiro-cli-installed"
 
 # Parse the version kiro-cli reports (last field of `--version`). Centralized
 # so the four call sites (bare-name resolution check, drift check, install
@@ -53,6 +67,29 @@ fatal() {
   printf 'level=error msg="%s" %scomponent=entrypoint\n' "$1" "${2:+$2 }" >&2
   sleep 10
   exit 1
+}
+
+# Create ONE level of a persistent directory and prove the created path is a real
+# directory rather than a symlink, BEFORE anything is written to or deleted beneath
+# it. `mkdir -p a/b/c` FOLLOWS a symlink at any component, so creating a deep path in
+# one call silently accepts a planted link and every later step then acts on the
+# link's TARGET: the $HOME/.local/bin legacy sweep would `rm -rf <target>/kiro-cli*`
+# and the ~/.kiro/settings theme write would replace a fixed-name file there. Checking
+# only the parent cannot constrain a symlink AT the child, which is why callers walk
+# the chain parent-to-child and validate each component before creating its child.
+# Mode enforcement stays with harden_config_dir / secure_tools_dir, which the callers
+# apply after this walk (they are the ones that must not run before the write probe).
+make_config_dir() {
+  local dir=$1
+  if [ -L "$dir" ]; then
+    fatal 'refusing to use a symlinked config path; its target may be outside the /config mount' "dir=\"$dir\""
+  fi
+  if ! mkdir -p "$dir"; then
+    fatal 'failed to create config directory (is /config mounted and writable?)' "dir=\"$dir\""
+  fi
+  if [ ! -d "$dir" ]; then
+    fatal 'config path is not a directory' "dir=\"$dir\""
+  fi
 }
 
 # Enforce the conventional 0700 on one /config-resident directory. mkdir -p
@@ -340,8 +377,21 @@ if [ -L "$HOME" ]; then
   fatal 'refusing to use a symlinked HOME; its target may be outside the /config mount' "home=\"$HOME\""
 fi
 
-mkdir -p "$TOOLS/bin" "$HOME/.local/bin" "$HOME/.ssh" "$HOME/.kiro" \
-  || fatal 'failed to create config directories (is /config mounted and writable?)'
+# Create every persistent directory parent-to-child, proving each component is a real
+# directory before its child (or any file beneath it) is created. A single
+# `mkdir -p "$HOME/.local/bin" ...` would traverse a symlink planted at any component
+# on an inherited, once-permissive volume -- and $HOME/.local/bin in particular is
+# swept with `rm -rf "$dir"/kiro-cli*` a few lines below, as root, so a
+# `.local/bin -> /workspace/victim` link used to delete the link target's matching
+# files before any guard looked at that path. /config is included so a symlinked mount
+# root cannot redirect the whole tree; $HOME itself was proven above.
+make_config_dir /config
+make_config_dir "$TOOLS"
+make_config_dir "$TOOLS/bin"
+make_config_dir "$HOME/.local"
+make_config_dir "$HOME/.local/bin"
+make_config_dir "$HOME/.ssh"
+make_config_dir "$HOME/.kiro"
 
 # mkdir -p succeeds when the directories already exist — even on a read-only
 # bind mount — so it is NOT proof that /config is writable. Prove it with a
@@ -602,9 +652,9 @@ install_kiro_cli() (
       "$chat_sidecar" >&2
     return 1
   fi
-  if ! mv -f "$chat_sidecar" "$TOOLS/bin/kiro-cli-chat"; then
+  if ! mv -f "$chat_sidecar" "$CHAT_SIDECAR"; then
     printf 'level=error msg="failed to promote the kiro-cli-chat sidecar dispatcher; kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" dest="%s" component=entrypoint\n' \
-      "$chat_sidecar" "$TOOLS/bin/kiro-cli-chat" >&2
+      "$chat_sidecar" "$CHAT_SIDECAR" >&2
     return 1
   fi
   # kiro-cli-term is optional (no session path launches it), so warn rather than
@@ -619,6 +669,29 @@ install_kiro_cli() (
     printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
       "$TOOLS/bin/kiro-cli-term" >&2
   fi
+  # Record install COMPLETION before the commit point, atomically. The required
+  # dispatcher set is on disk now (chat sidecar promoted above; kiro-cli-term is
+  # optional by design), and $BIN is still absent, so the marker is written in the one
+  # window where "the full set for this pin is installed" is true and nothing has yet
+  # committed. A crash on either side leaves a state the next boot reinstalls from:
+  # marker absent => incomplete set, $BIN absent => nothing to authenticate. The
+  # rename is atomic on the same filesystem, so a later boot never reads a
+  # half-written version string. The stage-prefixed temp name is deliberate: it is
+  # already covered by the every-boot orphan sweep near the top of this file, so a
+  # SIGKILL between mktemp and mv leaves nothing permanent on /config.
+  local marker_tmp
+  if ! marker_tmp=$(mktemp "$TOOLS/.kiro-cli-stage.marker.XXXXXX"); then
+    printf 'level=error msg="failed to stage the kiro-cli install-completion marker; refusing to promote an install a later boot cannot verify" marker="%s" component=entrypoint\n' \
+      "$KIRO_CLI_INSTALL_MARKER" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$KIRO_CLI_VERSION" >"$marker_tmp" \
+    || ! mv -f "$marker_tmp" "$KIRO_CLI_INSTALL_MARKER"; then
+    rm -f "$marker_tmp"
+    printf 'level=error msg="failed to publish the kiro-cli install-completion marker; refusing to promote an install a later boot cannot verify" marker="%s" component=entrypoint\n' \
+      "$KIRO_CLI_INSTALL_MARKER" >&2
+    return 1
+  fi
   # Promote to the canonical /config/tools/bin/ location so PATH
   # ordering (which puts /config/tools/bin first) and any in-process
   # absolute-path references resolve to the freshly installed binary.
@@ -629,10 +702,39 @@ install_kiro_cli() (
   printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
 )
 
-# Reinstall when either the binary is missing or the on-disk version
-# drifts from KIRO_CLI_VERSION. The binary lives on the persistent
-# /config volume, so a freshly bumped image needs this drift check to
-# actually pick up the new version on restart.
+# 0 when the PERSISTED DISPATCHER SET is complete for the pinned version: the required
+# kiro-cli-chat sidecar is a self-contained regular executable (not a symlink, whose
+# staging-tree target would have died with the install's EXIT trap), and the
+# install-completion marker names exactly the pin. Both callers already hold $BIN's
+# --version answer, so version identity is deliberately NOT re-checked here: a second
+# probe would add another 10s to the foreground boot allowance the Dockerfile
+# HEALTHCHECK comment sums. The sidecar is checked by SHAPE rather than by asking it
+# for a version flag it need not support.
+kiro_cli_dispatcher_set_complete() {
+  local recorded
+  if [ -L "$CHAT_SIDECAR" ] || [ ! -f "$CHAT_SIDECAR" ] || [ ! -x "$CHAT_SIDECAR" ]; then
+    printf 'level=warn msg="required kiro-cli-chat sidecar dispatcher is missing or not a self-contained executable; kiro-cli chat cannot dispatch" path="%s" component=entrypoint\n' \
+      "$CHAT_SIDECAR" >&2
+    return 1
+  fi
+  recorded=$(cat "$KIRO_CLI_INSTALL_MARKER" 2>/dev/null) || recorded=""
+  if [ "$recorded" != "$KIRO_CLI_VERSION" ]; then
+    printf 'level=warn msg="kiro-cli install-completion marker absent or not at the pinned version; the persisted dispatcher set was never completed by this pin" marker="%s" recorded=%s pinned=%s component=entrypoint\n' \
+      "$KIRO_CLI_INSTALL_MARKER" "${recorded:-none}" "$KIRO_CLI_VERSION" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Reinstall when the binary is missing, the on-disk version drifts from
+# KIRO_CLI_VERSION, or the dispatcher SET the pin describes is incomplete. The
+# binaries live on the persistent /config volume, so a freshly bumped image needs
+# this drift check to actually pick up the new version on restart -- and an
+# inherited volume needs the set check, because a main dispatcher that answers
+# --version correctly is no evidence that `kiro-cli chat` can dispatch (a
+# pre-marker partial promotion, a deleted sidecar, or an interrupted install all
+# leave exactly that state, and the version-only predicate repaired none of them:
+# it returned 1 forever while every session exited at chat).
 needs_kiro_cli_install() {
   if [ ! -x "$BIN" ]; then
     return 0
@@ -642,6 +744,11 @@ needs_kiro_cli_install() {
   if [ "$current" != "$KIRO_CLI_VERSION" ]; then
     printf 'level=info msg="kiro-cli version drift; reinstalling" installed=%s pinned=%s component=entrypoint\n' \
       "${current:-unknown}" "$KIRO_CLI_VERSION" >&2
+    return 0
+  fi
+  if ! kiro_cli_dispatcher_set_complete; then
+    printf 'level=info msg="kiro-cli dispatcher set incomplete for the pinned version; reinstalling" pinned=%s component=entrypoint\n' \
+      "$KIRO_CLI_VERSION" >&2
     return 0
   fi
   return 1
@@ -681,6 +788,14 @@ if needs_kiro_cli_install; then
   # name added upstream must still be quarantined. "$BIN" is covered by the
   # first pattern.
   sweep_legacy_dispatchers "$TOOLS/bin" "$HOME/.local/bin" || true
+  # The install-completion marker describes the binaries just swept, so it goes with
+  # them: a marker that outlived its dispatcher set would let a later boot (and the
+  # readiness check below) treat a failed reinstall as a completed one. Cleared here,
+  # republished only by a transaction that promotes a full set -- same fail-closed
+  # ordering as the readiness marker at the top of this file.
+  if ! rm -f "$KIRO_CLI_INSTALL_MARKER"; then
+    fatal 'failed to clear the stale kiro-cli install-completion marker' "marker=\"$KIRO_CLI_INSTALL_MARKER\""
+  fi
   if ! resolves_to_pinned_kiro_cli; then
     fatal 'an unpinned kiro-cli is still reachable by bare name after the pre-reinstall sweep; refusing to install over a shadowed binary' "path=\"$BIN\""
   fi
@@ -799,6 +914,14 @@ if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
   # distinguishable from a missing binary or a genuine version mismatch.
   printf 'level=warn msg="kiro-cli not verified at pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" installed=%s pinned=%s component=entrypoint\n' \
     "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
+elif ! kiro_cli_dispatcher_set_complete; then
+  # $BIN is at the pin, but the dispatcher SET is not complete: `kiro-cli --version`
+  # succeeds while `kiro-cli chat` -- the command every session runs -- cannot
+  # dispatch. Readiness must describe the terminal, not the version probe, or health
+  # stays green over a container whose every session exits immediately. The helper
+  # already logged which half is missing (sidecar or completion marker).
+  printf 'level=warn msg="kiro-cli dispatcher set incomplete for the pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" version=%s component=entrypoint\n' \
+    "$KIRO_CLI_VERSION" >&2
 elif [ "$kiro_cli_pin_enforced" -ne 1 ]; then
   # Right version on disk, but auto-update could not be turned off: the binary
   # may replace itself mid-session and invalidate the pinned sha, so the version
@@ -935,19 +1058,28 @@ fi
 theme_dir="$HOME/.kiro/settings"
 theme_file="$theme_dir/kiro_cli_theme.json"
 theme_tmp=''
-if ! mkdir -p "$theme_dir" \
-  || ! theme_tmp=$(mktemp "${theme_file}.XXXXXX") \
-  || ! printf '{"baseTheme":"dark","diffPreset":"dark"}\n' >"$theme_tmp" \
-  || ! mv "$theme_tmp" "$theme_file"; then
-  [ -z "${theme_tmp:-}" ] || rm -f "$theme_tmp"
-  printf 'level=warn msg="failed to write kiro-cli theme file; diff colors may be unreadable" file="%s" component=entrypoint\n' "$theme_file" >&2
+# Validate and harden this directory BEFORE the first write, not after it: mkdir -p
+# FOLLOWS a symlink at settings/, and the mktemp + mv below then create and replace a
+# FIXED-NAME file through it. kiro-cli persists mcp.json (remote MCP server URLs and
+# tokens) in this same directory, so the hardening also matters on its own terms: the
+# mkdir creates the dir umask-wide (root umask 022 -> 0755) and only the 0700 ~/.kiro
+# parent is stopping traversal today. A symlink here is fatal (its target may be
+# outside the /config mount); a failed mkdir stays a warn, because the theme is
+# cosmetic -- unreadable diff colors, not a broken boot.
+if [ -L "$theme_dir" ]; then
+  fatal 'refusing to write kiro-cli settings through a symlinked settings directory; its target may be outside the /config mount' "dir=\"$theme_dir\""
 fi
-# kiro-cli persists mcp.json (remote MCP server URLs and tokens) in this same
-# directory, so tighten it on the same terms as the /config dirs hardened at the
-# top of this file: the mkdir -p above creates it umask-wide (root umask 022 ->
-# 0755), and only the 0700 ~/.kiro parent is stopping traversal today. Guarded on
-# existence so a failed mkdir does not emit a second, redundant warning.
-[ ! -d "$theme_dir" ] || harden_config_dir "$theme_dir"
+if ! mkdir -p "$theme_dir"; then
+  printf 'level=warn msg="failed to create kiro-cli settings directory; theme not written and diff colors may be unreadable" dir="%s" component=entrypoint\n' "$theme_dir" >&2
+else
+  harden_config_dir "$theme_dir"
+  if ! theme_tmp=$(mktemp "${theme_file}.XXXXXX") \
+    || ! printf '{"baseTheme":"dark","diffPreset":"dark"}\n' >"$theme_tmp" \
+    || ! mv "$theme_tmp" "$theme_file"; then
+    [ -z "${theme_tmp:-}" ] || rm -f "$theme_tmp"
+    printf 'level=warn msg="failed to write kiro-cli theme file; diff colors may be unreadable" file="%s" component=entrypoint\n' "$theme_file" >&2
+  fi
+fi
 
 # Hand the image's PATH back so the server and its PTY sessions keep the engine-managed
 # /config/tools/bin first, as the Dockerfile ENV and the toolbelt engine expect.

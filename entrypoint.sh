@@ -94,16 +94,19 @@ harden_config_dir() {
 # sites guard. With $BIN present nothing in $HOME/.local/bin can shadow it, which is
 # why the every-boot site stays warn-only.
 sweep_legacy_dispatchers() {
-  local dir rc=0
+  local dir
   for dir in "$@"; do
     # Never expand to /kiro-cli* on an unset/empty argument.
     [ -n "$dir" ] || continue
     if ! rm -rf "$dir/kiro-cli"*; then
-      rc=1
       printf 'level=warn msg="failed to remove legacy kiro-cli residue" dir="%s" component=entrypoint\n' "$dir" >&2
     fi
   done
-  return "$rc"
+  # Always 0, deliberately: per the block comment above, rm's status answers 'did the
+  # unlink succeed', never 'is an unpinned kiro-cli still reachable'. Callers gate on
+  # resolves_to_pinned_kiro_cli; returning a failure count here only invited them to read
+  # it as the safety verdict.
+  return 0
 }
 
 # 0 when bare-name `kiro-cli` resolves to the pinned binary, or resolves to nothing
@@ -170,21 +173,23 @@ KIRO_CLI_SHA256_ARM64="c6a090372664db8a103b5de1addcf6322a845be853d8e8f38aab9c28a
 mkdir -p "$TOOLS/bin" "$HOME/.local/bin" "$HOME/.ssh" "$HOME/.kiro" \
   || fatal 'failed to create config directories (is /config mounted and writable?)'
 
+# mkdir -p succeeds when the directories already exist — even on a read-only
+# bind mount — so it is NOT proof that /config is writable. Prove it with a
+# create+remove probe and fail fast (the documented behavior for an
+# unwritable persistent volume) instead of limping into an install that
+# cannot update the readiness marker. Runs BEFORE the chmod pass below: on a
+# read-only mount every chmod fails too, and four permission warnings ahead of
+# this fatal point the operator at the wrong cause.
+if ! probe=$(mktemp "$TOOLS/.write-probe.XXXXXX") || ! rm -f "$probe"; then
+  fatal '/config/tools is not writable (read-only bind mount?)'
+fi
+
 # Tighten the /config-resident dirs created above (see harden_config_dir for
 # why, and for the symlink guard).
 harden_config_dir "$HOME/.ssh"
 harden_config_dir "$HOME/.kiro"
 harden_config_dir "$HOME/.local"
 harden_config_dir "$HOME"
-
-# mkdir -p succeeds when the directories already exist — even on a read-only
-# bind mount — so it is NOT proof that /config is writable. Prove it with a
-# create+remove probe and fail fast (the documented behavior for an
-# unwritable persistent volume) instead of limping into an install that
-# cannot update the readiness marker.
-if ! probe=$(mktemp "$TOOLS/.write-probe.XXXXXX") || ! rm -f "$probe"; then
-  fatal '/config/tools is not writable (read-only bind mount?)'
-fi
 
 # Best-effort: drop boot-time temp artifacts orphaned by a hard container kill
 # (a stage dir from install_kiro_cli, or a write probe removed as part of its
@@ -357,6 +362,33 @@ install_kiro_cli() (
     return 1
   fi
 
+  # Sidecars BEFORE the canonical binary: $BIN is the commit point. kiro-cli
+  # dispatches `chat` to the kiro-cli-chat sidecar, so a missing one breaks every
+  # session while `kiro-cli --version` (the readiness check) still succeeds --
+  # health would report ready over a terminal that cannot start. The pre-reinstall
+  # quarantine already deleted $TOOLS/bin/kiro-cli*, so there is no older sidecar
+  # to fall back on, and any legacy copy under $HOME/.local/bin then wins
+  # bare-name resolution at a version the pin does not control. Failing here with
+  # $BIN still ABSENT is the point: the caller's degraded path warns, the readiness
+  # marker is withheld, and the next boot's drift check retries the install.
+  if [ ! -e "$stage/.local/bin/kiro-cli-chat" ]; then
+    printf 'level=error msg="install.sh produced no kiro-cli-chat sidecar dispatcher (upstream dispatcher set changed?); kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" component=entrypoint\n' \
+      "$stage/.local/bin/kiro-cli-chat" >&2
+    return 1
+  fi
+  if ! mv -f "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat"; then
+    printf 'level=error msg="failed to promote the kiro-cli-chat sidecar dispatcher; kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" dest="%s" component=entrypoint\n' \
+      "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat" >&2
+    return 1
+  fi
+  # kiro-cli-term is optional (no session path launches it), so warn rather than
+  # fail -- but do not stay silent about it either.
+  if [ ! -e "$stage/.local/bin/kiro-cli-term" ]; then
+    printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
+  elif ! mv -f "$stage/.local/bin/kiro-cli-term" "$TOOLS/bin/kiro-cli-term"; then
+    printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
+      "$TOOLS/bin/kiro-cli-term" >&2
+  fi
   # Promote to the canonical /config/tools/bin/ location so PATH
   # ordering (which puts /config/tools/bin first) and any in-process
   # absolute-path references resolve to the freshly installed binary.
@@ -364,8 +396,6 @@ install_kiro_cli() (
     printf 'level=error msg="failed to promote kiro-cli binary to tools bin" src="%s" dest="%s" component=entrypoint\n' "$staged" "$BIN" >&2
     return 1
   }
-  mv -f "$stage/.local/bin/kiro-cli-chat" "$TOOLS/bin/kiro-cli-chat" 2>/dev/null || true
-  mv -f "$stage/.local/bin/kiro-cli-term" "$TOOLS/bin/kiro-cli-term" 2>/dev/null || true
   printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
 )
 

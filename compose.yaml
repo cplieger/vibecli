@@ -7,7 +7,9 @@ services:
 
     ports:
       # No built-in auth: this is a root shell. See README "It is a remote shell";
-      # bind "127.0.0.1:9848:9848" when fronting it with a reverse proxy.
+      # bind "127.0.0.1:9848:9848" when fronting it with a reverse proxy. Loopback alone
+      # does not stop DNS rebinding via your own browser: also set KWEB_ALLOWED_HOSTS to
+      # the hostnames you reach it by (see the README config table).
       - "9848:9848"
 
     volumes:

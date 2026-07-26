@@ -155,7 +155,7 @@ func main() {
 	// level; warn AFTER Setup so the warning emits through the configured
 	// handler (the slogx contract). KWEB_LOG_LEVEL=debug surfaces the
 	// diagnostic lines that are invisible at the default info — e.g. the
-	// classifyStatus trace for a kiro-cli notification-wording drift.
+	// newStatusClassifier trace for a kiro-cli notification-wording drift.
 	logLevelRaw := envx.String("KWEB_LOG_LEVEL", "")
 	logLevel, logLevelOK := slogx.ParseLevel(logLevelRaw, slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: logLevel})
@@ -184,10 +184,17 @@ func main() {
 	// tests) so /api/health keeps pure-listener readiness there.
 	kiroReadyMarker := envx.String("KIRO_CLI_READY_MARKER", "")
 
-	if fi, err := os.Stat(workDir); err != nil || !fi.IsDir() {
-		slog.Error("work directory missing or not a directory",
-			"work_dir", workDir, "error", err,
+	fi, statErr := os.Stat(workDir)
+	switch {
+	case statErr != nil:
+		slog.Error("work directory missing",
+			"work_dir", workDir, "error", statErr,
 			"hint", "bind-mount a host directory to /workspace in compose.yaml")
+		os.Exit(1)
+	case !fi.IsDir():
+		slog.Error("work directory is not a directory",
+			"work_dir", workDir,
+			"hint", "the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml")
 		os.Exit(1)
 	}
 
@@ -428,6 +435,14 @@ func startTools(cfg baseTools) toolsRuntime {
 		warnIfNoLSPEnabled(eng)
 	default:
 		syncing.Store(true)
+		// Mark the gated window OPENING. Without this the only boot-convergence
+		// records are the terminal ones (converged / degraded), so an operator
+		// looking at 503 "tools installing" answers has no line saying the gate
+		// is closed, since when, or which job to correlate with toolbelt's own
+		// job-timeout/job-failed warnings.
+		slog.Info("tools: boot convergence started; session creation is gated until it finishes",
+			"job", job.ID,
+			"hint", "POST /api/sessions answers 503 \"tools installing\" (Retry-After 5) and /api/health reports tools=syncing until this converges")
 		go awaitBootConvergence(eng, job.ID, finish)
 	}
 	// Boot catalog fetch, explicitly AFTER the reconcile enqueue: the
@@ -578,7 +593,16 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 	return webhttp.Chain(mux,
 		webhttp.Logging(
 			webhttp.WithLogger(slog.Default()),
-			webhttp.WithSkipPaths(terminal.WSPath, terminal.SessionEventsPath),
+			// SSE stays blanket-skipped: a plain GET is indistinguishable from the
+			// stream itself, so there is no non-stream shape to keep. /ws HAS one —
+			// the upgrade headers — so only real upgrade attempts are skipped and a
+			// request that arrives WITHOUT them (the classic reverse-proxy
+			// misconfiguration: no `proxy_set_header Upgrade`) is logged with the
+			// 426 the engine's websocket.Accept writes.
+			webhttp.WithSkipPaths(terminal.SessionEventsPath),
+			webhttp.WithSkipFunc(func(r *http.Request) bool {
+				return r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r)
+			}),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
 			// at Debug (out of the shipped stream, visible under
@@ -588,26 +612,39 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// one open-to-close line per WebSocket/SSE would be misleading
 			// by shape, not merely noisy.
 			webhttp.ProbeLogLevel(healthPath),
-			// DELETE /api/sessions/{id} and PUT /api/sessions/{id}/title embed
-			// the FULL session id (the /ws attach/resume capability token that
-			// routes.go truncates to safeID before logging). Their access
-			// lines are KEPT, with the recorded path rewritten to the
-			// token-free route template via WithPathFunc, so operators keep
+			// The session-id-bearing subtree — DELETE /api/sessions/{id},
+			// PUT /api/sessions/{id}/title, and PUT + DELETE
+			// /api/sessions/{id}/pinned-title (the engine's rename routes, which
+			// the vendored UI's tab rename calls) — embeds the FULL session id
+			// (the /ws attach/resume capability token that routes.go truncates to
+			// safeID before logging). Their access lines are KEPT, with the
+			// recorded path rewritten to the token-free route template via
+			// WithPathFunc, so operators keep
 			// method/status/duration/request_id/client_ip for title updates,
-			// deletes, and rejected subtree requests without a live token
+			// renames, deletes, and rejected subtree requests without a live token
 			// ever reaching log-read consumers (webhttp records the
 			// "(path-redaction-failed)" placeholder — never the raw path —
-			// if this mapping breaks). The exact-path create/list lines
-			// (POST/GET /api/sessions) miss the prefix and log unchanged.
+			// if this mapping breaks). Every template must name a route the
+			// server actually serves, or the line misreports which call was made.
+			// The exact-path create/list lines (POST/GET /api/sessions) miss the
+			// prefix and log unchanged; the SSE stream shares the prefix but
+			// carries no id, so it maps to itself (it is skip-listed above, so no
+			// line is emitted for it either way).
 			webhttp.WithPathFunc(func(r *http.Request) string {
 				p := r.URL.Path
 				if !strings.HasPrefix(p, terminal.SessionsSubtreePath) {
 					return p
 				}
-				if strings.HasSuffix(p, "/title") {
+				switch {
+				case p == terminal.SessionEventsPath:
+					return p
+				case strings.HasSuffix(p, "/pinned-title"):
+					return terminal.SessionsSubtreePath + "{id}/pinned-title"
+				case strings.HasSuffix(p, "/title"):
 					return terminal.SessionsSubtreePath + "{id}/title"
+				default:
+					return terminal.SessionsSubtreePath + "{id}"
 				}
-				return terminal.SessionsSubtreePath + "{id}"
 			}),
 			webhttp.WithClientIP(trustedProxies...),
 		),
@@ -633,4 +670,25 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)
+}
+
+// isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal
+// (Upgrade: websocket plus the Upgrade connection option). It is the access
+// log's "this is a long-lived stream" test for /ws: a real upgrade is skipped
+// (one open-to-close line would report a bogus 200 with an hours-long
+// duration, since the handler hijacks the connection), while a request that
+// reaches /ws WITHOUT the upgrade headers is a short request whose refusal
+// deserves an access line — today it produces NO record anywhere, in either
+// the app or the engine, so a proxy that strips the upgrade headers presents
+// as a page that loads normally, a UI stuck reconnecting, and a silent log.
+func isWebSocketUpgrade(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for opt := range strings.SplitSeq(r.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(opt), "upgrade") {
+			return true
+		}
+	}
+	return false
 }

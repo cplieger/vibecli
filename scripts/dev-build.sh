@@ -165,12 +165,16 @@ FONT_SHA256="$(sed -n 's/^ARG NERDFONT_SHA256=\([^[:space:]#]*\).*/\1/p' Dockerf
 # corrupt face.
 FONT_CACHE="${HOME}/.cache/web-terminal-kiro-fonts/${FONT_VER}-${FONT_SHA256}"
 FONT_CACHE_MARKER="$FONT_CACHE/.complete"
-fonts=(
-  MonaspiceNeNerdFontMono-Regular.otf
-  MonaspiceNeNerdFontMono-Bold.otf
-  MonaspiceNeNerdFontMono-Italic.otf
-  MonaspiceNeNerdFontMono-BoldItalic.otf
-)
+# Same single-source-of-truth rule as the NERDFONT_* pins above: the face set is the
+# Dockerfile's tar member list. Hardcoding it here drifts SILENTLY (extracting the old
+# four faces still succeeds), so the dev binary would embed a different font set than the
+# image and only show it as tofu at runtime.
+mapfile -t fonts < <(sed -n \
+  's/^[[:space:]]*\(MonaspiceNeNerdFontMono-[A-Za-z]*\.otf\).*/\1/p' Dockerfile)
+[ "${#fonts[@]}" -gt 0 ] || {
+  printf 'error: failed to parse the Monaspace face list from Dockerfile\n' >&2
+  exit 1
+}
 mkdir -p "$FONT_CACHE" static/vendor/fonts
 need_fonts=0
 [ -f "$FONT_CACHE_MARKER" ] || need_fonts=1

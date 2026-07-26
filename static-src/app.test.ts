@@ -674,6 +674,28 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(true);
   });
 
+  it("watchdog sweep fires on a failed stylesheet whose media query matches", () => {
+    // The other half of the media gate. The non-matching (print) case below
+    // pins the stand-down, but nothing pinned that a MATCHING media query
+    // still reports: narrowing the gate to `!link.media` alone keeps every
+    // explicit screen/width-scoped stylesheet failure silent, which is the
+    // unstyled, unusable terminal the watchdog exists to surface.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    linkEl.media = "screen"; // no href: happy-dom must not attempt a real fetch
+    document.head.appendChild(linkEl);
+    onTestFinished(() => {
+      linkEl.remove(); // beforeEach only clears <body>
+    });
+
+    evaluateWatchdog(readWatchdogSource());
+
+    expectFatalOverlayShape(overlay);
+    expect(root.hasAttribute("inert")).toBe(true);
+  });
+
   it("watchdog sweep ignores a failed stylesheet whose media query does not match", () => {
     // A non-matching-media stylesheet (print-only here) never applies to the
     // current rendering, so a null .sheet is its normal state and its failure
@@ -761,6 +783,32 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const scriptEl = document.createElement("script");
     document.body.appendChild(scriptEl);
     scriptEl.dispatchEvent(new Event("error"));
+
+    expectPristineOverlayUntouched(overlay, root);
+  });
+
+  it("watchdog sweep ignores a stylesheet that loaded successfully", () => {
+    // The false-positive direction of the sweep, and the only guard between a
+    // healthy boot and a fatal dialog on EVERY page load: index.html's own
+    // <link rel="stylesheet" href="/style.css"> is present on every load, so
+    // dropping the `!link.sheet` clause converts a working terminal into
+    // "Terminal failed to start" for every user. happy-dom never loads a link
+    // it was given no resolvable href for, so .sheet is defined directly --
+    // the same surface a browser exposes once the stylesheet parses.
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+    const linkEl = document.createElement("link");
+    linkEl.rel = "stylesheet";
+    document.head.appendChild(linkEl);
+    onTestFinished(() => {
+      linkEl.remove(); // beforeEach only clears <body>
+    });
+    Object.defineProperty(linkEl, "sheet", {
+      value: new CSSStyleSheet(),
+      configurable: true,
+    });
+
+    evaluateWatchdog(readWatchdogSource());
 
     expectPristineOverlayUntouched(overlay, root);
   });

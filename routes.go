@@ -94,7 +94,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 
 	mgr := terminal.NewSessionManager(newSessionFactory(deps),
 		terminal.WithManagerLogger(slog.Default()),
-		terminal.WithStatusClassifier(classifyStatus),
+		terminal.WithStatusClassifier(newStatusClassifier()),
 	)
 
 	// The engine owns its route topology: MountAPI wires exactly its documented
@@ -125,8 +125,9 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// Tools REST surface: the toolbelt httpapi projection, loopback-only.
 	// The consumer is an agent inside the container (kiro-cli's ! shell
 	// escape + curl localhost:9848); remote callers — LAN browsers
-	// included — get 403. The gate checks the socket peer (RemoteAddr),
-	// never forwarded headers, so it cannot be spoofed through a proxy.
+	// included — get 403. The gate checks the socket peer (RemoteAddr) and
+	// the Host header, never forwarded headers, so it cannot be spoofed
+	// through a proxy nor reached by a DNS-rebound page.
 	// Config-file edits + restart remain the primary toggle path; this
 	// API is the no-restart alternative.
 	if deps.tools != nil {
@@ -222,6 +223,15 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	}
 }
 
+// kiroMarkerStatErrOnce bounds the readiness-marker stat diagnostic to one line
+// per process: /api/health is probed every 30s, so an unbounded Warn would
+// repeat forever while the fault lasts, but a marker stat that fails for any
+// reason OTHER than "not created yet" (an unmounted or read-only /config, an
+// I/O error) is an anomaly the operator cannot otherwise tell apart from the
+// expected first-boot/broken-install case, since both render as the same
+// "kiro-cli unavailable" body and the same Warn access line.
+var kiroMarkerStatErrOnce sync.Once
+
 // handleHealth returns the /api/health readiness handler. It reflects, in
 // order: listener readiness (deps.ready), the env-gated kiro-cli readiness
 // marker (deps.kiroReadyMarker; see the entrypoint), and the INFORMATIONAL
@@ -251,6 +261,13 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// this to a readinessProbe, not a livenessProbe.
 		if deps.kiroReadyMarker != "" {
 			if _, err := os.Stat(deps.kiroReadyMarker); err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					kiroMarkerStatErrOnce.Do(func() {
+						slog.Warn("kiro-cli readiness marker unreadable (not merely absent); reporting unready",
+							"marker", deps.kiroReadyMarker, "error", err,
+							"hint", "check that the /config volume is mounted and writable; the entrypoint writes this marker after verifying kiro-cli")
+					})
+				}
 				unready("kiro-cli unavailable")
 				return
 			}
@@ -267,51 +284,64 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	}
 }
 
-// unrecognizedNotifyOnce promotes the FIRST unrecognized OSC 9 notification of
-// the process to Warn, so a kiro-cli notification-wording drift is visible in the
-// DEFAULT (info) log stream instead of only under KWEB_LOG_LEVEL=debug. Bounded to
-// one line per process: a build that legitimately emits some other notification
-// cannot flood the shipped stream, and the Debug trace below still records every
-// occurrence.
-var unrecognizedNotifyOnce sync.Once
+// unrecognizedNotifyMsg is the one wording both the bounded Warn and the
+// per-occurrence Debug emit, so the two records a log search correlates cannot
+// drift apart.
+const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)"
 
-// classifyStatus maps kiro-cli's OSC 9 notification text to a latched session
-// status for the tab activity dots: "Response complete" at the end of an agent
-// turn latches the done (green) state, and "Permission required" when a tool
-// call is blocked on approval latches the needs-input (amber) state (confirmed
-// against the pinned 2.14.1 build's kiro-cli-chat notifier strings — the
-// strings live in the kiro-cli-chat sidecar binary, not the kiro-cli
-// dispatcher, so re-verify both strings there after every kiro-cli bump, in
-// the same PR as the pin move). A new
+// newStatusClassifier returns the kiro-cli OSC 9 -> session-status mapping the
+// composition root injects into the engine (terminal.WithStatusClassifier),
+// with its own warn-once latch: the FIRST unrecognized notification is promoted
+// to Warn, so a kiro-cli notification-wording drift is visible in the DEFAULT
+// (info) log stream instead of only under KWEB_LOG_LEVEL=debug, while the Debug
+// trace still records every occurrence — a build that legitimately emits some
+// other notification cannot flood the shipped stream. The latch lives in the
+// closure rather than in a package var so its lifetime is the classifier
+// INSTANCE the root wires (exactly one per process in production, so the
+// shipped bound is unchanged) instead of the process, and a test constructs a
+// fresh classifier instead of reassigning package state.
+//
+// The returned mapping: "Response complete" at the end of an agent turn latches
+// the done (green) state, and "Permission required" when a tool call is blocked
+// on approval latches the needs-input (amber) state (confirmed against the
+// pinned kiro-cli build's kiro-cli-chat notifier strings; the pin is
+// entrypoint.sh's KIRO_CLI_VERSION, the single source of truth, so do not copy
+// the version number here — it drifts on the next Renovate bump — the strings
+// live in the kiro-cli-chat sidecar binary, not the kiro-cli dispatcher, so
+// re-verify both strings there after every kiro-cli bump, in the same PR as the
+// pin move). A new
 // working phase (the OSC 9;4 progress
 // signal, enabled by the factory's TERM_PROGRAM) clears the latch. Any other
 // message is ignored. This mapping is the only kiro-cli-specific coupling; the
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
-func classifyStatus(msg string) (string, bool) {
-	switch msg {
-	case "Response complete":
-		return terminal.StatusDone, true
-	case "Permission required":
-		return terminal.StatusInput, true
-	default:
-		// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
-		// tool-approval. If a kiro-cli bump reworded "Response complete"/"Permission
-		// required", every notification lands here and the per-tab status dots
-		// silently stop latching. The FIRST occurrence warns (visible at the
-		// default info level, bounded to one line per process); the Debug line
-		// records every occurrence, so KWEB_LOG_LEVEL=debug is what shows the
-		// full set of unrecognized strings after a version bump.
-		// msg is safe to log raw: the engine's sanitizeNotification strips
-		// every runesafe-unsafe rune (C0/C1 controls, Bidi controls, U+2028/29)
-		// and rune-caps the text before the classifier ever sees it.
-		unrecognizedNotifyOnce.Do(func() {
-			slog.Warn("unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)",
-				"message", msg,
-				"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update classifyStatus; set KWEB_LOG_LEVEL=debug for every occurrence`)
-		})
-		slog.Debug("unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)", "message", msg)
-		return "", false
+func newStatusClassifier() func(string) (string, bool) {
+	var unrecognizedNotifyOnce sync.Once
+	return func(msg string) (string, bool) {
+		switch msg {
+		case "Response complete":
+			return terminal.StatusDone, true
+		case "Permission required":
+			return terminal.StatusInput, true
+		default:
+			// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
+			// tool-approval. If a kiro-cli bump reworded "Response complete"/"Permission
+			// required", every notification lands here and the per-tab status dots
+			// silently stop latching. The FIRST occurrence warns (visible at the
+			// default info level, bounded to one line per classifier); the Debug line
+			// records every occurrence, so KWEB_LOG_LEVEL=debug is what shows the
+			// full set of unrecognized strings after a version bump.
+			// msg is safe to log raw: the engine's sanitizeNotification strips
+			// every runesafe-unsafe rune (C0/C1 controls, Bidi controls, U+2028/29)
+			// and rune-caps the text before the classifier ever sees it.
+			unrecognizedNotifyOnce.Do(func() {
+				slog.Warn(unrecognizedNotifyMsg,
+					"message", msg,
+					"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for every occurrence`)
+			})
+			slog.Debug(unrecognizedNotifyMsg, "message", msg)
+			return "", false
+		}
 	}
 }
 
@@ -453,15 +483,35 @@ func loopbackPeer(remoteAddr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// loopbackOnly admits only requests whose SOCKET PEER is a loopback
-// address. Forwarded headers are deliberately ignored — they are
+// loopbackHost reports whether a request's Host header names the local host:
+// "localhost" or a loopback IP literal, canonicalized by webhttp.CanonicalHost
+// (so 127.0.0.1:9848, [::1]:9848 and localhost all match, and a malformed Host
+// canonicalizes to "" and fails closed). Paired with loopbackPeer this is the
+// both-ends test webhttp.WithLoopbackExempt applies to the KWEB_ALLOWED_HOSTS
+// carve-out: a DNS-rebound page carries the ATTACKER's name in Host even when
+// its socket peer is loopback, so the peer check alone does not close CWE-346
+// wherever the browser and the server share a loopback interface (host
+// networking, a bare `go run`, or any same-host proxy that forwards the public
+// Host).
+func loopbackHost(host string) bool {
+	canon := webhttp.CanonicalHost(host)
+	if canon == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(canon)
+	return ip != nil && ip.IsLoopback()
+}
+
+// loopbackOnly admits only requests whose SOCKET PEER *and* Host header are
+// both loopback. Forwarded headers are deliberately ignored — they are
 // client-controlled, and this gate is the tools API's only boundary on
 // an otherwise-unauthenticated port. In-container consumers (kiro-cli's
 // ! escape hitting curl localhost:9848) pass; everything routed in from
-// outside — LAN browsers, the reverse proxy — is refused.
+// outside — LAN browsers, the reverse proxy — is refused, as is a
+// DNS-rebound page whose loopback socket peer carries an attacker Host.
 func loopbackOnly(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !loopbackPeer(r.RemoteAddr) {
+		if !loopbackPeer(r.RemoteAddr) || !loopbackHost(r.Host) {
 			webhttp.WriteError(w, r, http.StatusForbidden, "",
 				"tools API is loopback-only; call it from inside the container (curl localhost:9848)")
 			return

@@ -16,6 +16,15 @@ trap 'rm -f "$tmp"' EXIT
 # a cleanup-only signal handler would resume assembly with $tmp deleted
 # and mv a partial bundle.
 trap 'exit 1' HUP INT TERM
+# The containment root itself comes from a tarball-controlled path component (the image build
+# passes @cplieger/web-terminal-ui/css, whose final component tar creates from the UI
+# tarball), and every check below is relative to it -- so a crafted tarball shipping `css` as
+# a symlink would move the boundary wherever it likes. Refuse a symlinked or non-directory
+# css dir so the root is as trustworthy as the MANIFEST and entries resolved under it.
+if [ -L "$css_dir" ] || [ ! -d "$css_dir" ]; then
+  printf 'css-bundle: css dir is a symlink or not a directory, refusing: %s\n' "$css_dir" >&2
+  exit 1
+fi
 css_root=$(realpath "$css_dir")
 # The per-entry regular-file guard below cannot protect the MANIFEST
 # itself: opening a FIFO for the loop redirect blocks the build forever,

@@ -233,15 +233,19 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 }
 
 // TestBuildHandlerSkipsAccessLogForStreams pins the access-log wiring in
-// buildHandler: the long-lived streams (/ws and the /api/sessions/events SSE)
-// must emit NO access-log line; a healthy /api/health probe is suppressed at
+// buildHandler: the long-lived streams (a real /ws upgrade and the
+// /api/sessions/events SSE) must emit NO access-log line, while a request that
+// reaches /ws WITHOUT the RFC 6455 upgrade headers — the classic reverse-proxy
+// misconfiguration, which the engine refuses with a 426 it logs nowhere — is
+// short-lived and MUST be logged; a healthy /api/health probe is suppressed at
 // the default Info level while a failing probe still emits at Warn/Error.
 // The token-bearing /api/sessions/ subtree must emit lines whose recorded
 // path is the token-free route template (WithPathFunc — a raw session id
 // must never appear), and normal requests still log their real path. A regression
-// dropping WithSkipPaths would flood the access log with one misleading line
-// per reconnect; a regression dropping WithPathFunc would leak live session
-// tokens to log-read consumers; both pass every other test. Serial: swaps
+// dropping the stream skips would flood the access log with one misleading line
+// per reconnect; a regression widening them back to the whole /ws path would
+// re-hide the unlogged 426; a regression dropping WithPathFunc would leak live
+// session tokens to log-read consumers; all pass every other test. Serial: swaps
 // the process-global default logger (buildHandler binds
 // WithLogger(slog.Default()) at construction).
 func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
@@ -257,9 +261,14 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	mux.HandleFunc("/probe", ok)
 
 	h := buildHandler(mux, nil, "default-src 'self'", nil)
-	for _, path := range []string{"/ws", "/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe"} {
+	for _, path := range []string{"/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe"} {
 		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, http.NoBody))
 	}
+	// A REAL upgrade attempt is the stream shape, so it stays skipped.
+	upgrade := httptest.NewRequest(http.MethodGet, "/ws", http.NoBody)
+	upgrade.Header.Set("Upgrade", "websocket")
+	upgrade.Header.Set("Connection", "keep-alive, Upgrade")
+	h.ServeHTTP(httptest.NewRecorder(), upgrade)
 
 	log := buf.String()
 	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events"} {
@@ -288,6 +297,13 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	}
 	if !strings.Contains(log, "path=/api/sessions ") {
 		t.Errorf("access log = %q, want a kept access line with the REAL path for the exact /api/sessions create/list routes (they miss the subtree prefix and must not be rewritten)", log)
+	}
+
+	// A non-upgrade GET /ws never becomes a stream: it is the proxy-stripped-the-
+	// upgrade-headers case, whose refusal is otherwise recorded by nobody.
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ws", http.NoBody))
+	if !strings.Contains(buf.String(), "path=/ws") {
+		t.Errorf("access log = %q, want an access line for a NON-upgrade GET /ws (a proxy that strips Upgrade/Connection must not vanish from the log)", buf.String())
 	}
 }
 

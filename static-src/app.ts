@@ -9,11 +9,13 @@
 // context menu + clipboard + scroll-to-bottom + predictive echo + connection
 // banner + animations). presetAgentTabbed and presetTabbed ship the SAME
 // features -- the library's buildTabbed always includes the activity monitor --
-// and differ only in two agent-shell tunings: preferInputTitle (kiro-cli emits a
-// non-empty but useless OSC 0/2 title, so each tab's label follows the latest
-// submitted line) and presumeReports (every session here IS an agent that will
+// and differ only in presumeReports (every session here IS an agent that will
 // report OSC 9;4, so the activity dot shows from tab creation instead of popping
-// in once the agent has booted far enough to first report). A generic shell
+// in once the agent has booted far enough to first report). Tab LABELS are not a
+// preset concern at all: the engine resolves each session's name server-side, and
+// this app's agent-shell tuning for that is routes.go's terminal.WithInputTitle()
+// (kiro-cli emits a non-empty but useless OSC 0/2 title, so the label follows the
+// latest submitted line). A generic shell
 // would use presetTabbed, whose dot stays hidden until a session actually
 // reports. Each browser tab drives its own independent kiro-cli chat session
 // over the shared server; kiro-cli's TUI is rendered verbatim through the raw PTY
@@ -38,12 +40,22 @@ const ACCENT_HSL_COMPONENTS = "263.1683 100% 80%";
 // Reveal the #loading overlay as a modal alert dialog with a fatal message.
 // remove("fade") is unconditional normalization, not a race fix: it guarantees the
 // dialog is opaque and hit-testable (.fade sets opacity:0 + pointer-events:none)
-// however the overlay arrived. It is a no-op on both call sites today -- the UI
-// kernel only ever adds .fade from ASYNCHRONOUS callbacks (dismissLoadingOverlay,
-// reached via markReady from a screen frame / font settle / close handler, or from
-// the setupFeatures continuation), so a synchronous createTerminal throw cannot have
-// faded anything by the time this catch runs, and on the missing-root path
-// createTerminal never ran at all.
+// however the overlay arrived. It is a no-op on both call sites that fire today --
+// but NOT because the kernel fades only from asynchronous callbacks: since
+// web-terminal-ui 4.7.0 createTerminal's OWN synchronous catch calls
+// fadeOutOverlay(opts.loading) before it rethrows (kernel.ts), which is the same
+// lowering the comment on the catch block below describes. It is a no-op because
+// neither live call site follows a kernel that ran: the missing-root path never
+// calls createTerminal, and a preset throw happens while evaluating the ARGUMENT,
+// before the kernel is entered. The catch's fallback arm (a kernel that threw
+// WITHOUT reporting through onFatalError) is the one path where a kernel DID fade
+// this overlay; there this remove("fade") restores opacity but cannot cancel the
+// transitionend listener and 1.5s setTimeout removeOverlay that fadeOutOverlay
+// already armed, so the dialog built there is deleted from the document shortly
+// after it appears. That arm is unreachable with the pinned library (the
+// kernel-init catch always delivers onFatalError, inside its own try, and this
+// app's handler cannot throw); if a kernel regression or a downgraded pin ever
+// makes it reachable, restoring the retired detached-clone workaround is the fix.
 // Mirrored by the inline bootstrap watchdog in static/index.html, which builds
 // the same alertdialog shape for app.js load failures (before this module can
 // run) -- keep the two in sync when changing this shape: the shared shape
@@ -220,7 +232,8 @@ try {
     // buttons, and the tab activity dots (--status-*, below). Note what
     // --tab-hover-bg does NOT reach: both tab HOVER states use the library's own
     // neutral lift, color-mix(in oklch, var(--tab-bg), var(--text) 15%)
-    // (30-tabs.css:98-104 desktop, 31-switcher.css:400-414 mobile rows),
+    // (30-tabs.css .wt-tab:not(.wt-tab-active):hover desktop,
+    // 31-switcher.css .wt-switcher-row-select:hover mobile rows),
     // deliberately -- a translucent accent wash over a filled chip reads as
     // "more transparent", not "lighter" -- so a hovered inactive tab stays grey
     // in this theme however this token is set. Since web-terminal-ui v4 all tokens

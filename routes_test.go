@@ -500,10 +500,13 @@ func newWSUpgradeRequest(t *testing.T, srvURL, id, origin string) *http.Request 
 // re-open cross-site WebSocket hijacking. This test fails if that happens.
 func TestWSRejectsCrossOrigin(t *testing.T) {
 	mux, mgr, csp := mustRegisterRoutes(t, newTestDeps(true))
-	// A valid session id is required: WebSocketHandler returns 404 for an unknown
-	// id BEFORE the upgrade, so the same-origin (CSWSH) guard only runs for an
-	// existing session. Create one so the cross-origin handshake reaches
-	// websocket.Accept (nil AcceptOptions) and is rejected with 403.
+	// Drive the guard on a REAL session: the shape a malicious page in the
+	// victim's browser would actually target. The pinned engine runs the
+	// same-origin check on EVERY upgrade -- an unknown id is reported after the
+	// upgrade via close 4004 and a non-WebSocket GET gets Accept's 426 either
+	// way, so the response is no session-existence oracle -- so the 403 below is
+	// websocket.Accept's origin refusal (nil AcceptOptions) on a session that
+	// exists and is attachable, not an artifact of a missing session.
 	id, err := mgr.Create()
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -646,9 +649,10 @@ func TestClassifyStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, latch := classifyStatus(tc.msg)
+			classify := newStatusClassifier()
+			got, latch := classify(tc.msg)
 			if got != tc.want || latch != tc.wantLatch {
-				t.Errorf("classifyStatus(%q) = (%q, %v), want (%q, %v)", tc.msg, got, latch, tc.want, tc.wantLatch)
+				t.Errorf("newStatusClassifier()(%q) = (%q, %v), want (%q, %v)", tc.msg, got, latch, tc.want, tc.wantLatch)
 			}
 		})
 	}
@@ -688,6 +692,40 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 	code, b = body(newMux(true, filepath.Join(t.TempDir(), ".absent")))
 	if code != http.StatusServiceUnavailable || !strings.Contains(b, "kiro-cli unavailable") {
 		t.Errorf("kiro-cli-absent: (status %d, body %q), want 503 with reason %q", code, b, "kiro-cli unavailable")
+	}
+}
+
+// TestHealthEndpoint_readyBodyContract pins the READY health document, which
+// every other health test leaves unchecked (they assert status codes, or the
+// tools field only in the tools-engine cases): the body is {"status":"ok"} and
+// carries NO tools key when the app runs without a tools engine. Both halves
+// are operator-facing contracts -- "status" is the field a human or a
+// body-matching probe reads, and the tools key's ABSENCE is what distinguishes
+// a deliberately disabled tools subsystem (bare `go run`, tests) from a
+// degraded one, the documented syncing|ok|degraded signal. Renaming the field
+// or emitting an empty tools value passes the whole suite today, because the
+// Docker HEALTHCHECK's curl only reads the status code.
+func TestHealthEndpoint_readyBodyContract(t *testing.T) {
+	mux, _, _ := mustRegisterRoutes(t, newTestDeps(true))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s: status = %d, want %d", healthPath, rec.Code, http.StatusOK)
+	}
+
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("health body %q is not a JSON object of strings: %v", rec.Body.String(), err)
+	}
+	if got := body["status"]; got != "ok" {
+		t.Errorf(`health body status = %q, want "ok" (body %q)`, got, rec.Body.String())
+	}
+	if got, ok := body["tools"]; ok {
+		t.Errorf("health body carries tools = %q with no tools engine; the key's absence is what marks the subsystem disabled rather than degraded", got)
+	}
+	if len(body) != 1 {
+		t.Errorf("health body = %v, want exactly the status field when no tools engine is wired", body)
 	}
 }
 
@@ -784,10 +822,11 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message with an empty code", denied.Error, denied.Code)
 	}
 
-	// Loopback peer: served. The fresh engine has an empty manifest, so
-	// the inventory decodes with zero tools.
+	// Loopback peer AND loopback Host: served. The fresh engine has an empty
+	// manifest, so the inventory decodes with zero tools.
 	req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
 	req.RemoteAddr = "127.0.0.1:55555"
+	req.Host = "127.0.0.1:9848"
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -806,6 +845,7 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	// IPv6 loopback passes too.
 	req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
 	req.RemoteAddr = "[::1]:55555"
+	req.Host = "[::1]:9848"
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

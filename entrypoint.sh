@@ -77,6 +77,9 @@ harden_config_dir() {
     fatal 'failed to read config directory mode; cannot prove it is private' "dir=\"$dir\""
   fi
   # 8#$mode: %a prints octal without a base prefix. 0077 = every group/other bit.
+  if [ $((8#$mode & 0077)) -ne 0 ]; then
+    fatal 'config directory holding credential-bearing state is not private; refusing to boot with it group/other-accessible' "dir=\"$dir\" mode=$mode"
+  fi
 }
 
 # --- persistent tool-tree integrity ---------------------------------------------
@@ -162,6 +165,54 @@ sweep_legacy_dispatchers() {
   # unlink succeed', never 'is an unpinned kiro-cli still reachable'. Callers gate on
   # resolves_to_pinned_kiro_cli; returning a failure count here only invited them to read
   # it as the safety verdict.
+  return 0
+}
+
+# Reclaims the one install residue the two bin-dir sweeps cannot see: kiro-cli's own
+# agent-server runtimes. Each version unpacks a ~240 MB tree under
+# <data-dir>/kas/<version>-<hash>/ (plus a sibling .lock) on its FIRST chat launch --
+# after this entrypoint has already exec'd the server -- and nothing ever removes the
+# superseded ones, so the store gains a full tree per Renovate bump and never shrinks
+# (six trees / 1.4 GB found on the borgcube volume, 2026-07). The miss was structural,
+# not an oversight in a loop: every existing sweep cleans what the ENTRYPOINT wrote,
+# and this tree is written later, by the binary the entrypoint promoted. The toolbelt
+# engine already applies exactly this keep-current-drop-the-rest rule to its own
+# versioned opt/<tool>/<version>/ trees (pruneOldVersions in the library's install.go),
+# so this extends the same rule to the one install outside the engine's custody --
+# kiro-cli, which cannot be engine-managed because licensing forbids baking it in.
+#
+# Data-dir resolution mirrors kiro-cli's own (XDG_DATA_HOME, else $HOME/.local/share):
+# pruning a directory the CLI does not use would be a silent no-op, which is the one
+# failure mode a disk-hygiene step must not have. Warn, never fatal -- same argument as
+# the sweeps above: nothing here is on PATH or gates integrity, and a container whose
+# runtime store cannot be tidied must still boot.
+prune_superseded_kas_runtimes() {
+  local data_home kas_dir entry name
+  data_home="${XDG_DATA_HOME:-}"
+  if [ -z "$data_home" ]; then
+    # Under set -u an unset HOME would abort the boot; a data dir we cannot locate is
+    # simply nothing to prune.
+    [ -n "${HOME:-}" ] || return 0
+    data_home="$HOME/.local/share"
+  fi
+  kas_dir="$data_home/kiro-cli/kas"
+  [ -d "$kas_dir" ] || return 0
+  for entry in "$kas_dir"/*; do
+    # An empty store leaves the glob unexpanded.
+    [ -e "$entry" ] || continue
+    name="${entry##*/}"
+    # One pattern covers the tree and its sibling .lock: both carry the
+    # <version>-<hash> stem, and the quoted expansion keeps a version string from
+    # being read as a glob. Anything not on the pin is a superseded version.
+    case "$name" in
+      "$KIRO_CLI_VERSION"-*) continue ;;
+    esac
+    if rm -rf "$entry"; then
+      printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" pin=%s component=entrypoint\n' "$name" "$KIRO_CLI_VERSION" >&2
+    else
+      printf 'level=warn msg="failed to prune superseded kiro-cli agent runtime" entry="%s" component=entrypoint\n' "$name" >&2
+    fi
+  done
   return 0
 }
 
@@ -285,6 +336,14 @@ if [ "$tools_tree_was_writable" -eq 1 ]; then
   # SHA-verified archive instead of trusting what is on the volume.
   printf 'level=warn msg="quarantining kiro-cli binaries from a previously group/other-writable tools tree; forcing a pinned SHA-verified reinstall" dir="%s" component=entrypoint\n' "$TOOLS/bin" >&2
   sweep_legacy_dispatchers "$TOOLS/bin" || true
+  # The sweep's status is deliberately always 0 (see the function's comment), so it
+  # cannot answer "is the tainted payload gone". Check the invariant directly: an
+  # immutable or separately-mounted file would survive the rm and then be trusted by
+  # needs_kiro_cli_install's spoofable --version probe.
+  for tainted in "$TOOLS/bin"/kiro-cli*; do
+    [ -e "$tainted" ] || [ -L "$tainted" ] || continue
+    fatal 'a tainted kiro-cli payload survived quarantine; refusing to trust its version output' "path=\"$tainted\""
+  done
 fi
 
 # Best-effort: drop boot-time temp artifacts orphaned by a hard container kill
@@ -311,6 +370,14 @@ sweep_legacy_dispatchers "$HOME/.local/bin" || true
 if ! resolves_to_pinned_kiro_cli; then
   printf 'level=warn msg="a kiro-cli other than the pinned binary at the pinned version is still reachable by bare name after the boot sweep; residue or a drifted binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
 fi
+
+# Third hygiene sweep, same unconditional-every-boot argument, applied to the agent
+# runtimes (see the function's comment for why they escape the two above). Ordering is
+# load-bearing and it must run BEFORE the install: on a bump boot the pin already names
+# the NEW version while only the OLD tree is on disk, so the old tree goes first and
+# peak usage stays at one tree instead of two. A boot that installs nothing prunes
+# nothing.
+prune_superseded_kas_runtimes || true
 
 # Readiness marker consumed by the Go server's /api/health (main.go reads
 # KIRO_CLI_READY_MARKER; routes.go Stats it). Initialized BEFORE any fallible
@@ -373,8 +440,11 @@ install_kiro_cli() (
   # throughput stays under --speed-limit for --speed-time consecutive seconds, which
   # is the condition we actually care about. --max-time is now an absolute backstop
   # (3600s => a ~150 KB/s floor, ~1.2 Mbit/s; 12x lower than before), and
-  # --retry-max-time bounds the whole retry envelope so a flapping link cannot stack
-  # three hour-long attempts. NOTE the HEALTHCHECK --start-period (20m) no longer
+  # --retry-max-time caps the retry envelope, but only by barring the START of a new
+  # attempt: one begun just under 5400s still runs to its own --max-time, so the
+  # download leg's true ceiling is ~9000s rather than 5400s (see the Dockerfile
+  # HEALTHCHECK comment, kept in lockstep). NOTE the HEALTHCHECK --start-period (20m)
+  # no longer
   # covers the worst-case window; that degrades safely because an unhealthy state
   # never restarts this container (restart policy acts on process exit), so a very
   # slow first boot shows unhealthy and then converges once the marker is written.

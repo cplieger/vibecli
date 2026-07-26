@@ -408,8 +408,10 @@ EXPOSE 9848
 # written — but tests/image-smoke.sh FAILS the build at SMOKE_TIMEOUT, so a
 # slow-but-alive download that stall detection deliberately lets run is a red CI
 # image-smoke job with no artifact explaining why. Resolving that gap is a pending
-# maintainer decision (bound the retries, raise both budgets in lockstep to the
-# retry envelope (~171m / 10290), drop --retry, or accept the exposure). Keep this comment and
+# maintainer decision (bound the retries, raise both budgets in lockstep to cover
+# the ~10230s retry envelope -- start-period ~171m (10260s), SMOKE_TIMEOUT 10320
+# per the "+ two 30s probe intervals" rule above -- drop --retry, or accept the
+# exposure). Keep this comment and
 # tests/image-smoke.conf's header in lockstep whenever a foreground timeout
 # changes. Tool installs
 # converge in the background AFTER bind (only session creation waits on

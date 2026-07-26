@@ -243,9 +243,9 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 // path is the token-free route template (WithPathFunc — a raw session id
 // must never appear) for the route shapes the server actually serves, and the
 // fail-closed placeholder for a malformed subtree path, while normal requests
-// still log their real path. A regression
-// dropping the stream skips would flood the access log with one misleading line
-// per reconnect; a regression widening them back to the whole /ws path would
+// still log their real path. A regression dropping the stream skips would flood
+// the access log with one misleading line per reconnect; a regression widening
+// them back to the whole /ws path would
 // re-hide the unlogged 426; a regression dropping WithPathFunc would leak live
 // session tokens to log-read consumers; all pass every other test. Serial: swaps
 // the process-global default logger (buildHandler binds
@@ -299,9 +299,6 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	}
 	if n := strings.Count(log, "path=/api/sessions/{id}/title"); n != 1 {
 		t.Errorf("access log = %q, got %d title-template lines, want exactly 1 (the malformed /extra/title path must not be classified as the title route)", log, n)
-	}
-	if !strings.Contains(log, "path=/api/sessions/{id}/title") {
-		t.Errorf("access log = %q, want a template-path access line for the title route (the subtree's telemetry is kept, redacted)", log)
 	}
 	if !strings.Contains(log, "path=/api/sessions/{id}") {
 		t.Errorf("access log = %q, want a template-path access line for the id route (the subtree's telemetry is kept, redacted)", log)

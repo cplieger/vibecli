@@ -20,7 +20,7 @@ const THEME = {
   "--tab-active-bg": "hsl(263.1683 100% 80% / 32%)",
   "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
   "--tab-active-fg": "#fff",
-  "--status-working": "oklch(78% 0.15 300deg)",
+  "--status-working": "#c6a0ff",
   "--status-done": "oklch(78% 0.15 150deg)",
   "--status-input": "oklch(78% 0.15 95deg)",
 };

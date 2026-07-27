@@ -539,7 +539,7 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 // apiNoStore marks the JSON API surface uncacheable. GET /api/sessions returns
 // live session ids, and a session id is the /ws attach + resume capability
 // token — the same value routes.go's LogID truncates before logging and
-// WithPathFunc keeps out of the access log. Neither the engine's REST handler
+// WithTemplatePathsUnder keeps out of the access log. Neither the engine's REST handler
 // nor webhttp's JSON helpers set Cache-Control, so today that response is
 // stored by the browser's disk cache (a live token persisted to disk,
 // outliving the tab) and is heuristically cacheable by a caching reverse proxy
@@ -583,7 +583,7 @@ func apiNoStore(next http.Handler) http.Handler {
 //     HEALTHCHECK probe's healthy 2xx at Debug (out of the shipped stream)
 //     and promotes a failing probe to Warn/Error; the token-bearing
 //     /api/sessions/ subtree stays logged with its recorded path rewritten
-//     to the route template via WithPathFunc below.
+//     to the matched route template via WithTemplatePathsUnder below.
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
 //     so the access line records the 500, not the recorder's default 200).
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
@@ -640,9 +640,20 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// one open-to-close line per WebSocket/SSE would be misleading
 			// by shape, not merely noisy.
 			webhttp.ProbeLogLevel(healthPath),
-			// The session-id-bearing subtree logs its token-free route
-			// template instead of the raw path; see redactSessionPath.
-			webhttp.WithPathFunc(redactSessionPath),
+			// The session-id-bearing subtree logs the route template the mux
+			// actually matched instead of the raw path, so a live capability
+			// token never reaches the access log. The prefix comes from the
+			// engine -- the package that DECLARES those routes and already
+			// treats the id as a credential (terminal.LogID) -- rather than a
+			// literal here, and the template comes from r.Pattern, so a route
+			// the engine adds in a future version logs correctly with no change
+			// in this app. This replaced a local transform that re-derived the
+			// engine's route table by string-parsing the path: it was a second
+			// copy of upstream knowledge with nothing keeping the two in step,
+			// and a new engine subroute would have silently logged every request
+			// to it as "(path-redaction-failed)", losing method/status/duration/
+			// client_ip attribution with no test or build failing.
+			webhttp.WithTemplatePathsUnder(terminal.SessionsSubtreePath),
 			webhttp.WithClientIP(trustedProxies...),
 		),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.Default())),
@@ -679,54 +690,6 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)
-}
-
-// redactSessionPath is the access log's recorded-path policy for the
-// session-id-bearing subtree — DELETE /api/sessions/{id}, PUT
-// /api/sessions/{id}/title, and PUT + DELETE /api/sessions/{id}/pinned-title
-// (the engine's rename routes, which the vendored UI's tab rename calls) —
-// each of which embeds the FULL session id (the /ws attach/resume capability
-// token that routes.go truncates to safeID before logging). Their access lines
-// are KEPT, with the recorded path rewritten to the token-free route template,
-// so operators keep method/status/duration/request_id/client_ip for title
-// updates, renames, deletes, and rejected subtree requests without a live token
-// ever reaching log-read consumers.
-//
-// Matching is EXACT-SHAPE, not suffix-based: only a single id segment, or an id
-// segment followed by exactly "title" or "pinned-title", maps to a template.
-// Every template must name a route the server actually serves, or the line
-// misreports which call was made — a suffix test would report a malformed
-// /api/sessions/{id}/extra/title as the legitimate title route and every other
-// malformed subtree path as the plain {id} route, hiding route probing from
-// access telemetry and pointing an operator diagnosing a 404 at the wrong
-// handler. Anything that is not one of the served shapes returns the empty
-// string, which webhttp records fail-closed as its
-// "(path-redaction-failed)" placeholder — never the raw path, so the token in
-// a malformed request is not leaked either.
-//
-// The exact-path create/list lines (POST/GET /api/sessions) miss the prefix and
-// log unchanged; the SSE stream shares the prefix but carries no id, so it maps
-// to itself (it is skip-listed in buildHandler, so no line is emitted for it
-// either way).
-func redactSessionPath(r *http.Request) string {
-	p := r.URL.Path
-	if !strings.HasPrefix(p, terminal.SessionsSubtreePath) {
-		return p
-	}
-	if p == terminal.SessionEventsPath {
-		return p
-	}
-	parts := strings.Split(strings.TrimPrefix(p, terminal.SessionsSubtreePath), "/")
-	switch {
-	case len(parts) == 1 && parts[0] != "":
-		return terminal.SessionsSubtreePath + "{id}"
-	case len(parts) == 2 && parts[0] != "" && parts[1] == "title":
-		return terminal.SessionsSubtreePath + "{id}/title"
-	case len(parts) == 2 && parts[0] != "" && parts[1] == "pinned-title":
-		return terminal.SessionsSubtreePath + "{id}/pinned-title"
-	default:
-		return ""
-	}
 }
 
 // isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal

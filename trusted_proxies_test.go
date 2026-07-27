@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"log/slog"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 // trustedContains reports whether ip is inside any of the parsed trusted nets.
@@ -239,34 +241,79 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 // misconfiguration, which the engine refuses with a 426 it logs nowhere — is
 // short-lived and MUST be logged; a healthy /api/health probe is suppressed at
 // the default Info level while a failing probe still emits at Warn/Error.
-// The token-bearing /api/sessions/ subtree must emit lines whose recorded
-// path is the token-free route template (WithPathFunc — a raw session id
-// must never appear) for the route shapes the server actually serves, and the
-// fail-closed placeholder for a malformed subtree path, while normal requests
-// still log their real path. A regression dropping the stream skips would flood
-// the access log with one misleading line per reconnect; a regression widening
-// them back to the whole /ws path would
-// re-hide the unlogged 426; a regression dropping WithPathFunc would leak live
-// session tokens to log-read consumers; all pass every other test. Serial: swaps
-// the process-global default logger (buildHandler binds
-// WithLogger(slog.Default()) at construction).
+// The token-bearing /api/sessions/ subtree must emit lines whose recorded path
+// is the token-free route template (a raw session id must never appear) for the
+// route shapes the server actually serves, and the "(unmatched)" marker for a
+// path under the subtree that routes nowhere, while normal requests still log
+// their real path. A regression dropping the stream skips would flood the access
+// log with one misleading line per reconnect; a regression widening them back to
+// the whole /ws path would re-hide the unlogged 426; a regression dropping
+// WithTemplatePathsUnder would leak live session tokens to log-read consumers;
+// all pass every other test. Serial: swaps the process-global default logger
+// (buildHandler binds WithLogger(slog.Default()) at construction).
+//
+// It mounts the ENGINE's real session routes rather than hand-written stand-ins,
+// and that is the point: the recorded template now comes from the pattern the mux
+// actually matched, so this asserts the app agrees with the ENGINE's route table
+// instead of agreeing with its own copy of it. The app used to carry that table
+// as a local string-parsing transform, and this test used to register its own
+// literal paths — so an engine route added or renamed by a version bump would
+// have silently logged as the fail-closed placeholder with nothing failing here.
+// Mounting the real surface means the engine's table is the only copy, and a
+// change to it shows up in this test's output.
 func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	buf := captureTextLog(t)
 
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
-	mux.HandleFunc("/ws", ok)
-	mux.HandleFunc("/api/sessions/events", ok)
-	mux.HandleFunc("/api/sessions/", ok) // subtree: catches the id-bearing REST paths (PUT {id}/title, DELETE {id})
+	// The engine's OWN route table, mounted the way routes.go mounts it. The
+	// factory is never invoked (nothing here creates a session), so no PTY is
+	// spawned; MountAPI only registers patterns.
+	mgr := terminal.NewSessionManager(
+		func(string) *terminal.Handler { return terminal.NewHandler([]string{"/bin/true"}) },
+		terminal.WithManagerLogger(slog.New(slog.DiscardHandler)),
+	)
+	t.Cleanup(mgr.Shutdown)
+	mgr.MountAPI(mux)
 	mux.HandleFunc("/api/health", ok)
-	mux.HandleFunc("/api/sessions", ok) // exact path: create/list access lines are documented as KEPT
 	mux.HandleFunc("/probe", ok)
 
 	h := buildHandler(mux, nil, "default-src 'self'", nil)
-	// The last entry is a MALFORMED subtree path (no such route): it must not be
+	// Every session route the engine actually serves, with the METHOD each is
+	// registered under (the templates are method-scoped, so a GET at a PUT-only
+	// route would route nowhere and prove nothing). pinned-title carries both of
+	// its verbs: it is the vendored UI's tab-rename surface, and it had no
+	// coverage here at all while this test registered its own stand-in paths.
+	// The last entry is a subtree path matching NO engine route: it must not be
 	// reported as the legitimate {id}/title route, and its token must not leak.
-	for _, path := range []string{"/api/sessions/events", "/api/sessions/live-token-1234/title", "/api/sessions/live-token-5678", "/api/health", "/api/sessions", "/probe", "/api/sessions/live-token-9012/extra/title"} {
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, http.NoBody))
+	// stream marks a route that only returns when the CLIENT disconnects. Now
+	// that the engine's real handlers are mounted, /api/sessions/events is the
+	// live SSE stream: driven with a background context it never returns, and the
+	// test hangs to its deadline (it did). An already-cancelled context is the
+	// disconnect, so the handler unwinds immediately and the assertion below --
+	// that a stream emits NO access line -- still exercises the real route.
+	for _, req := range []struct {
+		method, path string
+		stream       bool
+	}{
+		{method: http.MethodGet, path: "/api/sessions/events", stream: true},
+		{method: http.MethodPut, path: "/api/sessions/live-token-1234/title"},
+		{method: http.MethodDelete, path: "/api/sessions/live-token-5678"},
+		{method: http.MethodPut, path: "/api/sessions/live-token-2345/pinned-title"},
+		{method: http.MethodDelete, path: "/api/sessions/live-token-3456/pinned-title"},
+		{method: http.MethodGet, path: "/api/health"},
+		{method: http.MethodGet, path: "/api/sessions"},
+		{method: http.MethodGet, path: "/probe"},
+		{method: http.MethodGet, path: "/api/sessions/live-token-9012/extra/title"},
+	} {
+		ctx := context.Background()
+		if req.stream {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithCancel(ctx)
+			cancel()
+		}
+		h.ServeHTTP(httptest.NewRecorder(),
+			httptest.NewRequestWithContext(ctx, req.method, req.path, http.NoBody))
 	}
 	// A REAL upgrade attempt is the stream shape, so it stays skipped.
 	upgrade := httptest.NewRequest(http.MethodGet, "/ws", http.NoBody)
@@ -285,23 +332,33 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	if strings.Contains(log, "path=/api/health") {
 		t.Errorf("access log = %q, want no healthy-probe line at the default level (ProbeLogLevel maps 2xx to Debug)", log)
 	}
-	for _, token := range []string{"live-token-1234", "live-token-5678", "live-token-9012"} {
+	for _, token := range []string{"live-token-1234", "live-token-5678", "live-token-2345", "live-token-3456", "live-token-9012"} {
 		if strings.Contains(log, token) {
-			t.Errorf("access log = %q, must never carry the raw session token %q (WithPathFunc must rewrite the subtree's recorded path)", log, token)
+			t.Errorf("access log = %q, must never carry the raw session token %q (WithTemplatePathsUnder must rewrite the subtree's recorded path)", log, token)
 		}
 	}
-	// A malformed subtree path matches no served route, so redactSessionPath
-	// returns "" and webhttp records its fail-closed placeholder. Suffix-only
-	// matching would instead have reported it as a real title call, hiding route
-	// probing and pointing an operator at the wrong handler.
-	if !strings.Contains(log, "path=(path-redaction-failed)") {
-		t.Errorf("access log = %q, want the fail-closed placeholder for a malformed subtree path (only served route shapes may map to a template)", log)
+	// A subtree path matching no engine route records the prefix plus the
+	// unmatched marker: distinguishable from a real route (suffix-only matching
+	// would have reported it as a title call, hiding route probing and pointing
+	// an operator at the wrong handler) AND distinguishable from
+	// "(path-redaction-failed)", which means the path policy itself broke rather
+	// than the request routing nowhere.
+	if !strings.Contains(log, "path=/api/sessions/(unmatched)") {
+		t.Errorf("access log = %q, want the unmatched marker for a subtree path that routes nowhere (only served route shapes may map to a template)", log)
+	}
+	if strings.Contains(log, "path=(path-redaction-failed)") {
+		t.Errorf("access log = %q, must not report a routine unmatched route as a FAILED path policy", log)
 	}
 	if n := strings.Count(log, "path=/api/sessions/{id}/title"); n != 1 {
 		t.Errorf("access log = %q, got %d title-template lines, want exactly 1 (the malformed /extra/title path must not be classified as the title route)", log, n)
 	}
 	if !strings.Contains(log, "path=/api/sessions/{id}") {
 		t.Errorf("access log = %q, want a template-path access line for the id route (the subtree's telemetry is kept, redacted)", log)
+	}
+	// Both rename verbs record the SAME template, since the method is its own
+	// attribute on the line. Two lines, one template.
+	if n := strings.Count(log, "path=/api/sessions/{id}/pinned-title"); n != 2 {
+		t.Errorf("access log = %q, got %d pinned-title template lines, want 2 (PUT and DELETE both serve that route)", log, n)
 	}
 	if !strings.Contains(log, "path=/probe") {
 		t.Errorf("access log = %q, want an access line for the normal request path=/probe (the skip list must not swallow everything)", log)

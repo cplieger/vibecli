@@ -699,6 +699,49 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 	}
 }
 
+// TestHealthEndpoint_envelopeMatchesTheLibrary pins the two wire properties this
+// app shares with webhttp.ReadinessHandler and therefore with every other app in
+// the fleet that serves a readiness verdict.
+//
+// KEY ORDER: this handler cannot use the library's handler (its verdict is
+// composite -- a second reason plus the informational tools field -- while
+// ReadinessChecker is Ready() bool), so it matches the library's wire shape by
+// hand. It used to build a map, and encoding/json sorts map keys, so it emitted
+// {"reason":…,"status":…} while the library emitted {"status":…,"reason":…}: one
+// envelope, two orders, across three apps that are supposed to agree.
+//
+// CACHE: a readiness verdict must never be cached. A 200 with no explicit
+// freshness is heuristically cacheable under RFC 9111, and a cached "ok"
+// outliving the readiness it reported keeps traffic arriving at an instance that
+// has begun draining -- the exact failure the gate exists to prevent. The handler
+// sets it itself rather than relying on the /api/-wide apiNoStore middleware, so
+// the contract holds wherever the route is mounted and a future narrowing of that
+// middleware's scope cannot silently drop it. That is also why this asserts
+// against the bare mux: it is the HANDLER's property being pinned.
+func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		deps *routeDeps
+		want string
+	}{
+		{"unready", newTestDeps(false), `{"status":"unready","reason":"starting up or shutting down"}`},
+		{"ready", newTestDeps(true), `{"status":"ok"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mux, _, _ := mustRegisterRoutes(t, tc.deps)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
+
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.want {
+				t.Errorf("raw health body = %q, want %q (byte-exact: the key ORDER is the shared contract)", got, tc.want)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want no-store: a cached readiness verdict defeats the gate", got)
+			}
+		})
+	}
+}
+
 // TestHealthEndpoint_readyBodyContract pins the READY health document, which
 // every other health test leaves unchecked (they assert status codes, or the
 // tools field only in the tools-engine cases): the body is {"status":"ok"} and

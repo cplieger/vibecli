@@ -243,6 +243,27 @@ func kiroMarkerUnavailable(marker string, statErrOnce *sync.Once) bool {
 	return false
 }
 
+// healthBody is /api/health's response envelope. A struct, not a map, for the
+// reason webhttp.ReadinessHandler's own readinessResponse is one: encoding/json
+// sorts map keys, so a map emits {"reason":…,"status":…} while the library — and
+// therefore web-terminal-server and subflux, which use its handler — emits
+// {"status":…,"reason":…}. Three apps served one envelope in two key orders.
+//
+// This app cannot use the library handler outright: its verdict is COMPOSITE (a
+// second reason for the env-gated kiro-cli marker, plus the informational tools
+// field), and the library's ReadinessChecker is Ready() bool. Extending the
+// library to absorb a composite verdict was considered and rejected as a wide
+// public surface for a six-line envelope; matching its wire shape exactly is the
+// cheap half that actually removes the divergence.
+//
+// Tools is omitempty because it is INFORMATIONAL and absent when no tools engine
+// is wired (a bare `go run`), where an empty string would read as a state.
+type healthBody struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+	Tools  string `json:"tools,omitempty"`
+}
+
 // handleHealth returns the /api/health readiness handler. It reflects, in
 // order: listener readiness (deps.ready), the env-gated kiro-cli readiness
 // marker (deps.kiroReadyMarker; see the entrypoint), and the INFORMATIONAL
@@ -262,10 +283,18 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	// state.
 	var kiroMarkerStatErrOnce sync.Once
 	return func(w http.ResponseWriter, _ *http.Request) {
+		// Set here, not left to the /api/-wide apiNoStore middleware, so the
+		// handler carries its own contract wherever it is mounted: a readiness
+		// verdict must never be cached (a 200 with no explicit freshness is
+		// heuristically cacheable under RFC 9111, and a cached "ok" keeps traffic
+		// arriving at an instance that has begun draining). Idempotent with the
+		// middleware, which sets the same value; the same header now comes from
+		// webhttp.ReadinessHandler for the apps that use it directly.
+		w.Header().Set("Cache-Control", "no-store")
 		unready := func(reason string) {
-			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, map[string]string{
-				"status": "unready",
-				"reason": reason,
+			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthBody{
+				Status: "unready",
+				Reason: reason,
 			})
 		}
 		if !deps.ready.Ready() {
@@ -291,9 +320,9 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// readiness (kiro-cli is the only core dependency), so monitoring
 		// stays green during a long first-boot install window while
 		// operators can still see it (syncing | ok | degraded).
-		body := map[string]string{"status": "ok"}
+		body := healthBody{Status: "ok"}
 		if deps.toolsState != nil {
-			body["tools"] = deps.toolsState()
+			body.Tools = deps.toolsState()
 		}
 		webhttp.WriteJSON(w, body)
 	}

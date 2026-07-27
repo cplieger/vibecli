@@ -2,6 +2,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+// The real constant from the real package -- NOT mocked below. The point is to
+// compare the served HTML against what the library actually ships.
+import { STARTUP_FAILURE_COPY } from "@cplieger/web-terminal-ui/startup-copy";
 
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
@@ -81,11 +84,11 @@ function readStaticAsset(name: string): string {
   return readFileSync(resolve(sourceRoot, `../static/${name}`), "utf8");
 }
 
-// The fatal-overlay alertdialog contract duplicated (by necessity) between
-// showFatal (app.ts) and the inline pre-module bootstrap watchdog
-// (static/index.html). Both builders are asserted through this single helper
-// so the two shapes cannot drift independently: a change to either side that
-// breaks the shared shape fails here.
+// The fatal-overlay alertdialog contract of the inline pre-module bootstrap
+// watchdog (static/index.html). It is the LAST hand-built fatal surface in this
+// app: app.ts's own copy is gone (createTerminal owns every terminal startup
+// failure now), but the watchdog reports "the JS bundle never ran", a rung below
+// `import` by definition, so it cannot use the library and cannot be deleted.
 function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("role")).toBe("alertdialog");
   // The handoff marker both builders set: the app -> watchdog and watchdog -> app
@@ -101,7 +104,12 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("aria-labelledby")).toBe("bootstrap-failure-title");
   const title = overlay.querySelector("#bootstrap-failure-title");
   expect(title?.tagName).toBe("H2");
-  expect(title?.textContent).toBe("Terminal failed to start");
+  // Taken from the library's exported constant, not restated. This is the whole
+  // reason STARTUP_FAILURE_COPY exists: the watchdog cannot import at runtime, so
+  // its wording used to be agreed with the library by comment. Now the agreement
+  // is checked, and a change on the library side fails here instead of shipping
+  // two different words for one event.
+  expect(title?.textContent).toBe(STARTUP_FAILURE_COPY.title);
   expect(overlay.getAttribute("aria-describedby")).toBe("bootstrap-failure-message");
   // The pristine loading bar is always replaced by the dialog content.
   expect(overlay.querySelector(".bar")).toBeNull();
@@ -111,7 +119,7 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.querySelector(".loading-status")).toBeNull();
   const reload = overlay.querySelector("button");
   expect(reload?.type).toBe("button");
-  expect(reload?.textContent).toBe("Reload page");
+  expect(reload?.textContent).toBe(STARTUP_FAILURE_COPY.reloadLabel);
   // Initial focus lands on the recovery CTA (the alertdialog pattern's
   // initial focus; Reload is the only actionable element left).
   expect(document.activeElement).toBe(reload);
@@ -199,7 +207,7 @@ function appendTerminalRoot({ booted = false } = {}): HTMLElement {
 
 // index.html's pristine pre-JS #loading overlay (role=status, with its two
 // children: the aria-hidden .bar and the .loading-status announcement): the
-// exact state both showFatal and the watchdog key their behavior on.
+// exact state the watchdog keys its behavior on.
 // fade: the kernel's first-frame fade-out has begun.
 function appendPristineOverlay({ fade = false } = {}): HTMLElement {
   const overlay = document.createElement("div");
@@ -246,27 +254,33 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     document.body.replaceChildren();
   });
 
-  it("throws a clear error when the #terminal root element is missing", async () => {
-    await expect(import("./app.js")).rejects.toThrow(
-      "web-terminal-kiro: missing #terminal root element",
-    );
-    expect(createTerminalMock).not.toHaveBeenCalled();
-  });
-
-  it("builds the terminal with the agent preset and theme when #loading is absent", async () => {
+  it("mounts by SELECTOR and passes the preset as a function, not a call", async () => {
     const root = appendTerminalRoot();
 
     await import("./app.js");
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
-    expect(createTerminalMock).toHaveBeenCalledWith(root, {
-      features: ["preset-features"],
+    // Both halves of this assertion are the reason this app no longer carries a
+    // fatal dialog of its own. A selector means createTerminal resolves the
+    // element inside its failure boundary, so a missing #terminal is the
+    // library's to report; a preset FUNCTION means the library calls it inside
+    // the same boundary, so a preset that throws is too. Passing a resolved
+    // element and an already-called preset put both failures out here, where the
+    // app had to hand-build a recovery surface -- and the library never saw them.
+    expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
+      features: presetAgentTabbedMock,
       theme: THEME,
     });
+    // Passing the function must NOT call it here.
+    expect(presetAgentTabbedMock).not.toHaveBeenCalled();
+    // The root is untouched by this module: the mocked kernel builds nothing, and
+    // the app adds no dialog, no inert, nothing.
+    expect(root.hasAttribute("inert")).toBe(false);
+    expect(root.children).toHaveLength(0);
   });
 
   it("passes the #loading element to createTerminal when it is present", async () => {
-    const root = appendTerminalRoot();
+    appendTerminalRoot();
     const loading = document.createElement("div");
     loading.id = "loading";
     document.body.appendChild(loading);
@@ -274,35 +288,32 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     await import("./app.js");
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
-    expect(createTerminalMock).toHaveBeenCalledWith(root, {
-      features: ["preset-features"],
+    expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
+      features: presetAgentTabbedMock,
       theme: THEME,
       loading,
     });
   });
 
-  it("surfaces an alert dialog on the #loading overlay when #terminal is missing but #loading exists", async () => {
-    const overlay = appendPristineOverlay();
+  it("boots even with no #terminal in the document, leaving the failure to the library", async () => {
+    // The app used to look the root up and throw its own error here, because the
+    // old signature could not accept a null element. It now hands the selector
+    // over unconditionally: an unresolvable one is a kernel-init failure that
+    // lowers the overlay and renders the library's panel. The app's job is to
+    // NOT get in the way of that.
+    await import("./app.js");
 
-    await expect(import("./app.js")).rejects.toThrow(
-      "web-terminal-kiro: missing #terminal root element",
-    );
-
-    // showFatal sets data-bootstrap-fatal (asserted inside the shape helper),
-    // and that marker -- not the replaced .bar -- is what stands the
-    // index.html watchdog down when the rethrown error reaches its
-    // capture-phase window listener, so it cannot clobber this message.
-    expectFatalOverlayShape(overlay);
-    const description = overlay.querySelector("#bootstrap-failure-message");
-    expect(description?.textContent).toContain("Web Terminal for Kiro failed to start");
-    expect(createTerminalMock).not.toHaveBeenCalled();
+    expect(createTerminalMock).toHaveBeenCalledTimes(1);
+    expect(createTerminalMock).toHaveBeenCalledWith("#terminal", expect.anything());
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
 
-  // The other direction of the marker protocol on the missing-root path: when
-  // the index.html watchdog has ALREADY claimed #loading, showFatal's
-  // first-claim guard must leave that dialog (and its live Reload control)
-  // untouched rather than replaceChildren() over it.
-  it("preserves a watchdog-owned fatal dialog when #terminal is missing", async () => {
+  // The one startup condition this app still decides for itself, and it is not a
+  // terminal failure: the inline watchdog has already reported a resource failure
+  // this module cannot see (a dead /style.css still lets /app.js evaluate), so
+  // booting would hand its live dialog to createTerminal as `loading` and the
+  // kernel would fade the Reload button away on first frame.
+  it("aborts boot when the watchdog already claimed the overlay, leaving its dialog intact", async () => {
     const overlay = appendPristineOverlay();
     overlay.setAttribute("data-bootstrap-fatal", "");
     const watchdogMessage = document.createElement("p");
@@ -310,7 +321,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     overlay.replaceChildren(watchdogMessage);
 
     await expect(import("./app.js")).rejects.toThrow(
-      "web-terminal-kiro: missing #terminal root element",
+      "bootstrap watchdog already reported a fatal resource failure",
     );
 
     expect(overlay.firstElementChild).toBe(watchdogMessage);
@@ -318,78 +329,43 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).not.toHaveBeenCalled();
   });
 
-  it("offers a working reload action when startup fails", async () => {
-    const reload = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
+  it("keys the abort on the handoff marker, not on the dialog's ARIA shape", async () => {
+    // data-bootstrap-fatal is an explicit protocol marker precisely so the
+    // fatal surface's a11y shape can change without silently severing the
+    // handoff. An overlay carrying the marker and NOTHING else must still abort.
     const overlay = appendPristineOverlay();
+    overlay.setAttribute("data-bootstrap-fatal", "");
 
     await expect(import("./app.js")).rejects.toThrow(
-      "web-terminal-kiro: missing #terminal root element",
+      "bootstrap watchdog already reported a fatal resource failure",
     );
-
-    const reloadButton = overlay.querySelector("button");
-    expectFatalOverlayShape(overlay);
-    reloadButton?.click();
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(createTerminalMock).not.toHaveBeenCalled();
   });
 
   it("leaves the kernel's own recovery surface alone and rethrows when createTerminal throws", async () => {
     const root = appendTerminalRoot();
     const loading = appendPristineOverlay({ fade: true });
-    // Emulate web-terminal-ui >= 4.7.0's kernel-init path: by the time it
-    // rethrows, the kernel has rendered its own surface into #terminal and
-    // lowered #loading. createTerminal is called OUTSIDE the app's only
-    // try/catch (which wraps the preset call alone), so the throw propagates
-    // untouched and the app builds nothing.
+    // By the time the kernel-init path rethrows, the library has rendered its own
+    // surface and lowered #loading. This app has no try/catch around
+    // createTerminal at all now, so the throw propagates untouched.
     createTerminalMock.mockImplementationOnce(() => {
       throw new Error("kernel boom");
     });
 
     await expect(import("./app.js")).rejects.toThrow("kernel boom");
 
-    // The app must NOT build a second dialog: the kernel owns this phase now.
-    // Two recovery surfaces at once (the kernel's in #terminal, the app's in the
-    // #loading slot) is the regression this pins.
+    // The app must NOT build a second dialog. Two recovery surfaces at once (the
+    // kernel's and the app's) is the regression this pins, and deleting the
+    // app's builder is what makes it unreachable.
     const overlay = document.getElementById("loading");
     expect(overlay).toBe(loading);
     expect(overlay?.hasAttribute("data-bootstrap-fatal")).toBe(false);
     expect(overlay?.getAttribute("role")).not.toBe("alertdialog");
     expect(overlay?.querySelector("button")).toBeNull();
-    // ...and it does not inert #terminal, which now holds the kernel's surface.
     expect(root.hasAttribute("inert")).toBe(false);
   });
 
-  it("surfaces the fatal dialog and rethrows when the agent preset fails", async () => {
-    const root = appendTerminalRoot();
-    const loading = appendPristineOverlay({ fade: true });
-    const failure = new Error("preset boom");
-    presetAgentTabbedMock.mockImplementationOnce(() => {
-      throw failure;
-    });
-
-    await expect(import("./app.js")).rejects.toBe(failure);
-
-    // The preset is evaluated in its own statement, inside the app's only
-    // try/catch, so it throws before createTerminal is entered: nothing captured
-    // #loading and nothing will ever lower it, so the app still owns the
-    // recovery surface here. No clone is needed either, because no kernel
-    // continuation exists to fade the dialog out from under us.
-    expect(createTerminalMock).not.toHaveBeenCalled();
-    const dialog = document.getElementById("loading");
-    expect(dialog).toBe(loading);
-    expect(loading.isConnected).toBe(true);
-    expect(dialog?.classList.contains("fade")).toBe(false);
-    expectFatalOverlayShape(dialog as HTMLElement);
-    // showFatal backs its aria-modal claim with a real inert on the terminal
-    // root; asserted here (the app.ts failure path where #terminal exists and
-    // the app owns the dialog) so a regression cannot hide behind the watchdog
-    // test's own inert assertion below.
-    expect(root.hasAttribute("inert")).toBe(true);
-    expect(dialog?.querySelector("#bootstrap-failure-message")?.textContent).toContain(
-      "The terminal's feature set could not be built",
-    );
-  });
-
-  it("rethrows the original error without touching the DOM when createTerminal throws and #loading is absent", async () => {
+  it("rethrows without touching the DOM when createTerminal throws and #loading is absent", async () => {
     appendTerminalRoot();
     createTerminalMock.mockImplementationOnce(() => {
       throw new Error("kernel boom no overlay");
@@ -400,27 +376,16 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
 
-  it("rethrows the preset failure untouched when #loading is absent", async () => {
-    appendTerminalRoot();
-    const failure = new Error("preset boom no overlay");
-    presetAgentTabbedMock.mockImplementationOnce(() => {
-      throw failure;
-    });
-
-    await expect(import("./app.js")).rejects.toBe(failure);
-    expect(createTerminalMock).not.toHaveBeenCalled();
-    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
-  });
-
   it("builds the same alertdialog shape when the real index.html watchdog fires", () => {
     // Execute the REAL inline bootstrap watchdog from static/index.html (the
     // pre-module, CSP-hashed script that catches /app.js load failures before
     // app.ts can run) against index.html's pristine pre-JS markup, and assert
-    // it produces the exact overlay shape showFatal builds — via the same
-    // expectFatalOverlayShape helper, so the two builders (which cannot share
-    // code) are pinned to one contract from a single source. Mirrors how
-    // routes_test.go independently re-extracts the same inline scripts for
-    // the CSP hash check.
+    // it produces the shape expectFatalOverlayShape pins — including the title
+    // and Reload label, which come from the library's exported
+    // STARTUP_FAILURE_COPY rather than being restated here, so the one copy this
+    // app still hand-writes cannot drift from the one the library renders.
+    // Mirrors how routes_test.go independently re-extracts the same inline
+    // scripts for the CSP hash check.
     const watchdogSource = readWatchdogSource();
 
     // Recreate index.html's static body: the terminal root plus the pristine
@@ -444,11 +409,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expectFatalOverlayShape(overlay);
     const description = overlay.querySelector("#bootstrap-failure-message");
     expect(description?.textContent).toContain("Web Terminal for Kiro failed to load");
-    // aria-modal made true: the watchdog inerts the terminal root, exactly
-    // like showFatal.
+    // aria-modal made true: the watchdog inerts the terminal root, so the claim
+    // is backed by real containment.
     expect(root.hasAttribute("inert")).toBe(true);
     // The watchdog's Reload button must actually reload -- the same contract
-    // the app.ts "offers a working reload action" test pins for showFatal. A
+    // the library's own fatal-panel tests pin for its Reload button. A
     // dead click listener would leave a dead-end recovery CTA on the only
     // actionable element left.
     const reloadSpy = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
@@ -486,13 +451,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(false);
   });
 
-  it("watchdog does not clobber an overlay showFatal already converted", () => {
+  it("watchdog does not clobber an overlay a fatal dialog already converted", () => {
     evaluateWatchdog(readWatchdogSource());
 
     appendTerminalRoot();
     // The marker-less converted overlay: this fixture deliberately omits
-    // data-bootstrap-fatal (which showFatal now always sets), so it is NOT the
-    // full post-showFatal shape -- it isolates the older missing-.bar fallback
+    // data-bootstrap-fatal, so it is NOT the full claimed-overlay
+    // shape -- it isolates the older missing-.bar fallback
     // clause, complementing the marker-only stand-down test above.
     const overlay = document.createElement("div");
     overlay.id = "loading";
@@ -510,7 +475,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const scriptEl = document.createElement("script");
     dispatchWindowError({ target: scriptEl });
 
-    // showFatal's branch-specific message survives; the watchdog's generic
+    // the existing dialog's specific message survives; the watchdog's generic
     // failed-to-load text never replaces it.
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toBe(
       "Web Terminal for Kiro failed to start.",
@@ -669,9 +634,9 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog stands down when a fatal dialog already owns the overlay", () => {
     // The app -> watchdog leg of the marker protocol, mirroring "aborts boot
     // from the fatal handoff marker independently of dialog ARIA" for the other
-    // direction: showFatal claims the overlay by setting data-bootstrap-fatal,
+    // direction: a fatal dialog claims the overlay by setting data-bootstrap-fatal,
     // and the rethrown error then reaches this capture-phase listener, which
-    // must NOT overwrite showFatal's branch-specific message with the generic
+    // must NOT overwrite that dialog's specific message with the generic
     // "failed to load" text. A pristine overlay carrying only the marker
     // isolates that clause from the replaced-.bar side effect it supersedes:
     // with the marker guard removed the watchdog builds its dialog here.

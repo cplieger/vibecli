@@ -65,8 +65,8 @@
         text-align: center;
       }
       /* The fatal dialog's visible title, which is also its accessible name via
-         aria-labelledby (both builders: showFatal in app.ts and the watchdog
-         below). It lives in this critical block rather than style.css for the
+         aria-labelledby (built by the watchdog below). It lives in this critical
+         block rather than style.css for the
          same reason the rest of #loading does: this overlay must be styled
          before /style.css has loaded, and a stylesheet failure is one of the
          states it exists to report. The library's own .wt-fatal-title rules
@@ -258,8 +258,7 @@
           // fade-out and that removal the bar is still a child, so a stray
           // uncaught runtime error in that window would otherwise convert a
           // BOOTED terminal's invisible (opacity:0, pointer-events:none)
-          // overlay into a focus-stealing alertdialog. app.js's own showFatal
-          // replaces the bar before it throws.
+          // overlay into a focus-stealing alertdialog.
           if (
             !overlay ||
             overlay.hasAttribute("data-bootstrap-fatal") ||
@@ -288,15 +287,23 @@
             return;
           // alertdialog, not alert: the overlay carries an interactive Reload
           // button and moves focus into it, the alertdialog interaction model
-          // (APG) -- same treatment as showFatal in app.ts. The role plus the
+          // (APG), the same treatment the library's panel gets. The role plus the
           // focus transition supplies the announcement, so no aria-live is
           // needed. The name comes from a VISIBLE title via aria-labelledby
           // rather than an invisible aria-label, replacing the static "Loading"
           // name: APG prefers one name serving both audiences, and a sighted
-          // user otherwise gets a bare message with no heading. Title text and
-          // button copy match web-terminal-ui's renderFatalStartup() and
-          // showFatal in app.ts, so all three fatal-startup dialogs read alike;
-          // the message below stays this builder's own, being more precise than
+          // user otherwise gets a bare message with no heading.
+          //
+          // Title and button copy MUST equal web-terminal-ui's exported
+          // STARTUP_FAILURE_COPY. This is the only fatal surface left outside the
+          // library -- app.ts no longer builds one, because createTerminal now
+          // owns every terminal startup failure -- and this one cannot be deleted:
+          // it reports "the JS bundle never ran", a rung below `import`, so it can
+          // never import the constant it must agree with. app.test.ts closes that
+          // gap by executing this very script and comparing what it renders
+          // against the real exported constant, so the agreement is checked rather
+          // than remembered. The MESSAGE below stays this builder's own: it names
+          // a cause the library cannot know, which is strictly more useful than
           // the library's generic wording.
           const title = document.createElement("h2");
           title.id = "bootstrap-failure-title";
@@ -318,17 +325,16 @@
           reload.type = "button";
           reload.textContent = "Reload page";
           reload.addEventListener("click", () => window.location.reload());
-          // No Tab trap, mirroring showFatal in app.ts: this button is the only
-          // focusable node in the document, so there is nothing to contain, and
-          // trapping Tab only blocked the address bar. Containment that does work
-          // (inert + aria-modal) is below. Keep the two builders in sync.
+          // No Tab trap, matching the library's own panel: this button is the
+          // only focusable node in the document, so there is nothing to contain,
+          // and trapping Tab only blocked the address bar. Containment that does
+          // work (inert + aria-modal) is below.
           overlay.replaceChildren(title, description, reload);
           // aria-modal claims the rest of the page is inert; make it true
-          // (APG alertdialog focus containment; WCAG 2.4.11) -- mirrors
-          // showFatal in app.ts, keep the two in sync.
+          // (APG alertdialog focus containment; WCAG 2.4.11).
           const terminalRoot = document.getElementById("terminal");
           if (terminalRoot) terminalRoot.setAttribute("inert", "");
-          // Match showFatal (app.ts): move focus to the recovery CTA; the
+          // Move focus to the recovery CTA, like the library's own panel: the
           // page content never loaded and Reload is the only actionable
           // element left (the alertdialog pattern's initial focus).
           reload.focus({ focusVisible: true });

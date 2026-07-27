@@ -423,22 +423,34 @@ EXPOSE 9848
 # --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
 # begun just under the limit still runs to --max-time 3600, putting the download
 # leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10245s with
-# APT_PACKAGES (≈ 9285s without). Two consequences, not one: an unhealthy state
-# never restarts this container (restart policy acts on process exit), so a very
-# slow first boot merely shows unhealthy and converges once the marker is
-# written — but tests/image-smoke.sh FAILS the build at SMOKE_TIMEOUT, so a
-# slow-but-alive download that stall detection deliberately lets run is a red CI
-# image-smoke job with no artifact explaining why. Resolving that gap is a pending
-# maintainer decision (bound the retries, raise both budgets in lockstep to cover
-# the ~10245s retry envelope -- start-period ~171m (10260s), SMOKE_TIMEOUT 10320
-# per the "+ two 30s probe intervals" rule above -- drop --retry, or accept the
-# exposure). Keep this comment and
-# tests/image-smoke.conf's header in lockstep whenever a foreground timeout
-# changes. Tool installs
-# converge in the background AFTER bind (only session creation waits on
-# them), so /api/health is reachable throughout that window — it reports the
-# install state in the informational "tools" field without going
-# unhealthy. Under `restart: unless-stopped`, health failures are reported
+# APT_PACKAGES (≈ 9285s without).
+#
+# THE BUDGETS ARE DELIBERATELY LEFT BELOW THAT SUM (decided 2026-07). The two
+# budgets protect different things and only one has teeth:
+#   - At RUNTIME `unhealthy` is cosmetic. The restart policy acts on process exit,
+#     not health status, so a very slow first boot shows unhealthy, keeps
+#     downloading, and converges once the readiness marker is written. /api/health
+#     is reachable throughout (tool installs converge in the BACKGROUND after
+#     bind; only session creation waits on them) and reports the install state in
+#     its informational "tools" field.
+#   - In CI the download runs on a GitHub-hosted runner over a fast link and takes
+#     minutes. A smoke boot that exceeds this start-period means something is
+#     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not
+#     a false negative on a healthy image.
+# Raising both budgets to cover the ~10245s retry envelope was considered and
+# rejected: it would make a genuinely hung CI job burn ~3 hours of Actions time
+# before failing, which is a real recurring cost against a theoretical worst case
+# (CI cost matters on the free plan; validation is meant to stay minutes, not
+# hours). Bounding or dropping --retry was also rejected: stall detection already
+# aborts a link that stops making progress, so --retry exists for the case worth
+# keeping, a connection DROPPED mid-528MB.
+# What this accepts, stated plainly: a download slow enough to outlast the
+# start-period fails the smoke job, and an operator on a genuinely slow link sees
+# an unhealthy interval on first boot before it converges. Both are the intended
+# outcomes, not a gap awaiting a decision.
+# Keep this comment and tests/image-smoke.conf's header in lockstep whenever a
+# foreground timeout changes.
+# Under `restart: unless-stopped`, health failures are reported
 # but do not restart the container (restart policies react to process exit,
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.

@@ -868,6 +868,12 @@ needs_kiro_cli_install() {
   fi
   local current
   current=$(kiro_cli_version "$BIN")
+  # Publish what we just measured. The failed-update fallback below needs the
+  # pre-install version to name it in its warning, and probing again would add a
+  # fifth 10s --version call to the foreground boot allowance the Dockerfile
+  # HEALTHCHECK comment sums. Empty when $BIN was absent (nothing to name) or when
+  # the probe timed out, which both callers already treat as unknown.
+  kiro_cli_measured_version="$current"
   if [ "$current" != "$KIRO_CLI_VERSION" ]; then
     printf 'level=info msg="kiro-cli version drift; reinstalling" installed=%s pinned=%s component=entrypoint\n' \
       "${current:-unknown}" "$KIRO_CLI_VERSION" >&2
@@ -888,6 +894,10 @@ needs_kiro_cli_install() {
 # settings flake. (install_kiro_cli's body is a subshell, so it cannot set this
 # itself -- the caller records it from the exit status.)
 kiro_cli_pin_asserted_at_install=0
+# The version needs_kiro_cli_install measured off $BIN, published so the
+# failed-update fallback can name it without a second 10s --version probe. Empty
+# when $BIN was absent or the probe timed out.
+kiro_cli_measured_version=""
 # Set when an update failed but a usable earlier version stayed on the volume, so the
 # readiness section can publish over the OLD version instead of withholding the marker
 # and leaving a working terminal answering 503 for the container's lifetime.
@@ -914,10 +924,11 @@ if needs_kiro_cli_install; then
   # loud, not silent -- the warn below names both versions, and the readiness
   # section publishes the marker with a matching warn instead of pretending the
   # container is at the pin.
-  kiro_cli_previous=""
-  if [ -x "$BIN" ]; then
-    kiro_cli_previous=$(kiro_cli_version "$BIN")
-  fi
+  # Reuse the version needs_kiro_cli_install just measured rather than probing
+  # again: this block only runs when that predicate returned 0, so the value is
+  # already in hand, and a second probe would cost another 10s of foreground boot
+  # allowance for a string that appears in one log line.
+  kiro_cli_previous="$kiro_cli_measured_version"
   if ! install_kiro_cli; then
     if [ -x "$BIN" ]; then
       kiro_cli_update_failed=1

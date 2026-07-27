@@ -23,8 +23,7 @@ set -u
 . "$(dirname -- "$0")/lib.sh"
 new_workdir >/dev/null
 
-# shellcheck disable=SC1090
-. "$(extract_function resolves_to_pinned_kiro_cli)"
+load_function resolves_to_pinned_kiro_cli
 
 KIRO_CLI_VERSION="2.14.1"
 PROBES=0

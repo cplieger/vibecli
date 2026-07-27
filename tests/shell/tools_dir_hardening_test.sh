@@ -23,8 +23,7 @@ set -u
 . "$(dirname -- "$0")/lib.sh"
 new_workdir >/dev/null
 
-# shellcheck disable=SC1090
-. "$(extract_function secure_tools_dir)"
+load_function secure_tools_dir
 
 # fatal() is the abort under test: record the call and return non-zero so the caller
 # unwinds the way `exit` would, without killing this harness.

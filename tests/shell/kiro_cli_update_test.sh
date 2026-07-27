@@ -43,7 +43,7 @@ for _fn in kiro_cli_snapshot_one kiro_cli_restore_one kiro_cli_update_finish \
 done
 # The readiness decision chain is inline boot code, not a function: take it from
 # the version probe down to the line before the next section, then drop that line.
-READINESS=$(extract_range '^kiro_cli_installed=""' '^# OS packages' "$WORK/readiness.raw")
+READINESS=$(extract_range '^kiro_cli_installed=""' '^# OS packages' "$WORK/readiness.raw") || exit 1
 sed '$d' "$READINESS" >"$WORK/readiness.sh"
 
 # --- scenario scaffolding -----------------------------------------------------

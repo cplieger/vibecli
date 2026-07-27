@@ -2,8 +2,13 @@
 # Runs every entrypoint.sh unit test in this directory.
 #
 # This filename is the contract: cplieger/ci's shell-ci.yaml runs
-# `tests/shell/run.sh` when it exists and is executable, and skips otherwise, so a
-# repo opts into shell unit testing by committing this file. Keep the name.
+# `tests/shell/run.sh` when it exists, and skips otherwise, so a repo opts into
+# shell unit testing by committing this file. Keep the name.
+#
+# The hook tests -f and invokes this through `bash`, so the exec bit is not
+# load-bearing (it was committed 100644 once, which under an -x check would have
+# skipped the whole suite silently and still reported CI green). The bit is set
+# anyway, for anyone running it directly.
 #
 # Each *_test.sh is a separate process, so one test's stubs, traps and shell
 # options cannot leak into another's. All of them run even when an early one

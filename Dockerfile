@@ -412,8 +412,13 @@ EXPOSE 9848
 # runs outside the sums. Single-attempt allowance-sum: kiro-cli download (curl
 # --max-time 3600, the absolute backstop behind --speed-limit/--speed-time stall
 # detection) + install.sh (120, +15 kill-after) + version/settings probes
-# (150: four --version checks — the every-boot bare-name resolution check, the drift
-# check, install_kiro_cli's staged verify, and the readiness probe — plus SIX settings
+# (150: four --version checks on the worst-case UPGRADE boot — the drift check,
+# install_kiro_cli's staged verify, the POST-install bare-name resolution check, and
+# the readiness probe. The every-boot resolution check before the install runs in
+# identity mode and probes nothing: asking the version there warned about a suspected
+# stale binary on every routine bump, and dropping the probe is what keeps this at
+# four. A first boot with no $BIN present runs three, since the drift check finds
+# nothing to probe — plus SIX settings
 # calls, the five applied after
 # promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
 # assertion — at 10s each, +5s kill-after) + optional APT_PACKAGES (apt-get

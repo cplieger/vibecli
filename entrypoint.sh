@@ -350,7 +350,7 @@ prune_superseded_kas_runtimes() {
 # still answers "$BIN" while a stale, no-longer-pinned CLI remains first on PATH and
 # launchable by sessions -- exactly the state the quarantine exists to prevent.
 resolves_to_pinned_kiro_cli() {
-  local resolved resolved_version
+  local mode=${1:-full} resolved resolved_version
   # Resolve against the SESSION PATH, not the entrypoint's trimmed one: this check is about
   # what a session (or `docker exec ... kiro-cli`) resolves by bare name.
   resolved=$(PATH="$SESSION_PATH" command -v kiro-cli 2>/dev/null) || return 0
@@ -361,7 +361,18 @@ resolves_to_pinned_kiro_cli() {
   # is a binary at some OTHER path winning bare-name resolution, which is the genuine
   # shadowing risk. Callers that must tolerate a fallback check the status explicitly;
   # `! resolves_to_pinned_kiro_cli` still treats both as failure.
+  #
+  # mode=identity asks only the SHADOWING question and never probes --version. The
+  # every-boot advisory site wants exactly that: on the first boot after a Renovate
+  # bump, $BIN legitimately holds the OLD version, and a full check there emitted a
+  # warn about a suspected "unremovable stale binary" on the routine upgrade path,
+  # followed by a second warn from the caller -- for a condition that is expected and
+  # corrected by needs_kiro_cli_install's own truthful info line moments later. The
+  # version question belongs to that check, not to this one, and skipping the probe
+  # also keeps the every-boot path at ONE fewer 10s --version call (the foreground
+  # boot allowance the Dockerfile HEALTHCHECK comment sums).
   if [ "$resolved" = "$BIN" ]; then
+    [ "$mode" = identity ] && return 0
     resolved_version=$(kiro_cli_version "$resolved")
     [ "$resolved_version" = "$KIRO_CLI_VERSION" ] && return 0
     printf 'level=warn msg="bare-name kiro-cli resolves to the pinned path but not the pinned version (unremovable stale binary?)" resolved="%s" installed=%s pinned=%s component=entrypoint\n' \
@@ -580,8 +591,19 @@ fi
 # the pinned binary is present and leads PATH here, so this is hygiene, not an
 # integrity gate (the fatal treatment stays on the reinstall paths below).
 sweep_legacy_dispatchers "$HOME/.local/bin" || true
-if ! resolves_to_pinned_kiro_cli; then
-  printf 'level=warn msg="a kiro-cli other than the pinned binary at the pinned version is still reachable by bare name after the boot sweep; residue or a drifted binary may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
+# identity mode: this site asks only "does something OTHER than $BIN win bare-name
+# resolution", which is the residue question the sweep above is about. It must NOT ask
+# the version question -- on the first boot after a Renovate bump $BIN legitimately
+# still holds the old version, and asking here produced two WARN lines per upgrade
+# (one from the helper about a suspected unremovable binary, one from this caller)
+# describing a condition that is expected, benign, and corrected seconds later by
+# needs_kiro_cli_install's own `level=info msg="kiro-cli version drift; reinstalling"`.
+# The drifted-$BIN cases that DO matter keep their signal elsewhere: the two
+# post-install sites below use full mode (where a surviving unpinned $BIN really is
+# dangerous, since the sweep has run), and a failed update logs its own warn naming
+# both versions.
+if ! resolves_to_pinned_kiro_cli identity; then
+  printf 'level=warn msg="a kiro-cli other than the pinned binary is reachable by bare name after the boot sweep; residue may remain on the volume" dir="%s/.local/bin" component=entrypoint\n' "$HOME" >&2
 fi
 
 # Third hygiene sweep, same unconditional-every-boot argument, applied to the agent

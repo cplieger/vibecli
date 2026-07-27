@@ -18,31 +18,37 @@
     <link rel="stylesheet" href="/style.css">
     <!-- [html-validate-disable-next no-style-tag -- critical CSS for instant loading indicator] -->
     <style>
+      /* The loading overlay's APPEARANCE is not here any more: web-terminal-ui's
+         css/page.css owns .wt-loading / .wt-loading-bar / .wt-loading-text, and it
+         arrives with /style.css above. That link is render-blocking, so nothing
+         paints before it either way and an inline copy bought no earlier paint --
+         it only bought three divergent copies of one loading screen (this app's,
+         web-terminal-server's, and the library scaffold's).
+         What survives inline is ONLY the failure surface below: the case where
+         /style.css is the thing that failed, which the bootstrap watchdog reports
+         by converting this overlay into an alertdialog. Those rules are therefore
+         written to be SELF-SUFFICIENT (their own position/inset/background), since
+         by definition no library CSS is available when they are needed. */
       #loading {
+        /* web-terminal-kiro's brand purple, as the library's overlay token. Same
+           literal as the createTerminal theme --accent (the overlay cannot read
+           the JS theme) and pinned by app.test.ts's brand-accent parity test. */
+        --wt-loading-accent: hsl(263.1683 100% 80%);
+      }
+
+      #loading[role="alertdialog"] {
+        /* Self-sufficient by necessity: the state this dialog reports includes
+           "/style.css failed to load", so it cannot inherit the box from
+           page.css's .wt-loading rule. Everything the panel needs to be a
+           legible full-screen surface is declared here. */
         position: fixed;
         inset: 0;
         z-index: 200;
         display: flex;
-        align-items: center;
-        justify-content: center;
-        /* web-terminal-kiro accent (matches the createTerminal theme --accent); the pre-JS
-           overlay can't read the JS theme, so the brand purple is set here too. */
-        --accent: hsl(263.1683 100% 80%);
         background: #000;
-        color: var(--accent);
-        /* easing matches the UI bundle's --ease-exit; tokens are scoped to .wt-root
-           and unreachable here, so the value is inlined like the --accent literal. */
-        transition: opacity 0.3s cubic-bezier(0.4, 0, 1, 1);
-      }
-      #loading.fade {
-        opacity: 0;
-        /* the kernel removes the node on transitionend (1.5s fallback); until
-           then the invisible full-viewport overlay must not swallow the first
-           tap-to-focus on the freshly rendered terminal */
-        pointer-events: none;
-      }
-      #loading[role="alertdialog"] {
+        color: var(--wt-loading-accent);
         flex-direction: column;
+        align-items: center;
         /* Keep the ONLY recovery affordance reachable. This is a fixed
            inset:0 box with centred content, so at small viewport heights (a
            short landscape window, a large user font size) the message and the
@@ -122,56 +128,16 @@
       #loading[role="alertdialog"] p {
         margin: 0;
       }
-      #loading .bar {
-        position: relative;
-        inline-size: min(220px, 62vw);
-        block-size: 5px;
-        overflow: hidden;
-        border-radius: 999px;
-        background: color-mix(in oklch, currentColor 16%, transparent);
-      }
-      #loading .bar::before {
-        content: "";
-        position: absolute;
-        inset-block: 0;
-        inline-size: 42%;
-        border-radius: inherit;
-        background: linear-gradient(
-          90deg,
-          transparent,
-          currentColor 28%,
-          color-mix(in oklch, currentColor, #fff 45%) 50%,
-          currentColor 72%,
-          transparent
-        );
-        filter: drop-shadow(
-          0 0 4px color-mix(in oklch, currentColor 55%, transparent)
-        );
-        /* Deliberately NOT one of the library's easing tokens: --ease-standard
-           /--ease-enter/--ease-exit are all asymmetric (they settle at one
-           end), which reads as a stutter on a looping indeterminate sweep.
-           This is the symmetric ease-in-out-cubic the sweep needs; like the
-           --ease-exit value above, it is inlined because .wt-root tokens are
-           unreachable from this pre-JS block. */
-        animation: kweb-loading-slide 1.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
-      }
-      @keyframes kweb-loading-slide {
-        0% {
-          transform: translateX(-110%);
-        }
-        100% {
-          transform: translateX(250%);
-        }
-      }
-      /* The shared clip-based hide technique, now used by two elements.
-         #loading .loading-status: readable content for the role="status" region
-         (the bar is aria-hidden, so without this the live region carries no text
-         for assistive tech to render -- WCAG 4.1.3); both fatal builders
-         replaceChildren(), so it is gone by the time the overlay becomes the
-         alertdialog. .visually-hidden: the document's <h1>, which is PERMANENT --
-         a body-level sibling no builder clears. Same technique web-terminal-ui's
-         kernel announcer uses (src/kernel/a11y.ts hideVisually). */
-      #loading .loading-status,
+      /* The document <h1>'s permanent off-screen hide (a body-level sibling no
+         builder clears). Same technique web-terminal-ui's kernel announcer uses
+         (src/kernel/a11y.ts hideVisually).
+         The overlay's own status line used to share this rule: this app carried a
+         clip-hidden <p class="loading-status">Starting the terminal...</p> so the
+         role="status" region had text for assistive tech (WCAG 4.1.3). That is the
+         library's job now -- the kernel writes a PROGRESSIVE line into the overlay
+         (silent for the first seconds, then rotating, superseded by the server's
+         own reason), and it owns both the visible and the announced half. One
+         status owner instead of a static sentence this app had to keep in step. */
       .visually-hidden {
         position: absolute;
         inline-size: 1px;
@@ -183,15 +149,7 @@
         white-space: nowrap;
         border: 0;
       }
-      @media (prefers-reduced-motion: reduce) {
-        #loading {
-          transition-duration: 0.01ms;
-        }
-        #loading .bar::before {
-          animation-duration: 0.01ms;
-          animation-iteration-count: 1;
-        }
-      }
+
       .noscript-fallback {
         position: fixed;
         inset: 0;
@@ -224,9 +182,13 @@
     <!-- createTerminal() (in /app.js) builds the entire terminal UI inside this
      root element; the loading overlay is a sibling so it is never cleared. -->
     <main id="terminal"></main>
-    <div id="loading" role="status" aria-label="Loading">
-      <div class="bar" aria-hidden="true"></div>
-      <p class="loading-status">Starting the terminal…</p>
+    <!-- Styled by web-terminal-ui's css/page.css through the wt-loading* CLASSES
+         (recoloured by the --wt-loading-accent token set above), NOT by this id.
+         role="status" is load-bearing: the kernel writes a progressive status line
+         in here once startup drags on, and that region is what a screen reader
+         reads. No static status text of our own -- the library owns it now. -->
+    <div id="loading" class="wt-loading" role="status" aria-label="Loading">
+      <div class="wt-loading-bar" aria-hidden="true"></div>
     </div>
     <noscript>
       <p class="noscript-fallback">
@@ -262,7 +224,7 @@
           if (
             !overlay ||
             overlay.hasAttribute("data-bootstrap-fatal") ||
-            !overlay.querySelector(".bar") ||
+            !overlay.querySelector(".wt-loading-bar") ||
             overlay.classList.contains("fade")
           )
             return;

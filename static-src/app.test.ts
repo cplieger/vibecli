@@ -112,11 +112,12 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(title?.textContent).toBe(STARTUP_FAILURE_COPY.title);
   expect(overlay.getAttribute("aria-describedby")).toBe("bootstrap-failure-message");
   // The pristine loading bar is always replaced by the dialog content.
-  expect(overlay.querySelector(".bar")).toBeNull();
-  // ...and so is the pre-JS status announcement: replaceChildren() drops every
-  // pristine child, so the live region's "Starting the terminal" text cannot
-  // survive next to the failure message.
-  expect(overlay.querySelector(".loading-status")).toBeNull();
+  expect(overlay.querySelector(".wt-loading-bar")).toBeNull();
+  // ...and so is any status line the kernel had written: replaceChildren() drops
+  // every child, so a "still working" reassurance cannot survive next to a
+  // failure message that says the terminal is not coming.
+  expect(overlay.querySelector(".wt-loading-text")).toBeNull();
+  expect(overlay.querySelector(".wt-loading-live")).toBeNull();
   const reload = overlay.querySelector("button");
   expect(reload?.type).toBe("button");
   expect(reload?.textContent).toBe(STARTUP_FAILURE_COPY.reloadLabel);
@@ -146,7 +147,7 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
 // asserted only partially.
 function expectPristineOverlayUntouched(overlay: HTMLElement, root: HTMLElement): void {
   expect(overlay.getAttribute("role")).toBe("status");
-  expect(overlay.querySelector(".bar")).not.toBeNull();
+  expect(overlay.querySelector(".wt-loading-bar")).not.toBeNull();
   expect(overlay.querySelector("button")).toBeNull();
   expect(root.hasAttribute("inert")).toBe(false);
 }
@@ -205,27 +206,29 @@ function appendTerminalRoot({ booted = false } = {}): HTMLElement {
   return root;
 }
 
-// index.html's pristine pre-JS #loading overlay (role=status, with its two
-// children: the aria-hidden .bar and the .loading-status announcement): the
-// exact state the watchdog keys its behavior on.
+// index.html's pristine pre-JS #loading overlay (role=status, one aria-hidden
+// .wt-loading-bar child): the exact state the watchdog keys its behavior on.
 // fade: the kernel's first-frame fade-out has begun.
 function appendPristineOverlay({ fade = false } = {}): HTMLElement {
   const overlay = document.createElement("div");
   overlay.id = "loading";
+  overlay.className = "wt-loading";
   overlay.setAttribute("role", "status");
   overlay.setAttribute("aria-label", "Loading");
   if (fade) {
     overlay.classList.add("fade");
   }
+  // The overlay's ONLY pre-JS child. It carries no status text of its own any
+  // more: web-terminal-ui's kernel writes a progressive status line into this
+  // region (silent for the first seconds, then rotating, superseded by the
+  // server's reason), so the app no longer keeps a static sentence in step with
+  // it. The class is wt-loading-bar, not bar, because css/page.css owns the
+  // overlay's appearance now and must not claim a name as generic as `.bar` in a
+  // host document.
   const bar = document.createElement("div");
-  bar.className = "bar";
+  bar.className = "wt-loading-bar";
+  bar.setAttribute("aria-hidden", "true");
   overlay.appendChild(bar);
-  // index.html's readable content for the role=status region (the bar is
-  // aria-hidden); both fatal builders replaceChildren() it away.
-  const status = document.createElement("p");
-  status.className = "loading-status";
-  status.textContent = "Starting the terminal\u2026";
-  overlay.appendChild(status);
   document.body.appendChild(overlay);
   return overlay;
 }
@@ -757,8 +760,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // still clear a >= 2 bound. The [^}]* bound keeps each assertion inside the
     // named rule rather than matching the accent later in the stylesheet.
     const escapedAccent = ACCENT_HSL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // #loading critical CSS (the pre-JS overlay, which cannot read the JS theme):
-    expect(html).toMatch(new RegExp(`#loading\\s*\\{[^}]*--accent:\\s*${escapedAccent}\\s*;`));
+    // The pre-JS overlay, which cannot read the JS theme. It sets the LIBRARY's
+    // overlay token now (page.css owns the overlay's appearance and derives the
+    // bar and status text from it) rather than a local --accent, so this is the
+    // one place the brand reaches the loading screen.
+    expect(html).toMatch(
+      new RegExp(`#loading\\s*\\{[^}]*--wt-loading-accent:\\s*${escapedAccent}\\s*;`),
+    );
     // the no-JS fallback message:
     expect(html).toMatch(
       new RegExp(`\\.noscript-fallback\\s*\\{[^}]*color:\\s*${escapedAccent}\\s*;`),
@@ -790,11 +798,16 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // The guards the watchdog keys on, read from the served file rather than
     // from appendPristineOverlay()'s hand-built copy.
     expect(overlay?.getAttribute("role")).toBe("status");
-    expect(overlay?.querySelector(".bar")).not.toBeNull();
-    expect(overlay?.querySelector(".bar")?.getAttribute("aria-hidden")).toBe("true");
-    expect(overlay?.querySelector(".loading-status")?.textContent).toContain(
-      "Starting the terminal",
-    );
+    expect(overlay?.querySelector(".wt-loading-bar")).not.toBeNull();
+    expect(overlay?.querySelector(".wt-loading-bar")?.getAttribute("aria-hidden")).toBe("true");
+    // The overlay ships with NO status text of its own: web-terminal-ui's kernel
+    // owns that line now (progressive, rotating, superseded by the server's own
+    // reason), so a static sentence here would be a second owner to keep in step.
+    expect(overlay?.querySelector(".wt-loading-text")).toBeNull();
+    expect(overlay?.textContent?.trim()).toBe("");
+    // ...and it opts in to the library's overlay styling by CLASS, which is what
+    // makes page.css the single definition of this screen across the fleet.
+    expect(overlay?.classList.contains("wt-loading")).toBe(true);
     expect(overlay?.classList.contains("fade")).toBe(false);
     // ...and the booted-root guard's pre-JS precondition: #terminal is empty
     // until createTerminal builds into it.

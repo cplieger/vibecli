@@ -44,7 +44,11 @@ setup() {
   HOME_DIR="$ROOT/home"
   mkdir -p "$TOOLS/bin" "$HOME_DIR/.local/bin"
   BIN="$TOOLS/bin/kiro-cli"
-  SESSION_PATH="$TOOLS/bin:$HOME_DIR/.local/bin:/usr/bin"
+  # ONLY the two fake bin dirs: command -v is a builtin and kiro_cli_version is
+  # stubbed, so no real directory is needed -- and a real /usr/bin here would turn
+  # the "nothing reachable" cases into a shadowing case on any host that has its
+  # own /usr/bin/kiro-cli (a per-user false failure, not a product signal).
+  SESSION_PATH="$TOOLS/bin:$HOME_DIR/.local/bin"
   : >"$PROBE_LOG"
   STUB_VERSION="$KIRO_CLI_VERSION"
 }
@@ -82,7 +86,7 @@ run
 for mode in identity full; do
   setup
   : >"$HOME_DIR/.local/bin/kiro-cli" && chmod +x "$HOME_DIR/.local/bin/kiro-cli"
-  SESSION_PATH="$HOME_DIR/.local/bin:$TOOLS/bin:/usr/bin"
+  SESSION_PATH="$HOME_DIR/.local/bin:$TOOLS/bin"
   run "$([ "$mode" = identity ] && printf identity)"
   [ "$RC" -eq 1 ] && [ "$WARNS" -eq 1 ] \
     && ok "unpinned binary at another path: rc1 + warn in $mode mode" \

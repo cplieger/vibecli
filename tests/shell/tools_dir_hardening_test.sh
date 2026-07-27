@@ -16,7 +16,9 @@
 #     because lib.sh's ok/no return 0 unconditionally by design (see their comment).
 #   SC2034 - the variables set below are the INPUTS to entrypoint.sh code that is
 #     extracted and sourced at RUNTIME, so shellcheck cannot see the reads.
-# shellcheck disable=SC2015,SC2034
+#   SC2329 - the stat/chmod stubs below are invoked INDIRECTLY, by the extracted
+#     function they shadow, which shellcheck cannot see.
+# shellcheck disable=SC2015,SC2034,SC2329
 set -u
 
 # shellcheck source-path=SCRIPTDIR
@@ -34,13 +36,22 @@ fatal() {
 }
 tools_tree_was_writable=0
 
-# run <owned> <shape-setup...> -> sets FATALED and RC
+# run <owned> <shape-setup...> -> sets FATALED, RC, and WARNLOG
+# stderr is kept per attempt: several assertions below claim a WARNING, and a
+# warning claim that only inspects FATALED stays green when the warn line itself
+# is deleted -- the loud degraded-mode signal is the contract, so the log is the
+# observable.
 attempt() {
   local dir=$1 owned=$2
   FATALED=0
   tools_tree_was_writable=0
-  secure_tools_dir "$dir" 0 "$owned" >/dev/null 2>&1
+  WARNLOG="$WORK/warn.log"
+  secure_tools_dir "$dir" 0 "$owned" >/dev/null 2>"$WARNLOG"
   RC=$?
+}
+
+warned() {
+  grep -Fq "$1" "$WARNLOG"
 }
 
 mk() {
@@ -51,20 +62,22 @@ mk() {
 # --- unowned (legacy PATH segments): must NEVER abort ---------------------------
 R=$(mk) && ln -s /nonexistent-target "$R/seg"
 attempt "$R/seg" 0
-[ "$FATALED" -eq 0 ] && ok "unowned symlink: warns, does not abort" \
-  || no "unowned symlink" "aborted boot on a dir the entrypoint does not own"
+[ "$FATALED" -eq 0 ] && warned 'is a symlink; skipping it' \
+  && ok "unowned symlink: warns, does not abort" \
+  || no "unowned symlink" "fataled=$FATALED, warn log: $(cat "$WARNLOG")"
 
 R=$(mk) && : >"$R/seg"
 attempt "$R/seg" 0
-[ "$FATALED" -eq 0 ] && ok "unowned plain file: warns, does not abort" \
-  || no "unowned plain file" "aborted boot"
+[ "$FATALED" -eq 0 ] && warned 'is not a directory; skipping it' \
+  && ok "unowned plain file: warns, does not abort" \
+  || no "unowned plain file" "fataled=$FATALED, warn log: $(cat "$WARNLOG")"
 
 R=$(mk) && mkdir -p "$R/seg" && chmod 0777 "$R/seg"
 attempt "$R/seg" 0
-if [ "$FATALED" -eq 0 ]; then
+if [ "$FATALED" -eq 0 ] && warned 'permits group/other writes; tightening it (no kiro-cli quarantine'; then
   ok "unowned world-writable: warns, does not abort"
 else
-  no "unowned world-writable" "aborted boot"
+  no "unowned world-writable" "fataled=$FATALED, warn log: $(cat "$WARNLOG")"
 fi
 # ...and it still TIGHTENS the mode, which is the part worth keeping.
 MODE=$(stat -c '%a' "$R/seg" 2>/dev/null)
@@ -104,5 +117,44 @@ R=$(mk) && mkdir -p "$R/seg" && chmod 0777 "$R/seg"
 attempt "$R/seg" 0
 [ "$tools_tree_was_writable" -eq 0 ] && ok "unowned writable: quarantine NOT armed" \
   || no "unowned quarantine" "armed a kiro-cli quarantine for a tree that holds none"
+
+# --- the owned fail-CLOSED postconditions: mode that cannot be PROVED clean -------
+# These three are the point of the whole gate: the tree holds the first-on-PATH
+# kiro-cli, so an unprovable or unfixable mode must stop the boot. Each failure is
+# forced with a scoped stub for exactly one call shape; the filesystem cases above
+# keep using the real commands.
+
+# stat fails outright: the mode cannot be read, so it cannot be proved clean.
+R=$(mk) && mkdir -p "$R/owned" && chmod 0755 "$R/owned"
+stat() { return 1; }
+attempt "$R/owned" 1
+unset -f stat
+[ "$FATALED" -eq 1 ] && ok "owned unreadable mode: fails closed instead of assuming clean" \
+  || no "owned unreadable mode" "did not abort when stat failed"
+
+# chmod is a no-op (an immutable or foreign-fs tree): the re-read still sees the
+# write bits, and an owned tree that RESISTS tightening must stop the boot.
+R=$(mk) && mkdir -p "$R/owned" && chmod 0777 "$R/owned"
+chmod() { return 0; }
+attempt "$R/owned" 1
+unset -f chmod
+[ "$FATALED" -eq 1 ] && ok "owned tighten-resistant tree: fails closed on the re-read" \
+  || no "owned tighten-resistant" "kept trusting a tree that stayed group/other-writable"
+
+# stat succeeds before tightening and fails after: the RESULT cannot be verified.
+# The call count lives in a FILE because the function runs inside the extracted
+# code's command substitutions -- a shell variable incremented there dies with the
+# subshell and every call would see count 0.
+R=$(mk) && mkdir -p "$R/owned" && chmod 0777 "$R/owned"
+: >"$WORK/statcalls"
+stat() {
+  printf 'x\n' >>"$WORK/statcalls"
+  [ "$(wc -l <"$WORK/statcalls")" -ge 2 ] && return 1
+  command stat "$@"
+}
+attempt "$R/owned" 1
+unset -f stat
+[ "$FATALED" -eq 1 ] && ok "owned unverifiable tightening: fails closed on the second stat" \
+  || no "owned unverifiable tightening" "trusted a tighten it could not re-read"
 
 report

@@ -36,6 +36,25 @@ ENTRYPOINT="${ENTRYPOINT:-$REPO_ROOT/entrypoint.sh}"
 _pass=0
 _fail=0
 _skip=0
+_reported=0
+
+# One EXIT trap owns both end-of-process duties: scrub the scratch dir, and
+# refuse to let a test file end without calling report. ok/no record failures but
+# deliberately return 0 (see below), so a file whose final `report` line was lost
+# would otherwise exit 0 after its last assertion and the runner would count a
+# clean pass — a complete false green from a one-line deletion. Subshells reset
+# EXIT traps, so command substitutions and per-case subshells never double-fire
+# this.
+_lib_on_exit() {
+  _lib_status=$?
+  [ -n "${WORK:-}" ] && rm -rf "$WORK"
+  if [ "$_reported" -eq 0 ]; then
+    printf 'harness error: %s exited without calling report\n' "$(basename "$0")" >&2
+    exit 70
+  fi
+  exit "$_lib_status"
+}
+trap _lib_on_exit EXIT
 
 # ok/no are the whole assertion vocabulary: a test states what it verified in the
 # same words the failure would use, so a CI log reads as a list of guarantees.
@@ -109,8 +128,11 @@ extract_function() {
     !inside && index($0, fn "()") == 1 {
       print
       # The opening line closes the body itself only for a one-liner; `fn() {` and
-      # `fn() (` end with the OPENER, so they must not match here.
-      if ($0 ~ /[)}][[:space:]]*$/) exit
+      # `fn() (` end with the OPENER, so they must not match here. A one-liner may
+      # carry a trailing comment (`fn() { cmd; } # note`), so the closer test
+      # tolerates one rather than requiring the line to END on the closer —
+      # anchored to `; <closer>` so an opener line can never satisfy it.
+      if ($0 ~ /;[[:space:]]*[)}][[:space:]]*(#.*)?$/) exit
       inside = 1
       next
     }
@@ -142,9 +164,16 @@ load_function() {
   local src
   src=$(extract_function "$@") || exit 1
   # The path is generated above, so there is nothing on disk for shellcheck to
-  # follow at lint time.
+  # follow at lint time. The source itself must be fatal too: a malformed
+  # extraction raises a syntax error but `.` does not stop a non-interactive
+  # shell without set -e, and the file would carry on with the function
+  # undefined or half-defined — the same false-green class the extract guard
+  # closes.
   # shellcheck disable=SC1090
-  . "$src"
+  . "$src" || {
+    printf 'harness error: sourcing the extraction of %s failed\n' "$1" >&2
+    exit 1
+  }
 }
 
 # extract_range <start-regex> <end-regex> [dest]
@@ -166,21 +195,21 @@ extract_range() {
 }
 
 # A private scratch directory per test process, removed on exit including on a
-# failed assertion, so a run leaves nothing behind in /tmp.
+# failed assertion, so a run leaves nothing behind in /tmp. The removal lives in
+# the harness's single EXIT trap (installed above); installing one here would
+# silently REPLACE that trap and with it the forgot-report guard.
 new_workdir() {
   WORK=$(mktemp -d)
-  # Deliberate early expansion: the trap must capture THIS directory, not whatever
-  # $WORK holds when the shell exits.
-  # shellcheck disable=SC2064
-  trap "rm -rf '$WORK'" EXIT
   printf '%s\n' "$WORK"
 }
 
 # Prints the tally and sets the process exit status. Every test file ends with
-# this, and the runner reads the status rather than parsing output. Skips are
+# this, and the runner reads the status rather than parsing output — the EXIT
+# trap above turns a missing report call into a loud harness error. Skips are
 # reported separately and never fold into the pass count: a suite whose premises
 # all went unmet must not read as a suite that verified them.
 report() {
+  _reported=1
   if [ "$_skip" -ne 0 ]; then
     printf '\n%s: %d passed, %d failed, %d skipped\n' "$(basename "$0")" "$_pass" "$_fail" "$_skip"
   else

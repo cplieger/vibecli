@@ -55,10 +55,23 @@ apt-get() {
   case "\$*" in
     *update*) return \$_URC ;;
     *install*)
-      # Record exactly what apt would have been handed, one token per line.
+      # Record the CALL itself before any argv filtering: the empty-list guard is
+      # asserted on invocations, and a stub that only records package args cannot
+      # see an empty install.
+      printf 'install-call\n' >>"$WORK/calls"
+      # Then record exactly what apt would have been handed AS PACKAGES: everything
+      # after the -- separator, verbatim. apt's own invocation options sit before
+      # the separator and are not evidence; a hostile token shaped like an option
+      # can only be a package, so it lands after -- and is recorded ('opt:'
+      # prefixed) instead of vanishing into a filter.
+      _sep=0
       for a in "\$@"; do
         case "\$a" in
-          -*|install|--) ;;
+          --) _sep=1; continue ;;
+        esac
+        [ "\$_sep" -eq 1 ] || continue
+        case "\$a" in
+          -*) printf 'opt:%s\n' "\$a" >>"$WORK/installed" ;;
           *) printf '%s\n' "\$a" >>"$WORK/installed" ;;
         esac
       done
@@ -79,8 +92,10 @@ $(cat "$WORK/warn.sh")
 $(cat "$WORK/block.sh")
 HARNESS
   : >"$WORK/installed"
+  : >"$WORK/calls"
   SKIPPED=$(bash "$WORK/harness.sh" 2>&1 >/dev/null | grep -c 'level=warn.*skipping' || true)
   INSTALLED=$(tr '\n' ' ' <"$WORK/installed" | sed 's/ *$//')
+  INSTALL_CALLS=$(grep -c 'install-call' "$WORK/calls" 2>/dev/null || true)
 }
 
 # --- the gate RUNS: unchanged behaviour, dots verified literally -------------
@@ -115,15 +130,29 @@ run 100 ok 'jq gcc g++'
   || no "undotted degraded" "installed='$INSTALLED' skipped=$SKIPPED"
 
 # --- an all-dotted list must not invoke apt with an empty argv ---------------
+# INSTALL_CALLS is the oracle, not the package list: an empty install records no
+# packages either way, so only the invocation count can see this guard.
 run 100 ok 'python3.13 docker.io'
-[ -z "$INSTALLED" ] && [ "$SKIPPED" -eq 2 ] \
+[ "$INSTALL_CALLS" -eq 0 ] && [ -z "$INSTALLED" ] && [ "$SKIPPED" -eq 2 ] \
   && ok "all tokens dropped: apt is not called with an empty package list" \
-  || no "all dropped" "installed='$INSTALLED' skipped=$SKIPPED"
+  || no "all dropped" "install_calls=$INSTALL_CALLS installed='$INSTALLED' skipped=$SKIPPED"
 
 # --- the grammar stage still owns its own rejections ------------------------
-run 0 ok 'jq ../etc/passwd jq- -0day'
-[ "$INSTALLED" = "jq" ] \
-  && ok "grammar rejections unchanged (traversal, remove-suffix, option-like)" \
-  || no "grammar" "installed='$INSTALLED', want 'jq'"
+# Run with the GATE UNAVAILABLE (failed update): with the gate up, these tokens
+# would be rejected by the known-name check too, and this case could go green with
+# the grammar deleted. Degraded mode is where only the grammar stands between a
+# hostile token and apt's argv, so that is where it is asserted. 'jq-' is the
+# canary: name-shaped enough to reach apt if the grammar's anchor broke, absent
+# from the known-name list, and not dotted (so the degraded dotted-token drop
+# cannot mask its rejection either).
+run 100 ok 'jq ../etc/passwd jq- -0day'
+case "$INSTALLED" in
+  *jq-* | *passwd* | *opt:*) no "grammar" "a grammar-invalid token reached apt: '$INSTALLED'" ;;
+  *)
+    [ "$INSTALLED" = "jq" ] \
+      && ok "grammar rejections hold with the gate down (traversal, remove-suffix, option-like)" \
+      || no "grammar" "installed='$INSTALLED', want 'jq'"
+    ;;
+esac
 
 report

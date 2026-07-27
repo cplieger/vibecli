@@ -361,15 +361,29 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # kiro-cli installs under $HOME/.local. Home is under /config so the
 # install survives container restarts.
 ENV HOME=/config/home
-# PATH leads with the engine-managed bin dir. The legacy segments
-# (tools/go/bin, runtimes/{go,node}/bin) are retained for volumes whose
-# binaries predate the toolbelt engine; prune them once a startup audit
-# shows no binary resolves only through them (evidence-gated, not
-# release-count-gated). GOROOT/GOBIN are gone: the engine installs Go
-# under versioned opt/go/<ver>/ trees with a bin/go symlink and the
-# toolchain derives GOROOT itself; go-installed tools land in the bin
-# dir via the engine's own GOBIN env at install time.
-ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/tools/runtimes/go/bin:/config/tools/runtimes/node/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# PATH leads with the engine-managed bin dir. The two `runtimes/{go,node}/bin`
+# segments are GONE: the audit they were gated on ran on the borgcube volume
+# (2026-07) and found they held only go/gofmt and node/npm/npx, every one already
+# resolving through tools/bin to the engine's opt/<tool>/<ver>/ trees, so both
+# trees were deleted (265 MB) after symlinking the one exception, corepack, into
+# tools/bin. Keeping them on PATH after that bought nothing and cost real exposure:
+# they sit ahead of /usr/bin, are never created or repaired by this entrypoint, and
+# a binary planted while such a tree was group/other-writable stays executable by
+# root even after the mode is tightened (chmod stops new writes, it does not
+# re-verify existing files). Removing the segments removes that path instead of
+# policing it. Restoring a pre-toolbelt backup volume is the one case that
+# regresses; the remedy is the same one the audit used, symlink the exception into
+# tools/bin.
+# tools/go/bin STAYS: it is GOPATH/bin (see ENV GOPATH below), the landing site for
+# any `go install` run without the engine's GOBIN, and 18 binaries live there on the
+# real volume. Its residual exposure is accepted rather than hardened -- deleting a
+# user's own go-installed tools is the productivity harm the dev-box failure posture
+# forbids (web-terminal-kiro.md), and anyone able to plant there already holds
+# /config/home/.ssh and the auth tokens.
+# GOROOT/GOBIN are gone: the engine installs Go under versioned opt/go/<ver>/ trees
+# with a bin/go symlink and the toolchain derives GOROOT itself; go-installed tools
+# land in the bin dir via the engine's own GOBIN env at install time.
+ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
 ENV KIRO_CLI_PATH=/config/tools/bin/kiro-cli
 ENV KWEB_WORK_DIR=/workspace

@@ -492,24 +492,31 @@ harden_config_dir "$HOME"
 secure_tools_dir /config
 secure_tools_dir "$TOOLS"
 secure_tools_dir "$TOOLS/bin"
-# The Dockerfile's ENV PATH puts THREE more /config-resident dirs ahead of
-# /usr/bin for the server, its PTY sessions and the toolbelt engine:
-# $TOOLS/go/bin (GOPATH/bin, not prunable) and $TOOLS/runtimes/{go,node}/bin
-# (legacy segments kept for pre-toolbelt volumes). /config and $TOOLS keep
-# their group/other EXECUTE bits above -- secure_tools_dir strips only w -- so
-# those dirs stay traversable by a foreign host user, and a group/other-writable
-# one of them lets that user plant a `go`/`gofmt`/`node`/`npm` this container
-# then runs as root, ahead of /usr/bin, with no --version or sha gate anywhere.
-# Same premise and same enforcement as $TOOLS/bin; arm=0 because these trees
-# never hold kiro-cli. Include a planted symlink (-L) the way the kiro-cli
-# binary loop below does. Walk parent-to-child, matching the /config -> $TOOLS ->
-# $TOOLS/bin chain above: a writable PARENT lets a foreign host user replace the
-# leaf bin dir wholesale with a clean-mode tree of planted binaries, which the
-# leaf check alone would then pass. Skip-if-absent keeps fresh volumes (no legacy
-# trees) untouched.
-for path_dir in "$TOOLS/go" "$TOOLS/go/bin" \
-  "$TOOLS/runtimes" "$TOOLS/runtimes/go" "$TOOLS/runtimes/go/bin" \
-  "$TOOLS/runtimes/node" "$TOOLS/runtimes/node/bin"; do
+# The Dockerfile's ENV PATH puts ONE more /config-resident dir ahead of /usr/bin
+# for the server, its PTY sessions and the toolbelt engine: $TOOLS/go/bin, i.e.
+# GOPATH/bin. (The two runtimes/{go,node}/bin segments were dropped from ENV PATH
+# once the audit showed both trees held only binaries already resolving through
+# $TOOLS/bin -- see the Dockerfile's PATH comment. Nothing hardens them here any
+# more: a directory that is not on PATH cannot be the source of a root-executed
+# planted binary, so walking it would be theatre.)
+# /config and $TOOLS keep their group/other EXECUTE bits above -- secure_tools_dir
+# strips only w -- so those dirs stay traversable by a foreign host user, and a
+# group/other-writable GOPATH/bin lets that user plant a binary this container then
+# runs as root, ahead of /usr/bin, with no --version or sha gate anywhere. Tighten
+# the mode; arm=0 because this tree never holds kiro-cli, and owned=0 because the
+# entrypoint neither creates nor repairs GOPATH/bin, so an odd shape there is warned
+# about rather than fatal (see web-terminal-kiro.md "Failure posture"). Walk
+# parent-to-child, matching the /config -> $TOOLS -> $TOOLS/bin chain above: a
+# writable PARENT lets a foreign host user replace the leaf bin dir wholesale with a
+# clean-mode tree of planted binaries, which the leaf check alone would then pass.
+#
+# Accepted residual, deliberately not hardened further: `chmod go-w` stops NEW
+# directory writes but never re-verifies files already planted while the tree was
+# writable, and their owner can keep rewriting them. The alternative -- quarantining
+# unrecognized binaries -- would delete the user's own `go install` output, which the
+# dev-box posture forbids, and the threat already presupposes an actor holding
+# /config/home/.ssh and the auth tokens.
+for path_dir in "$TOOLS/go" "$TOOLS/go/bin"; do
   [ -e "$path_dir" ] || [ -L "$path_dir" ] || continue
   secure_tools_dir "$path_dir" 0 0
 done

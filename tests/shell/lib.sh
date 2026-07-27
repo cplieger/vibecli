@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# Shared harness for the entrypoint.sh unit tests.
+# Shared harness for a repo's shell unit tests — CANONICAL COPY in cplieger/ci
+# (configs/shell/lib.sh), synced to each adopting repo's tests/shell/lib.sh
+# by scripts/classify-repos.py (a repo enrolls by committing a tests/shell/run.sh,
+# which is also what the shell-ci hook looks for). DO NOT edit the synced copy in
+# an app repo — change it here and let the sync land it.
 #
-# WHY THESE TESTS EXIST, and why they are not the image smoke test: entrypoint.sh
-# is ~1200 lines and it IS the product's boot path. Its most consequential
-# branches are the ones that fail CLOSED — an unremovable stale binary, a
-# non-private /config, a failed kiro-cli download, a package index that cannot be
-# read — and a smoke test can never reach them, because a healthy image never
-# takes them. tests/image-smoke.sh builds an image and asserts it boots; these
-# assert what happens when it should NOT.
+# WHY THESE SUITES EXIST, generically: an image smoke test proves the assembled
+# image boots, so it can only ever walk the paths a HEALTHY container takes. The
+# branches that matter most are the ones that fail CLOSED — a refusal, a guard, a
+# fallback — and a healthy image never reaches them. These suites assert what
+# happens when it should NOT work. Each repo's own rationale (which of its shell
+# files are covered, and what its existing tests already own) belongs in its
+# repo-owned tests/shell/run.sh header, not here.
 #
-# HOW: each test extracts one function verbatim from the shipped entrypoint.sh
-# and runs it against temp directories, with the few external commands it touches
-# stubbed. Nothing is reimplemented here — an assertion that passed against a
-# paraphrase would prove nothing about what ships. The functions under test are
-# already parameterised (they take the directory or mode as an argument), which is
-# what makes this possible without a container or a writable /config.
+# HOW: each test EXTRACTS one function verbatim out of the shipped shell and runs
+# it against temp directories, stubbing only what spawns a process or touches the
+# host. Nothing is reimplemented — an assertion against a paraphrase proves nothing
+# about what ships. That requires the function under test to take its inputs as
+# arguments or environment rather than hardcoding paths; where it does not, the
+# honest answer is to leave it uncovered rather than to restructure shipped
+# behaviour for the test's benefit.
 #
 # Sourced by every tests/shell/*_test.sh via the runner; not executable itself.
 

@@ -10,6 +10,18 @@
 # skipped the whole suite silently and still reported CI green). The bit is set
 # anyway, for anyone running it directly.
 #
+# WHAT THIS REPO'S SUITE COVERS. This file is repo-owned (lib.sh and
+# harness_test.sh beside it are synced from cplieger/ci), so the per-repo scope
+# rationale lives here.
+#
+# entrypoint.sh
+# is ~1200 lines and it IS the product's boot path. Its most consequential
+# branches are the ones that fail CLOSED — an unremovable stale binary, a
+# non-private /config, a failed kiro-cli download, a package index that cannot be
+# read — and a smoke test can never reach them, because a healthy image never
+# takes them. tests/image-smoke.sh builds an image and asserts it boots; these
+# assert what happens when it should NOT.
+#
 # Each *_test.sh is a separate process, so one test's stubs, traps and shell
 # options cannot leak into another's. All of them run even when an early one
 # fails: a boot path's tests are cheap, and a maintainer wants the whole picture

@@ -446,7 +446,7 @@ EXPOSE 9848
 #     minutes. A smoke boot that exceeds this start-period means something is
 #     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not
 #     a false negative on a healthy image.
-# Raising both budgets to cover the ~10245s retry envelope was considered and
+# Raising both budgets to cover the ~10315s retry envelope was considered and
 # rejected: it would make a genuinely hung CI job burn ~3 hours of Actions time
 # before failing, which is a real recurring cost against a theoretical worst case
 # (CI cost matters on the free plan; validation is meant to stay minutes, not

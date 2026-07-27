@@ -550,13 +550,22 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 // apiNoStore marks the JSON API surface uncacheable. GET /api/sessions returns
 // live session ids, and a session id is the /ws attach + resume capability
 // token — the same value routes.go's LogID truncates before logging and
-// WithTemplatePathsUnder keeps out of the access log. Neither the engine's REST handler
-// nor webhttp's JSON helpers set Cache-Control, so today that response is
-// stored by the browser's disk cache (a live token persisted to disk,
-// outliving the tab) and is heuristically cacheable by a caching reverse proxy
-// — the README's recommended deployment shape. Gated on the /api/ prefix so
-// the static surface keeps kiroCacheControl's ETag/immutable policy untouched;
-// the SSE handler sets its own Cache-Control: no-cache downstream, which wins.
+// WithTemplatePathsUnder keeps out of the access log. A 200 JSON body carrying no
+// freshness information is heuristically cacheable under RFC 9111, so with no
+// directive that response is stored by the browser's disk cache (a live token
+// persisted to disk, outliving the tab) and by a caching reverse proxy — the
+// README's recommended deployment shape.
+//
+// The engine covers its OWN session routes as of v3.2.1 (terminal's writeJSON sets
+// no-store on create/list, and the SSE stream sends "no-cache, no-store"), and
+// handleHealth sets no-store itself, so on those paths this middleware only
+// restates what the route owner already promises — setting the same header twice
+// is idempotent. The surface it still covers ALONE is /api/tools: toolbelt's
+// httpapi sets no Cache-Control at all. That is the reason to keep it, not the
+// sessions surface it was originally written for.
+//
+// Gated on the /api/ prefix so the static surface keeps kiroCacheControl's
+// ETag/immutable policy untouched.
 func apiNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, apiPrefix) {

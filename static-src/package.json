@@ -10,7 +10,7 @@
     "lint:prettier": "prettier --check .",
     "lint:fix": "eslint . --fix && prettier --write .",
     "lint:knip": "knip",
-    "lint:stylelint": "stylelint --configBasedir . --config ../.stylelintrc.json '../static/*.html'"
+    "lint:stylelint": "stylelint --configBasedir . --config stylelint-html.json '../static/*.html'"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

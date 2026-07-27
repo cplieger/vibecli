@@ -158,7 +158,11 @@ run 100 ok 'python3.13 docker.io'
 # canary: name-shaped enough to reach apt if the grammar's anchor broke, absent
 # from the known-name list, and not dotted (so the degraded dotted-token drop
 # cannot mask its rejection either).
-run 100 ok 'jq ../etc/passwd jq- -0day'
+# `etc/passwd` carries no dot either, so the degraded dotted-token drop cannot mask
+# it: it is the traversal/slash canary the way `jq-` is the anchor canary, and it
+# isolates the grammar's slash rejection that `../etc/passwd` alone cannot.
+# `../etc/passwd` stays for the dotted-traversal shape.
+run 100 ok 'jq ../etc/passwd etc/passwd jq- -0day'
 case "$INSTALLED" in
   *jq-* | *passwd* | *opt:*) no "grammar" "a grammar-invalid token reached apt: '$INSTALLED'" ;;
   *)

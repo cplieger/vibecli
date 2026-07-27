@@ -64,17 +64,5 @@
     "comment-empty-line-before": null,
     "rule-empty-line-before": null
   },
-  "referenceFiles": "**/*.css",
-  "overrides": [
-    {
-      "comment": "The app's only hand-written CSS is the critical block embedded in static/index.html: the self-sufficient #loading fatal surface. It is id-scoped on purpose (#loading is this app's own element, and the library selects the overlay by class precisely so it never reaches for our id), so selector-max-id and its specificity companion cannot apply here. hue-degree-notation is off for the same kind of reason: the accent literal hsl(263.1683 100% 80%) is one of FOUR independent spellings of one color (app.ts's createTerminal theme, this block, <meta name=\"theme-color\">, manifest.json), pinned byte-for-byte by app.test.ts's brand-accent parity test, so this file cannot adopt the deg suffix unilaterally. Every other rule still does apply -- no-unknown-custom-properties is the one that catches a typo'd --wt-loading-accent silently reverting the overlay to the library's default.",
-      "files": ["**/*.html"],
-      "customSyntax": "postcss-html",
-      "rules": {
-        "selector-max-id": null,
-        "selector-max-specificity": null,
-        "hue-degree-notation": null
-      }
-    }
-  ]
+  "referenceFiles": "**/*.css"
 }

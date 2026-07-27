@@ -650,8 +650,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // data-bootstrap-fatal, and a later error reaching this capture-phase
     // listener must NOT rebuild the dialog or overwrite that first, specific
     // message with the generic "failed to load" text. A pristine overlay carrying
-    // only the marker
-    // isolates that clause from the replaced-bar side effect it supersedes:
+    // only the marker isolates that clause from the replaced-.wt-loading-bar side
+    // effect it supersedes:
     // with the marker guard removed the watchdog builds its dialog here.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
@@ -776,8 +776,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // REAL markup (a .wt-loading-bar child, no .fade) while appendPristineOverlay()
     // re-creates that markup by hand. If index.html's overlay ever loses the
     // .wt-loading-bar (or #terminal ships a pre-JS child), the watchdog silently
-    // never
-    // fires in production while every watchdog test above still passes against
+    // never fires in production while every watchdog test above still passes
+    // against
     // its own fabricated overlay -- so pin the hand-built fixture to the
     // served file here.
     // Drop the external stylesheet link before parsing: happy-dom fetches

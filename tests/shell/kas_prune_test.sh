@@ -44,6 +44,19 @@ prune_superseded_kas_runtimes >/dev/null 2>&1
 [ ! -e "$KAS/2.13.0-def.lock" ] && ok "the superseded .lock sibling pruned too" \
   || no ".lock sibling" "still present"
 
+# --- 1b. the keep version is an ARGUMENT, not always the pin ---------------------
+# A failed update keeps SERVING the version already on the volume, so the call site
+# passes the running version and this tree must survive while the pinned-but-absent
+# one does not. Without this case every invocation defaulted to the pin, so dropping
+# `$1` (or the call site's argument) left all assertions green while restoring the
+# repeated ~240 MB prune/re-unpack on every boot.
+setup
+mkdir -p "$KAS/2.14.2-pin" "$KAS/2.13.0-running"
+prune_superseded_kas_runtimes "2.13.0" >/dev/null 2>&1
+[ -d "$KAS/2.13.0-running" ] && [ ! -d "$KAS/2.14.2-pin" ] \
+  && ok "failed-update fallback keeps the running version rather than the pin" \
+  || no "running-version keep" "running tree was pruned or the non-running pin tree survived"
+
 # --- 2. non-version-keyed entries are kiro-cli's, not ours ----------------------
 setup
 mkdir -p "$KAS/2.14.2-abc" "$KAS/unpack-scratch" "$KAS/index"

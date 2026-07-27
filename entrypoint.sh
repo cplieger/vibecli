@@ -1240,7 +1240,7 @@ if needs_kiro_cli_install; then
     if [ "$kiro_cli_postinstall_resolve_rc" -eq 1 ]; then
       fatal 'an unpinned kiro-cli is still reachable by bare name after a successful install; refusing to leave it resolvable for the container lifetime' "path=\"$BIN\""
     elif [ "$kiro_cli_postinstall_resolve_rc" -ne 0 ]; then
-      printf 'level=warn msg="the freshly promoted kiro-cli did not answer --version at the pinned version (probe failure or deadline); readiness will be withheld and the next boot reinstalls" path="%s" pinned=%s component=entrypoint\n' "$BIN" "$KIRO_CLI_VERSION" >&2
+      printf 'level=warn msg="the freshly promoted kiro-cli did not answer --version at the pinned version (probe failure or deadline); unless the readiness probe below recovers, readiness is withheld and the next boot reinstalls" path="%s" pinned=%s component=entrypoint\n' "$BIN" "$KIRO_CLI_VERSION" >&2
     fi
   fi
 fi

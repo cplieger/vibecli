@@ -320,12 +320,18 @@ resolves_to_pinned_kiro_cli() {
   # what a session (or `docker exec ... kiro-cli`) resolves by bare name.
   resolved=$(PATH="$SESSION_PATH" command -v kiro-cli 2>/dev/null) || return 0
   [ -n "$resolved" ] || return 0
+  # Two distinct failures, distinct statuses: rc 2 is OUR OWN binary at the wrong
+  # version (nothing is shadowing anything -- the pinned path simply holds an older
+  # build, which is the state a failed update deliberately falls back to), while rc 1
+  # is a binary at some OTHER path winning bare-name resolution, which is the genuine
+  # shadowing risk. Callers that must tolerate a fallback check the status explicitly;
+  # `! resolves_to_pinned_kiro_cli` still treats both as failure.
   if [ "$resolved" = "$BIN" ]; then
     resolved_version=$(kiro_cli_version "$resolved")
     [ "$resolved_version" = "$KIRO_CLI_VERSION" ] && return 0
     printf 'level=warn msg="bare-name kiro-cli resolves to the pinned path but not the pinned version (unremovable stale binary?)" resolved="%s" installed=%s pinned=%s component=entrypoint\n' \
       "$resolved" "${resolved_version:-unknown}" "$KIRO_CLI_VERSION" >&2
-    return 1
+    return 2
   fi
   printf 'level=warn msg="bare-name kiro-cli resolves to an unpinned path ahead of the pinned binary" resolved="%s" pinned="%s" component=entrypoint\n' "$resolved" "$BIN" >&2
   return 1
@@ -777,6 +783,9 @@ install_kiro_cli() (
 # for a version flag it need not support.
 kiro_cli_dispatcher_set_complete() {
   local recorded
+  # rc 1: the sidecar itself is unusable, so `kiro-cli chat` -- the command every
+  # session runs -- cannot dispatch. The terminal is BROKEN, and no caller may treat
+  # that as tolerable.
   if ! is_self_contained_executable "$CHAT_SIDECAR"; then
     printf 'level=warn msg="required kiro-cli-chat sidecar dispatcher is missing or not a self-contained executable; kiro-cli chat cannot dispatch" path="%s" component=entrypoint\n' \
       "$CHAT_SIDECAR" >&2
@@ -790,10 +799,14 @@ kiro_cli_dispatcher_set_complete() {
   else
     recorded=$(cat "$KIRO_CLI_INSTALL_MARKER" 2>/dev/null) || recorded=""
   fi
+  # rc 2: the dispatcher set is USABLE but was not completed by this pin -- an
+  # inherited pre-marker volume, or a set left by an earlier version. Kept distinct
+  # from rc 1 because the terminal still works, so after a failed update the readiness
+  # path may serve on it rather than answering 503 over a working shell.
   if [ "$recorded" != "$KIRO_CLI_VERSION" ]; then
     printf 'level=warn msg="kiro-cli install-completion marker absent or not at the pinned version; the persisted dispatcher set was never completed by this pin" marker="%s" recorded=%s pinned=%s component=entrypoint\n' \
       "$KIRO_CLI_INSTALL_MARKER" "${recorded:-none}" "$KIRO_CLI_VERSION" >&2
-    return 1
+    return 2
   fi
   return 0
 }
@@ -833,65 +846,82 @@ needs_kiro_cli_install() {
 # settings flake. (install_kiro_cli's body is a subshell, so it cannot set this
 # itself -- the caller records it from the exit status.)
 kiro_cli_pin_asserted_at_install=0
+# Set when an update failed but a usable earlier version stayed on the volume, so the
+# readiness section can publish over the OLD version instead of withholding the marker
+# and leaving a working terminal answering 503 for the container's lifetime.
+kiro_cli_update_failed=0
 if needs_kiro_cli_install; then
-  # Quarantine the stale dispatcher and its sidecars out of BOTH $TOOLS/bin
-  # and the legacy $HOME/.local/bin staging directory BEFORE the reinstall.
-  # install_kiro_cli now stages into a private, off-PATH directory under
-  # $TOOLS, but $HOME/.local/bin is on the image PATH and on the persistent
-  # /config volume, so residue staged there by an EARLIER image version must
-  # still be swept: otherwise, once the canonical binary is removed, that
-  # residue stays reachable via bare-name PATH resolution (the README's
-  # `docker exec ... kiro-cli mcp add`) at a version the pin does not control.
-  # Without the quarantine, a failed reinstall after version drift would also
-  # leave the old, no-longer-pinned binary executable on PATH: /api/health
-  # would report unavailable (marker withheld) yet new sessions would still
-  # launch the stale CLI, contradicting the pin guarantee. With it, an install
-  # failure leaves every binary absent, so new sessions hit the explicit
-  # install-failed guard instead.
-  # A failed unlink is NOT itself fatal any more; a still-reachable unpinned binary
-  # is. That distinction is the point: an unremovable non-binary shadows nothing and
-  # must not brick boot, while anything the kiro-cli* prefix misses must still be
-  # caught. rm -rf is a no-op on the first-boot (nothing present) path.
-  if [ -e "$BIN" ] || [ -e "$HOME/.local/bin/kiro-cli" ]; then
-    printf 'level=info msg="quarantining stale kiro-cli binaries (canonical and legacy staging) before reinstall" path="%s" component=entrypoint\n' "$BIN" >&2
-  fi
-  # Glob rather than an explicit name list: an installer that resolves its
-  # prefix via getpwuid writes whatever dispatcher set THAT version ships, so a
-  # name added upstream must still be quarantined. "$BIN" is covered by the
-  # first pattern.
-  sweep_legacy_dispatchers "$TOOLS/bin" "$HOME/.local/bin" || true
-  # The install-completion marker describes the binaries just swept, so it goes with
-  # them: a marker that outlived its dispatcher set would let a later boot (and the
-  # readiness check below) treat a failed reinstall as a completed one. Cleared here,
-  # republished only by a transaction that promotes a full set -- same fail-closed
-  # ordering as the readiness marker at the top of this file.
-  if ! rm -f "$KIRO_CLI_INSTALL_MARKER"; then
-    fatal 'failed to clear the stale kiro-cli install-completion marker' "marker=\"$KIRO_CLI_INSTALL_MARKER\""
-  fi
-  if ! resolves_to_pinned_kiro_cli; then
-    fatal 'an unpinned kiro-cli is still reachable by bare name after the pre-reinstall sweep; refusing to install over a shadowed binary' "path=\"$BIN\""
+  # DOWNLOAD-THEN-SWAP. install_kiro_cli fetches the ~528 MB zip, verifies it
+  # against the pinned sha, stages it off PATH under $TOOLS, and only then
+  # promotes by rename -- and every promotion is `mv -f`, which replaces the old
+  # file in place. So nothing on the volume is destroyed before a verified
+  # replacement is in hand, and no window exists where $BIN is absent.
+  #
+  # This deliberately REVERSES the older ordering, which quarantined $TOOLS/bin
+  # first so that a failed reinstall left no binary at all rather than a stale
+  # unpinned one a session might silently launch. Two things decided it the other
+  # way (user call, cycle-5 deferral d-u3c4-3): the destructive order turned any
+  # download failure -- blocked egress, an upstream 404 on an older pin, a link
+  # slow enough to trip --speed-limit -- into a container with NO terminal where
+  # it previously had a working one, boot after boot; and this container IS the
+  # operator's access path, so that failure mode removes the tool you would use to
+  # repair it. A working old terminal beats a dead one.
+  #
+  # The cost is explicit: while an update keeps failing, the running version is
+  # NOT the pinned one, so the pin is advisory rather than enforced. That is made
+  # loud, not silent -- the warn below names both versions, and the readiness
+  # section publishes the marker with a matching warn instead of pretending the
+  # container is at the pin.
+  kiro_cli_previous=""
+  if [ -x "$BIN" ]; then
+    kiro_cli_previous=$(kiro_cli_version "$BIN")
   fi
   if ! install_kiro_cli; then
-    printf 'level=warn msg="kiro-cli install failed; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
+    if [ -x "$BIN" ]; then
+      kiro_cli_update_failed=1
+      printf 'level=warn msg="kiro-cli update failed; keeping the version already on the volume and continuing boot (the pin is NOT in force until an update succeeds)" installed=%s pinned=%s component=entrypoint\n' \
+        "${kiro_cli_previous:-unknown}" "$KIRO_CLI_VERSION" >&2
+    else
+      printf 'level=warn msg="kiro-cli install failed and no previous version is present; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
+    fi
     # Belt-and-braces: the installer ran with HOME pointed at the private stage, so it
     # should never have touched $HOME/.local/bin -- but that dir is on PATH and on the
     # persistent volume, and an installer that resolves its prefix via getpwuid rather
     # than $HOME would have. Sweeping here keeps a failed install from leaving an
-    # unpinned binary reachable by bare-name resolution until the NEXT boot's
-    # pre-reinstall quarantine runs. What is fatal here is the same condition as at
-    # the pre-reinstall quarantine above: not a failed unlink, but an unpinned
-    # kiro-cli still resolving by bare name afterwards, which is exactly the case
-    # where an installer that resolved its prefix via getpwuid left one on PATH for
-    # the container's lifetime. A failed install alone still degrades (web UI up,
-    # terminal errors); only a surviving reachable binary exits, with fatal's 10s
-    # crash-loop throttle. The sweep is a no-op when nothing was written there,
-    # which is the normal path.
+    # unpinned binary reachable by bare-name resolution.
     sweep_legacy_dispatchers "$HOME/.local/bin" || true
-    if ! resolves_to_pinned_kiro_cli; then
-      fatal 'an unpinned kiro-cli is still reachable by bare name after a failed install; refusing to leave it resolvable for the container lifetime' "dir=\"$HOME/.local/bin\""
+    # Only a binary at some OTHER path is fatal (rc 1). rc 2 -- $BIN itself at the
+    # previous version -- is precisely the fallback this ordering exists to allow, so
+    # it must not abort the boot; aborting would replace a working terminal with a
+    # 10s-throttled crash loop, which is the very outcome the reorder prevents.
+    kiro_cli_resolve_rc=0
+    resolves_to_pinned_kiro_cli || kiro_cli_resolve_rc=$?
+    if [ "$kiro_cli_resolve_rc" -eq 1 ]; then
+      fatal 'an unpinned kiro-cli outside the pinned path is reachable by bare name after a failed install; refusing to leave it resolvable for the container lifetime' "dir=\"$HOME/.local/bin\""
     fi
   else
     kiro_cli_pin_asserted_at_install=1
+    # Post-promotion cleanup, now that the new set is committed. Two residue classes:
+    # binaries an EARLIER image staged into $HOME/.local/bin (that install ran with the
+    # real HOME; the current one stages off-PATH under $TOOLS), and any dispatcher name
+    # the OLD version shipped that the new one does not -- the promotions overwrite
+    # kiro-cli/-chat/-term by name, so a retired name would otherwise linger unpinned.
+    sweep_legacy_dispatchers "$HOME/.local/bin" || true
+    for stale in "$TOOLS/bin"/kiro-cli*; do
+      [ -e "$stale" ] || [ -L "$stale" ] || continue
+      case "${stale##*/}" in
+        kiro-cli | kiro-cli-chat | kiro-cli-term) continue ;;
+      esac
+      if ! rm -rf "$stale"; then
+        printf 'level=warn msg="failed to remove a retired kiro-cli dispatcher name left by an older version" path="%s" component=entrypoint\n' "$stale" >&2
+      fi
+    done
+    # Post-condition on the committed state: with the pinned binary in place, ANY
+    # non-zero here is a real problem -- either something shadows it from another
+    # path, or the promotion did not take.
+    if ! resolves_to_pinned_kiro_cli; then
+      fatal 'an unpinned kiro-cli is still reachable by bare name after a successful install; refusing to leave it resolvable for the container lifetime' "path=\"$BIN\""
+    fi
   fi
 fi
 
@@ -979,21 +1009,55 @@ kiro_cli_installed=""
 if [ -x "$BIN" ]; then
   kiro_cli_installed=$(kiro_cli_version "$BIN")
 fi
+# Resolved before the chain below, not inside it: `if ! cmd` leaves $? holding the
+# NEGATED status, so the distinction between an unusable sidecar (rc 1) and a
+# marker that predates the pin (rc 2) is unreadable from inside the branch. The
+# helper spawns nothing -- a file shape test plus a cat -- so calling it here costs
+# no boot allowance even on paths that end up not consulting it.
+kiro_cli_set_rc=0
+kiro_cli_dispatcher_set_complete || kiro_cli_set_rc=$?
 if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
-  # Withholding the marker is otherwise a silent signal: /api/health answers 503
-  # and the container sits `unhealthy` forever (readiness, not liveness) with no
-  # reason in Loki. Log the observed version so a wedged --version (timeout) is
-  # distinguishable from a missing binary or a genuine version mismatch.
-  printf 'level=warn msg="kiro-cli not verified at pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" installed=%s pinned=%s component=entrypoint\n' \
-    "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
-elif ! kiro_cli_dispatcher_set_complete; then
-  # $BIN is at the pin, but the dispatcher SET is not complete: `kiro-cli --version`
-  # succeeds while `kiro-cli chat` -- the command every session runs -- cannot
-  # dispatch. Readiness must describe the terminal, not the version probe, or health
-  # stays green over a container whose every session exits immediately. The helper
-  # already logged which half is missing (sidecar or completion marker).
-  printf 'level=warn msg="kiro-cli dispatcher set incomplete for the pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" version=%s component=entrypoint\n' \
-    "$KIRO_CLI_VERSION" >&2
+  if [ "$kiro_cli_update_failed" -eq 1 ] && [ -n "$kiro_cli_installed" ]; then
+    # An update failed and the previous version is still installed and answering
+    # --version. The terminal genuinely works, so readiness describes the terminal:
+    # withholding here would mean a container that boots, serves a working shell, and
+    # still reports 503 for its lifetime -- the availability trade taken deliberately
+    # in the install block above. The pin is NOT in force; that is what the warn says,
+    # and the version is named so Loki shows exactly what is running.
+    printf 'level=warn msg="serving a kiro-cli version older than the pin after a failed update; readiness published because the terminal works, but the pin is NOT in force until an update succeeds" installed=%s pinned=%s component=entrypoint\n' \
+      "$kiro_cli_installed" "$KIRO_CLI_VERSION" >&2
+    if ! touch "$KIRO_CLI_READY_MARKER"; then
+      printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
+    fi
+  else
+    # Withholding the marker is otherwise a silent signal: /api/health answers 503
+    # and the container sits `unhealthy` forever (readiness, not liveness) with no
+    # reason in Loki. Log the observed version so a wedged --version (timeout) is
+    # distinguishable from a missing binary or a genuine version mismatch.
+    printf 'level=warn msg="kiro-cli not verified at pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" installed=%s pinned=%s component=entrypoint\n' \
+      "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
+  fi
+elif [ "$kiro_cli_set_rc" -ne 0 ]; then
+  if [ "$kiro_cli_update_failed" -eq 1 ] && [ "$kiro_cli_set_rc" -eq 2 ]; then
+    # $BIN is at the pin and the chat sidecar is usable; only the completion marker
+    # does not name this pin (an inherited pre-marker volume). The update that would
+    # have written it failed, so serve the working terminal rather than answering 503
+    # over it. rc 1 -- an unusable sidecar -- deliberately does NOT land here: there
+    # the terminal really is broken, so readiness must still be withheld.
+    printf 'level=warn msg="kiro-cli dispatcher set predates this pin and the update that would complete it failed; readiness published because the terminal works" version=%s component=entrypoint\n' \
+      "$KIRO_CLI_VERSION" >&2
+    if ! touch "$KIRO_CLI_READY_MARKER"; then
+      printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
+    fi
+  else
+    # $BIN is at the pin, but the dispatcher SET is not complete: `kiro-cli --version`
+    # succeeds while `kiro-cli chat` -- the command every session runs -- cannot
+    # dispatch. Readiness must describe the terminal, not the version probe, or health
+    # stays green over a container whose every session exits immediately. The helper
+    # already logged which half is missing (sidecar or completion marker).
+    printf 'level=warn msg="kiro-cli dispatcher set incomplete for the pinned version; readiness marker withheld and /api/health will report kiro-cli unavailable" version=%s component=entrypoint\n' \
+      "$KIRO_CLI_VERSION" >&2
+  fi
 elif [ "$kiro_cli_pin_enforced" -ne 1 ]; then
   # Right version on disk, but auto-update could not be turned off: the binary
   # may replace itself mid-session and invalidate the pinned sha, so the version

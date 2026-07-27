@@ -34,6 +34,13 @@ HELPERS="$WORK/helpers.sh"
 extract_function kiro_cli_dispatcher_set_complete "$HELPERS" >/dev/null
 extract_function resolves_to_pinned_kiro_cli "$WORK/_resolve.sh" >/dev/null
 cat "$WORK/_resolve.sh" >>"$HELPERS"
+# The update transaction: the journal is what keeps an interrupted promotion from
+# leaving the OLD $BIN paired with the NEW chat sidecar.
+for _fn in kiro_cli_snapshot_one kiro_cli_restore_one kiro_cli_update_finish \
+  kiro_cli_update_begin kiro_cli_update_rollback recover_kiro_cli_update_journal; do
+  extract_function "$_fn" "$WORK/_$_fn.sh" >/dev/null
+  cat "$WORK/_$_fn.sh" >>"$HELPERS"
+done
 # The readiness decision chain is inline boot code, not a function: take it from
 # the version probe down to the line before the next section, then drop that line.
 READINESS=$(extract_range '^kiro_cli_installed=""' '^# OS packages' "$WORK/readiness.raw")
@@ -51,6 +58,10 @@ setup() {
   CHAT_SIDECAR="$TOOLS/bin/kiro-cli-chat"
   KIRO_CLI_INSTALL_MARKER="$TOOLS/.kiro-cli-installed"
   KIRO_CLI_READY_MARKER="$TOOLS/.kiro-cli-ready"
+  KIRO_CLI_UPDATE_JOURNAL="$TOOLS/.kiro-cli-update-in-progress"
+  BIN_PREV="$TOOLS/bin/.kiro-cli.prev"
+  CHAT_SIDECAR_PREV="$TOOLS/bin/.kiro-cli-chat.prev"
+  KIRO_CLI_INSTALL_MARKER_PREV="$TOOLS/.kiro-cli-installed.prev"
   KIRO_CLI_VERSION="2.14.1"
   SESSION_PATH="$TOOLS/bin:$HOME/.local/bin:/usr/bin"
   kiro_cli_pin_enforced=1
@@ -175,6 +186,18 @@ kiro_cli_update_failed=1
 ready_published && no "failed update, sidecar missing" "marker published but kiro-cli chat cannot dispatch" \
   || ok "readiness WITHHELD when the chat sidecar is unusable, fallback or not"
 
+# Same rule on the OLD-VERSION fallback branch, which used to consult only "is $BIN
+# executable": an interrupted update can leave the old $BIN beside a replaced sidecar,
+# so an executable main dispatcher is not evidence that the terminal works.
+setup
+: >"$BIN" && chmod +x "$BIN"
+printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
+STUB_VERSION="2.13.0"
+kiro_cli_update_failed=1
+ready_published && no "failed update, old version, sidecar missing" \
+  "marker published over an old \$BIN whose chat sidecar cannot dispatch" \
+  || ok "readiness WITHHELD on the old-version fallback when the chat sidecar is unusable"
+
 # Auto-update could not be disabled -> withhold (unchanged behaviour).
 setup
 : >"$BIN" && chmod +x "$BIN"
@@ -184,5 +207,77 @@ STUB_VERSION="$KIRO_CLI_VERSION"
 kiro_cli_pin_enforced=0
 ready_published && no "pin not enforced" "marker published though the binary may self-replace" \
   || ok "readiness WITHHELD when auto-update could not be disabled"
+
+# --- 4. the update transaction ----------------------------------------------
+# Plants a complete OLD set, opens the journal, then promotes ONLY the sidecar --
+# exactly the mixed state a kill between the two renames leaves behind.
+plant_old_set() {
+  setup
+  printf 'old-bin\n' >"$BIN" && chmod +x "$BIN"
+  printf 'old-chat\n' >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
+  printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
+}
+# Promotion is a RENAME in production, and the test must mimic that rather than
+# writing in place: the backup is a hard link, so an in-place `>` would rewrite the
+# shared inode and silently defeat it. `mv -f` replaces the directory entry only.
+promote() {
+  printf '%s\n' "$2" >"$WORK/promote.tmp" && chmod +x "$WORK/promote.tmp"
+  mv -f "$WORK/promote.tmp" "$1"
+}
+
+plant_old_set
+kiro_cli_update_begin >/dev/null 2>&1
+[ -f "$KIRO_CLI_UPDATE_JOURNAL" ] && [ -f "$BIN_PREV" ] && [ -f "$CHAT_SIDECAR_PREV" ] \
+  && ok "update_begin opens the journal and backs up the whole set" \
+  || no "update_begin" "journal or a backup is missing"
+
+plant_old_set
+kiro_cli_update_begin >/dev/null 2>&1
+promote "$CHAT_SIDECAR" new-chat
+kiro_cli_update_rollback >/dev/null 2>&1
+[ "$(cat "$CHAT_SIDECAR")" = "old-chat" ] && [ "$(cat "$BIN")" = "old-bin" ] \
+  && ok "rollback restores the COMPLETE old set after a partial promotion" \
+  || no "rollback" "the set stayed mixed: bin=$(cat "$BIN") chat=$(cat "$CHAT_SIDECAR")"
+
+plant_old_set
+kiro_cli_update_begin >/dev/null 2>&1
+promote "$CHAT_SIDECAR" new-chat
+kiro_cli_update_rollback >/dev/null 2>&1
+[ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] && [ ! -e "$BIN_PREV" ] && [ ! -e "$CHAT_SIDECAR_PREV" ] \
+  && ok "rollback closes the journal and drops its backups" \
+  || no "rollback cleanup" "journal or backup residue survived"
+
+# The next boot's repair pass, on the state a SIGKILL leaves: journal open, sidecar
+# already new, $BIN still old. Without it the drift check reads an old --version off
+# a mixed set and the fallback publishes readiness over a terminal that cannot chat.
+plant_old_set
+kiro_cli_update_begin >/dev/null 2>&1
+promote "$CHAT_SIDECAR" new-chat
+recover_kiro_cli_update_journal >/dev/null 2>&1
+[ "$(cat "$CHAT_SIDECAR")" = "old-chat" ] && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
+  && ok "boot recovery repairs an uncommitted update before any version check" \
+  || no "boot recovery" "the mixed set survived into the boot path"
+
+# A committed update must NOT be rolled back on the next boot, and its backups must
+# not keep occupying the volume.
+plant_old_set
+kiro_cli_update_begin >/dev/null 2>&1
+promote "$CHAT_SIDECAR" new-chat
+promote "$BIN" new-bin
+kiro_cli_update_finish >/dev/null 2>&1
+recover_kiro_cli_update_journal >/dev/null 2>&1
+[ "$(cat "$BIN")" = "new-bin" ] && [ "$(cat "$CHAT_SIDECAR")" = "new-chat" ] \
+  && [ ! -e "$BIN_PREV" ] \
+  && ok "a committed update survives the next boot's recovery pass" \
+  || no "commit" "recovery reverted or leaked a committed install"
+
+# Recovery is strictly additive: with no journal it must not touch the live set even
+# when a stray backup is lying around (a commit whose backup removal failed).
+plant_old_set
+printf 'stale\n' >"$BIN_PREV"
+recover_kiro_cli_update_journal >/dev/null 2>&1
+[ "$(cat "$BIN")" = "old-bin" ] && [ ! -e "$BIN_PREV" ] \
+  && ok "recovery ignores a stray backup with no journal and sweeps it" \
+  || no "stray backup" "recovery restored a backup outside a transaction"
 
 report

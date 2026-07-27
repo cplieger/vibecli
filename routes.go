@@ -291,11 +291,21 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// middleware, which sets the same value; the same header now comes from
 		// webhttp.ReadinessHandler for the apps that use it directly.
 		w.Header().Set("Cache-Control", "no-store")
+		// One constructor for both outcomes, so the INFORMATIONAL tools field cannot
+		// diverge between them (and neither can any field added later). It belongs on
+		// the 503 bodies too: tool convergence never GATES readiness, but an operator
+		// diagnosing a 503 needs to see whether tools are still syncing or already
+		// degraded — and that is exactly the moment the field used to disappear,
+		// because both unready paths returned before it was attached.
+		healthResponse := func(status, reason string) healthBody {
+			body := healthBody{Status: status, Reason: reason}
+			if deps.toolsState != nil {
+				body.Tools = deps.toolsState()
+			}
+			return body
+		}
 		unready := func(reason string) {
-			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthBody{
-				Status: "unready",
-				Reason: reason,
-			})
+			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthResponse("unready", reason))
 		}
 		if !deps.ready.Ready() {
 			unready("starting up or shutting down")
@@ -320,11 +330,7 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// readiness (kiro-cli is the only core dependency), so monitoring
 		// stays green during a long first-boot install window while
 		// operators can still see it (syncing | ok | degraded).
-		body := healthBody{Status: "ok"}
-		if deps.toolsState != nil {
-			body.Tools = deps.toolsState()
-		}
-		webhttp.WriteJSON(w, body)
+		webhttp.WriteJSON(w, healthResponse("ok", ""))
 	}
 }
 
@@ -378,6 +384,44 @@ func notifyExcerpt(msg string) string {
 	return string(runes[:unrecognizedNotifyExcerptRunes]) + "…"
 }
 
+// notifyWarningState is newStatusClassifier's bounded warn budget for
+// unrecognized OSC 9 notifications, extracted so the classifier maps messages
+// and emits records while the synchronized bookkeeping (distinct-message
+// seen-set, cap exhaustion, announce-once) lives in one place: changing the cap
+// or the repeat behavior no longer means re-reading the mapping and logging
+// branches. One instance per classifier instance (never a package var), so its
+// lifetime is the classifier the composition root wires and a test gets a fresh
+// budget.
+type notifyWarningState struct {
+	warned map[string]struct{}
+	mu     sync.Mutex
+	capped bool
+}
+
+// observe records msg against the warn budget and reports which record (if any)
+// the caller should emit: warnFirst for the first occurrence of a DISTINCT
+// message while budget remains, warnCapped exactly once for the first distinct
+// message the cap turns away (so a silent stop is distinguishable from "nothing
+// new appeared"). Both false means the message is Debug-only. The engine shares
+// one classifier across every session and calls it from per-session goroutines,
+// so the state is mutex guarded; the caller logs OUTSIDE the lock.
+func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, seen := s.warned[msg]; seen {
+		return false, false
+	}
+	if len(s.warned) < unrecognizedNotifyCap {
+		s.warned[msg] = struct{}{}
+		return true, false
+	}
+	if s.capped {
+		return false, false
+	}
+	s.capped = true
+	return false, true
+}
+
 // newStatusClassifier returns the kiro-cli OSC 9 -> session-status mapping the
 // composition root injects into the engine (terminal.WithStatusClassifier),
 // with its own bounded warn latch: the first occurrence of each DISTINCT
@@ -404,30 +448,28 @@ func notifyExcerpt(msg string) string {
 // guarded; the logging happens outside the lock.
 //
 // The returned mapping: "Response complete" at the end of an agent turn latches
-// the done (green) state, and "Permission required" when a tool call is blocked
-// on approval latches the needs-input (amber) state (confirmed against the
+// the done (green) state, and BOTH "Permission required" (a tool call blocked on
+// approval) and "Input required" (a structured user question, the notifier's
+// pendingQuestion arm) latch the needs-input (amber) state (confirmed against the
 // pinned kiro-cli build's kiro-cli-chat notifier strings; the pin is
 // entrypoint.sh's KIRO_CLI_VERSION, the single source of truth, so do not copy
 // the version number here — it drifts on the next Renovate bump — the strings
 // live in the kiro-cli-chat sidecar binary, not the kiro-cli dispatcher, so
-// re-verify both strings there after every kiro-cli bump, in the same PR as the
-// pin move). A new
+// re-verify all three strings there after every kiro-cli bump, in the same PR as
+// the pin move; a notifier arm this switch does not name is a status dot that
+// never latches). A new
 // working phase (the OSC 9;4 progress
 // signal, enabled by the factory's TERM_PROGRAM) clears the latch. Any other
 // message is ignored. This mapping is the only kiro-cli-specific coupling; the
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
 func newStatusClassifier() func(string) (string, bool) {
-	var (
-		notifyMu     sync.Mutex
-		notifyWarned = make(map[string]struct{}, unrecognizedNotifyCap)
-		notifyCapped bool
-	)
+	warnings := notifyWarningState{warned: make(map[string]struct{}, unrecognizedNotifyCap)}
 	return func(msg string) (string, bool) {
 		switch msg {
 		case "Response complete":
 			return terminal.StatusDone, true
-		case "Permission required":
+		case "Permission required", "Input required":
 			return terminal.StatusInput, true
 		default:
 			// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
@@ -449,26 +491,13 @@ func newStatusClassifier() func(string) (string, bool) {
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
 			// the write would serialize them all behind the log sink.
-			notifyMu.Lock()
-			_, seen := notifyWarned[msg]
-			atCap := len(notifyWarned) >= unrecognizedNotifyCap
-			warnFirst := !seen && !atCap
-			if warnFirst {
-				notifyWarned[msg] = struct{}{}
-			}
-			// Announce exhaustion once, on the first distinct message the cap turns
-			// away, so a silent stop is distinguishable from "nothing new appeared".
-			warnCapped := !seen && atCap && !notifyCapped
-			if warnCapped {
-				notifyCapped = true
-			}
-			notifyMu.Unlock()
+			warnFirst, warnCapped := warnings.observe(msg)
 
 			switch {
 			case warnFirst:
 				slog.Warn(unrecognizedNotifyMsg,
 					"message_excerpt", notifyExcerpt(msg),
-					"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for the full text`)
+					"hint", `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for the full text`)
 			case warnCapped:
 				slog.Warn(unrecognizedNotifyCapMsg, "distinct_limit", unrecognizedNotifyCap)
 			}

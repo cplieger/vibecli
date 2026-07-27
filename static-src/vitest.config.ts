@@ -27,14 +27,12 @@ export default defineConfig({
     // Vitest's defaults (node_modules at any depth, .git); spreading
     // configDefaults.exclude avoids narrowing the built-in
     // "**/node_modules/**" to a top-level-only glob.
-    // "**/.code-review/**" keeps stray *.test.ts scratch (e.g. files written under
-    // .code-review/tmp by tooling) from being collected and failing the run.
     // "**/.stryker-tmp/**" keeps a leftover Stryker sandbox (an interrupted
     // mutation run does not clean it up) from double-collecting the suite's
     // test files with stale or mutated copies.
     // (Compiled output under ../static needs no entry: include/exclude resolve
     // against this directory, so files outside it are never collected.)
-    exclude: [...configDefaults.exclude, "**/.code-review/**", "**/.stryker-tmp/**"],
+    exclude: [...configDefaults.exclude, "**/.stryker-tmp/**"],
 
     // Forbid .only tests unconditionally — not just in CI.
     allowOnly: false,

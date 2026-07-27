@@ -38,14 +38,17 @@ func TestDebugRoutesNotExposed(t *testing.T) {
 
 	// /ws must be registered as its own pattern.
 	if _, pat := mux.Handler(httptest.NewRequest(http.MethodGet, "/ws", http.NoBody)); pat != "/ws" {
-		t.Errorf("/ws routed to pattern %q, want \"/ws\"", pat)
+		t.Errorf("/ws routed to pattern %q, want %q", pat, "/ws")
 	}
 
-	// /debug/* must NOT be registered — an unregistered path falls through to
-	// the "/" file-server catch-all, so its matched pattern must not be itself.
-	for _, p := range []string{"/debug/raw", "/debug/screen"} {
-		if _, pat := mux.Handler(httptest.NewRequest(http.MethodGet, p, http.NoBody)); pat == p {
-			t.Errorf("%s is registered (pattern %q); /debug routes must not be exposed", p, pat)
+	// /debug/* must NOT be registered. Assert the POSITIVE observable — both probes
+	// resolve to the "/" file-server catch-all — rather than `pat != p`: ServeMux
+	// reports a SUBTREE registration by its pattern, so a handler registered at
+	// "/debug/" would answer /debug/raw while pat ("/debug/") still differs from the
+	// requested path, and the old assertion passed over an exposed debug handler.
+	for _, path := range []string{"/debug/raw", "/debug/screen"} {
+		if _, pat := mux.Handler(httptest.NewRequest(http.MethodGet, path, http.NoBody)); pat != "/" {
+			t.Errorf("%s routed to pattern %q, want the static catch-all %q; /debug routes must not be exposed", path, pat, "/")
 		}
 	}
 }
@@ -647,6 +650,7 @@ func TestClassifyStatus(t *testing.T) {
 	}{
 		{name: "response complete latches done", msg: "Response complete", want: terminal.StatusDone, wantLatch: true},
 		{name: "permission required latches input", msg: "Permission required", want: terminal.StatusInput, wantLatch: true},
+		{name: "input required latches input", msg: "Input required", want: terminal.StatusInput, wantLatch: true},
 		{name: "unknown message is ignored", msg: "Working on it", want: "", wantLatch: false},
 		{name: "empty message is ignored", msg: "", want: "", wantLatch: false},
 		{name: "case mismatch is ignored", msg: "response complete", want: "", wantLatch: false},
@@ -718,61 +722,37 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 // the contract holds wherever the route is mounted and a future narrowing of that
 // middleware's scope cannot silently drop it. That is also why this asserts
 // against the bare mux: it is the HANDLER's property being pinned.
+// STATUS + READY BODY: the byte-exact bodies above are also what pins the ready
+// document, so no separate ready-body test is needed -- an exact match fails for
+// a renamed status field, an empty tools value, or ANY extra key (the tools
+// key's ABSENCE is what marks the subsystem deliberately disabled, as under bare
+// `go run` or tests, rather than degraded). The status codes ride along in the
+// same table because the Docker HEALTHCHECK's curl reads only the code.
 func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		deps *routeDeps
-		want string
+		name       string
+		deps       *routeDeps
+		wantStatus int
+		wantBody   string
 	}{
-		{"unready", newTestDeps(false), `{"status":"unready","reason":"starting up or shutting down"}`},
-		{"ready", newTestDeps(true), `{"status":"ok"}`},
+		{"unready", newTestDeps(false), http.StatusServiceUnavailable, `{"status":"unready","reason":"starting up or shutting down"}`},
+		{"ready", newTestDeps(true), http.StatusOK, `{"status":"ok"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mux, _, _ := mustRegisterRoutes(t, tc.deps)
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
 
-			if got := strings.TrimSpace(rec.Body.String()); got != tc.want {
-				t.Errorf("raw health body = %q, want %q (byte-exact: the key ORDER is the shared contract)", got, tc.want)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("health status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+				t.Errorf("raw health body = %q, want %q (byte-exact: the key ORDER is the shared contract)", got, tc.wantBody)
 			}
 			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 				t.Errorf("Cache-Control = %q, want no-store: a cached readiness verdict defeats the gate", got)
 			}
 		})
-	}
-}
-
-// TestHealthEndpoint_readyBodyContract pins the READY health document, which
-// every other health test leaves unchecked (they assert status codes, or the
-// tools field only in the tools-engine cases): the body is {"status":"ok"} and
-// carries NO tools key when the app runs without a tools engine. Both halves
-// are operator-facing contracts -- "status" is the field a human or a
-// body-matching probe reads, and the tools key's ABSENCE is what distinguishes
-// a deliberately disabled tools subsystem (bare `go run`, tests) from a
-// degraded one, the documented syncing|ok|degraded signal. Renaming the field
-// or emitting an empty tools value passes the whole suite today, because the
-// Docker HEALTHCHECK's curl only reads the status code.
-func TestHealthEndpoint_readyBodyContract(t *testing.T) {
-	mux, _, _ := mustRegisterRoutes(t, newTestDeps(true))
-
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s: status = %d, want %d", healthPath, rec.Code, http.StatusOK)
-	}
-
-	var body map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("health body %q is not a JSON object of strings: %v", rec.Body.String(), err)
-	}
-	if got := body["status"]; got != "ok" {
-		t.Errorf(`health body status = %q, want "ok" (body %q)`, got, rec.Body.String())
-	}
-	if got, ok := body["tools"]; ok {
-		t.Errorf("health body carries tools = %q with no tools engine; the key's absence is what marks the subsystem disabled rather than degraded", got)
-	}
-	if len(body) != 1 {
-		t.Errorf("health body = %v, want exactly the status field when no tools engine is wired", body)
 	}
 }
 

@@ -91,8 +91,8 @@ function readStaticAsset(name: string): string {
 // `import` by definition, so it cannot use the library and cannot be deleted.
 function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("role")).toBe("alertdialog");
-  // The handoff marker both builders set: the app -> watchdog and watchdog -> app
-  // stand-downs both key on it, so neither depends on the other's DOM shape.
+  // The watchdog sets the handoff marker before app.ts can boot. app.ts consumes
+  // this explicit token rather than depending on the dialog's ARIA or child shape.
   expect(overlay.hasAttribute("data-bootstrap-fatal")).toBe(true);
   expect(overlay.getAttribute("aria-modal")).toBe("true");
   // Named by a VISIBLE title via aria-labelledby, not an invisible aria-label:

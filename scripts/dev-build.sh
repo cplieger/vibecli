@@ -175,7 +175,7 @@ mapfile -t fonts < <(sed -n \
   printf 'error: failed to parse the Monaspace face list from Dockerfile\n' >&2
   exit 1
 }
-mkdir -p "$FONT_CACHE" static/vendor/fonts
+mkdir -p "$FONT_CACHE"
 need_fonts=0
 [ -f "$FONT_CACHE_MARKER" ] || need_fonts=1
 for font in "${fonts[@]}"; do
@@ -200,6 +200,13 @@ if [ "$need_fonts" = 1 ]; then
   done
   : >"$FONT_CACHE_MARKER"
 fi
+# Recreate the generated destination so a face dropped from the Dockerfile list
+# does not survive in the dev tree: the image build starts from a clean builder
+# and extracts only the current members, but a dev build reuses the working tree
+# and `cp` cannot delete what the source list no longer names — the stale OTF
+# would keep landing in the //go:embed static tree. $FONT_CACHE stays persistent.
+rm -rf static/vendor/fonts
+mkdir -p static/vendor/fonts
 for font in "${fonts[@]}"; do
   cp "$FONT_CACHE/$font" static/vendor/fonts/
 done

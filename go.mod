@@ -5,13 +5,13 @@ go 1.26.5
 require (
 	github.com/cplieger/slogx v1.4.0
 	github.com/cplieger/toolbelt/v2 v2.2.9
-	github.com/cplieger/web-terminal-engine/v3 v3.2.0
-	github.com/cplieger/webhttp v1.16.0
+	github.com/cplieger/web-terminal-engine/v3 v3.2.1
+	github.com/cplieger/webhttp v1.18.0
 )
 
 require (
 	github.com/cplieger/atomicfile/v2 v2.4.0 // indirect
-	github.com/cplieger/httpx/v4 v4.1.0 // indirect
+	github.com/cplieger/httpx/v4 v4.2.0 // indirect
 	github.com/cplieger/runesafe v1.2.1 // indirect
 	github.com/cplieger/scheduler/v3 v3.0.0 // indirect
 	github.com/cplieger/ssrf/v3 v3.0.0 // indirect
@@ -23,6 +23,6 @@ require (
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/cplieger/envx v1.3.0
+	github.com/cplieger/envx v1.4.0
 	github.com/creack/pty v1.1.24 // indirect
 )

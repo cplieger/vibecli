@@ -76,7 +76,6 @@ kiro_cli_version() {
 }
 fatal() { FATALS="$FATALS|$1"; }
 
-run_readiness() { (. "$WORK/readiness.sh" >/dev/null 2>&1); }
 ready_published() {
   rm -f "$KIRO_CLI_READY_MARKER"
   # shellcheck disable=SC1090  # extracted chain, path is computed
@@ -99,8 +98,9 @@ setup
 mkdir -p "$TOOLS/bin"
 printf '%s\n' "$KIRO_CLI_VERSION" >"$KIRO_CLI_INSTALL_MARKER"
 kiro_cli_dispatcher_set_complete >/dev/null 2>&1
-[ $? -eq 1 ] && ok "set_complete rc1 when the chat sidecar is missing (terminal broken)" \
-  || no "set_complete rc1" "expected 1, got $?"
+set_rc=$?
+[ "$set_rc" -eq 1 ] && ok "set_complete rc1 when the chat sidecar is missing (terminal broken)" \
+  || no "set_complete rc1" "expected 1, got $set_rc"
 
 setup
 : >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
@@ -198,6 +198,33 @@ ready_published && no "failed update, old version, sidecar missing" \
   "marker published over an old \$BIN whose chat sidecar cannot dispatch" \
   || ok "readiness WITHHELD on the old-version fallback when the chat sidecar is unusable"
 
+# A DOUBLE fault -- the update failed AND kiro_cli_update_rollback also failed -- is
+# the one state that leaves the journal OPEN, and it is the one state where an
+# executable $BIN plus a usable sidecar is still not evidence of a verified set: the
+# old $BIN can sit beside an already-promoted NEW sidecar, which set_complete
+# deliberately never version-probes. Both fallback branches must refuse to publish
+# over it; the next boot's recovery pass repairs the set and publishes then.
+setup
+: >"$BIN" && chmod +x "$BIN"
+: >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
+printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
+STUB_VERSION="2.13.0"
+kiro_cli_update_failed=1
+: >"$KIRO_CLI_UPDATE_JOURNAL"
+ready_published && no "failed update, old version, open journal" \
+  "marker published over a mixed set whose rollback never completed" \
+  || ok "readiness WITHHELD on the old-version fallback while the update journal is open"
+
+setup
+: >"$BIN" && chmod +x "$BIN"
+: >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
+STUB_VERSION="$KIRO_CLI_VERSION"
+kiro_cli_update_failed=1
+: >"$KIRO_CLI_UPDATE_JOURNAL"
+ready_published && no "pre-marker volume, open journal" \
+  "marker published over a mixed set whose rollback never completed" \
+  || ok "readiness WITHHELD on the pre-marker fallback while the update journal is open"
+
 # Auto-update could not be disabled -> withhold (unchanged behaviour).
 setup
 : >"$BIN" && chmod +x "$BIN"
@@ -246,6 +273,30 @@ kiro_cli_update_rollback >/dev/null 2>&1
 [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] && [ ! -e "$BIN_PREV" ] && [ ! -e "$CHAT_SIDECAR_PREV" ] \
   && ok "rollback closes the journal and drops its backups" \
   || no "rollback cleanup" "journal or backup residue survived"
+
+# The REPAIR-install shape, which needs no kill at all: an old $BIN whose chat
+# sidecar and completion marker are ABSENT. There is nothing to link aside for those
+# two, so a rollback that could only restore backups left the promoted NEW sidecar
+# and marker beside the restored OLD $BIN -- the same mixed set the journal exists to
+# prevent. The `.absent` tombstones make the absence a snapshotted state, so rollback
+# removes what this update promoted instead of adopting it.
+setup
+printf 'old-bin\n' >"$BIN" && chmod +x "$BIN"
+kiro_cli_update_begin >/dev/null 2>&1
+promote "$CHAT_SIDECAR" new-chat
+promote "$KIRO_CLI_INSTALL_MARKER" "$KIRO_CLI_VERSION"
+kiro_cli_update_rollback >/dev/null 2>&1
+[ "$(cat "$BIN")" = "old-bin" ] && [ ! -e "$CHAT_SIDECAR" ] && [ ! -e "$KIRO_CLI_INSTALL_MARKER" ] \
+  && ok "rollback removes components that were absent before a repair install" \
+  || no "rollback tombstone" \
+    "a promoted component survived the rollback: chat=$([ -e "$CHAT_SIDECAR" ] && echo present || echo gone) marker=$([ -e "$KIRO_CLI_INSTALL_MARKER" ] && echo present || echo gone)"
+
+# ...and it leaves no tombstone behind: an orphaned one would make the NEXT boot's
+# recovery pass delete a component that by then belongs to a committed install.
+[ ! -e "$BIN_PREV.absent" ] && [ ! -e "$CHAT_SIDECAR_PREV.absent" ] \
+  && [ ! -e "$KIRO_CLI_INSTALL_MARKER_PREV.absent" ] \
+  && ok "rollback drops the .absent tombstones along with the backups" \
+  || no "tombstone cleanup" "a tombstone survived and would delete a committed component next boot"
 
 # The next boot's repair pass, on the state a SIGKILL leaves: journal open, sidecar
 # already new, $BIN still old. Without it the drift check reads an old --version off

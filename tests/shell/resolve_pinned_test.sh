@@ -26,11 +26,15 @@ new_workdir >/dev/null
 load_function resolves_to_pinned_kiro_cli
 
 KIRO_CLI_VERSION="2.14.1"
-PROBES=0
-# Stub: counts probes so "identity mode costs no --version call" is observable, and
-# returns whatever the scenario planted.
+PROBE_LOG="$WORK/probes"
+# Stub: RECORDS each probe in a file so "identity mode costs no --version call" is
+# observable. A counter variable cannot work here: the function under test always runs
+# inside a command substitution (run() below, and the production probe site is itself
+# `resolved_version=$(kiro_cli_version ...)`), so an increment happens in a subshell
+# and is discarded -- the parent's copy stays 0 however many probes fire. Returns
+# whatever the scenario planted.
 kiro_cli_version() {
-  PROBES=$((PROBES + 1))
+  printf 'probe\n' >>"$PROBE_LOG"
   printf '%s\n' "$STUB_VERSION"
 }
 
@@ -41,7 +45,7 @@ setup() {
   mkdir -p "$TOOLS/bin" "$HOME_DIR/.local/bin"
   BIN="$TOOLS/bin/kiro-cli"
   SESSION_PATH="$TOOLS/bin:$HOME_DIR/.local/bin:/usr/bin"
-  PROBES=0
+  : >"$PROBE_LOG"
   STUB_VERSION="$KIRO_CLI_VERSION"
 }
 # run <mode> -> RC, WARNS (count of level=warn lines on stderr)
@@ -62,8 +66,8 @@ if [ "$RC" -eq 0 ] && [ "$WARNS" -eq 0 ]; then
 else
   no "bump boot identity" "rc=$RC warns=$WARNS -- the routine upgrade path warns again"
 fi
-[ "$PROBES" -eq 0 ] && ok "identity mode costs no --version probe" \
-  || no "identity probe" "probed $PROBES times; the boot allowance sum assumes zero here"
+[ ! -s "$PROBE_LOG" ] && ok "identity mode costs no --version probe" \
+  || no "identity probe" "probed $(grep -c . "$PROBE_LOG") times; the boot allowance sum assumes zero here"
 
 # ...while FULL mode still reports it, which is what the post-install sites rely on.
 setup

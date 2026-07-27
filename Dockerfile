@@ -434,10 +434,13 @@ EXPOSE 9848
 # budgets protect different things and only one has teeth:
 #   - At RUNTIME `unhealthy` is cosmetic. The restart policy acts on process exit,
 #     not health status, so a very slow first boot shows unhealthy, keeps
-#     downloading, and converges once the readiness marker is written. /api/health
-#     is reachable throughout (tool installs converge in the BACKGROUND after
-#     bind; only session creation waits on them) and reports the install state in
-#     its informational "tools" field.
+#     downloading, and converges once the readiness marker is written. Mind the
+#     phase boundary: during the FOREGROUND kiro-cli download no HTTP listener
+#     exists yet, so a probe is refused outright — Docker reports unhealthy after
+#     the start period and, with `restart: unless-stopped`, does not restart it.
+#     Only AFTER the server binds is /api/health reachable, and from then on tool
+#     installs converge in the BACKGROUND (only session creation waits on them)
+#     while health reports the install state in its informational "tools" field.
 #   - In CI the download runs on a GitHub-hosted runner over a fast link and takes
 #     minutes. A smoke boot that exceeds this start-period means something is
 #     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not

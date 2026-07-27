@@ -103,20 +103,30 @@ is_self_contained_executable() {
 # --- kiro-cli update transaction ---------------------------------------------
 # See KIRO_CLI_UPDATE_JOURNAL above for why the promotion needs one at all.
 
-# Link $1 aside as $2 so the promotion can be undone. A MISSING backup means the
-# file was absent before the update (a first install), which is exactly what
-# recovery needs to know: there is no old version to restore, so it must not
-# invent one. Any other failure returns non-zero, and the caller then refuses to
-# start the transaction at all -- refusing to update is the app's stated trade
-# (a working old terminal beats a dead one), while promoting without a way back
-# is the mixed-set bug this exists to prevent.
+# Link $1 aside as $2 so the promotion can be undone, and record an ABSENCE
+# explicitly when there is nothing to link. "No backup" used to carry two
+# meanings -- "this component did not exist before the update" and "the snapshot
+# never ran" -- and rollback could only read the second, so it left a component
+# this update newly promoted in place. That is the mixed-set bug on a REPAIR
+# install: an old $BIN with no chat sidecar snapshots only $BIN, so a later $BIN
+# promotion failure restored the old $BIN beside the NEW sidecar and marker. The
+# `.absent` tombstone beside the backup closes that: restore consumes it by
+# DELETING $dest, which leaves the genuine pre-update set (no sidecar => the set
+# is incomplete => readiness is withheld and the drift check reinstalls). Any
+# other failure returns non-zero, and the caller then refuses to start the
+# transaction at all -- refusing to update is the app's stated trade (a working
+# old terminal beats a dead one), while promoting without a way back is the
+# mixed-set bug this exists to prevent.
 kiro_cli_snapshot_one() {
-  local src="$1" backup="$2"
-  rm -f "$backup" || return 1
+  local src="$1" backup="$2" absent="$2.absent"
+  rm -f "$backup" "$absent" || return 1
   # A symlink is deliberately NOT snapshotted: the boot quarantine treats one at
   # these paths as untrusted, so restoring it would put back a file this script
-  # already refuses to authenticate.
+  # already refuses to authenticate. It is tombstoned rather than ignored for the
+  # same reason an absent file is: whatever this update promotes over it is the
+  # only thing rollback can be sure about.
   if [ ! -e "$src" ] || [ -L "$src" ]; then
+    : >"$absent" || return 1
     return 0
   fi
   # A hard link is instant and costs no space; fall back to a copy only where the
@@ -126,14 +136,19 @@ kiro_cli_snapshot_one() {
   cp -p "$src" "$backup"
 }
 
-# Put $2 back from the backup at $1, consuming the backup. Absent backup => the
-# file did not exist before the update, so there is nothing to restore and
-# nothing is deleted: recovery is strictly additive. (A first install cannot
-# produce a MIXED set -- there is no older version to mix with -- so the
-# leftovers of an interrupted one are safely handled by the drift check, which
-# reinstalls whenever $BIN is absent or the set is incomplete.)
+# Put $2 back from the backup at $1, consuming the backup -- or, when the snapshot
+# left a tombstone, remove $2 because it did not exist before the update. Only the
+# two together restore the COMPLETE old set: without the tombstone arm, a promoted
+# file whose predecessor was absent survives a rollback and pairs a new component
+# with an old $BIN. A tombstone that is a symlink is not one this script wrote, so
+# it is not trusted to describe the old set either; the conservative reading is
+# "no snapshot", which leaves $dest alone.
 kiro_cli_restore_one() {
-  local backup="$1" dest="$2"
+  local backup="$1" dest="$2" absent="$1.absent"
+  if [ -f "$absent" ] && [ ! -L "$absent" ]; then
+    rm -f -- "$dest" "$absent" || return 1
+    return 0
+  fi
   if [ ! -e "$backup" ] || [ -L "$backup" ]; then
     return 0
   fi
@@ -151,9 +166,12 @@ kiro_cli_restore_one() {
 # Close the transaction. Backups go FIRST and the journal LAST: a kill in between
 # leaves a journal with nothing to restore, which the next boot's recovery reads
 # as "nothing to do" and leaves the committed set alone. The reverse order would
-# let that same kill make recovery restore a stale set over a good install.
+# let that same kill make recovery restore a stale set over a good install. The
+# `.absent` tombstones are backups too -- an orphaned one would make the next
+# recovery pass DELETE a committed component -- so they are dropped here as well.
 kiro_cli_update_finish() {
-  if ! rm -f "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV"; then
+  if ! rm -f "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
+    "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; then
     printf 'level=warn msg="failed to remove kiro-cli update backups; they keep occupying the /config volume" dir="%s" component=entrypoint\n' "$TOOLS" >&2
   fi
   if ! rm -f "$KIRO_CLI_UPDATE_JOURNAL"; then
@@ -705,7 +723,8 @@ if [ "$tools_tree_was_writable" -eq 1 ]; then
   # their dot-prefixed names are outside the `kiro-cli*` glob the sweep uses. Drop
   # them here so the recovery pass below cannot restore a payload this boot has
   # already decided not to trust.
-  if ! rm -f "$KIRO_CLI_UPDATE_JOURNAL" "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV"; then
+  if ! rm -f "$KIRO_CLI_UPDATE_JOURNAL" "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
+    "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; then
     printf 'level=warn msg="failed to remove the kiro-cli update journal and backups from a previously group/other-writable tools tree" dir="%s" component=entrypoint\n' "$TOOLS" >&2
   fi
   # The sweep's status is deliberately always 0 (see the function's comment), so it
@@ -1278,7 +1297,8 @@ fi
 kiro_cli_set_rc=0
 kiro_cli_dispatcher_set_complete || kiro_cli_set_rc=$?
 if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
-  if [ "$kiro_cli_update_failed" -eq 1 ] && [ -n "$kiro_cli_installed" ] && [ "$kiro_cli_set_rc" -ne 1 ]; then
+  if [ "$kiro_cli_update_failed" -eq 1 ] && [ -n "$kiro_cli_installed" ] && [ "$kiro_cli_set_rc" -ne 1 ] \
+    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]; then
     # An update failed and the previous version is still installed and answering
     # --version. The terminal genuinely works, so readiness describes the terminal:
     # withholding here would mean a container that boots, serves a working shell, and
@@ -1290,6 +1310,13 @@ if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
     # describe a COMPLETE old dispatcher set, not merely a launchable main dispatcher
     # (set_rc 2 -- the marker naming the pre-update version -- is the fallback's own
     # expected state and still publishes).
+    # A still-OPEN update journal is excluded for the same reason: it means the
+    # promotion neither committed nor rolled back, so the on-disk set is unverified
+    # by construction -- an old $BIN can sit beside an already-promoted NEW chat
+    # sidecar, which the set check deliberately never version-probes. Every commit
+    # and every completed rollback closes the journal (kiro_cli_update_finish), so
+    # this only excludes a double fault (failed update AND failed rollback); the
+    # next boot's recovery pass repairs the set and publishes then.
     printf 'level=warn msg="serving a kiro-cli version older than the pin after a failed update; readiness published because the terminal works, but the pin is NOT in force until an update succeeds" installed=%s pinned=%s component=entrypoint\n' \
       "$kiro_cli_installed" "$KIRO_CLI_VERSION" >&2
     if ! touch "$KIRO_CLI_READY_MARKER"; then
@@ -1304,12 +1331,15 @@ if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
       "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
   fi
 elif [ "$kiro_cli_set_rc" -ne 0 ]; then
-  if [ "$kiro_cli_update_failed" -eq 1 ] && [ "$kiro_cli_set_rc" -eq 2 ]; then
+  if [ "$kiro_cli_update_failed" -eq 1 ] && [ "$kiro_cli_set_rc" -eq 2 ] \
+    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]; then
     # $BIN is at the pin and the chat sidecar is usable; only the completion marker
     # does not name this pin (an inherited pre-marker volume). The update that would
     # have written it failed, so serve the working terminal rather than answering 503
     # over it. rc 1 -- an unusable sidecar -- deliberately does NOT land here: there
-    # the terminal really is broken, so readiness must still be withheld.
+    # the terminal really is broken, so readiness must still be withheld. An open
+    # update journal is excluded here for the same reason as in the branch above: an
+    # un-rolled-back promotion leaves a set nothing has verified.
     printf 'level=warn msg="kiro-cli dispatcher set predates this pin and the update that would complete it failed; readiness published because the terminal works" version=%s component=entrypoint\n' \
       "$KIRO_CLI_VERSION" >&2
     if ! touch "$KIRO_CLI_READY_MARKER"; then

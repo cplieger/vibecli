@@ -97,7 +97,8 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   expect(overlay.getAttribute("aria-modal")).toBe("true");
   // Named by a VISIBLE title via aria-labelledby, not an invisible aria-label:
   // one name for both audiences (APG), and it matches web-terminal-ui's
-  // renderFatalStartup() so all three fatal-startup dialogs read alike. The
+  // renderFatalStartup() so the inline watchdog's dialog and the library's
+  // recovery surface -- the only two fatal-startup dialogs left -- read alike. The
   // stale aria-label must be GONE, not merely overridden -- leaving both would
   // let the two names drift apart silently.
   expect(overlay.hasAttribute("aria-label")).toBe(false);
@@ -392,7 +393,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const watchdogSource = readWatchdogSource();
 
     // Recreate index.html's static body: the terminal root plus the pristine
-    // loading overlay (role=status, .bar child, no fade).
+    // loading overlay (role=status, .wt-loading-bar child, no fade).
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
 
@@ -460,7 +461,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     appendTerminalRoot();
     // The marker-less converted overlay: this fixture deliberately omits
     // data-bootstrap-fatal, so it is NOT the full claimed-overlay
-    // shape -- it isolates the older missing-.bar fallback
+    // shape -- it isolates the older missing-.wt-loading-bar fallback
     // clause, complementing the marker-only stand-down test above.
     const overlay = document.createElement("div");
     overlay.id = "loading";
@@ -635,13 +636,14 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("watchdog stands down when a fatal dialog already owns the overlay", () => {
-    // The app -> watchdog leg of the marker protocol, mirroring "aborts boot
-    // from the fatal handoff marker independently of dialog ARIA" for the other
-    // direction: a fatal dialog claims the overlay by setting data-bootstrap-fatal,
-    // and the rethrown error then reaches this capture-phase listener, which
-    // must NOT overwrite that dialog's specific message with the generic
-    // "failed to load" text. A pristine overlay carrying only the marker
-    // isolates that clause from the replaced-.bar side effect it supersedes:
+    // Watchdog idempotency, not an app-owned dialog: app.ts no longer builds a
+    // fatal surface or sets the marker, so the only producer is this same inline
+    // watchdog. An EARLIER bootstrap error it already handled set
+    // data-bootstrap-fatal, and a later error reaching this capture-phase
+    // listener must NOT rebuild the dialog or overwrite that first, specific
+    // message with the generic "failed to load" text. A pristine overlay carrying
+    // only the marker
+    // isolates that clause from the replaced-bar side effect it supersedes:
     // with the marker guard removed the watchdog builds its dialog here.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
@@ -779,9 +781,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
     // Why this test exists: the watchdog's stand-down guards read index.html's
-    // REAL markup (a .bar child, no .fade) while appendPristineOverlay()
+    // REAL markup (a .wt-loading-bar child, no .fade) while appendPristineOverlay()
     // re-creates that markup by hand. If index.html's overlay ever loses the
-    // .bar (or #terminal ships a pre-JS child), the watchdog silently never
+    // .wt-loading-bar (or #terminal ships a pre-JS child), the watchdog silently
+    // never
     // fires in production while every watchdog test above still passes against
     // its own fabricated overlay -- so pin the hand-built fixture to the
     // served file here.

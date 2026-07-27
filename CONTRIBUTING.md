@@ -144,14 +144,18 @@ assert at least once (`expect.requireAssertions`) and `.only` is forbidden.
   reason to fork the app-owned shape.
 - **Client-local vs library code.** `static-src/app.ts` is the only client
   source Web Terminal for Kiro owns: a
-  `createTerminal(root, { features: presetAgentTabbed(), theme })` call plus a
-  small bootstrap-failure handler. The theme is Web Terminal for Kiro's purple
+  `createTerminal("#terminal", { features: presetAgentTabbed, theme })` call
+  plus the `data-bootstrap-fatal` handoff check. The theme is Web Terminal for
+  Kiro's purple
   token set, and `presetAgentTabbed` pulls in tabs, the activity monitor,
   touch toolbar, context menu, clipboard, scroll-to-bottom, predictive echo,
-  connection banner, and animations. The handler (`showFatal`) surfaces a
-  missing `#terminal` root or a `createTerminal` throw on the pre-JS
-  `#loading` overlay as a `role="alertdialog"` overlay with a focused Reload
-  button. The input model,
+  connection banner, and animations. Startup failures (a missing `#terminal`
+  root, a preset that throws, a kernel-init failure) are the library's since
+  web-terminal-ui v5: `createTerminal` resolves the selector and calls the
+  preset inside its own failure boundary and renders its recovery panel. The
+  one app-owned startup decision left is aborting boot when `index.html`'s
+  inline watchdog has already claimed the `#loading` overlay
+  (`data-bootstrap-fatal`). The input model,
   IME/composition, predictive echo, viewport, mobile key toolbar, and status
   banner, plus the render / keyboard / scroll / connection layers, all live in
   `@cplieger/web-terminal-ui` (built on `@cplieger/web-terminal-engine`);

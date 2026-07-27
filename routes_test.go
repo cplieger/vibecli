@@ -737,6 +737,14 @@ func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
 	}{
 		{"unready", newTestDeps(false), http.StatusServiceUnavailable, `{"status":"unready","reason":"starting up or shutting down"}`},
 		{"ready", newTestDeps(true), http.StatusOK, `{"status":"ok"}`},
+		// The informational tools field rides on the 503 bodies too: tool
+		// convergence never GATES readiness, but an operator diagnosing an unready
+		// instance needs to see whether tools are still syncing -- and that is
+		// exactly the moment the field used to disappear, because both unready paths
+		// returned before it was attached. Without this row, reverting
+		// handleHealth's healthResponse to the pre-fix early-return shape leaves the
+		// whole suite green.
+		{"unready carries the informational tools state", unreadyDepsWithTools(), http.StatusServiceUnavailable, `{"status":"unready","reason":"starting up or shutting down","tools":"syncing"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mux, _, _ := mustRegisterRoutes(t, tc.deps)
@@ -769,6 +777,16 @@ func newTestDeps(ready bool) *routeDeps {
 		workDir:  "",
 		cmd:      []string{"/bin/cat"},
 	}
+}
+
+// unreadyDepsWithTools is an UNREADY handler with a tools engine wired: the
+// combination that proves the informational tools field survives the 503 path,
+// which newTestDeps(false) alone cannot show (its toolsState is nil, and a nil
+// state is the deliberately-disabled case that omits the key).
+func unreadyDepsWithTools() *routeDeps {
+	d := newTestDeps(false)
+	d.toolsState = func() string { return "syncing" }
+	return d
 }
 
 // mustRegisterRoutes wires deps on a fresh mux, failing the test on

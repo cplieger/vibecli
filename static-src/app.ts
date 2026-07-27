@@ -90,7 +90,8 @@ createTerminal("#terminal", {
     // This accent literal is mirrored in four declaration sites across the two
     // static assets that cannot read this object: static/index.html's
     // <meta name="theme-color"> (#c099ff is this same colour) and its #loading
-    // critical CSS (--accent plus the .noscript-fallback colour), plus
+    // critical CSS (--wt-loading-accent, the token the library's overlay reads,
+    // plus the .noscript-fallback colour), plus
     // static/manifest.json's theme_color. All four are pinned by app.test.ts's
     // brand-accent parity test.
     // index.html carries the matching note; change all of them together or the

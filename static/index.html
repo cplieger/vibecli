@@ -100,16 +100,15 @@
         touch-action: manipulation;
       }
       /* Plain :focus, deliberately broader than the family's :focus-visible-only
-         convention (web-terminal-ui 10-primitives.css). Both fatal builders move
+         convention (web-terminal-ui 10-primitives.css). The watchdog below moves
          focus to Reload with focus({ focusVisible: true }), which Samsung Internet,
          Chrome < 145 and Safari < 18.4 ignore; script focus after a pointer load
-         does not match :focus-visible there, and because Tab is swallowed by the
-         dialog's focus wrap (and focus() on the already-focused button
-         short-circuits per the HTML focusing steps) no later keypress can repaint
-         the ring -- the only recovery control would stay focused with no visible
-         indicator for the dialog's whole life (WCAG 2.4.7). Safe to broaden HERE
-         because this dialog has exactly one control and is a dead end: the extra
-         ring can only ever appear on a click of Reload itself. */
+         does not match :focus-visible there, so on those engines the dialog's only
+         recovery control would be focused with no visible indicator from the moment
+         it appears (WCAG 2.4.7) -- and a user who never presses a key never gets
+         one. Safe to broaden HERE because this dialog has exactly one control and
+         is a dead end: the extra ring can only ever appear on a click of Reload
+         itself. */
       #loading[role="alertdialog"] button:focus {
         outline: 2px solid currentcolor;
         outline-offset: 3px;
@@ -160,7 +159,8 @@
         margin: 0;
         padding: 1rem;
         background: #000;
-        /* brand accent (matches #loading --accent and the createTerminal theme) */
+        /* brand accent (matches #loading's --wt-loading-accent and the
+           createTerminal theme) */
         color: hsl(263.1683 100% 80%);
         font-family:
           system-ui,

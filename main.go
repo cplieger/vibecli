@@ -565,7 +565,8 @@ func apiNoStore(next http.Handler) http.Handler {
 //     status on logged routes, including a recovered 500 and a cross-origin
 //     403 — subject to the skip list below (/ws and the SSE stream emit no
 //     access lines), the ProbeLogLevel policy (/api/health logs at Debug
-//     when healthy, Warn/Error when failing), and the WithPathFunc redaction
+//     when healthy, Warn/Error when failing), and the WithTemplatePathsUnder
+//     redaction
 //     (the token-bearing /api/sessions/ subtree logs its route template,
 //     never a session id). WithClientIP is
 //     passed the TRUSTED_PROXIES set (parseTrustedProxies) as the `client_ip`
@@ -678,10 +679,15 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// what vibekit already pins (webhttp's default is what the two
 			// non-terminal consumers keep) — one fleet value, not a fourth.
 			// Permissions-Policy denies the browser features a terminal never
-			// uses (same values subflux ships). All three are ignored on a
-			// non-secure origin (plain-HTTP LAN bind) and active on localhost /
-			// behind a TLS-terminating proxy — the README's recommended
-			// deployment.
+			// uses (same values subflux ships). COOP is secure-context gated, so
+			// it is inert on a non-secure origin (plain-HTTP LAN bind) and active
+			// on localhost / behind a TLS-terminating proxy — the README's
+			// recommended deployment; the three features Permissions-Policy names
+			// are themselves secure-context-only, so denying them there is moot
+			// too. Referrer-Policy is NOT gated: a plain-HTTP origin honors it,
+			// which is exactly the bind where suppressing the Referer matters
+			// most, since that is where the internal hostname would otherwise
+			// leak.
 			webhttp.WithCOOP("same-origin"),
 			webhttp.WithReferrerPolicy("same-origin"),
 			webhttp.WithPermissionsPolicy("camera=(), microphone=(), geolocation=()"),

@@ -189,10 +189,18 @@ func TestClassifyStatus_logsSanitizedNotificationText(t *testing.T) {
 	}
 	quietTeardown(t, deps)
 
-	const (
-		unsafeRune = "\u202e"
-		wantSubstr = "evil"
-	)
+	const unsafeRune = "\u202e"
+	// The EXACT text each record must carry. The engine's sanitizeNotification
+	// DROPS an unsafe rune (it does not substitute a placeholder) and caps at 256
+	// runes, so the sanitized notification is the emitted text minus U+202E; the
+	// excerpt is then notifyExcerpt's bounded prefix of exactly that. Spelled out
+	// rather than probed with a substring + length bound, because a loose oracle
+	// admitted the regressions this test exists to catch: a Debug attribute
+	// truncated to anything from 65 to 74 runes still contained "evil" and still
+	// exceeded the bound, and any short excerpt ending in an ellipsis satisfied the
+	// Warn side without proving the full 64-rune prefix survived.
+	wantFull := "evilwording" + longTail
+	wantExcerpt := string([]rune(wantFull)[:unrecognizedNotifyExcerptRunes]) + "…"
 	// attrOf returns the named attribute of the first record at level that carries
 	// the unrecognized-notification message.
 	attrOf := func(level slog.Level, key string) (string, bool) {
@@ -222,27 +230,23 @@ func TestClassifyStatus_logsSanitizedNotificationText(t *testing.T) {
 		full, haveDebug := attrOf(slog.LevelDebug, "message")
 		if haveWarn && haveDebug {
 			// Both records carry the text and neither carries the unsafe rune: the
-			// engine sanitized before the classifier ever saw it.
+			// engine sanitized before the classifier ever saw it. Kept as an
+			// independent guard -- it fails on a sanitization regression even if the
+			// exact comparisons below are ever relaxed.
 			for _, tc := range []struct{ what, got string }{
 				{"Warn excerpt", excerpt},
 				{"Debug full text", full},
 			} {
-				if !strings.Contains(tc.got, wantSubstr) {
-					t.Errorf("%s = %q, want it to carry the notification text %q", tc.what, tc.got, wantSubstr)
-				}
 				if strings.Contains(tc.got, unsafeRune) {
 					t.Errorf("%s = %q carries U+202E; the engine must sanitize notification text before the classifier logs it, or arbitrary child output can inject into the log stream", tc.what, tc.got)
 				}
 			}
 			// The default stream is BOUNDED and says so; the Debug record is not.
-			if n := len([]rune(excerpt)); n > unrecognizedNotifyExcerptRunes+1 {
-				t.Errorf("Warn excerpt is %d runes, want at most %d+1 (the bound plus the truncation marker); a token in child output must not reach the always-on stream in full", n, unrecognizedNotifyExcerptRunes)
+			if full != wantFull {
+				t.Errorf("Debug full text = %q, want the COMPLETE sanitized notification %q (Debug must not be truncated -- it is what an operator raises the level for)", full, wantFull)
 			}
-			if !strings.HasSuffix(excerpt, "…") {
-				t.Errorf("Warn excerpt = %q, want a truncation marker so a clipped wording is distinguishable from a short one", excerpt)
-			}
-			if len([]rune(full)) <= unrecognizedNotifyExcerptRunes {
-				t.Errorf("Debug full text is %d runes, want more than the excerpt bound %d (Debug must not be truncated -- it is what an operator raises the level for)", len([]rune(full)), unrecognizedNotifyExcerptRunes)
+			if excerpt != wantExcerpt {
+				t.Errorf("Warn excerpt = %q, want exactly the %d-rune prefix plus the truncation marker: %q (a token in child output must not reach the always-on stream in full, and a clipped wording must stay distinguishable from a short one)", excerpt, unrecognizedNotifyExcerptRunes, wantExcerpt)
 			}
 			return
 		}

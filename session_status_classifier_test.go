@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -55,18 +56,27 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 	}
 }
 
-// TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning pins the two
+// TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning pins the three
 // observable LOGGING behaviors of the unrecognized-notification path, which
-// TestClassifyStatus (return values only) leaves entirely unguarded: exactly the
-// FIRST unknown notification per classifier is promoted to Warn so a kiro-cli
-// wording drift is visible at the default info level, and EVERY occurrence stays
-// recorded at Debug for KWEB_LOG_LEVEL=debug. Without this test, deleting the
-// Warn block, moving it outside the sync.Once (log flooding on every
-// notification), or deleting the Debug trace all leave the suite green.
+// TestClassifyStatus (return values only) leaves entirely unguarded: the first
+// occurrence of each DISTINCT unknown notification is promoted to Warn so a
+// kiro-cli wording drift is visible at the default info level, a REPEAT of a
+// message already warned about is not, and EVERY occurrence stays recorded at
+// Debug for KWEB_LOG_LEVEL=debug. Without this test, deleting the Warn block,
+// warning on every occurrence (log flooding), or deleting the Debug trace all
+// leave the suite green.
 //
-// The warn-once latch is owned by the classifier instance, so the test builds
-// its own and depends on no package state. capture.Default swaps the global
-// default logger, so this test must never call t.Parallel.
+// The per-distinct keying is the point, and it is what this test used to get
+// wrong: it fed two DIFFERENT unknown messages and asserted exactly one Warn,
+// which pinned the defect rather than the intent. A single latch was spent by the
+// first unknown message of any kind, so one benign extra notification silenced
+// the warning for a later rewording of the two strings the dots depend on -- the
+// exact drift the Warn exists to surface. The bound that remains is on VOLUME
+// (unrecognizedNotifyCap distinct strings), asserted separately below.
+//
+// The latch is owned by the classifier instance, so the test builds its own and
+// depends on no package state. capture.Default swaps the global default logger,
+// so this test must never call t.Parallel.
 func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T) {
 	records := capture.Default(t)
 	const message = "unrecognized kiro-cli OSC 9 notification"
@@ -80,11 +90,55 @@ func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T)
 	if got != "" || latch {
 		t.Errorf("classify(second unknown) = (%q, %v), want (empty, false)", got, latch)
 	}
-	if got := records.CountLevel(slog.LevelWarn, message); got != 1 {
-		t.Errorf("unrecognized notification Warn count = %d, want 1 (bounded to the first occurrence per classifier)", got)
+	// A DISTINCT second message warns: this is the regression guard. With the old
+	// single latch this count was 1, and a reworded "Response complete" arriving
+	// after any other notification produced no Warn at all.
+	if got := records.CountLevel(slog.LevelWarn, message); got != 2 {
+		t.Errorf("unrecognized notification Warn count = %d, want 2 (one per distinct message)", got)
 	}
-	if got := records.CountLevel(slog.LevelDebug, message); got != 2 {
-		t.Errorf("unrecognized notification Debug count = %d, want 2 (every occurrence is traced)", got)
+	// A REPEAT does not warn again, which is what keeps a chatty build from
+	// flooding the shipped stream.
+	classify("New response wording")
+	if got := records.CountLevel(slog.LevelWarn, message); got != 2 {
+		t.Errorf("Warn count after repeating a known-unknown = %d, want 2 (repeats stay Debug-only)", got)
+	}
+	if got := records.CountLevel(slog.LevelDebug, message); got != 3 {
+		t.Errorf("unrecognized notification Debug count = %d, want 3 (every occurrence is traced)", got)
+	}
+}
+
+// TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings pins the volume
+// bound that replaced the single latch. Without it, per-distinct warning would be
+// an unbounded log-volume AND unbounded-memory vector: the map key is child
+// process output, so a session emitting a fresh notification per turn would grow
+// the seen-set for the container's lifetime.
+func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.T) {
+	records := capture.Default(t)
+	const message = "unrecognized kiro-cli OSC 9 notification"
+	classify := newStatusClassifier()
+
+	// One more distinct message than the budget allows.
+	for i := range unrecognizedNotifyCap + 1 {
+		classify(fmt.Sprintf("wording variant %d", i))
+	}
+	if got := records.CountLevel(slog.LevelWarn, message); got != unrecognizedNotifyCap {
+		t.Errorf("per-distinct Warn count = %d, want %d (the cap)", got, unrecognizedNotifyCap)
+	}
+	// The message the cap turned away announces exhaustion exactly once, so a
+	// silent stop is never mistaken for "nothing new appeared". This wording must
+	// not be a substring of the drift wording (or vice versa) or the counts above
+	// would double-count it -- the same confusion a log search would hit.
+	const capped = "kiro-cli OSC 9 notification warn budget exhausted"
+	if got := records.CountLevel(slog.LevelWarn, capped); got != 1 {
+		t.Errorf("budget-exhausted Warn count = %d, want 1", got)
+	}
+	classify("yet another distinct wording")
+	if got := records.CountLevel(slog.LevelWarn, capped); got != 1 {
+		t.Errorf("budget-exhausted Warn count after a further distinct message = %d, want 1 (announced once)", got)
+	}
+	// Every occurrence still reaches Debug, so the full set stays diagnosable.
+	if got := records.CountLevel(slog.LevelDebug, message); got != unrecognizedNotifyCap+2 {
+		t.Errorf("Debug count = %d, want %d (every occurrence traced)", got, unrecognizedNotifyCap+2)
 	}
 }
 

@@ -304,17 +304,45 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 // drift apart.
 const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab status dots will not latch (kiro-cli notification wording may have changed on a version bump)"
 
+// unrecognizedNotifyCapMsg is emitted once, when the distinct-message budget is
+// exhausted, so a silent stop is never mistaken for "nothing new appeared".
+// Deliberately does NOT contain unrecognizedNotifyMsg as a substring: these are two
+// different events and a log search (or a test) matching on one must not also match
+// the other.
+const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set KWEB_LOG_LEVEL=debug)"
+
+// unrecognizedNotifyCap bounds how many DISTINCT unrecognized notifications are
+// promoted to Warn. It bounds two things, and the second is why a cap is
+// mandatory rather than tidy: log volume (at most this many lines per container
+// lifetime), and the memory of the seen-set below — its key comes from child
+// process output, so an unbounded set would let a chatty or hostile session grow
+// it without limit. Insertion stops at the cap; the map never exceeds it.
+const unrecognizedNotifyCap = 8
+
 // newStatusClassifier returns the kiro-cli OSC 9 -> session-status mapping the
 // composition root injects into the engine (terminal.WithStatusClassifier),
-// with its own warn-once latch: the FIRST unrecognized notification is promoted
-// to Warn, so a kiro-cli notification-wording drift is visible in the DEFAULT
-// (info) log stream instead of only under KWEB_LOG_LEVEL=debug, while the Debug
-// trace still records every occurrence — a build that legitimately emits some
-// other notification cannot flood the shipped stream. The latch lives in the
-// closure rather than in a package var so its lifetime is the classifier
-// INSTANCE the root wires (exactly one per process in production, so the
-// shipped bound is unchanged) instead of the process, and a test constructs a
-// fresh classifier instead of reassigning package state.
+// with its own bounded warn latch: the first occurrence of each DISTINCT
+// unrecognized notification is promoted to Warn (up to unrecognizedNotifyCap),
+// so a kiro-cli notification-wording drift is visible in the DEFAULT (info) log
+// stream instead of only under KWEB_LOG_LEVEL=debug, while the Debug trace still
+// records every occurrence — a build that legitimately emits some other
+// notification cannot flood the shipped stream.
+//
+// Per-DISTINCT rather than one-per-classifier, which is what this used to be: a
+// single sync.Once was consumed by the first unrecognized message of ANY kind, so
+// one benign extra notification (kiro-cli 2.14 added structured user-input
+// prompts, exactly this shape) spent the whole budget, and a LATER bump rewording
+// "Response complete" or "Permission required" then warned NOTHING while every
+// turn-end silently stopped latching. That is the failure the Warn exists to
+// surface, so the bound now keys on the message rather than on the count of
+// messages. Log volume is still bounded (the cap), which was the original intent.
+//
+// The latch lives in the closure rather than in a package var so its lifetime is
+// the classifier INSTANCE the root wires (exactly one per process in production)
+// instead of the process, and a test constructs a fresh classifier instead of
+// reassigning package state. The engine shares one classifier across every
+// session and calls it from per-session goroutines, so the seen-set is mutex
+// guarded; the logging happens outside the lock.
 //
 // The returned mapping: "Response complete" at the end of an agent turn latches
 // the done (green) state, and "Permission required" when a tool call is blocked
@@ -331,7 +359,11 @@ const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab sta
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
 func newStatusClassifier() func(string) (string, bool) {
-	var unrecognizedNotifyOnce sync.Once
+	var (
+		notifyMu     sync.Mutex
+		notifyWarned = make(map[string]struct{}, unrecognizedNotifyCap)
+		notifyCapped bool
+	)
 	return func(msg string) (string, bool) {
 		switch msg {
 		case "Response complete":
@@ -342,18 +374,40 @@ func newStatusClassifier() func(string) (string, bool) {
 			// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
 			// tool-approval. If a kiro-cli bump reworded "Response complete"/"Permission
 			// required", every notification lands here and the per-tab status dots
-			// silently stop latching. The FIRST occurrence warns (visible at the
-			// default info level, bounded to one line per classifier); the Debug line
-			// records every occurrence, so KWEB_LOG_LEVEL=debug is what shows the
-			// full set of unrecognized strings after a version bump.
+			// silently stop latching. The first occurrence of each DISTINCT message
+			// warns (visible at the default info level, up to unrecognizedNotifyCap
+			// distinct strings); the Debug line records every occurrence, so
+			// KWEB_LOG_LEVEL=debug is what shows the full set after a version bump.
 			// msg is safe to log raw: the engine's sanitizeNotification strips
 			// every runesafe-unsafe rune (C0/C1 controls, Bidi controls, U+2028/29)
 			// and rune-caps the text before the classifier ever sees it.
-			unrecognizedNotifyOnce.Do(func() {
+			//
+			// Decide under the lock, log outside it: slog handlers can block on I/O and
+			// this runs on every session's event goroutine, so holding the mutex across
+			// the write would serialize them all behind the log sink.
+			notifyMu.Lock()
+			_, seen := notifyWarned[msg]
+			atCap := len(notifyWarned) >= unrecognizedNotifyCap
+			warnFirst := !seen && !atCap
+			if warnFirst {
+				notifyWarned[msg] = struct{}{}
+			}
+			// Announce exhaustion once, on the first distinct message the cap turns
+			// away, so a silent stop is distinguishable from "nothing new appeared".
+			warnCapped := !seen && atCap && !notifyCapped
+			if warnCapped {
+				notifyCapped = true
+			}
+			notifyMu.Unlock()
+
+			switch {
+			case warnFirst:
 				slog.Warn(unrecognizedNotifyMsg,
 					"message", msg,
 					"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for every occurrence`)
-			})
+			case warnCapped:
+				slog.Warn(unrecognizedNotifyCapMsg, "distinct_limit", unrecognizedNotifyCap)
+			}
 			slog.Debug(unrecognizedNotifyMsg, "message", msg)
 			return "", false
 		}

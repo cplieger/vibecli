@@ -42,11 +42,20 @@ _reported=0
 # refuse to let a test file end without calling report. ok/no record failures but
 # deliberately return 0 (see below), so a file whose final `report` line was lost
 # would otherwise exit 0 after its last assertion and the runner would count a
-# clean pass — a complete false green from a one-line deletion. Subshells reset
-# EXIT traps, so command substitutions and per-case subshells never double-fire
-# this.
+# clean pass — a complete false green from a one-line deletion.
+#
+# The PID guard is load-bearing, not defensive. Command substitutions and `( )`
+# subshells do reset the EXIT trap, but an ASYNC child (`cmd &`) INHERITS it: a
+# stubbed background process that dies before its exec would otherwise run this
+# handler with the parent's $WORK and _reported=0 — printing a spurious
+# forgot-report error and `rm -rf`-ing the parent's live scratch dir mid-run.
+# Measured on the radvd latch suite before this guard: the error fired on 26 of 30
+# cases and a canary in $WORK was deleted on the first iteration. Only the process
+# that INSTALLED the trap may act on it.
+_LIB_OWNER_PID=$$
 _lib_on_exit() {
   _lib_status=$?
+  [ "${BASHPID:-$$}" = "$_LIB_OWNER_PID" ] || return 0
   [ -n "${WORK:-}" ] && rm -rf "$WORK"
   if [ "$_reported" -eq 0 ]; then
     printf 'harness error: %s exited without calling report\n' "$(basename "$0")" >&2
@@ -127,12 +136,18 @@ extract_function() {
   awk -v fn="$name" '
     !inside && index($0, fn "()") == 1 {
       print
-      # The opening line closes the body itself only for a one-liner; `fn() {` and
-      # `fn() (` end with the OPENER, so they must not match here. A one-liner may
-      # carry a trailing comment (`fn() { cmd; } # note`), so the closer test
-      # tolerates one rather than requiring the line to END on the closer —
-      # anchored to `; <closer>` so an opener line can never satisfy it.
-      if ($0 ~ /;[[:space:]]*[)}][[:space:]]*(#.*)?$/) exit
+      # Decide opener-vs-one-liner by which bracket the line ENDS on, ignoring a
+      # trailing comment. An opener ends on `{` or `(`; a one-liner ends on `}` or
+      # `)`. Testing the opener first matters: `fn() { # note` contains a `)` from the
+      # parameter list, so a closer-only test could mistake it for a complete body.
+      #
+      # The `)` form is not hypothetical in one direction and is gate-prevented in
+      # the other: entrypoint files really do carry multi-line subshell bodies
+      # (`install_kiro_cli() (`), while shfmt -i 2 -ci -bn rewrites a ONE-line
+      # subshell, so that shape cannot reach a formatted repo. Handled anyway rather
+      # than resting on the format gate.
+      if ($0 ~ /[({][[:space:]]*(#.*)?$/) { inside = 1; next }
+      if ($0 ~ /[)}][[:space:]]*(#.*)?$/) exit
       inside = 1
       next
     }

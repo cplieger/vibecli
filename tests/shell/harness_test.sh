@@ -36,6 +36,10 @@ subshell_bodied() (
 )
 one_liner() { echo tiny; }
 one_liner_commented() { echo tiny; } # trailing note
+one_line_subshell() ( echo tiny )
+opener_commented() { # note on the opener
+  echo two lines
+}
 next_victim() {
   echo "must never be swept into a neighbour's extraction"
 }
@@ -52,7 +56,7 @@ defs() {
 }
 
 # --- 1. the four documented shapes each extract as EXACTLY one definition ---------
-for fn in ordinary subshell_bodied one_liner one_liner_commented; do
+for fn in ordinary subshell_bodied one_liner one_liner_commented one_line_subshell opener_commented; do
   src=$(extract_function "$fn") || exit 1
   [ "$(defs "$src")" -eq 1 ] && ! grep -q next_victim "$src" \
     && ok "$fn extracts alone ($(wc -l <"$src") lines, 1 definition)" \
@@ -66,23 +70,33 @@ src=$(extract_function subshell_bodied) || exit 1
   || no "subshell close" "last line: '$(tail -1 "$src")'"
 
 # --- 2. a missing function is FATAL through load_function --------------------------
-# In a subshell so the fatal kills that process, not this file; the exit status is
-# the observable. This is the exact defect class that shipped once: the fatal fired
-# inside $(...) and the test carried on with the function undefined.
-(load_function does_not_exist) 2>/dev/null
+# The `; true` is the whole assertion. Without it the subshell's status IS
+# load_function's status, so a version that merely RETURNED non-zero and let the
+# caller carry on would be indistinguishable from one that exited — and carrying on
+# is exactly the historical defect (the fatal died inside $(...) and five assertions
+# passed against a function that did not exist). With the sentinel, the subshell
+# exits 0 unless load_function really terminated the process.
+(
+  load_function does_not_exist
+  true
+) 2>/dev/null
 rc=$?
 [ "$rc" -ne 0 ] \
-  && ok "load_function of a missing function is fatal (rc=$rc), not a silent no-op" \
-  || no "missing-function fatality" "load_function returned 0 for a function that does not exist"
+  && ok "load_function of a missing function TERMINATES the process (rc=$rc), it does not return" \
+  || no "missing-function fatality" "load_function returned instead of exiting; a real test file would carry on with the function undefined"
 
 # --- 3. a malformed extraction is FATAL through load_function ----------------------
 # extract_function succeeds (the text exists); the SOURCE then raises a syntax
-# error, which `.` does not turn fatal on its own without set -e.
-(load_function malformed) 2>/dev/null
+# error, which `.` does not turn fatal on its own without set -e. Same sentinel, for
+# the same reason.
+(
+  load_function malformed
+  true
+) 2>/dev/null
 rc=$?
 [ "$rc" -ne 0 ] \
-  && ok "sourcing a malformed extraction is fatal (rc=$rc), not a skipped definition" \
-  || no "malformed-source fatality" "load_function returned 0 after a failed source"
+  && ok "sourcing a malformed extraction TERMINATES the process (rc=$rc), not a skipped definition" \
+  || no "malformed-source fatality" "load_function returned after a failed source; the function is undefined and the file continues"
 
 # --- 4. a bad ENTRYPOINT names itself instead of extracting nothing ----------------
 (ENTRYPOINT=/nonexistent-entrypoint.sh extract_function ordinary) 2>"$WORK/err" >/dev/null

@@ -250,7 +250,13 @@ func main() {
 	}
 
 	// Concurrent kiro-cli chat sessions (browser tabs) are uncapped, like a
-	// browser: managing tabs is the user's job.
+	// browser: managing tabs is the user's job. Idle reaping is deliberately OFF
+	// too (the engine's WithIdleReaper is left at its zero default): terminal state
+	// lives only in the server's in-memory VT buffer and replays on reconnect, so a
+	// session outliving its browser IS the resume feature -- close the laptop, come
+	// back tomorrow. Any reaper window short enough to bound a runaway creator is
+	// short enough to break that, and the create-rate limiter in routes.go is the
+	// bound we chose instead. Reviewed and re-affirmed 2026-07.
 	cmd := sessionCommand(cliPath, chatArgs...)
 
 	mux := http.NewServeMux()

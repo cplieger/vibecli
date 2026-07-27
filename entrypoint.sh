@@ -150,15 +150,42 @@ tools_tree_was_writable=0
 # $2 (default 1) arms the kiro-cli quarantine when the dir was writable. Pass 0
 # for a PATH segment that never holds kiro-cli.
 secure_tools_dir() {
-  local dir=$1 arm=${2:-1} mode
+  local dir=$1 arm=${2:-1} owned=${3:-1} mode
+  # `owned` decides what an UNRECOVERABLE state costs. This is a dev-box container:
+  # the operator is expected to reshape /config/tools to stay productive (the
+  # borgcube audit deleted both runtimes trees and symlinked corepack, see
+  # web-terminal-kiro.md), so a broken state must be able to heal itself or at worst
+  # be fixable from INSIDE the container. Aborting boot fails that test -- there is no
+  # way in to repair it, and nothing recreates these trees.
+  #   owned=1  /config, $TOOLS, $TOOLS/bin -- created by this entrypoint, so a symlink
+  #            or a plain file there is unambiguously anomalous and a reinstall repairs
+  #            the contents. Fatal.
+  #   owned=0  the legacy PATH segments -- never created, never repaired, and holding
+  #            no integrity-gated binary. Warn and skip, matching
+  #            prune_superseded_kas_runtimes' explicit "disk hygiene must not brick
+  #            boot" precedent for a tree this script does not own.
+  # The mode enforcement below is unaffected: a writable tree is still tightened on
+  # every path, and on an owned tree that resists tightening the boot still stops.
   if [ -L "$dir" ]; then
+    if [ "$owned" -eq 0 ]; then
+      printf 'level=warn msg="PATH-segment directory is a symlink; skipping it (its target may be outside the /config mount, and this tree holds no integrity-gated binary)" dir="%s" component=entrypoint\n' "$dir" >&2
+      return 0
+    fi
     fatal 'refusing to use a symlinked tools directory; its target may be outside the /config mount' "dir=\"$dir\""
   fi
   if [ ! -d "$dir" ]; then
+    if [ "$owned" -eq 0 ]; then
+      printf 'level=warn msg="PATH-segment path is not a directory; skipping it" dir="%s" component=entrypoint\n' "$dir" >&2
+      return 0
+    fi
     fatal 'tools path is not a directory' "dir=\"$dir\""
   fi
   mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode=""
   if [ -z "$mode" ]; then
+    if [ "$owned" -eq 0 ]; then
+      printf 'level=warn msg="failed to read PATH-segment directory mode; skipping it" dir="%s" component=entrypoint\n' "$dir" >&2
+      return 0
+    fi
     fatal 'failed to read tools directory mode; cannot prove it is not group/other-writable' "dir=\"$dir\""
   fi
   # 0022 = the group and other write bits; 8#$mode because %a has no base prefix.
@@ -176,9 +203,17 @@ secure_tools_dir() {
   fi
   mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode=""
   if [ -z "$mode" ]; then
+    if [ "$owned" -eq 0 ]; then
+      printf 'level=warn msg="failed to re-read PATH-segment directory mode after tightening; leaving it out of the trusted set" dir="%s" component=entrypoint\n' "$dir" >&2
+      return 0
+    fi
     fatal 'failed to re-read tools directory mode after tightening' "dir=\"$dir\""
   fi
   if [ $((8#$mode & 0022)) -ne 0 ]; then
+    if [ "$owned" -eq 0 ]; then
+      printf 'level=warn msg="PATH-segment directory remains group/other-writable after tightening; a foreign host user could plant a binary this container runs, but bricking boot on a tree the entrypoint neither creates nor repairs is the worse failure" dir="%s" mode=%s component=entrypoint\n' "$dir" "$mode" >&2
+      return 0
+    fi
     fatal 'tools directory holding the first-on-PATH kiro-cli remains group/other-writable; refusing to trust the persistent binary tree' "dir=\"$dir\" mode=$mode"
   fi
 }
@@ -476,7 +511,7 @@ for path_dir in "$TOOLS/go" "$TOOLS/go/bin" \
   "$TOOLS/runtimes" "$TOOLS/runtimes/go" "$TOOLS/runtimes/go/bin" \
   "$TOOLS/runtimes/node" "$TOOLS/runtimes/node/bin"; do
   [ -e "$path_dir" ] || [ -L "$path_dir" ] || continue
-  secure_tools_dir "$path_dir" 0
+  secure_tools_dir "$path_dir" 0 0
 done
 # Directory modes are only half the invariant: a kiro-cli binary that is ITSELF
 # group/other-writable can be rewritten in place with no write access to the

@@ -37,6 +37,21 @@ import (
 	"github.com/cplieger/webhttp"
 )
 
+// staticFS holds the served asset tree. This embeds the DIRECTORY, not an explicit
+// file list, and that is deliberate rather than lazy: two of the assets (app.js, built
+// by the generate step above; style.css, concatenated by the Dockerfile's CSS step) are
+// build outputs that are gitignored, and go:embed fails the build on a pattern matching
+// nothing -- so an explicit allowlist would break `go vet ./...` on a fresh checkout,
+// which the shared CI template runs before anything generates those bundles.
+//
+// The consequence is that this edge accepts whatever the build tools leave in static/,
+// so purity is enforced OUTSIDE the directive: .dockerignore keeps non-product output
+// out of the build context (and therefore out of the image's embed), and .gitignore
+// keeps it out of the repo. Those lists are load-bearing, not decoration -- an earlier
+// tsconfig did emit app.test.js into static/, and .dockerignore is the only reason test
+// code never reached a published image. Add a pattern to both before adding any new
+// build step that writes into static/.
+//
 //go:embed static
 var staticFS embed.FS
 

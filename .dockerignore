@@ -1,7 +1,6 @@
 # Dev-only build artifacts; production uses vendored TS via tsc at Docker build time.
 static/*.js
 static/*.js.map
-static/wire/
 static/*.test.js
 # The CSS bundle is generated inside the builder by scripts/css-bundle.sh; keep
 # a local dev copy (and any mktemp sibling left by a SIGKILLed run) out of the

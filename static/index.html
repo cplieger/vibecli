@@ -318,20 +318,10 @@
           reload.type = "button";
           reload.textContent = "Reload page";
           reload.addEventListener("click", () => window.location.reload());
-          // Focus containment (APG alertdialog), mirroring showFatal in app.ts:
-          // inert-ing #terminal keeps focus out of the page, but only this wrap
-          // keeps Tab/Shift+Tab on the dialog's single control. Bound on the
-          // document (capture) because a stray tap on the overlay background
-          // blurs to <body>, outside an overlay-scoped listener's reach.
-          document.addEventListener(
-            "keydown",
-            (event) => {
-              if (event.key !== "Tab" || !overlay.isConnected) return;
-              event.preventDefault();
-              reload.focus({ focusVisible: true });
-            },
-            true,
-          );
+          // No Tab trap, mirroring showFatal in app.ts: this button is the only
+          // focusable node in the document, so there is nothing to contain, and
+          // trapping Tab only blocked the address bar. Containment that does work
+          // (inert + aria-modal) is below. Keep the two builders in sync.
           overlay.replaceChildren(title, description, reload);
           // aria-modal claims the rest of the page is inert; make it true
           // (APG alertdialog focus containment; WCAG 2.4.11) -- mirrors

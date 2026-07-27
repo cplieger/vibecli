@@ -109,34 +109,18 @@ function showFatal(overlay: HTMLElement, message: string): void {
   reload.addEventListener("click", () => {
     window.location.reload();
   });
-  // Focus containment (APG alertdialog): inert-ing #terminal below keeps focus
-  // OUT of the half-built terminal, but it does not make Tab/Shift+Tab cycle
-  // WITHIN the dialog -- without this, Tab walks off Reload into the browser
-  // chrome (or nothing at all in an installed standalone PWA, where this dialog
-  // is the only recovery surface). Reload is the dialog's sole control, so both
-  // directions wrap back onto it. Bound on the DOCUMENT (capture), not on the
-  // overlay: a stray tap or click on this full-viewport dialog's own background
-  // blurs to <body>, which is NOT a descendant of the overlay, so an
-  // overlay-scoped listener stops containing Tab after the single most likely
-  // stray interaction. isConnected keeps the trap from outliving the dialog
-  // (the UI kernel removes the overlay it owns on first frame).
-  // Mirrored by the index.html watchdog.
-  document.addEventListener(
-    "keydown",
-    (event) => {
-      if (event.key !== "Tab" || !overlay.isConnected) {
-        return;
-      }
-      event.preventDefault();
-      // Stryker disable next-line ObjectLiteral,BooleanLiteral: focusVisible is a UA
-      // RENDERING hint (paint the focus ring for this script-initiated focus) with no
-      // scriptable effect, and happy-dom models neither the option nor :focus-visible,
-      // so no test in this environment can observe either mutant. Engines that ignore
-      // the option are covered by index.html's plain :focus rule for this button.
-      reload.focus({ focusVisible: true });
-    },
-    true,
-  );
+  // No Tab trap. This dialog's Reload button is the ONLY focusable node in the
+  // document once #terminal is inerted below -- index.html declares no anchor,
+  // button, input, select, textarea or tabindex anywhere, and #loading is a status
+  // div -- so a trap has nothing to contain: there is no second focusable to cycle
+  // between and nothing behind the overlay to reach. What it did block was
+  // Tab-to-address-bar in a normal browser tab, which is a place the user may
+  // legitimately want to go and which F6/Ctrl+L reach anyway. The library ships the
+  // same failure surface without one (renderFatalStartupInto sets aria-modal and
+  // focuses its reload button, nothing more), so dropping it also stops this app
+  // diverging from the panel it mirrors, and removes a listener that had to stay in
+  // sync with index.html's watchdog copy. Containment that DOES do work stays below:
+  // inert on #terminal plus aria-modal.
   overlay.replaceChildren(title, description, reload);
   // aria-modal claims everything outside the dialog is inert; make it true so
   // Tab cannot reach focusables inside a partially-built terminal behind the
@@ -156,8 +140,8 @@ function showFatal(overlay: HTMLElement, message: string): void {
   // (Samsung Internet, Chrome < 145, Safari < 18.4) are covered by index.html's
   // plain :focus rule for this dialog's button, which is scoped to the fatal
   // overlay so it never leaks onto terminal chrome.
-  // Stryker disable next-line ObjectLiteral,BooleanLiteral: same unobservable UA
-  // rendering hint as the trap's focus call above.
+  // Stryker disable next-line ObjectLiteral,BooleanLiteral: unobservable UA
+  // rendering hint (see the reasoning on focusVisible above).
   reload.focus({ focusVisible: true });
 }
 

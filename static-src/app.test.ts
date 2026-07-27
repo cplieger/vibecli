@@ -115,63 +115,20 @@ function expectFatalOverlayShape(overlay: HTMLElement): void {
   // Initial focus lands on the recovery CTA (the alertdialog pattern's
   // initial focus; Reload is the only actionable element left).
   expect(document.activeElement).toBe(reload);
-  // ...and RETURNS there: blur first, so the refocus half of the trap is
-  // observable at all -- happy-dom does not move focus as Tab's default action,
-  // so asserting activeElement while focus is ALREADY on Reload could never
-  // fail. Both directions are dispatched because the guard is key-only and this
-  // one-control dialog wraps Shift+Tab identically; without the shiftKey pass a
-  // `&& !event.shiftKey` narrowing would survive (APG modal focus containment).
-  for (const shiftKey of [false, true]) {
-    reload?.blur();
-    expect(document.activeElement).not.toBe(reload);
-    const tab = new KeyboardEvent("keydown", {
-      key: "Tab",
-      shiftKey,
-      bubbles: true,
-      cancelable: true,
-    });
-    expect(reload?.dispatchEvent(tab)).toBe(false);
-    expect(tab.defaultPrevented).toBe(true);
-    expect(document.activeElement).toBe(reload);
+  // ...and Tab is NOT trapped. This button is the only focusable node in the
+  // document (index.html declares no anchor/button/input/select/textarea/tabindex,
+  // and #terminal is inerted), so a trap had nothing to contain -- it only blocked
+  // Tab-to-address-bar, which F6/Ctrl+L reach anyway, and the library's own fatal
+  // panel ships without one. Asserted from BOTH the button and <body>: the trap this
+  // replaces was document-scoped with nothing removing it, so a reintroduced one
+  // would leak across this suite (isolate is false) and swallow Tab for every later
+  // test. Either dispatch coming back cancelled means the trap is back.
+  for (const target of [reload, document.body]) {
+    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+    expect(target?.dispatchEvent(tab)).toBe(true);
+    expect(tab.defaultPrevented).toBe(false);
   }
-  // ...and ONLY Tab is swallowed: an unconditional trap would eat Enter/Space
-  // too and break the Reload button's own keyboard activation, so a non-Tab
-  // keydown must pass through uncancelled.
-  const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
-  expect(reload?.dispatchEvent(enter)).toBe(true);
-  expect(enter.defaultPrevented).toBe(false);
-  // ...and containment holds when focus is OUTSIDE the overlay: a stray tap on
-  // this full-viewport dialog's own background blurs to <body>, so the trap has
-  // to be document-scoped. With an overlay-scoped listener this Tab is neither
-  // cancelled nor refocused.
-  reload?.blur();
-  expect(document.activeElement).not.toBe(reload);
-  const outsideTab = new KeyboardEvent("keydown", {
-    key: "Tab",
-    bubbles: true,
-    cancelable: true,
-  });
-  expect(document.body.dispatchEvent(outsideTab)).toBe(false);
-  expect(outsideTab.defaultPrevented).toBe(true);
-  expect(document.activeElement).toBe(reload);
-  // ...and the trap RELEASES Tab once the dialog leaves the document: it is
-  // document-scoped and nothing ever removes it, so without the isConnected
-  // guard every later Tab in the page would be swallowed and bounced onto a
-  // detached Reload button -- in this suite too, where isolate is false and
-  // each fatal test leaves another trap behind. Detach, assert the release,
-  // then restore the dialog so the caller sees the state it had before.
-  const parent = overlay.parentNode;
-  const nextSibling = overlay.nextSibling;
-  overlay.remove();
-  const detachedTab = new KeyboardEvent("keydown", {
-    key: "Tab",
-    bubbles: true,
-    cancelable: true,
-  });
-  expect(document.body.dispatchEvent(detachedTab)).toBe(true);
-  expect(detachedTab.defaultPrevented).toBe(false);
-  parent?.insertBefore(overlay, nextSibling);
-  reload?.focus({ focusVisible: true });
+  // Focus is unchanged by Tab: nothing refocuses the button behind the user's back.
   expect(document.activeElement).toBe(reload);
 }
 
@@ -373,40 +330,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expectFatalOverlayShape(overlay);
     reloadButton?.click();
     expect(reload).toHaveBeenCalledTimes(1);
-  });
-
-  it("keeps the Tab trap working when a descendant handler stops propagation", async () => {
-    // Why showFatal binds its keydown listener in the CAPTURE phase, which is the
-    // third argument to document.addEventListener. In capture, the document
-    // handler runs BEFORE the event reaches any descendant, so no handler inside
-    // the dialog can defeat the trap; in the bubble phase a descendant
-    // stopPropagation() would keep the event from ever reaching document, and Tab
-    // would walk out of the dialog (in an installed standalone PWA, where this
-    // dialog is the only recovery surface, that means walking into nothing).
-    //
-    // Nothing pinned this before: the flag was invisible to the suite because
-    // both phases fire when no one stops propagation, and it was invisible to the
-    // mutation score too, since StringLiteral was not the only mutator the
-    // excludedMutations entry was hiding behind.
-    const overlay = appendPristineOverlay();
-
-    await expect(import("./app.js")).rejects.toThrow(
-      "web-terminal-kiro: missing #terminal root element",
-    );
-
-    const reloadButton = overlay.querySelector("button");
-    overlay.addEventListener("keydown", (event) => {
-      event.stopPropagation();
-    });
-    reloadButton?.blur();
-    expect(document.activeElement).not.toBe(reloadButton);
-
-    const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
-    // dispatchEvent returns false only because the capture-phase trap called
-    // preventDefault before the descendant could stop the event.
-    expect(reloadButton?.dispatchEvent(tab)).toBe(false);
-    expect(tab.defaultPrevented).toBe(true);
-    expect(document.activeElement).toBe(reloadButton);
   });
 
   it("leaves the kernel's own recovery surface alone and rethrows when createTerminal throws", async () => {

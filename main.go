@@ -640,12 +640,24 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// open an attacker page; the vendored UI already passes
 			// rel="noopener noreferrer" on every anchor and window.open, and
 			// this header makes that tabnabbing guarantee independent of the
-			// Renovate-bumped web-terminal-ui/engine pins. Permissions-Policy
-			// denies the browser features a terminal never uses (same values
-			// subflux ships). Both are ignored on a non-secure origin
-			// (plain-HTTP LAN bind) and active on localhost / behind a
-			// TLS-terminating proxy — the README's recommended deployment.
+			// Renovate-bumped web-terminal-ui/engine pins. Referrer-Policy is
+			// tightened from webhttp's default (strict-origin-when-cross-origin,
+			// which still discloses this server's origin) to same-origin for the
+			// SAME reason and against the same pins: the `rel="noreferrer"` half
+			// of that anchor contract is what suppresses the Referer today, so a
+			// UI bump that drops the attribute would otherwise leak the
+			// terminal's internal hostname to whatever attacker-chosen page the
+			// link points at. Nothing here reads Referer, so the tightening is
+			// inert for the app. same-origin rather than no-referrer to match
+			// what vibekit already pins (webhttp's default is what the two
+			// non-terminal consumers keep) — one fleet value, not a fourth.
+			// Permissions-Policy denies the browser features a terminal never
+			// uses (same values subflux ships). All three are ignored on a
+			// non-secure origin (plain-HTTP LAN bind) and active on localhost /
+			// behind a TLS-terminating proxy — the README's recommended
+			// deployment.
 			webhttp.WithCOOP("same-origin"),
+			webhttp.WithReferrerPolicy("same-origin"),
 			webhttp.WithPermissionsPolicy("camera=(), microphone=(), geolocation=()"),
 		),
 		apiNoStore,

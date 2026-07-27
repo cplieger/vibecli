@@ -277,10 +277,14 @@ func TestCreateRateLimit(t *testing.T) {
 // security headers that buildHandler layers on every response via
 // webhttp.SecurityHeaders(). web-terminal-kiro sent NO security headers before the
 // webhttp standardization, so this is the regression guard for the fleet
-// baseline: X-Content-Type-Options nosniff, X-Frame-Options DENY, and
-// Referrer-Policy strict-origin-when-cross-origin on a normal 200. It also pins
-// the two deliberate choices -- X-Frame-Options is the DENY default because
-// web-terminal-kiro is never embedded in a frame, and the Content-Security-Policy is the
+// baseline: X-Content-Type-Options nosniff and X-Frame-Options DENY on a normal
+// 200. It also pins the three deliberate choices -- X-Frame-Options is the DENY
+// default because web-terminal-kiro is never embedded in a frame; Referrer-Policy
+// is TIGHTENED from webhttp's strict-origin-when-cross-origin default to
+// same-origin, so a UI bump that drops the vendored `rel="noreferrer"` cannot
+// leak this server's hostname to a page an OSC 8 link points at (see
+// buildHandler's rationale, and vibekit pins the same value); and the
+// Content-Security-Policy is the
 // hash-pinned policy buildCSPPolicy assembles from the embedded index.html
 // (asserted below: script-src AND style-src each pin a sha256 token, and no
 // directive carries 'unsafe-inline').
@@ -298,7 +302,7 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 	for _, tc := range []struct{ header, want string }{
 		{"X-Content-Type-Options", "nosniff"},
 		{"X-Frame-Options", "DENY"},
-		{"Referrer-Policy", "strict-origin-when-cross-origin"},
+		{"Referrer-Policy", "same-origin"},
 		{"Cross-Origin-Opener-Policy", "same-origin"},
 		{"Permissions-Policy", "camera=(), microphone=(), geolocation=()"},
 	} {

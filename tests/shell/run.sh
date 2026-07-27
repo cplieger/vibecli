@@ -14,8 +14,7 @@
 # harness_test.sh beside it are synced from cplieger/ci), so the per-repo scope
 # rationale lives here.
 #
-# entrypoint.sh
-# is ~1200 lines and it IS the product's boot path. Its most consequential
+# entrypoint.sh IS the product's boot path, and its most consequential
 # branches are the ones that fail CLOSED — an unremovable stale binary, a
 # non-private /config, a failed kiro-cli download, a package index that cannot be
 # read — and a smoke test can never reach them, because a healthy image never

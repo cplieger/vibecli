@@ -14,8 +14,11 @@
 // in once the agent has booted far enough to first report). Tab LABELS are not a
 // preset concern at all: the engine resolves each session's name server-side, and
 // this app's agent-shell tuning for that is routes.go's terminal.WithInputTitle()
-// (kiro-cli emits a non-empty but useless OSC 0/2 title, so the label follows the
-// latest submitted line). A generic shell
+// (kiro-cli sets NO OSC 0/2 window title, so the engine's OSC rung is always empty
+// here and the label is the first substantial line the user submitted). Until that
+// first eligible line arrives -- 3+ characters, not a bare slash command -- the label
+// falls to the engine's own inference and every new tab reads "workspace",
+// "workspace 2", which is the state WithInputTitle exists to end. A generic shell
 // would use presetTabbed, whose dot stays hidden until a session actually
 // reports. Each browser tab drives its own independent kiro-cli chat session
 // over the shared server; kiro-cli's TUI is rendered verbatim through the raw PTY

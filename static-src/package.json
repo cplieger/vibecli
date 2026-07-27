@@ -9,7 +9,8 @@
     "lint:eslint": "eslint .",
     "lint:prettier": "prettier --check .",
     "lint:fix": "eslint . --fix && prettier --write .",
-    "lint:knip": "knip"
+    "lint:knip": "knip",
+    "lint:stylelint": "stylelint --configBasedir . --config ../.stylelintrc.json '../static/*.html'"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
@@ -23,6 +24,7 @@
     "happy-dom": "20.11.1",
     "html-validate": "11.5.6",
     "knip": "6.29.0",
+    "postcss-html": "1.8.0",
     "prettier": "3.9.6",
     "stylelint": "17.14.1",
     "stylelint-config-standard": "40.0.0",

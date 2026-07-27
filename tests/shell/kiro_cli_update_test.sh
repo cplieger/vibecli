@@ -37,7 +37,8 @@ cat "$WORK/_resolve.sh" >>"$HELPERS"
 # The update transaction: the journal is what keeps an interrupted promotion from
 # leaving the OLD $BIN paired with the NEW chat sidecar.
 for _fn in kiro_cli_snapshot_one kiro_cli_restore_one kiro_cli_update_finish \
-  kiro_cli_update_begin kiro_cli_update_rollback recover_kiro_cli_update_journal; do
+  kiro_cli_update_begin kiro_cli_update_rollback recover_kiro_cli_update_journal \
+  publish_readiness_marker; do
   extract_function "$_fn" "$WORK/_$_fn.sh" >/dev/null
   cat "$WORK/_$_fn.sh" >>"$HELPERS"
 done
@@ -75,6 +76,10 @@ kiro_cli_version() {
   printf '%s\n' "$STUB_VERSION"
 }
 fatal() { FATALS="$FATALS|$1"; }
+# The readiness range now opens with the KAS prune (it runs once the version that will
+# actually run is known). Its own behavior is kas_prune_test.sh's subject, and it would
+# reach outside the fake volume here, so stub it out to a no-op.
+prune_superseded_kas_runtimes() { :; }
 
 ready_published() {
   rm -f "$KIRO_CLI_READY_MARKER"

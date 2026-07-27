@@ -754,14 +754,48 @@ func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
 			if rec.Code != tc.wantStatus {
 				t.Errorf("health status = %d, want %d", rec.Code, tc.wantStatus)
 			}
-			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+			got := strings.TrimSpace(rec.Body.String())
+			if got != tc.wantBody {
 				t.Errorf("raw health body = %q, want %q (byte-exact: the key ORDER is the shared contract)", got, tc.wantBody)
 			}
 			if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 				t.Errorf("Cache-Control = %q, want no-store: a cached readiness verdict defeats the gate", got)
 			}
+			// The "ready" and "unready" rows ARE the library's envelope; the tools row is
+			// this app's composite extension and has no library counterpart.
+			switch tc.name {
+			case "ready":
+				if libBody, libCC := libraryEnvelope(t, true); got != libBody || rec.Header().Get("Cache-Control") != libCC {
+					t.Errorf("ready envelope = %q/%q, webhttp.ReadinessHandler emits %q/%q; the two must agree byte-for-byte",
+						got, rec.Header().Get("Cache-Control"), libBody, libCC)
+				}
+			case "unready":
+				if libBody, libCC := libraryEnvelope(t, false); got != libBody || rec.Header().Get("Cache-Control") != libCC {
+					t.Errorf("unready envelope = %q/%q, webhttp.ReadinessHandler emits %q/%q; the reason string and key order are the shared contract",
+						got, rec.Header().Get("Cache-Control"), libBody, libCC)
+				}
+			}
 		})
 	}
+}
+
+// readyStub adapts a bool to webhttp.ReadinessChecker so the library's own
+// handler can be driven here.
+type readyStub bool
+
+func (r readyStub) Ready() bool { return bool(r) }
+
+// libraryEnvelope returns webhttp.ReadinessHandler's body and Cache-Control
+// for the given readiness, so the assertions above compare this app's
+// hand-matched envelope against the REAL library output rather than against a
+// literal copied from it. A webhttp bump that reorders the keys, renames a
+// field, reworks the unready wording, or drops no-store fails HERE.
+func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	webhttp.ReadinessHandler(readyStub(ready)).ServeHTTP(
+		rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
+	return strings.TrimSpace(rec.Body.String()), rec.Header().Get("Cache-Control")
 }
 
 // newTestDeps returns the minimal routeDeps the route tests build
@@ -1180,5 +1214,43 @@ func TestComposeGate_syncingResponseIncludesRetryAfter(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "5" {
 		t.Errorf("syncing response Retry-After = %q, want %q", got, "5")
+	}
+}
+
+// TestNotifyExcerpt pins the log-hygiene bound the classifier applies to
+// arbitrary child output before any of it reaches the always-on (info) log
+// stream: a wording at or under unrecognizedNotifyExcerptRunes passes through
+// byte-identically and UNMARKED, so a short wording stays distinguishable from a
+// clipped one, while a longer one is cut to exactly that many RUNES plus the
+// truncation marker.
+//
+// TestClassifyStatus_logsSanitizedNotificationText exercises this function only
+// through a live session emitting one 75-rune ASCII notification, so it pins
+// neither end of the contract that can actually move. Tightening the comparison
+// to < marks every short wording as clipped, sending an operator chasing a
+// kiro-cli wording drift after text that was never truncated; slicing bytes
+// instead of runes writes a U+FFFD-mangled excerpt into the shipped stream for
+// an ordinary non-ASCII notification, which is the defect the rune basis exists
+// to prevent and which no ASCII fixture can see.
+func TestNotifyExcerpt(t *testing.T) {
+	const bound = unrecognizedNotifyExcerptRunes
+	// 3 bytes per rune, so a byte-based slice at the bound splits one mid-rune.
+	multibyte := strings.Repeat("\u2192", bound+5)
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{"a short wording passes through unmarked", "Response complete", "Response complete"},
+		{"an empty message passes through", "", ""},
+		{"exactly at the bound is not marked truncated", strings.Repeat("a", bound), strings.Repeat("a", bound)},
+		{"one rune past the bound is cut to the bound plus the marker", strings.Repeat("a", bound+1), strings.Repeat("a", bound) + "\u2026"},
+		{"multi-byte runes are counted, never split", multibyte, strings.Repeat("\u2192", bound) + "\u2026"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := notifyExcerpt(tc.msg); got != tc.want {
+				t.Errorf("notifyExcerpt(%q) = %q, want %q", tc.msg, got, tc.want)
+			}
+		})
 	}
 }

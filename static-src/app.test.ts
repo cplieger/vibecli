@@ -89,8 +89,13 @@ function readStaticAsset(name: string): string {
 // app: app.ts's own copy is gone (createTerminal owns every terminal startup
 // failure now), but the watchdog reports "the JS bundle never ran", a rung below
 // `import` by definition, so it cannot use the library and cannot be deleted.
-function expectFatalOverlayShape(overlay: HTMLElement): void {
+function expectFatalOverlayShape(overlay: HTMLElement, root: HTMLElement): void {
   expect(overlay.getAttribute("role")).toBe("alertdialog");
+  // aria-modal claims the rest of the page is inert; the watchdog makes that
+  // claim true by inerting the terminal root, so assert the containment here
+  // rather than per test -- the negative twin below pins the same attribute
+  // staying absent, and the two must not drift.
+  expect(root.hasAttribute("inert")).toBe(true);
   // The watchdog sets the handoff marker before app.ts can boot. app.ts consumes
   // this explicit token rather than depending on the dialog's ARIA or child shape.
   expect(overlay.hasAttribute("data-bootstrap-fatal")).toBe(true);
@@ -234,6 +239,38 @@ function appendPristineOverlay({ fade = false } = {}): HTMLElement {
   return overlay;
 }
 
+// A <link rel="stylesheet"> in <head>: the fixture index.html's
+// post-registration sweep reads. In <head> because that is where index.html
+// declares it -- and beforeEach only clears <body>, so the link MUST be removed
+// when the test finishes: isolate is false, so a leaked link is swept by every
+// later watchdog test in this file. Never given an href, so happy-dom cannot
+// attempt a real fetch. loaded: the stylesheet parsed (a defined .sheet, the
+// healthy state a browser exposes); media/disabled: the sweep's two gates.
+function appendHeadStylesheet({
+  media,
+  disabled = false,
+  loaded = false,
+}: { media?: string; disabled?: boolean; loaded?: boolean } = {}): HTMLLinkElement {
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  if (media !== undefined) {
+    link.media = media;
+  }
+  if (disabled) {
+    link.disabled = true;
+  }
+  document.head.appendChild(link);
+  if (loaded) {
+    // happy-dom never loads a link it was given no resolvable href for, so set
+    // .sheet directly -- the same surface a browser exposes once it parses.
+    Object.defineProperty(link, "sheet", { value: new CSSStyleSheet(), configurable: true });
+  }
+  onTestFinished(() => {
+    link.remove();
+  });
+  return link;
+}
+
 // The synthetic window "error" event the watchdog keys on: `target` for a
 // resource load failure, `error` for an uncaught runtime error. (The
 // capture-flag test deliberately dispatches on a real attached element
@@ -333,19 +370,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).not.toHaveBeenCalled();
   });
 
-  it("keys the abort on the handoff marker, not on the dialog's ARIA shape", async () => {
-    // data-bootstrap-fatal is an explicit protocol marker precisely so the
-    // fatal surface's a11y shape can change without silently severing the
-    // handoff. An overlay carrying the marker and NOTHING else must still abort.
-    const overlay = appendPristineOverlay();
-    overlay.setAttribute("data-bootstrap-fatal", "");
-
-    await expect(import("./app.js")).rejects.toThrow(
-      "bootstrap watchdog already reported a fatal resource failure",
-    );
-    expect(createTerminalMock).not.toHaveBeenCalled();
-  });
-
   it("leaves the kernel's own recovery surface alone and rethrows when createTerminal throws", async () => {
     const root = appendTerminalRoot();
     const loading = appendPristineOverlay({ fade: true });
@@ -410,12 +434,9 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     document.body.appendChild(scriptEl);
     scriptEl.dispatchEvent(new Event("error"));
 
-    expectFatalOverlayShape(overlay);
+    expectFatalOverlayShape(overlay, root);
     const description = overlay.querySelector("#bootstrap-failure-message");
     expect(description?.textContent).toContain("Web Terminal for Kiro failed to load");
-    // aria-modal made true: the watchdog inerts the terminal root, so the claim
-    // is backed by real containment.
-    expect(root.hasAttribute("inert")).toBe(true);
     // The watchdog's Reload button must actually reload -- the same contract
     // the library's own fatal-panel tests pin for its Reload button. A
     // dead click listener would leave a dead-end recovery CTA on the only
@@ -514,8 +535,15 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     linkEl.href = "/style.css";
     dispatchWindowError({ target: linkEl }); // plain Event: no .error property
 
-    expectFatalOverlayShape(overlay);
-    expect(root.hasAttribute("inert")).toBe(true);
+    expectFatalOverlayShape(overlay, root);
+    // The message must NAME this cause, not fall back to the generic "check your
+    // connection": /style.css is the branch a user cannot see (the page just goes
+    // black, nothing 404s in the UI) and it is routinely a 200 that never applied,
+    // so a connection hint points the user -- and an operator reading a
+    // screenshot -- at the wrong thing.
+    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "/style.css",
+    );
   });
 
   it("watchdog surfaces a stylesheet that failed before the listener was registered", () => {
@@ -530,17 +558,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the post-registration sweep can raise the dialog.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
-    const linkEl = document.createElement("link");
-    linkEl.rel = "stylesheet"; // no href: happy-dom must not attempt a real fetch
-    document.head.appendChild(linkEl);
-    onTestFinished(() => {
-      linkEl.remove(); // beforeEach only clears <body>
-    });
+    appendHeadStylesheet();
 
     evaluateWatchdog(readWatchdogSource());
 
-    expectFatalOverlayShape(overlay);
-    expect(root.hasAttribute("inert")).toBe(true);
+    expectFatalOverlayShape(overlay, root);
   });
 
   it("watchdog sweep fires on a failed stylesheet whose media query matches", () => {
@@ -551,18 +573,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // unstyled, unusable terminal the watchdog exists to surface.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
-    const linkEl = document.createElement("link");
-    linkEl.rel = "stylesheet";
-    linkEl.media = "screen"; // no href: happy-dom must not attempt a real fetch
-    document.head.appendChild(linkEl);
-    onTestFinished(() => {
-      linkEl.remove(); // beforeEach only clears <body>
-    });
+    appendHeadStylesheet({ media: "screen" });
 
     evaluateWatchdog(readWatchdogSource());
 
-    expectFatalOverlayShape(overlay);
-    expect(root.hasAttribute("inert")).toBe(true);
+    expectFatalOverlayShape(overlay, root);
   });
 
   it("watchdog sweep ignores a failed stylesheet whose media query does not match", () => {
@@ -574,13 +589,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // screen render, and no test pins it.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
-    const linkEl = document.createElement("link");
-    linkEl.rel = "stylesheet";
-    linkEl.media = "print"; // no href: happy-dom must not attempt a real fetch
-    document.head.appendChild(linkEl);
-    onTestFinished(() => {
-      linkEl.remove(); // beforeEach only clears <body>
-    });
+    appendHeadStylesheet({ media: "print" });
 
     evaluateWatchdog(readWatchdogSource());
 
@@ -611,11 +620,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     expect(createTerminalMock).not.toHaveBeenCalled();
     // The watchdog's recovery UI survives app.ts's pass, inert included.
-    expectFatalOverlayShape(overlay);
+    expectFatalOverlayShape(overlay, root);
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
       "Web Terminal for Kiro failed to load",
     );
-    expect(root.hasAttribute("inert")).toBe(true);
   });
 
   it("aborts boot from the fatal handoff marker independently of dialog ARIA", async () => {
@@ -667,16 +675,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the same surface a browser exposes once the stylesheet parses.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
-    const linkEl = document.createElement("link");
-    linkEl.rel = "stylesheet";
-    document.head.appendChild(linkEl);
-    onTestFinished(() => {
-      linkEl.remove(); // beforeEach only clears <body>
-    });
-    Object.defineProperty(linkEl, "sheet", {
-      value: new CSSStyleSheet(),
-      configurable: true,
-    });
+    appendHeadStylesheet({ loaded: true });
 
     evaluateWatchdog(readWatchdogSource());
 
@@ -691,13 +690,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the same surface a browser exposes and scripts toggle.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
-    const linkEl = document.createElement("link");
-    linkEl.rel = "stylesheet";
-    linkEl.disabled = true;
-    document.head.appendChild(linkEl);
-    onTestFinished(() => {
-      linkEl.remove(); // beforeEach only clears <body>
-    });
+    appendHeadStylesheet({ disabled: true });
 
     evaluateWatchdog(readWatchdogSource());
 
@@ -730,11 +723,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // and a non-element target; recreate that shape.
     dispatchWindowError({ target: window, error: new Error("evaluate boom") });
 
-    expectFatalOverlayShape(overlay);
+    expectFatalOverlayShape(overlay, root);
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
       "Web Terminal for Kiro failed to load",
     );
-    expect(root.hasAttribute("inert")).toBe(true);
   });
 
   it("watchdog stands down after createTerminal has built UI inside #terminal", () => {
@@ -817,5 +809,92 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const terminalRoot = doc.getElementById("terminal");
     expect(terminalRoot).not.toBeNull();
     expect(terminalRoot?.firstElementChild).toBeNull();
+  });
+
+  // The UI package's shipped stylesheets, assembled from its own css/MANIFEST --
+  // exactly the member list scripts/css-bundle.sh concatenates into the served
+  // /style.css -- with CSS comments stripped so a name that survives only in
+  // prose can never satisfy a parity assertion below. readStaticAsset's
+  // INIT_CWD policy is repeated rather than reused because that helper is rooted
+  // at ../static (the served assets) while these files live under node_modules;
+  // both readers resolve from the same source root for the same Stryker-sandbox
+  // reason.
+  function readUiCssBundle(): string {
+    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
+    const readCss = (name: string): string =>
+      readFileSync(
+        resolve(sourceRoot, `node_modules/@cplieger/web-terminal-ui/css/${name}`),
+        "utf8",
+      );
+    const members = readCss("MANIFEST")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    expect(members.length).toBeGreaterThan(0);
+    return members
+      .map(readCss)
+      .join("\n")
+      .replace(/\/\*[\s\S]*?\*\//g, "");
+  }
+
+  function declaredCustomProperties(bundle: string): string[] {
+    return [...bundle.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((match) => match[1] as string);
+  }
+
+  it("themes only custom properties the shipped UI package declares and reads", () => {
+    // The theme object is Readonly<Record<string, string>> on the library side:
+    // the kernel copies every key onto .wt-root verbatim, so nothing -- not tsc,
+    // not the assertions above, which only pin what app.ts PASSES -- notices a
+    // token the library renamed or retired. The override silently becomes a dead
+    // declaration, the terminal renders in the library's neutral blue defaults,
+    // and this file stays green. Same mechanism as STARTUP_FAILURE_COPY: the
+    // agreement is checked against the shipped package rather than remembered.
+    const bundle = readUiCssBundle();
+    const declared = declaredCustomProperties(bundle);
+
+    // Every key app.ts sets, plus every token its VALUES reach through var():
+    // --tab-active-border's color-mix reads --text, so a rename there breaks the
+    // whole declaration and the active tab loses its edge.
+    const named = new Set(Object.keys(THEME));
+    for (const value of Object.values(THEME)) {
+      for (const reference of value.matchAll(/var\(\s*(--[\w-]+)/g)) {
+        named.add(reference[1] as string);
+      }
+    }
+    expect([...named]).toContain("--text");
+
+    for (const token of named) {
+      expect(declared, `theme token ${token} is not declared by the UI package`).toContain(token);
+      // Declared but unread is the same silent no-op: the kernel writes the
+      // override onto .wt-root and no rule consumes it.
+      expect(
+        new RegExp(`var\\(\\s*${token}\\s*[,)]`).test(bundle),
+        `theme token ${token} is declared but never read by the UI package`,
+      ).toBe(true);
+    }
+  });
+
+  it("opts into loading-overlay names the shipped UI package still styles", () => {
+    // index.html's overlay is styled by the library now (its ~70 duplicated lines
+    // are gone), and it opts in by NAME: the .wt-loading class, the
+    // .wt-loading-bar child, the .wt-loading-text region the kernel writes the
+    // progressive status line into, and the one --wt-loading-accent token that
+    // carries the brand into the pre-JS screen. Those names are hardcoded in a
+    // static HTML file no compiler reads, so a library rename leaves the first
+    // screen of every load unstyled with every test above still green -- the test
+    // at the end of this file pins index.html's half of the same contract.
+    const bundle = readUiCssBundle();
+
+    for (const selector of [".wt-loading", ".wt-loading-bar", ".wt-loading-text"]) {
+      expect(
+        new RegExp(`(^|[\\s,])\\${selector}(?![\\w-])[^{}]*\\{`, "m").test(bundle),
+        `${selector} is not styled by the UI package`,
+      ).toBe(true);
+    }
+    expect(declaredCustomProperties(bundle)).toContain("--wt-loading-accent");
+    expect(
+      /var\(\s*--wt-loading-accent\s*[,)]/.test(bundle),
+      "--wt-loading-accent is declared but never read by the UI package",
+    ).toBe(true);
   });
 });

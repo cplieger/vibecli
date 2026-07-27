@@ -524,7 +524,18 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 	inv, err := e.Inventory()
 	if err != nil {
-		slog.Debug("tools: inventory read failed; skipping the language-server nudge", "error", err)
+		// Warn, not Debug: Inventory's only failure mode is an unreadable or
+		// unparseable /config/tools.json, and toolbelt returns that error
+		// without logging it (Engine.Inventory), so at the default level this
+		// would be the one record of a manifest an operator has just broken.
+		// The nudge below is skipped either way — its ABSENCE must not be read
+		// as "a language server is enabled" when the answer is really unknown.
+		// Deliberately NOT the "no language servers enabled" wording: that is a
+		// different event, and TestWarnIfNoLSPEnabled's inventory-failure
+		// subtest counts Warns by that message.
+		slog.Warn("tools: manifest unreadable; cannot tell whether a language server is enabled",
+			"error", err,
+			"hint", "fix /config/tools.json (schema v2 JSON); an unreadable manifest fails the tools engine outright on the next restart")
 		return
 	}
 	for i := range inv.Tools {
@@ -563,44 +574,24 @@ func apiNoStore(next http.Handler) http.Handler {
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
-//     403 — subject to the skip list below (/ws and the SSE stream emit no
-//     access lines), the ProbeLogLevel policy (/api/health logs at Debug
-//     when healthy, Warn/Error when failing), and the WithTemplatePathsUnder
-//     redaction
-//     (the token-bearing /api/sessions/ subtree logs its route template,
-//     never a session id). WithClientIP is
-//     passed the TRUSTED_PROXIES set (parseTrustedProxies) as the `client_ip`
-//     field's trusted-proxy ranges: unset/empty ⇒ trust nothing, so `client_ip`
-//     is the unspoofable socket peer and X-Forwarded-For is ignored — the
-//     spoof-safe default for a directly-exposed deployment. Behind a reverse
-//     proxy, TRUSTED_PROXIES names the proxy CIDR(s) so `client_ip` resolves to
-//     the real client from a trusted XFF instead of the proxy's own address.
-//     This replaces the former app-side api.RequestLogger, whose only reason to
-//     exist was the `remote` (host:port) field; `client_ip` (host only, no port)
-//     is its successor. Skips the long-lived streams (/ws and the
-//     /api/sessions/events SSE) so neither emits a misleading open-time access
-//     line; the request id is still minted, echoed, and threaded on those paths.
-//     /api/health is NOT skipped: ProbeLogLevel keeps the every-30s Docker
-//     HEALTHCHECK probe's healthy 2xx at Debug (out of the shipped stream)
-//     and promotes a failing probe to Warn/Error; the token-bearing
-//     /api/sessions/ subtree stays logged with its recorded path rewritten
-//     to the matched route template via WithTemplatePathsUnder below.
+//     403. Its four policies are configured, and each justified, at the call
+//     sites in the body below: the stream skips (/ws upgrades and the SSE
+//     stream emit no access lines), ProbeLogLevel for /api/health, the
+//     WithTemplatePathsUnder redaction that keeps a live session id out of
+//     the token-bearing /api/sessions/ subtree's lines, and WithClientIP over
+//     the TRUSTED_PROXIES set (see parseTrustedProxies for the trust-nothing
+//     default). The request id is minted, echoed and threaded even on the
+//     skipped stream paths.
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
 //     so the access line records the 500, not the recorder's default 200).
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
-//     Referrer-Policy) plus Cross-Origin-Opener-Policy: same-origin (severs
-//     window.opener for any cross-origin page a session opens from an OSC 8 /
-//     autolinked URL taken from untrusted child output, making the vendored
-//     UI's rel="noopener noreferrer" a defence-in-depth pair rather than the
-//     only tabnabbing guard), a Permissions-Policy denying the browser
-//     features a terminal never uses (camera, microphone, geolocation), and
-//     the app's hash-pinned Content-Security-Policy
-//     (csp, built fail-loud by buildCSPPolicy from the embedded index.html —
-//     the same script-src sha256 pinning web-terminal-server ships, closing
-//     the family-drift gap where this app served the same embedded-static +
-//     inline-importmap pattern with no CSP at all). X-Frame-Options DENY is
-//     the default and is consistent with the CSP's frame-ancestors 'none' —
-//     web-terminal-kiro is never embedded in a frame. Placed outside
+//     Referrer-Policy) plus Cross-Origin-Opener-Policy, a Permissions-Policy
+//     denying the browser features a terminal never uses, and the app's
+//     hash-pinned Content-Security-Policy (csp, built fail-loud by
+//     buildCSPPolicy from the embedded index.html); each value's rationale and
+//     its secure-context caveats are at the call site below. X-Frame-Options
+//     DENY is the default and is consistent with the CSP's frame-ancestors
+//     'none' — web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
 //   - apiNoStore — Cache-Control: no-store on the /api/ surface (see

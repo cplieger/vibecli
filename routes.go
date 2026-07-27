@@ -282,6 +282,19 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	// root wires, so a test builds a fresh handler instead of resetting package
 	// state.
 	var kiroMarkerStatErrOnce sync.Once
+	// One constructor for both outcomes, so the INFORMATIONAL tools field cannot
+	// diverge between them (and neither can any field added later). It belongs on
+	// the 503 bodies too: tool convergence never GATES readiness, but an operator
+	// diagnosing a 503 needs to see whether tools are still syncing or already
+	// degraded — and that is exactly the moment the field used to disappear,
+	// because both unready paths returned before it was attached.
+	healthResponse := func(status, reason string) healthBody {
+		body := healthBody{Status: status, Reason: reason}
+		if deps.toolsState != nil {
+			body.Tools = deps.toolsState()
+		}
+		return body
+	}
 	return func(w http.ResponseWriter, _ *http.Request) {
 		// Set here, not left to the /api/-wide apiNoStore middleware, so the
 		// handler carries its own contract wherever it is mounted: a readiness
@@ -291,19 +304,6 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// middleware, which sets the same value; the same header now comes from
 		// webhttp.ReadinessHandler for the apps that use it directly.
 		w.Header().Set("Cache-Control", "no-store")
-		// One constructor for both outcomes, so the INFORMATIONAL tools field cannot
-		// diverge between them (and neither can any field added later). It belongs on
-		// the 503 bodies too: tool convergence never GATES readiness, but an operator
-		// diagnosing a 503 needs to see whether tools are still syncing or already
-		// degraded — and that is exactly the moment the field used to disappear,
-		// because both unready paths returned before it was attached.
-		healthResponse := func(status, reason string) healthBody {
-			body := healthBody{Status: status, Reason: reason}
-			if deps.toolsState != nil {
-				body.Tools = deps.toolsState()
-			}
-			return body
-		}
 		unready := func(reason string) {
 			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthResponse("unready", reason))
 		}
@@ -561,23 +561,18 @@ const cspTemplate = "default-src 'self'; " +
 // (via webhttp.InlineScriptHashes) plus its single inline <style> block (via
 // webhttp.InlineStyleHashes) — both the byte-precise scanners that hash exactly
 // the content a browser hashes — and assembles the full CSP string.
-// web-terminal-kiro's index.html carries TWO inline scripts -- the importmap
-// and the bootstrap watchdog (the script-load-failure alertdialog) -- both
-// hashed; the external /app.js module is covered by script-src 'self'. FAIL
-// LOUD: a
-// malformed build — a nil FS, an unreadable index.html, zero inline scripts, or
-// anything other than exactly one <style> block
-// — aborts startup rather than silently dropping the script-src or style-src
-// hardening or
-// serving a hash set that would block the importmap and break ES module
-// loading. (This ports web-terminal-server's hash-pinned CSP; web-terminal-kiro
-// previously shipped no CSP at all — the family-drift item the 2026-07
-// judgement run flagged.)
+// web-terminal-kiro's index.html carries TWO inline scripts — the importmap and
+// the bootstrap watchdog (the script-load-failure alertdialog) — both hashed;
+// the external /app.js module is covered by script-src 'self'.
+//
+// FAIL LOUD: a malformed build — a nil FS, an unreadable index.html, zero
+// inline scripts, or anything other than exactly one <style> block — aborts
+// startup rather than silently dropping the script-src or style-src hardening,
+// or serving a hash set that would block the importmap and break ES module
+// loading.
 //
 // The one-block assertion stays HERE rather than in the library: "exactly one"
 // is this app's contract about its own page, not a property of style hashing.
-// The local byte scanner this used to carry (its own index-preserving ASCII fold
-// duplicating webhttp's) is gone now that the library owns the style half too.
 func buildCSPPolicy(sub fs.FS) (string, error) {
 	if sub == nil {
 		return "", errors.New("buildCSPPolicy: nil static FS")
@@ -632,6 +627,14 @@ func composeGate(inner func(http.Handler) http.Handler, syncing func() bool) fun
 	}
 }
 
+// isLoopbackIP reports whether s parses as an IP literal in the loopback range.
+// The shared tail of the tools gate's two legs, so the fail-closed answer for an
+// unparseable value (nil ip) is defined once for both.
+func isLoopbackIP(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.IsLoopback()
+}
+
 // loopbackPeer reports whether an http.Request.RemoteAddr belongs to a
 // loopback socket peer. Forwarded headers play no part — RemoteAddr is set
 // by the server from the accepted connection. Malformed values fail closed.
@@ -643,8 +646,7 @@ func loopbackPeer(remoteAddr string) bool {
 	if err != nil {
 		return false
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return isLoopbackIP(host)
 }
 
 // loopbackHost reports whether a request's Host header names the local host:
@@ -659,11 +661,7 @@ func loopbackPeer(remoteAddr string) bool {
 // Host).
 func loopbackHost(host string) bool {
 	canon := webhttp.CanonicalHost(host)
-	if canon == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(canon)
-	return ip != nil && ip.IsLoopback()
+	return canon == "localhost" || isLoopbackIP(canon)
 }
 
 // loopbackOnly admits only requests whose SOCKET PEER *and* Host header are

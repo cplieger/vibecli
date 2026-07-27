@@ -422,12 +422,13 @@ EXPOSE 9848
 # calls, the five applied after
 # promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
 # assertion — at 10s each, +5s kill-after) + optional APT_PACKAGES (apt-get
-# update 300, +30 kill-after; apt-get install 600, +30 kill-after) = 4845s with
+# update 300, +30 kill-after; apt-cache pkgnames 60, +10 kill-after; apt-get
+# install 600, +30 kill-after) = 4915s with
 # APT_PACKAGES, 3885s without — so the 20m (1200s) start-period does NOT cover
 # even the single-attempt path. The download also runs with --retry 3 bounded by
 # --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
 # begun just under the limit still runs to --max-time 3600, putting the download
-# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10245s with
+# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10315s with
 # APT_PACKAGES (≈ 9285s without).
 #
 # THE BUDGETS ARE DELIBERATELY LEFT BELOW THAT SUM (decided 2026-07). The two

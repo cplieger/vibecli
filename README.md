@@ -86,6 +86,8 @@ Web Terminal for Kiro has no built-in authentication, so the cleanest way to exp
 
 Behind a proxy, also set `TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (e.g. `TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the access log then resolves the real client from a trusted `X-Forwarded-For` instead of logging the proxy as the peer. Unset (the default), the log records the direct socket peer and ignores `X-Forwarded-For`, so the logged IP cannot be spoofed; that is the right choice when the terminal is directly exposed. Only a request whose socket peer is inside the set has its `X-Forwarded-For` trusted, and a malformed entry is logged and skipped rather than aborting startup.
 
+One thing to configure on the proxy: the terminal WebSocket URL carries the session id as a query parameter (`/ws?session=<id>`), and that id is a capability token — anything that can reach the port and replay it attaches to that live session, and sessions have no idle timeout, so it stays valid until the tab is closed or the container restarts. This server never logs it (the access log records the request path only, and the `/api/sessions/` subtree is logged as its route template), but a proxy in front usually logs the full request URI by default (Caddy's `uri` field, nginx's `$request`). Drop or redact the query string for `/ws` in the proxy's access log before shipping it anywhere.
+
 ## Features
 
 Everything below works on a phone as well as a desktop.

@@ -32,9 +32,12 @@ CHAT_SIDECAR="$TOOLS/bin/kiro-cli-chat"
 # quarantine removes it together with the binaries it describes. An inherited volume
 # from a pre-marker image therefore takes exactly one repair install.
 KIRO_CLI_INSTALL_MARKER="$TOOLS/.kiro-cli-installed"
-# An update replaces THREE files that only mean anything as ONE set: $BIN, the
+# An update replaces THREE REQUIRED files that only mean anything as ONE set: $BIN, the
 # $CHAT_SIDECAR it dispatches `chat` to, and the marker that names the version whose
-# full set was promoted. Each `mv -f` is atomic; the SEQUENCE is not. A kill between
+# full set was promoted. (The optional kiro-cli-term dispatcher is NOT in the
+# transaction -- it is promoted after the commit, so a rollback cannot strand a
+# newer-pin term beside the restored older pair.) Each `mv -f` is atomic; the SEQUENCE
+# is not. A kill between
 # them -- or a later rename that fails -- leaves the OLD $BIN paired with the NEW
 # sidecar: `kiro-cli --version` answers with the old version, the caller's
 # keep-the-old-install fallback sees an executable $BIN and publishes readiness, and
@@ -446,7 +449,10 @@ sweep_legacy_dispatchers() {
 # the sweeps above: nothing here is on PATH or gates integrity, and a container whose
 # runtime store cannot be tidied must still boot.
 prune_superseded_kas_runtimes() {
-  local data_home kas_dir kas_real entry name
+  # $1 = the version whose runtime tree must survive; defaults to the pin. The caller
+  # passes the version actually on disk, because a failed update keeps serving that one
+  # and deleting its ~240 MB tree makes the next session re-unpack it on every boot.
+  local keep="${1:-$KIRO_CLI_VERSION}" data_home kas_dir kas_real entry name
   data_home="${XDG_DATA_HOME:-}"
   if [ -z "$data_home" ]; then
     # Under set -u an unset HOME would abort the boot; a data dir we cannot locate is
@@ -483,7 +489,7 @@ prune_superseded_kas_runtimes() {
     # <version>-<hash> stem, and the quoted expansion keeps a version string from
     # being read as a glob.
     case "$name" in
-      "$KIRO_CLI_VERSION"-*) continue ;;
+      "$keep"-*) continue ;;
     esac
     # Only VERSION-KEYED entries are superseded runtimes. kas/ is kiro-cli's
     # directory, not ours, so an entry with no leading numeric version component
@@ -498,7 +504,7 @@ prune_superseded_kas_runtimes() {
       continue
     fi
     if rm -rf "$entry"; then
-      printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" pin=%s component=entrypoint\n' "$name" "$KIRO_CLI_VERSION" >&2
+      printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" keep=%s pinned=%s component=entrypoint\n' "$name" "$keep" "$KIRO_CLI_VERSION" >&2
     else
       printf 'level=warn msg="failed to prune superseded kiro-cli agent runtime" entry="%s" component=entrypoint\n' "$name" >&2
     fi
@@ -723,9 +729,16 @@ if [ "$tools_tree_was_writable" -eq 1 ]; then
   # their dot-prefixed names are outside the `kiro-cli*` glob the sweep uses. Drop
   # them here so the recovery pass below cannot restore a payload this boot has
   # already decided not to trust.
-  if ! rm -f "$KIRO_CLI_UPDATE_JOURNAL" "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
+  # The install-completion marker is the same class of artifact: it lives one dir up from
+  # the swept bin dir and is dot-prefixed, so neither the sweep's glob nor the survival
+  # assertion below reaches it -- yet kiro_cli_dispatcher_set_complete reads it as the
+  # authority on whether this pin's full set was promoted. A marker written while the tree
+  # was foreign-writable must not answer that question; its absence is already a
+  # first-class state (rc 2), and the reinstall below rewrites it at 0600.
+  if ! rm -f "$KIRO_CLI_INSTALL_MARKER" \
+    "$KIRO_CLI_UPDATE_JOURNAL" "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
     "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; then
-    printf 'level=warn msg="failed to remove the kiro-cli update journal and backups from a previously group/other-writable tools tree" dir="%s" component=entrypoint\n' "$TOOLS" >&2
+    printf 'level=warn msg="failed to remove the kiro-cli install-completion marker, update journal and backups from a previously group/other-writable tools tree" dir="%s" component=entrypoint\n' "$TOOLS" >&2
   fi
   # The sweep's status is deliberately always 0 (see the function's comment), so it
   # cannot answer "is the tainted payload gone". Check the invariant directly: an
@@ -791,12 +804,9 @@ if ! resolves_to_pinned_kiro_cli identity; then
 fi
 
 # Third hygiene sweep, same unconditional-every-boot argument, applied to the agent
-# runtimes (see the function's comment for why they escape the two above). Ordering is
-# load-bearing and it must run BEFORE the install: on a bump boot the pin already names
-# the NEW version while only the OLD tree is on disk, so the old tree goes first and
-# peak usage stays at one tree instead of two. A boot that installs nothing prunes
-# nothing.
-prune_superseded_kas_runtimes || true
+# runtimes (see the function's comment for why they escape the two above). It runs in
+# the readiness section below, once the version that will ACTUALLY run is known -- see
+# the call site for why that placement still keeps at most one tree on disk.
 
 # Readiness marker consumed by the Go server's /api/health (main.go reads
 # KIRO_CLI_READY_MARKER; routes.go Stats it). Initialized BEFORE any fallible
@@ -808,6 +818,16 @@ export KIRO_CLI_READY_MARKER
 if ! rm -f "$KIRO_CLI_READY_MARKER"; then
   fatal 'failed to clear stale kiro-cli readiness marker' "marker=\"$KIRO_CLI_READY_MARKER\""
 fi
+
+# Publish the readiness marker /api/health gates on. Three branches below reach
+# this point (a clean install and the two failed-update fallbacks); the warn text
+# names /api/health and the marker path, so a copy that drifts makes a Loki query
+# built on it silently miss boots. One writer, one wording.
+publish_readiness_marker() {
+  if ! touch "$KIRO_CLI_READY_MARKER"; then
+    printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
+  fi
+}
 
 install_kiro_cli() (
   printf 'level=info msg="installing kiro-cli" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
@@ -957,7 +977,9 @@ install_kiro_cli() (
   # that any more: download-then-swap keeps the old set live until each rename
   # lands, so an aborted sequence pairs the new sidecar with the OLD $BIN rather
   # than leaving $BIN absent. That is what the journal is for -- every failure
-  # below restores the COMPLETE old set, and a kill is repaired on the next boot.
+  # below restores the COMPLETE old set of the three REQUIRED components, and a kill
+  # is repaired on the next boot. (The optional kiro-cli-term dispatcher is outside
+  # the transaction and promoted after the commit; see its block below.)
   # PRESENCE is weaker than the invariant each dispatcher has to satisfy after
   # promotion: it must still be a self-contained regular executable once the
   # EXIT trap deletes $stage. A directory passes `mv` but cannot be executed,
@@ -981,18 +1003,6 @@ install_kiro_cli() (
       "$chat_sidecar" "$CHAT_SIDECAR" >&2
     kiro_cli_update_rollback
     return 1
-  fi
-  # kiro-cli-term is optional (no session path launches it), so warn rather than
-  # fail -- but do not stay silent about it either. Same shape check as the chat
-  # dispatcher above; an unusable one is skipped instead of promoted.
-  if [ ! -e "$term_sidecar" ]; then
-    printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
-  elif ! is_self_contained_executable "$term_sidecar"; then
-    printf 'level=warn msg="install.sh produced an invalid optional kiro-cli-term sidecar dispatcher; skipping promotion" src="%s" sidecar="kiro-cli-term" component=entrypoint\n' \
-      "$term_sidecar" >&2
-  elif ! mv -f "$term_sidecar" "$TOOLS/bin/kiro-cli-term"; then
-    printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
-      "$TOOLS/bin/kiro-cli-term" >&2
   fi
   # Record install COMPLETION before the commit point, atomically. The required
   # dispatcher set is on disk now (chat sidecar promoted above; kiro-cli-term is
@@ -1039,6 +1049,25 @@ install_kiro_cli() (
     return 1
   fi
   kiro_cli_update_finish
+  # kiro-cli-term is optional (no session path launches it), so warn rather than fail --
+  # but do not stay silent about it either. Same shape check as the chat dispatcher
+  # above; an unusable one is skipped instead of promoted.
+  #
+  # Promoted AFTER the commit, deliberately: kiro_cli_update_begin snapshots only $BIN,
+  # $CHAT_SIDECAR and the marker, so a term promotion inside the transaction window
+  # survives every rollback and strands a NEWER-pin dispatcher beside the restored older
+  # pair -- a mixed set the completeness check and the bare-name check both look past.
+  # Past this point the new set is what recovery keeps, so a term failure can only be the
+  # warn it already is.
+  if [ ! -e "$term_sidecar" ]; then
+    printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
+  elif ! is_self_contained_executable "$term_sidecar"; then
+    printf 'level=warn msg="install.sh produced an invalid optional kiro-cli-term sidecar dispatcher; skipping promotion" src="%s" sidecar="kiro-cli-term" component=entrypoint\n' \
+      "$term_sidecar" >&2
+  elif ! mv -f "$term_sidecar" "$TOOLS/bin/kiro-cli-term"; then
+    printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
+      "$TOOLS/bin/kiro-cli-term" >&2
+  fi
   printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
 )
 
@@ -1196,11 +1225,22 @@ if needs_kiro_cli_install; then
         printf 'level=warn msg="failed to remove a retired kiro-cli dispatcher name left by an older version" path="%s" component=entrypoint\n' "$stale" >&2
       fi
     done
-    # Post-condition on the committed state: with the pinned binary in place, ANY
-    # non-zero here is a real problem -- either something shadows it from another
-    # path, or the promotion did not take.
-    if ! resolves_to_pinned_kiro_cli; then
+    # Post-condition on the committed state, with the SAME rc split the failed-install
+    # site above uses. rc 1 -- something at another path wins bare-name resolution --
+    # is the fatal condition: sessions would silently launch an unpinned binary. rc 2
+    # cannot be a genuine version mismatch here (the staged binary answered the pin
+    # before promotion and `mv -f` moved that same inode), so it means the --version
+    # probe itself failed or hit its 10s deadline. Aborting on that turns a transient
+    # probe timeout into a crash loop that re-downloads the ~528 MB zip on every retry,
+    # while the state is self-healing: the readiness section below withholds the marker
+    # whenever the observed version is not the pin, so the container serves degraded
+    # (unhealthy, no restart loop) and stays repairable from inside.
+    kiro_cli_postinstall_resolve_rc=0
+    resolves_to_pinned_kiro_cli || kiro_cli_postinstall_resolve_rc=$?
+    if [ "$kiro_cli_postinstall_resolve_rc" -eq 1 ]; then
       fatal 'an unpinned kiro-cli is still reachable by bare name after a successful install; refusing to leave it resolvable for the container lifetime' "path=\"$BIN\""
+    elif [ "$kiro_cli_postinstall_resolve_rc" -ne 0 ]; then
+      printf 'level=warn msg="the freshly promoted kiro-cli did not answer --version at the pinned version (probe failure or deadline); readiness will be withheld and the next boot reinstalls" path="%s" pinned=%s component=entrypoint\n' "$BIN" "$KIRO_CLI_VERSION" >&2
     fi
   fi
 fi
@@ -1289,6 +1329,14 @@ kiro_cli_installed=""
 if [ -x "$BIN" ]; then
   kiro_cli_installed=$(kiro_cli_version "$BIN")
 fi
+# Reclaim superseded agent runtimes now that the version that will actually run is
+# known: on a successful bump that is the pin, and on a failed update it is the older
+# version this boot fell back to -- whose tree must survive, or its first session pays a
+# ~240 MB re-unpack after every restart. Still before the exec and still at most one
+# tree on disk (kiro-cli creates the new one on its first chat launch, after this
+# script is gone), so the one-tree peak the earlier pre-install placement protected is
+# unchanged.
+prune_superseded_kas_runtimes "${kiro_cli_installed:-$KIRO_CLI_VERSION}" || true
 # Resolved before the chain below, not inside it: `if ! cmd` leaves $? holding the
 # NEGATED status, so the distinction between an unusable sidecar (rc 1) and a
 # marker that predates the pin (rc 2) is unreadable from inside the branch. The
@@ -1319,9 +1367,7 @@ if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
     # next boot's recovery pass repairs the set and publishes then.
     printf 'level=warn msg="serving a kiro-cli version older than the pin after a failed update; readiness published because the terminal works, but the pin is NOT in force until an update succeeds" installed=%s pinned=%s component=entrypoint\n' \
       "$kiro_cli_installed" "$KIRO_CLI_VERSION" >&2
-    if ! touch "$KIRO_CLI_READY_MARKER"; then
-      printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
-    fi
+    publish_readiness_marker
   else
     # Withholding the marker is otherwise a silent signal: /api/health answers 503
     # and the container sits `unhealthy` forever (readiness, not liveness) with no
@@ -1342,9 +1388,7 @@ elif [ "$kiro_cli_set_rc" -ne 0 ]; then
     # un-rolled-back promotion leaves a set nothing has verified.
     printf 'level=warn msg="kiro-cli dispatcher set predates this pin and the update that would complete it failed; readiness published because the terminal works" version=%s component=entrypoint\n' \
       "$KIRO_CLI_VERSION" >&2
-    if ! touch "$KIRO_CLI_READY_MARKER"; then
-      printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
-    fi
+    publish_readiness_marker
   else
     # $BIN is at the pin, but the dispatcher SET is not complete: `kiro-cli --version`
     # succeeds while `kiro-cli chat` -- the command every session runs -- cannot
@@ -1363,9 +1407,7 @@ elif [ "$kiro_cli_pin_enforced" -ne 1 ]; then
     "$KIRO_CLI_VERSION" >&2
 else
   printf 'level=info msg="kiro-cli verified at pinned version; publishing readiness marker" version=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
-  if ! touch "$KIRO_CLI_READY_MARKER"; then
-    printf 'level=warn msg="failed to write kiro-cli readiness marker; /api/health will report kiro-cli unavailable" marker="%s" component=entrypoint\n' "$KIRO_CLI_READY_MARKER" >&2
-  fi
+  publish_readiness_marker
 fi
 
 # OS packages (APT_PACKAGES env, e.g. "python3 gcc libc6-dev"). apt state
@@ -1446,7 +1488,27 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     apt_gate_ran=0
     if [ "$apt_update_rc" -eq 0 ]; then
       apt_names=$(mktemp) || apt_names=''
-      if [ -n "$apt_names" ] && apt-cache pkgnames >"$apt_names" 2>/dev/null && [ -s "$apt_names" ]; then
+      # Bounded like every other external call in this foreground path: this runs
+      # before any listener exists, so an index apt cannot read through (corrupt or
+      # partially-written cache, very slow storage) would otherwise stall boot with
+      # no deadline and no diagnostic -- the container would sit in starting/
+      # unhealthy forever, and restart:unless-stopped never acts because nothing
+      # exited. A killed probe leaves apt_gate_ran=0, which the narrowing below
+      # already handles exactly as it handles an unreadable index.
+      apt_names_rc=0
+      if [ -n "$apt_names" ]; then
+        timeout --signal=TERM --kill-after=10s 60s apt-cache pkgnames >"$apt_names" 2>/dev/null || apt_names_rc=$?
+      else
+        apt_names_rc=1
+      fi
+      if [ "$apt_names_rc" -eq 124 ] || [ "$apt_names_rc" -eq 137 ]; then
+        # 124/137 = the 60s deadline (TERM, then the --kill-after SIGKILL fallback),
+        # named distinctly from the generic unreadable-index warning for the same
+        # reason the sibling timeouts are: a wedged cache and an index apt rejected
+        # outright call for different operator action.
+        printf 'level=warn msg="apt-cache pkgnames exceeded its 60s deadline and was terminated; installing APT_PACKAGES without the known-name check" rc=%d component=entrypoint\n' "$apt_names_rc" >&2
+      fi
+      if [ "$apt_names_rc" -eq 0 ] && [ -s "$apt_names" ]; then
         apt_gate_ran=1
         known_pkgs=()
         for pkg in "${apt_pkgs[@]}"; do
@@ -1457,7 +1519,7 @@ if [ -n "${APT_PACKAGES:-}" ]; then
           fi
         done
         apt_pkgs=("${known_pkgs[@]}")
-      else
+      elif [ "$apt_names_rc" -ne 124 ] && [ "$apt_names_rc" -ne 137 ]; then
         printf 'level=warn msg="apt package index unreadable; installing APT_PACKAGES without the known-name check" component=entrypoint\n' >&2
       fi
       [ -z "$apt_names" ] || rm -f "$apt_names"

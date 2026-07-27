@@ -87,7 +87,20 @@ apt-cache() {
   esac
 }
 timeout() { shift 3; "\$@"; }
-rm() { command rm "\$@"; }
+rm() {
+  # The extracted block ends with the index reclaim (\`rm -rf /var/lib/apt/lists/*\`).
+  # apt-get is stubbed here; rm is NOT, so that line is real: run as root -- the
+  # ordinary way inside this container -- the suite wipes the package index and the
+  # next apt-get install fails until an update. Intercept exactly that path (and
+  # record it, so the reclaim stays observable) while every other rm still runs.
+  case "\$*" in
+    */var/lib/apt/lists/*)
+      printf 'apt-lists-reclaim\n' >>"$WORK/calls"
+      return 0
+      ;;
+  esac
+  command rm "\$@"
+}
 $(cat "$WORK/warn.sh")
 $(cat "$WORK/block.sh")
 HARNESS

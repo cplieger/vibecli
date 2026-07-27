@@ -600,11 +600,13 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 		}
 	})
 
-	t.Run("inventory failure skips the nudge quietly", func(t *testing.T) {
+	t.Run("inventory failure reports itself, not the nudge", func(t *testing.T) {
 		eng, dir := newEngine(t, `{"version":2,"tools":{}}`, "")
 		// Corrupt the manifest AFTER engine start: Inventory re-reads it from
-		// disk, so the read now fails and the nudge must be skipped (Debug
-		// only, no Warn).
+		// disk, so the read now fails. The property pinned here is that the
+		// failure must NOT surface as the LSP nudge Warn (the nudge's absence
+		// would otherwise be read as "a language server is enabled"); it
+		// reports itself under its own message instead.
 		if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte("{not json"), 0o644); err != nil {
 			t.Fatalf("corrupt manifest: %v", err)
 		}
@@ -612,6 +614,10 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 		warnIfNoLSPEnabled(eng)
 		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
 			t.Errorf("log = %q; an inventory failure must not produce the LSP Warn (got %d)", records.Messages(), got)
+		}
+		const readFailMsg = "tools: manifest unreadable; cannot tell whether a language server is enabled"
+		if got := records.CountLevel(slog.LevelWarn, readFailMsg); got != 1 {
+			t.Errorf("log = %q, want exactly one %q Warn (the read failure must not regress to Debug; got %d)", records.Messages(), readFailMsg, got)
 		}
 	})
 }

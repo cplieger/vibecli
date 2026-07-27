@@ -170,6 +170,16 @@ func logContains(records *capture.Recorder, s string) bool {
 // cleanup. buildHandler binds WithLogger(slog.Default()) at CONSTRUCTION, so
 // the capture must be installed before the handler is built; and because the
 // default logger is process-global, callers must not use t.Parallel.
+//
+// A TEXT handler at the DEFAULT level, not the slogx/capture recorder this file
+// uses elsewhere, and that is load-bearing: two assertions here turn on level
+// FILTERING rather than on capture. TestBuildHandlerSkipsAccessLogForStreams
+// proves a HEALTHY /api/health probe never reaches the shipped stream, which is
+// only true because the handler drops the Debug record ProbeLogLevel demotes it
+// to; and TestBuildHandlerFailingProbeSurfaces reads the rendered level=ERROR.
+// A capture.Recorder keeps records at every level, so converting these tests to
+// it would make the healthy-probe line present and reduce that assertion to
+// "recorded at Debug" - a weaker claim that no longer pins the demotion.
 func captureTextLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer

@@ -1216,9 +1216,11 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     # the warning says so: `apt-get install awk` fails on its own anyway, because a
     # multi-provider virtual has no installation candidate. Naming a concrete
     # provider is the fix in both cases, and the warning is clearer than apt's.
+    apt_gate_ran=0
     if [ "$apt_update_rc" -eq 0 ]; then
       apt_names=$(mktemp) || apt_names=''
       if [ -n "$apt_names" ] && apt-cache pkgnames >"$apt_names" 2>/dev/null && [ -s "$apt_names" ]; then
+        apt_gate_ran=1
         known_pkgs=()
         for pkg in "${apt_pkgs[@]}"; do
           if grep -qxF -- "$pkg" "$apt_names"; then
@@ -1229,13 +1231,45 @@ if [ -n "${APT_PACKAGES:-}" ]; then
         done
         apt_pkgs=("${known_pkgs[@]}")
       else
-        # No usable index. Skipping the gate is the correct failure mode: rejecting
-        # every token would turn a transient index problem into "none of your
-        # packages installed" plus a misleading per-token typo warning. The grammar
-        # still holds, so this degrades to the pre-gate behaviour, logged.
         printf 'level=warn msg="apt package index unreadable; installing APT_PACKAGES without the known-name check" component=entrypoint\n' >&2
       fi
       [ -z "$apt_names" ] || rm -f "$apt_names"
+    fi
+
+    # Whenever the gate could NOT run -- a failed apt-get update above OR an
+    # unreadable index -- skipping it is still the right failure mode: rejecting
+    # every token would turn a transient problem into "none of your packages
+    # installed" plus a misleading per-token typo warning, and the grammar still
+    # holds. But the pre-gate behaviour is exactly what leaves the 337-package
+    # regex blowup described above reachable, so it degrades with ONE narrowing.
+    #
+    # '.' is the only apt pattern metacharacter the grammar admits ('?' and '*' are
+    # outside its character class), so a dotted token is the only one that can be
+    # reinterpreted as a regex -- and it is precisely the token the gate exists to
+    # verify as literal. Dropping just those removes the blowup while every plain
+    # name still installs, which is the common case and the reason the
+    # skip-everything option was rejected.
+    #
+    # Handled here rather than inside either branch so the two ways of losing the
+    # gate cannot drift apart: the likelier one is a PARTIAL apt-get update failure
+    # (some mirrors fine, non-zero exit, index still usable), which is also the only
+    # state where the blowup is actually reachable -- with no index at all, apt
+    # resolves nothing and a regex matches nothing either.
+    #
+    # The cost is narrow and self-healing: a real dotted name (docker.io,
+    # python3.13) waits for a boot whose index is readable, which is a boot where
+    # the install was going to be unreliable anyway. Per "a broken state must be
+    # able to heal itself", the next boot's gate installs it.
+    if [ "$apt_gate_ran" -eq 0 ] && [ "${#apt_pkgs[@]}" -gt 0 ]; then
+      ungated_pkgs=()
+      for pkg in "${apt_pkgs[@]}"; do
+        if [[ "$pkg" == *.* ]]; then
+          warn_skipped_apt_token 'skipping dotted APT_PACKAGES token while the known-name check is unavailable (a dot is an apt regex metacharacter; retry once the package index is readable)' "$pkg"
+        else
+          ungated_pkgs+=("$pkg")
+        fi
+      done
+      apt_pkgs=("${ungated_pkgs[@]}")
     fi
   fi
   if [ "${#apt_pkgs[@]}" -gt 0 ]; then

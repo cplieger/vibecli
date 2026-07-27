@@ -319,6 +319,36 @@ const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhaus
 // it without limit. Insertion stops at the cap; the map never exceeds it.
 const unrecognizedNotifyCap = 8
 
+// unrecognizedNotifyExcerptRunes bounds how much of a notification's text reaches
+// the DEFAULT (info) log stream. The text is arbitrary child output — a program run
+// in the terminal can emit `ESC ] 9 ; <text>` — and the engine's sanitizeNotification
+// only guarantees INTEGRITY (it drops unsafe runes and caps at 256 runes, so the
+// record cannot be forged); it redacts nothing, so a token, a device code, or a
+// tokenised URL in that text would otherwise land in Loki, which retains longer and
+// is far more queryable than PTY scrollback.
+//
+// An excerpt rather than redaction because the text IS the diagnostic: the Warn
+// exists to show WHICH wording appeared after a kiro-cli bump, and the wordings that
+// matter are short ("Response complete" is 17 runes), so this costs the signal
+// nothing while truncating a long tokenised string. The full text stays at Debug for
+// KWEB_LOG_LEVEL=debug, which is the deliberate split — bounded in the always-on
+// stream, complete when someone is actually investigating. It bounds the accident,
+// not the adversary: a short secret still fits, and preventing that would mean
+// redacting the diagnostic away entirely.
+const unrecognizedNotifyExcerptRunes = 64
+
+// notifyExcerpt returns at most unrecognizedNotifyExcerptRunes runes of msg, marking
+// a truncation so a reader can tell a short wording from a clipped one. Rune-based,
+// not byte-based: a byte slice could split a multi-byte rune and emit U+FFFD into the
+// log for a perfectly ordinary non-ASCII notification.
+func notifyExcerpt(msg string) string {
+	runes := []rune(msg)
+	if len(runes) <= unrecognizedNotifyExcerptRunes {
+		return msg
+	}
+	return string(runes[:unrecognizedNotifyExcerptRunes]) + "…"
+}
+
 // newStatusClassifier returns the kiro-cli OSC 9 -> session-status mapping the
 // composition root injects into the engine (terminal.WithStatusClassifier),
 // with its own bounded warn latch: the first occurrence of each DISTINCT
@@ -378,9 +408,14 @@ func newStatusClassifier() func(string) (string, bool) {
 			// warns (visible at the default info level, up to unrecognizedNotifyCap
 			// distinct strings); the Debug line records every occurrence, so
 			// KWEB_LOG_LEVEL=debug is what shows the full set after a version bump.
-			// msg is safe to log raw: the engine's sanitizeNotification strips
-			// every runesafe-unsafe rune (C0/C1 controls, Bidi controls, U+2028/29)
-			// and rune-caps the text before the classifier ever sees it.
+			// The Warn carries only a bounded EXCERPT of the text
+			// (unrecognizedNotifyExcerptRunes): the engine's sanitizeNotification
+			// guarantees the record cannot be FORGED (it drops every
+			// runesafe-unsafe rune -- C0/C1 controls, Bidi controls, U+2028/29 --
+			// and rune-caps at 256 before the classifier sees it) but it redacts
+			// nothing, and this text is arbitrary child output, so the always-on
+			// stream must not carry a token or a device code in full. Debug gets
+			// the whole thing, because raising the level is a deliberate act.
 			//
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
@@ -403,11 +438,13 @@ func newStatusClassifier() func(string) (string, bool) {
 			switch {
 			case warnFirst:
 				slog.Warn(unrecognizedNotifyMsg,
-					"message", msg,
-					"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for every occurrence`)
+					"message_excerpt", notifyExcerpt(msg),
+					"hint", `re-verify the "Response complete" / "Permission required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for the full text`)
 			case warnCapped:
 				slog.Warn(unrecognizedNotifyCapMsg, "distinct_limit", unrecognizedNotifyCap)
 			}
+			// Debug carries the message in FULL: whoever raised the level is
+			// investigating, and the excerpt above is deliberately lossy.
 			slog.Debug(unrecognizedNotifyMsg, "message", msg)
 			return "", false
 		}

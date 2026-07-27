@@ -143,33 +143,46 @@ func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.
 }
 
 // TestClassifyStatus_logsSanitizedNotificationText pins the LOG-SAFETY half of
-// the OSC 9 coupling. newStatusClassifier's mapping logs the notification text
-// raw, and its comment justifies that by the engine's capture-time sanitization
-// (runesafe drops C0/DEL, C1, Bidi controls and U+2028/29 and rune-caps the
-// text). That
+// the OSC 9 coupling, which has two independent halves.
+//
+// INTEGRITY: newStatusClassifier logs notification text whose only forging
+// defence is the engine's capture-time sanitization (runesafe drops C0/DEL, C1,
+// Bidi controls and U+2028/29 and rune-caps the text). That
 // justification is an assumption about a Renovate-bumped dependency and
 // nothing here checks it: the notification text originates in arbitrary child
 // output, so if a bump moved or dropped sanitizeNotification, any program run
 // in the terminal could inject Bidi overrides or forged fields into the
 // aggregated log stream (CWE-117) and every existing test would still pass.
 //
-// A real session emits an OSC 9 whose text carries U+202E (RIGHT-TO-LEFT
-// OVERRIDE, an unsafe rune under the engine's policy). The assertion proves
-// the app's log record carries the notification text but not the unsafe rune,
-// so it fails on the Renovate PR that would break the guarantee.
+// CONFIDENTIALITY: sanitization redacts nothing, so the same arbitrary child
+// output could carry a token or a device code. The Warn therefore carries only a
+// bounded `message_excerpt` while the full text stays at Debug, and this test
+// pins that split — a long notification must be truncated in the default stream
+// and complete under KWEB_LOG_LEVEL=debug. Asserting only the Warn (as this test
+// originally did, on a `message` attribute that no longer exists there) would let
+// a change that logs the full text at Warn pass unnoticed.
 //
-// registerRoutes constructs a fresh classifier (with its own warn-once latch)
-// per call, so the record is produced regardless of what earlier tests logged.
-// capture.Default swaps the global default logger, so this test must never call
-// t.Parallel.
+// A real session emits an OSC 9 whose text carries U+202E (RIGHT-TO-LEFT
+// OVERRIDE, an unsafe rune under the engine's policy) followed by enough
+// characters to exceed the excerpt bound. The assertions prove the app's records
+// carry the notification text, never the unsafe rune, and truncate at Warn — so
+// they fail on the Renovate PR that would break the sanitization guarantee AND on
+// a regression that widens the default stream.
+//
+// registerRoutes constructs a fresh classifier (with its own warn latch)
+// per call, so the records are produced regardless of what earlier tests logged.
+// capture.Default records every level and swaps the global default logger, so this
+// test must never call t.Parallel.
 func TestClassifyStatus_logsSanitizedNotificationText(t *testing.T) {
 	records := capture.Default(t)
 
 	deps := newTestDeps(true)
-	// An unrecognized OSC 9 notification (so it reaches the logging branch)
-	// whose text embeds U+202E; `exec cat` keeps the child alive so the session
-	// is not torn down before the notification is classified.
-	deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;evil\342\200\256wording\a'; exec cat`}
+	// An unrecognized OSC 9 notification (so it reaches the logging branch) whose
+	// text embeds U+202E and is LONGER than the excerpt bound, so the same record
+	// exercises sanitization and truncation; `exec cat` keeps the child alive so
+	// the session is not torn down before the notification is classified.
+	longTail := strings.Repeat("x", unrecognizedNotifyExcerptRunes)
+	deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;evil\342\200\256wording` + longTail + `\a'; exec cat`}
 	_, mgr, _ := mustRegisterRoutes(t, deps)
 	if _, err := mgr.Create(); err != nil {
 		t.Fatalf("Create: %v", err)
@@ -180,30 +193,61 @@ func TestClassifyStatus_logsSanitizedNotificationText(t *testing.T) {
 		unsafeRune = "\u202e"
 		wantSubstr = "evil"
 	)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	// attrOf returns the named attribute of the first record at level that carries
+	// the unrecognized-notification message.
+	attrOf := func(level slog.Level, key string) (string, bool) {
 		for _, r := range records.Records() {
-			if !strings.Contains(r.Message, "unrecognized kiro-cli OSC 9 notification") {
+			if r.Level != level || !strings.Contains(r.Message, "unrecognized kiro-cli OSC 9 notification") {
 				continue
 			}
-			var logged string
+			var got string
+			found := false
 			r.Attrs(func(a slog.Attr) bool {
-				if a.Key == "message" {
-					logged = a.Value.String()
+				if a.Key == key {
+					got, found = a.Value.String(), true
 					return false
 				}
 				return true
 			})
-			if !strings.Contains(logged, wantSubstr) {
-				t.Fatalf("logged notification = %q, want it to carry the notification text %q", logged, wantSubstr)
+			if found {
+				return got, true
 			}
-			if strings.Contains(logged, unsafeRune) {
-				t.Errorf("logged notification = %q carries U+202E; the engine must sanitize notification text before the classifier logs it, or arbitrary child output can inject into the log stream", logged)
+		}
+		return "", false
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		excerpt, haveWarn := attrOf(slog.LevelWarn, "message_excerpt")
+		full, haveDebug := attrOf(slog.LevelDebug, "message")
+		if haveWarn && haveDebug {
+			// Both records carry the text and neither carries the unsafe rune: the
+			// engine sanitized before the classifier ever saw it.
+			for _, tc := range []struct{ what, got string }{
+				{"Warn excerpt", excerpt},
+				{"Debug full text", full},
+			} {
+				if !strings.Contains(tc.got, wantSubstr) {
+					t.Errorf("%s = %q, want it to carry the notification text %q", tc.what, tc.got, wantSubstr)
+				}
+				if strings.Contains(tc.got, unsafeRune) {
+					t.Errorf("%s = %q carries U+202E; the engine must sanitize notification text before the classifier logs it, or arbitrary child output can inject into the log stream", tc.what, tc.got)
+				}
+			}
+			// The default stream is BOUNDED and says so; the Debug record is not.
+			if n := len([]rune(excerpt)); n > unrecognizedNotifyExcerptRunes+1 {
+				t.Errorf("Warn excerpt is %d runes, want at most %d+1 (the bound plus the truncation marker); a token in child output must not reach the always-on stream in full", n, unrecognizedNotifyExcerptRunes)
+			}
+			if !strings.HasSuffix(excerpt, "…") {
+				t.Errorf("Warn excerpt = %q, want a truncation marker so a clipped wording is distinguishable from a short one", excerpt)
+			}
+			if len([]rune(full)) <= unrecognizedNotifyExcerptRunes {
+				t.Errorf("Debug full text is %d runes, want more than the excerpt bound %d (Debug must not be truncated -- it is what an operator raises the level for)", len([]rune(full)), unrecognizedNotifyExcerptRunes)
 			}
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no unrecognized-notification record reached the log; log = %q", records.Messages())
+			t.Fatalf("no unrecognized-notification record pair reached the log (warn=%v debug=%v); log = %q", haveWarn, haveDebug, records.Messages())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

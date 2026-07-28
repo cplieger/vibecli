@@ -1338,6 +1338,18 @@ func TestNotifyFingerprint(t *testing.T) {
 			if again, _ := fp.fingerprint(msg); again != got {
 				t.Errorf("fingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
 			}
+			// metadata is the integration point: it supplies the attrs routes.go
+			// logs, and only an EQUALITY against the keyed fingerprint pins that
+			// the emitted value IS this HMAC. Every shape assertion above (16
+			// lowercase hex digits, stable across the Warn/Debug pair) is equally
+			// satisfied by another hex-shaped transform of child output --
+			// hex.EncodeToString([]byte(msg))[:16] carries the plaintext and
+			// would keep this whole test green.
+			meta := fp.metadata(msg)
+			if len(meta) != 4 || meta[0] != "message_fingerprint" || meta[1] != got ||
+				meta[2] != "message_runes" || meta[3] != len([]rune(msg)) {
+				t.Errorf("metadata(%q) = %v, want [message_fingerprint %s message_runes %d]; the logged attribute must BE the keyed fingerprint, not another hex-shaped encoding of the notification", msg, meta, got, len([]rune(msg)))
+			}
 		})
 		got, _ := fp.fingerprint(msg)
 		if other, dup := seen[got]; dup {

@@ -275,9 +275,10 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 		return "", false, haveRecord
 	}
 
-	// The attr allowlist that pins WHICH attrs may describe a notification at a
-	// given level is the package-shared assertOnlyAttrs (trusted_proxies_test.go),
-	// used with unrecognizedNotifyMsg as the message filter below.
+	// The attr SCHEMA that pins which attrs may describe a notification at a given
+	// level AND what each of their values must be is the package-shared
+	// assertAttrSchema (trusted_proxies_test.go), used with unrecognizedNotifyMsg
+	// as the message filter below.
 
 	t.Run("default logs no notification text at any level", func(t *testing.T) {
 		records := capture.Default(t)
@@ -343,8 +344,15 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 					t.Errorf("log = %q carries a prefix of the notification text with KWEB_LOG_OSC_TEXT off; "+
 						"arbitrary child output may be a token or a device code", records.Messages())
 				}
-				assertOnlyAttrs(t, records, slog.LevelWarn, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "hint")
-				assertOnlyAttrs(t, records, slog.LevelDebug, unrecognizedNotifyMsg, "message_fingerprint", "message_runes")
+				assertAttrSchema(t, records, slog.LevelWarn, unrecognizedNotifyMsg, map[string]attrCheck{
+					"message_fingerprint": isNotifyFingerprint,
+					"message_runes":       wantInt(len([]rune(wantFull))),
+					"hint":                wantString(unrecognizedNotifyHint),
+				})
+				assertAttrSchema(t, records, slog.LevelDebug, unrecognizedNotifyMsg, map[string]attrCheck{
+					"message_fingerprint": isNotifyFingerprint,
+					"message_runes":       wantInt(len([]rune(wantFull))),
+				})
 				return
 			}
 			if time.Now().After(deadline) {
@@ -406,8 +414,19 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						return true
 					})
 				}
-				assertOnlyAttrs(t, records, slog.LevelWarn, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "hint")
-				assertOnlyAttrs(t, records, slog.LevelDebug, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "message")
+				assertAttrSchema(t, records, slog.LevelWarn, unrecognizedNotifyMsg, map[string]attrCheck{
+					"message_fingerprint": isNotifyFingerprint,
+					"message_runes":       wantInt(len([]rune(wantFull))),
+					"hint":                wantString(unrecognizedNotifyHint),
+				})
+				// The opt-in adds exactly one attr, and it must be the COMPLETE
+				// sanitized text: pinning message to wantFull here is what stops a
+				// truncated or re-encoded excerpt from passing as "the text".
+				assertAttrSchema(t, records, slog.LevelDebug, unrecognizedNotifyMsg, map[string]attrCheck{
+					"message_fingerprint": isNotifyFingerprint,
+					"message_runes":       wantInt(len([]rune(wantFull))),
+					"message":             wantString(wantFull),
+				})
 				return
 			}
 			if time.Now().After(deadline) {

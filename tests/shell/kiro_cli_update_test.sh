@@ -367,6 +367,33 @@ plant_old_set() {
   printf 'old-chat\n' >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
   printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
 }
+# A FAILING `rm` is not reachable through permission bits -- the suite runs as root,
+# where no mode makes `rm -rf` fail -- so the refusal is stubbed the same way this file
+# stubs every other external command: a real executable ahead of $PATH that refuses
+# exactly one path and delegates everything else to the genuine `rm`. A shell function
+# override was the obvious alternative and is worse twice over: the extracted code's
+# own `command rm` calls would bypass it, and shellcheck reads a function no line in
+# this file calls as dead (SC2329), since the only caller is sourced at runtime.
+RM_STUB_DIR="$WORK/rmstub"
+mkdir -p "$RM_STUB_DIR"
+cat >"$RM_STUB_DIR/rm" <<'STUB'
+#!/bin/sh
+for _arg in "$@"; do
+  [ "$_arg" = "${REFUSE_RM_PATH:-}" ] && exit 1
+done
+exec /bin/rm "$@"
+STUB
+chmod +x "$RM_STUB_DIR/rm"
+# refuse_rm_of <path>: every `rm` in the code under test fails when it names <path>.
+refuse_rm_of() {
+  REFUSE_RM_PATH="$1"
+  export REFUSE_RM_PATH
+  PATH="$RM_STUB_DIR:$PATH"
+}
+stop_refusing_rm() {
+  PATH="${PATH#"$RM_STUB_DIR":}"
+  unset REFUSE_RM_PATH
+}
 # Promotion is a RENAME in production, and the test must mimic that rather than
 # writing in place: the backup is a hard link, so an in-place `>` would rewrite the
 # shared inode and silently defeat it. `mv -f` replaces the directory entry only.
@@ -374,6 +401,28 @@ promote() {
   printf '%s\n' "$2" >"$WORK/promote.tmp" && chmod +x "$WORK/promote.tmp"
   mv -f "$WORK/promote.tmp" "$1"
 }
+
+# The fail-CLOSED branch first: update_begin must REFUSE to open a transaction on
+# top of an unresolved one, because kiro_cli_snapshot_one deletes each fixed-name
+# backup before linking a new one -- so a second begin erases the only record of the
+# pre-update set and then snapshots the already-MIXED live set into its place. The
+# readiness cases above only prove an open journal withholds health; none of them
+# calls update_begin, so nothing named this loss. Bait the unguarded code takes: an
+# open journal plus recognizable backup contents, which an unguarded begin replaces
+# with the live set (and returns 0).
+plant_old_set
+printf 'open\n' >"$KIRO_CLI_UPDATE_JOURNAL"
+printf 'original-bin-backup\n' >"$BIN_PREV"
+printf 'original-chat-backup\n' >"$CHAT_SIDECAR_PREV"
+kiro_cli_update_begin >/dev/null 2>"$WORK/begin.err"
+begin_rc=$?
+[ "$begin_rc" -ne 0 ] \
+  && grep -q 'refusing to start a kiro-cli update transaction while an unresolved one is journalled' "$WORK/begin.err" \
+  && [ "$(cat "$BIN_PREV")" = original-bin-backup ] \
+  && [ "$(cat "$CHAT_SIDECAR_PREV")" = original-chat-backup ] \
+  && ok "update_begin refuses an open journal without replacing its backups" \
+  || no "update_begin open-journal refusal" \
+    "rc=$begin_rc; the unresolved transaction's evidence changed or the specific refusal did not fire"
 
 plant_old_set
 kiro_cli_update_begin >/dev/null 2>&1
@@ -472,16 +521,42 @@ journal_rc=$?
 # ...and a DIRECTORY-shaped BACKUP is discarded rather than renamed over $BIN: `mv`
 # would put attacker-created state at the path the quarantine had just decided not to
 # trust, and where $BIN survives, `mv` fails and wedges the journal instead.
+# $BIN goes with the discarded backup, exactly as in the tombstone arm: without a
+# trustworthy snapshot the rollback cannot prove this component was never promoted, so
+# leaving it in place could report the OLD set restored while $BIN is still the NEW
+# one -- the mixed dispatcher set the transaction exists to prevent. Removing it makes
+# the set visibly INCOMPLETE instead, so readiness is withheld and the next boot's
+# drift check reinstalls. Bait the unguarded code takes: a live $BIN with recognizable
+# OLD contents, which a `mv`-anything-over-$dest arm adopts and a leave-$dest-alone arm
+# preserves -- both observably different from the removal asserted here.
 plant_old_set
 : >"$KIRO_CLI_UPDATE_JOURNAL"
 mkdir "$BIN_PREV"
 recover_kiro_cli_update_journal >/dev/null 2>&1
 journal_rc=$?
-[ "$journal_rc" -eq 0 ] && [ -f "$BIN" ] && [ "$(cat "$BIN")" = "old-bin" ] \
+[ "$journal_rc" -eq 0 ] && [ ! -e "$BIN" ] \
   && [ ! -e "$BIN_PREV" ] && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
-  && ok "recovery discards a DIRECTORY-shaped backup instead of restoring it over \$BIN" \
+  && ok "recovery discards a DIRECTORY-shaped backup AND the unprovable \$BIN, leaving the set visibly INCOMPLETE" \
   || no "directory backup" \
-    "a non-regular backup was adopted or wedged the journal (rc=$journal_rc, bin=$([ -d "$BIN" ] && echo DIRECTORY || echo "$(cat "$BIN" 2>/dev/null)"), journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+    "a non-regular backup was adopted, \$BIN survived an unprovable rollback, or the journal wedged (rc=$journal_rc, bin=$([ -d "$BIN" ] && echo DIRECTORY || { [ -e "$BIN" ] && cat "$BIN" 2>/dev/null || echo ABSENT; }), journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+
+# ...and when the $dest removal is what cannot complete, the failure PROPAGATES for the
+# same reason the backup's does: a $BIN nobody could remove is still possibly the NEW
+# component, so closing the journal here would report the old set restored over a
+# transaction that never finished. The refusal is aimed at $BIN so the backup discard
+# succeeds first and only the second removal fails.
+plant_old_set
+: >"$KIRO_CLI_UPDATE_JOURNAL"
+mkdir "$BIN_PREV"
+refuse_rm_of "$BIN"
+kiro_cli_update_rollback >/dev/null 2>&1
+journal_rc=$?
+stop_refusing_rm
+[ "$journal_rc" -ne 0 ] && [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
+  && ok "an unremovable \$BIN fails the rollback and KEEPS the journal for the next boot" \
+  || no "unremovable dest" \
+    "the rollback reported success or closed the journal over a \$BIN it could not remove (rc=$journal_rc, journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+rm -rf "$BIN_PREV"
 
 # ...and when that discard cannot complete, the failure must PROPAGATE: an artifact
 # `rm -rf` leaves behind is still in the way of the next boot's repair, so reporting
@@ -492,19 +567,14 @@ journal_rc=$?
 plant_old_set
 : >"$KIRO_CLI_UPDATE_JOURNAL"
 mkdir "$BIN_PREV"
-rm() {
-  case " $* " in
-  *" $BIN_PREV "*) return 1 ;;
-  esac
-  command rm "$@"
-}
+refuse_rm_of "$BIN_PREV"
 kiro_cli_update_rollback >/dev/null 2>&1
 journal_rc=$?
-unset -f rm
+stop_refusing_rm
 [ "$journal_rc" -ne 0 ] && [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
   && ok "an undeletable non-regular backup fails the rollback and KEEPS the journal for the next boot" \
   || no "undeletable backup" \
     "the rollback reported success or closed the journal over an artifact it could not discard (rc=$journal_rc, journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
-command rm -rf "$BIN_PREV"
+rm -rf "$BIN_PREV"
 
 report

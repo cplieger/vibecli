@@ -79,10 +79,22 @@ func lineInvokesTheGate(line string) bool {
 		// status, and the live chain has several -- inside the quoted sed scripts
 		// that read the client constants out of the vendored artifact. A `|`
 		// discards it too (a pipeline's status is the LAST command's), and a
-		// trailing `&` backgrounds the gate so the step never waits for its
-		// verdict -- both are refused on the same gate-onward terms.
+		// `&` backgrounds the gate so the step never waits for its verdict --
+		// both are refused on the same gate-onward terms. Backgrounding is
+		// judged as the presence of the `&` CONTROL OPERATOR, not as a trailing
+		// character: `go run … & wait` discards the verdict just as thoroughly
+		// (in POSIX `sh`, `false & wait` exits 0), so a shape test on the last
+		// character would accept it. Splitting on `&&` has already removed the
+		// legitimate chain separators from the gate's own segment, and the live
+		// gate arguments contain no ampersand, so any `&` left in that segment
+		// is a background operator. The trailing-`&` check is kept alongside it
+		// because `&` applies to the whole AND-list: a `&` at the END of a LATER
+		// segment (`go run … && true &`) backgrounds the gate too, without
+		// putting an ampersand in the gate's own segment.
 		rest := strings.Join(segments[i:], "&&")
-		if strings.ContainsAny(rest, ";|") || strings.HasSuffix(strings.TrimSpace(rest), "&") {
+		if strings.ContainsAny(rest, ";|") ||
+			strings.Contains(seg, "&") ||
+			strings.HasSuffix(strings.TrimSpace(rest), "&") {
 			return false
 		}
 		return true
@@ -144,6 +156,15 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		// the build stops acting on its verdict.
 		"verdict piped away": {"    go run ./scripts/wirecheck " + flags + " | tee /dev/null", false},
 		"gate backgrounded":  {"    go run ./scripts/wirecheck " + flags + " &", false},
+		// `& wait` is the shape a trailing-character test accepts: the gate is
+		// backgrounded and the step then waits, but `wait` reports 0 here, so an
+		// incompatible pair builds clean with this file's parity test still green.
+		"gate backgrounded then masked by wait": {"    go run ./scripts/wirecheck " + flags + " & wait", false},
+		// `&` applies to the whole AND-list, so a `&` ending a LATER segment
+		// backgrounds the gate as well, without appearing in the gate's segment.
+		"a chain backgrounded by a trailing & on a later segment": {
+			"    go run ./scripts/wirecheck " + flags + " && true &", false,
+		},
 		"the live chained form": {
 			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && go run ./scripts/wirecheck ` + flags, true,
 		},

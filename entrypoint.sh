@@ -169,8 +169,15 @@ kiro_cli_restore_one() {
   # undeletable directory, a mount point) is still in the way of the NEXT boot's
   # repair, so reporting this component restored would close the journal over a
   # transaction that never completed. Same contract as the tombstone arm above.
+  # $dest goes with it, exactly as in the tombstone arm: an open journal means the
+  # absence of a trustworthy snapshot cannot prove this component was never
+  # promoted, so leaving a possibly-new $dest in place would report the OLD set
+  # restored while one component is still the new one -- the mixed dispatcher set
+  # this whole transaction exists to prevent. Deleting it makes the set visibly
+  # INCOMPLETE instead: readiness is withheld and the drift check reinstalls.
   if [ ! -f "$backup" ]; then
     rm -rf "$backup" || return 1
+    rm -rf -- "$dest" || return 1
     return 0
   fi
   # Same inode => this component was never promoted, so the backup IS the live file
@@ -965,6 +972,30 @@ install_kiro_cli() (
   # its rc bookkeeping are gone).
   trap 'rm -rf "$tmpdir" "$stage"; [ -z "$install_log" ] || rm -f "$install_log"' EXIT
   zip="$tmpdir/kirocli.zip"
+  # Created here, beside the other temps, rather than in the staging phase that
+  # consumes it: the EXIT trap above is the single temp-resource owner, and it can
+  # only remove a path THIS subshell's own variable holds -- a mktemp inside a
+  # helper would be a local the trap never sees.
+  install_log=$(mktemp) || return 1
+
+  # The four phases below are same-file helpers, each readable on its own; every
+  # guard, deadline and ordering constraint lives inside them unchanged. The
+  # required-set promotion keeps the begin -> sidecar -> marker -> binary -> set
+  # verification -> finish ordering, and the optional kiro-cli-term dispatcher is
+  # reconciled strictly AFTER that commit (see each helper's own comments).
+  download_and_verify_kiro_cli_archive "$arch" "$zip_url" "$zip" || return 1
+  install_kiro_cli_into_stage "$tmpdir" "$zip" "$stage" "$install_log" || return 1
+  promote_required_kiro_cli_set "$stage" || return 1
+  reconcile_optional_kiro_cli_term "$stage"
+  printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
+)
+
+# Phase 1: fetch the pinned archive and prove it is the artifact the pin names.
+# Verification is the whole point of this phase -- nothing downstream re-checks the
+# digest -- so every failure returns non-zero and leaves the volume's existing
+# install untouched.
+download_and_verify_kiro_cli_archive() {
+  local arch="$1" zip_url="$2" zip="$3"
 
   # The zip is ~528 MB (2.14.1, x86_64), so a flat --max-time is a BANDWIDTH FLOOR
   # rather than a hang guard, and it applies PER ATTEMPT, so retries only repeat the
@@ -1024,6 +1055,16 @@ install_kiro_cli() (
     return 1
   fi
   printf 'level=info msg="kiro-cli SHA-256 verified against pinned hash" arch=%s component=entrypoint\n' "$arch" >&2
+}
+
+# Phase 2: extract the verified archive, let the upstream installer populate the
+# PRIVATE staging tree, then refuse anything that is not the pinned self-contained
+# binary -- including a candidate whose self-update could not be switched off.
+# Nothing here touches a live path, so every non-zero return leaves the install
+# already on the volume serving.
+install_kiro_cli_into_stage() {
+  local tmpdir="$1" zip="$2" stage="$3" install_log="$4"
+  local staged="$stage/.local/bin/kiro-cli"
 
   # Same deadline reasoning as the sha256sum above: half a gigabyte written
   # through the container layer, before any listener exists.
@@ -1044,8 +1085,7 @@ install_kiro_cli() (
   # is whether the binary it drops at $stage/.local/bin/kiro-cli reports the
   # version we pinned. Capture install.sh output to a tempfile so we can surface
   # it on failure.
-  local install_rc staged="$stage/.local/bin/kiro-cli"
-  install_log=$(mktemp) || return 1
+  local install_rc
   HOME="$stage" timeout --signal=TERM --kill-after=15s 120s "$tmpdir/kirocli/install.sh" --no-confirm </dev/null >"$install_log" 2>&1
   install_rc=$?
   # 124 = TERM deadline hit, 137 = the --kill-after SIGKILL fallback fired.
@@ -1088,6 +1128,15 @@ install_kiro_cli() (
     printf 'level=error msg="failed to disable kiro-cli auto-update; refusing to promote a binary that may replace itself and invalidate the pinned digest" setting=app.disableAutoupdates path="%s" component=entrypoint\n' "$staged" >&2
     return 1
   fi
+}
+
+# Phase 3: promote the three REQUIRED components as one journalled transaction. The
+# ordering is load-bearing and unchanged: begin (snapshot) -> chat sidecar -> install
+# marker -> canonical binary -> set verification -> finish. Every failure past `begin`
+# rolls the COMPLETE old set back; a kill is repaired by the next boot's recovery.
+promote_required_kiro_cli_set() {
+  local stage="$1"
+  local staged="$stage/.local/bin/kiro-cli"
 
   # Sidecars BEFORE the canonical binary, and the whole promotion inside the update
   # journal (see KIRO_CLI_UPDATE_JOURNAL). kiro-cli dispatches `chat` to the
@@ -1107,7 +1156,7 @@ install_kiro_cli() (
   # fires -- in both cases $BIN is promoted, --version succeeds, and readiness
   # is published over a terminal that cannot dispatch `chat`. So require the
   # shape (regular file, not a symlink, executable) rather than mere existence.
-  local chat_sidecar="$stage/.local/bin/kiro-cli-chat" term_sidecar="$stage/.local/bin/kiro-cli-term"
+  local chat_sidecar="$stage/.local/bin/kiro-cli-chat"
   if ! is_self_contained_executable "$chat_sidecar"; then
     printf 'level=error msg="install.sh produced no self-contained executable kiro-cli-chat sidecar dispatcher (upstream dispatcher set changed?); kiro-cli chat cannot start without it, so refusing to promote the dispatcher" src="%s" component=entrypoint\n' \
       "$chat_sidecar" >&2
@@ -1169,6 +1218,21 @@ install_kiro_cli() (
     return 1
   fi
   kiro_cli_update_finish
+  # Deliberately NOT this helper's exit status: kiro_cli_update_finish returns
+  # non-zero only when it could not clear the journal, which costs the next boot one
+  # unnecessary recovery pass and is never a reason to report the promotion -- already
+  # committed above -- as failed. Returning it would skip both the optional-term
+  # reconciliation and the success log.
+  return 0
+}
+
+# Phase 4: reconcile the OPTIONAL kiro-cli-term dispatcher. Outside the transaction
+# and strictly after the commit, on purpose (see below), and warn-only throughout:
+# no session path launches it, so nothing here may fail the install.
+reconcile_optional_kiro_cli_term() {
+  local stage="$1"
+  local term_sidecar="$stage/.local/bin/kiro-cli-term"
+
   # kiro-cli-term is optional (no session path launches it), so warn rather than fail --
   # but do not stay silent about it either. Same shape check as the chat dispatcher
   # above; an unusable one is skipped instead of promoted.
@@ -1204,8 +1268,7 @@ install_kiro_cli() (
     printf 'level=warn msg="failed to promote the optional kiro-cli-term sidecar dispatcher; a legacy copy on PATH may win bare-name resolution" sidecar="kiro-cli-term" dest="%s" component=entrypoint\n' \
       "$TOOLS/bin/kiro-cli-term" >&2
   fi
-  printf 'level=info msg="kiro-cli installed and promoted" version=%s path="%s" component=entrypoint\n' "$KIRO_CLI_VERSION" "$BIN" >&2
-)
+}
 
 # 0 when the PERSISTED DISPATCHER SET is complete for the pinned version: the required
 # kiro-cli-chat sidecar is a self-contained regular executable (not a symlink, whose

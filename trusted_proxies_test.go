@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -132,11 +133,15 @@ func TestParseTrustedProxies(t *testing.T) {
 				t.Errorf("log carries rejected raw entry %q; malformed values may hold credentials and must never be logged", raw)
 			}
 		}
-		// The needles above only catch the two values this test knows. The allowlist
+		// The needles above only catch the two values this test knows. The schema
 		// catches a rejected entry that reaches the log truncated, transformed, or
-		// under a new key -- the shape a library bump or a well-meant "log a sample"
-		// edit would take.
-		assertOnlyAttrs(t, records, slog.LevelWarn, "ignoring malformed", "invalid_count", "hint")
+		// under a new key -- and, because it pins the VALUES too, one appended to
+		// the fixed hint or substituted for the count, which is the shape a library
+		// bump or a well-meant "log a sample" edit would take.
+		assertAttrSchema(t, records, slog.LevelWarn, "ignoring malformed", map[string]attrCheck{
+			"invalid_count": wantInt(2),
+			"hint":          wantString(malformedProxyHint),
+		})
 	})
 
 	// A default route is syntactically perfect and semantically impossible: it
@@ -176,10 +181,14 @@ func TestParseTrustedProxies(t *testing.T) {
 		if logContains(records, sibling) {
 			t.Error("log enumerates the configured TRUSTED_PROXIES entries; this var can hold a compose-interpolated credential, so the warning must name the var and the prefix class only")
 		}
-		// The needle above only catches the one value this test knows; the
-		// allowlist catches an entry echoed under ANY key and of ANY length --
-		// the same reach gap the malformed-entry subtest closes above.
-		assertOnlyAttrs(t, records, slog.LevelWarn, "default route", "hint")
+		// The needle above only catches the one value this test knows; the schema
+		// catches an entry echoed under ANY key, of ANY length, and (because the
+		// hint is pinned to its exact fixed wording) appended to the one attr this
+		// record is allowed to carry -- the same reach gap the malformed-entry
+		// subtest closes above.
+		assertAttrSchema(t, records, slog.LevelWarn, "default route", map[string]attrCheck{
+			"hint": wantString(defaultRouteHint),
+		})
 	})
 
 	t.Run("narrower entries emit no default-route warning", func(t *testing.T) {
@@ -231,25 +240,86 @@ func logContains(records *capture.Recorder, s string) bool {
 	return false
 }
 
-// assertOnlyAttrs pins WHICH attrs may describe the records at level whose
-// message contains msgSub. A needle sweep only catches content it recognizes; an
-// allowlist catches a content-bearing attr under ANY name and of ANY length,
-// which is the leak shape a truncated or renamed value slips past. Shared by the
-// package's two credential boundaries (a rejected TRUSTED_PROXIES entry and a
-// classifier notification), so one implementation covers both.
-func assertOnlyAttrs(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, allowed ...string) {
+// The two TRUSTED_PROXIES warning hints, duplicated verbatim from
+// parseTrustedProxies (main.go). Duplicating the prose is the point: these
+// records are the ONLY thing an operator sees about a rejected entry, and the
+// entries themselves can be compose-interpolated credentials (CWE-532), so the
+// hint must stay a FIXED string that cannot grow an input-derived tail. A
+// deliberate rewording updates both sides; anything else is the regression these
+// pins exist to fail.
+const (
+	malformedProxyHint = "each entry must be a CIDR (e.g. 10.0.0.0/8) or a bare IP (e.g. 192.168.1.5)"
+	defaultRouteHint   = "list only the reverse proxy's own address(es), e.g. 10.0.0.0/8 or 192.0.2.10; leave TRUSTED_PROXIES unset to log the unspoofable socket peer"
+)
+
+// attrCheck validates one attribute's value. A schema pairs every attr key that
+// may describe a record with the check its value must pass, so the assertion
+// covers the value as well as the name.
+type attrCheck func(slog.Value) bool
+
+// wantString requires an attr's rendered value to equal want exactly. Exactness
+// is the point for a FIXED operator hint: an allowlist keyed on the name alone
+// stays green when a regression appends rejected content ("...unset to log the
+// unspoofable socket peer (rejected: <credential>)") to a key it already permits.
+func wantString(want string) attrCheck {
+	return func(v slog.Value) bool { return v.String() == want }
+}
+
+// wantInt requires an attr to be an integer equal to want. Kind is checked too:
+// a count replaced by a STRING of the same digits is a different attribute, and
+// it is the shape a "log a sample of what we rejected" edit produces.
+func wantInt(want int) attrCheck {
+	return func(v slog.Value) bool { return v.Kind() == slog.KindInt64 && v.Int64() == int64(want) }
+}
+
+// isNotifyFingerprint requires exactly notifyFingerprintHexDigits lowercase hex
+// digits — the shape TestNotifyFingerprint pins for the keyed HMAC, checked here
+// because the production key is unreachable so the exact value is not computable
+// from a live session.
+func isNotifyFingerprint(v slog.Value) bool {
+	s := v.String()
+	return len(s) == notifyFingerprintHexDigits && strings.Trim(s, "0123456789abcdef") == ""
+}
+
+// assertAttrSchema pins the EXACT attribute set of the records at level whose
+// message contains msgSub: every attr must be in the schema (an unexpected key
+// fails), every attr's value must pass its check (a truncated or transformed
+// value under an ALLOWED key fails — the leak a key-only allowlist cannot see),
+// and every schema key must actually appear (a required attr disappearing is a
+// regression too, and if no record matched at all, every key reports missing).
+// A needle sweep only catches content the test already knows; this catches
+// content under any name, of any length, in any shape. Shared by the package's
+// two credential boundaries (a rejected TRUSTED_PROXIES entry and a classifier
+// notification), so one implementation covers both.
+func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, schema map[string]attrCheck) {
 	t.Helper()
+	expected := slices.Sorted(maps.Keys(schema))
+	seen := make(map[string]bool, len(schema))
 	for _, r := range records.Records() {
 		if r.Level != level || !strings.Contains(r.Message, msgSub) {
 			continue
 		}
 		r.Attrs(func(a slog.Attr) bool {
-			if !slices.Contains(allowed, a.Key) {
+			check, ok := schema[a.Key]
+			if !ok {
 				t.Errorf("%s record %q carries unexpected attr %q = %q; only %v may describe it, "+
-					"or untrusted content reaches the log under a new key", level, r.Message, a.Key, a.Value, allowed)
+					"or untrusted content reaches the log under a new key", level, r.Message, a.Key, a.Value, expected)
+				return true
+			}
+			seen[a.Key] = true
+			if !check(a.Value.Resolve()) {
+				t.Errorf("%s record %q attr %q = %q is not the expected value; a value that keeps an allowed key "+
+					"but carries rejected content (truncated, transformed, or appended) is exactly the leak a key-only allowlist misses",
+					level, r.Message, a.Key, a.Value)
 			}
 			return true
 		})
+	}
+	for _, key := range expected {
+		if !seen[key] {
+			t.Errorf("no %s record matching %q carried the required attr %q (want %v); a withheld-credential guarantee "+
+				"is worthless if the attrs that carry the diagnosis can silently disappear", level, msgSub, key, expected)
+		}
 	}
 }
 

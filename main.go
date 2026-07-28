@@ -19,6 +19,8 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -251,6 +253,21 @@ func main() {
 			"hint", "set KWEB_ALLOWED_HOSTS to the exact hostnames/IPs you browse to (e.g. localhost,192.168.1.5,webterm.example.com)")
 	}
 
+	// KWEB_LOG_OSC_TEXT (default false) is the confidentiality opt-in for
+	// terminal notification TEXT. An unrecognized OSC 9 notification is
+	// arbitrary child output — any program run in the terminal can emit
+	// `ESC ] 9 ; <text>` — and it can carry a token or a device code, so by
+	// default the classifier logs only a content-free fingerprint plus a rune
+	// count (see newStatusClassifier). Turning this on adds the full text to
+	// the Debug record, which is why it warns at startup rather than logging
+	// silently: raising KWEB_LOG_LEVEL alone must not widen what content
+	// reaches the log store.
+	logOSCText := envx.Bool("KWEB_LOG_OSC_TEXT", false)
+	if logOSCText {
+		slog.Warn("KWEB_LOG_OSC_TEXT is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
+			"hint", "leave it off outside an active diagnostic session; the default records a content-free fingerprint that still distinguishes kiro-cli wording drift")
+	}
+
 	// KIRO_CLI_CHAT_ARGS appends extra launch flags to the per-session
 	// `kiro-cli chat` command (whitespace-separated, e.g. "--v3" or
 	// "--agent-engine v3 --effort high"). Empty ⇒ no extra flags. The values
@@ -283,6 +300,7 @@ func main() {
 		workDir:         workDir,
 		ready:           &ready,
 		kiroReadyMarker: kiroReadyMarker,
+		logOSCText:      logOSCText,
 		tools:           tools.engine,
 		toolsSyncing:    tools.syncing,
 		toolsState:      tools.state,
@@ -400,6 +418,22 @@ type toolsRuntime struct {
 	state func() string
 }
 
+// toolsStateDegraded is the /api/health informational tools verdict for a tools
+// subsystem that FAILED (as opposed to one deliberately absent, which omits the
+// field entirely). Named once because startTools reports it from several
+// distinct failures — an unusable config path, a failed engine start, a
+// reconcile that could not be enqueued — and a health consumer keys on the
+// literal.
+const toolsStateDegraded = "degraded"
+
+// degradedRuntime is the engine-less runtime a startTools failure returns:
+// engine and syncing stay nil (no /api/tools mount, sessions ungated) while
+// state reports degraded so the failure is visible on /api/health instead of
+// looking like a deliberate disable.
+func degradedRuntime() toolsRuntime {
+	return toolsRuntime{state: func() string { return toolsStateDegraded }}
+}
+
 func (t *toolsRuntime) close() {
 	if t.engine != nil {
 		t.engine.Close()
@@ -416,11 +450,28 @@ func (t *toolsRuntime) close() {
 // language server is enabled (kiro-cli scans PATH for LSPs at session
 // start).
 func startTools(cfg baseTools) toolsRuntime {
-	if fi, err := os.Stat(cfg.configDir); err != nil || !fi.IsDir() {
+	// Three distinct outcomes, deliberately NOT collapsed: only a genuinely
+	// ABSENT directory is the intentionally-disabled out-of-container shape
+	// (zero runtime, health omits the tools field). A stat failure for any
+	// other reason (permission, I/O, ELOOP) or a non-directory mounted at
+	// KWEB_CONFIG_DIR is a FAILED production subsystem, so it follows the
+	// same degraded-not-dead contract as a failed toolbelt.New below —
+	// otherwise the operator reads a broken mount as "tools deliberately off".
+	fi, statErr := os.Stat(cfg.configDir)
+	switch {
+	case errors.Is(statErr, fs.ErrNotExist):
 		slog.Warn("tools engine disabled: config dir missing",
 			"config_dir", cfg.configDir,
 			"hint", "bind-mount the persistent config volume (compose.yaml) or set KWEB_CONFIG_DIR")
 		return toolsRuntime{}
+	case statErr != nil:
+		slog.Error("tools engine failed to inspect config dir; continuing without it",
+			"config_dir", cfg.configDir, "error", statErr)
+		return degradedRuntime()
+	case !fi.IsDir():
+		slog.Error("tools engine config path is not a directory; continuing without it",
+			"config_dir", cfg.configDir)
+		return degradedRuntime()
 	}
 	refresh := &toolbelt.CatalogRefresh{
 		URL:      cfg.catalogURL,
@@ -443,7 +494,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		// subsystem must stay visible: report state "degraded" so
 		// /api/health carries the documented informational tools field.
 		// engine and syncing stay nil so sessions remain ungated.
-		return toolsRuntime{state: func() string { return "degraded" }}
+		return degradedRuntime()
 	}
 
 	var syncing atomic.Bool
@@ -458,7 +509,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	switch {
 	case rerr != nil:
 		slog.Warn("tools: boot reconcile not enqueued", "error", rerr)
-		finish("degraded")
+		finish(toolsStateDegraded)
 		warnIfNoLSPEnabled(eng)
 	case job == nil: // empty manifest: nothing to converge
 		finish("ok")
@@ -500,11 +551,11 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 	switch {
 	case werr != nil:
 		slog.Warn("tools: boot reconcile wait failed", "error", werr)
-		finish("degraded")
+		finish(toolsStateDegraded)
 	case final.State != toolbelt.JobDone:
 		slog.Warn("tools: boot reconcile finished degraded",
 			"state", final.State, "error", final.Error)
-		finish("degraded")
+		finish(toolsStateDegraded)
 	default:
 		slog.Info("tools: boot reconcile converged")
 		finish("ok")

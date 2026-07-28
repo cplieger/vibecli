@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/toolbelt/v2/httpapi"
@@ -54,6 +57,12 @@ type routeDeps struct {
 	// gate, preserving pure-listener readiness semantics.
 	kiroReadyMarker string
 	cmd             []string
+	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
+	// OSC 9 notification's full text is logged at Debug. Default false — the
+	// text is arbitrary child output that may carry a token or device code, so
+	// the log otherwise carries only a content-free fingerprint (see
+	// newStatusClassifier).
+	logOSCText bool
 }
 
 // buildStaticSurface assembles the embedded-static serving surface: the
@@ -94,7 +103,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 
 	mgr := terminal.NewSessionManager(newSessionFactory(deps),
 		terminal.WithManagerLogger(slog.Default()),
-		terminal.WithStatusClassifier(newStatusClassifier()),
+		terminal.WithStatusClassifier(newStatusClassifier(deps.logOSCText)),
 	)
 
 	// The engine owns its route topology: MountAPI wires exactly its documented
@@ -354,34 +363,50 @@ const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhaus
 // it without limit. Insertion stops at the cap; the map never exceeds it.
 const unrecognizedNotifyCap = 8
 
-// unrecognizedNotifyExcerptRunes bounds how much of a notification's text reaches
-// the DEFAULT (info) log stream. The text is arbitrary child output — a program run
-// in the terminal can emit `ESC ] 9 ; <text>` — and the engine's sanitizeNotification
-// only guarantees INTEGRITY (it drops unsafe runes and caps at 256 runes, so the
-// record cannot be forged); it redacts nothing, so a token, a device code, or a
-// tokenised URL in that text would otherwise land in Loki, which retains longer and
-// is far more queryable than PTY scrollback.
-//
-// An excerpt rather than redaction because the text IS the diagnostic: the Warn
-// exists to show WHICH wording appeared after a kiro-cli bump, and the wordings that
-// matter are short ("Response complete" is 17 runes), so this costs the signal
-// nothing while truncating a long tokenised string. The full text stays at Debug for
-// KWEB_LOG_LEVEL=debug, which is the deliberate split — bounded in the always-on
-// stream, complete when someone is actually investigating. It bounds the accident,
-// not the adversary: a short secret still fits, and preventing that would mean
-// redacting the diagnostic away entirely.
-const unrecognizedNotifyExcerptRunes = 64
+// unrecognizedNotifyHint is the operator-facing next step both Warn arms carry:
+// what to re-verify after a kiro-cli bump, and the two levers that surface the
+// notification's actual TEXT (raising the level alone is no longer enough —
+// KWEB_LOG_OSC_TEXT is the deliberate confidentiality opt-in).
+const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_OSC_TEXT=true with KWEB_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
 
-// notifyExcerpt returns at most unrecognizedNotifyExcerptRunes runes of msg, marking
-// a truncation so a reader can tell a short wording from a clipped one. Rune-based,
-// not byte-based: a byte slice could split a multi-byte rune and emit U+FFFD into the
-// log for a perfectly ordinary non-ASCII notification.
-func notifyExcerpt(msg string) string {
-	runes := []rune(msg)
-	if len(runes) <= unrecognizedNotifyExcerptRunes {
-		return msg
+// notifyFingerprintHexDigits bounds the fingerprint written in place of the
+// notification text. 16 hex digits (64 bits of SHA-256) is far more than enough
+// to tell a handful of distinct wordings apart — the warn budget is
+// unrecognizedNotifyCap — while staying short enough to read in a log line.
+const notifyFingerprintHexDigits = 16
+
+// notifyFingerprint returns a stable, CONTENT-FREE identifier for msg: the
+// leading notifyFingerprintHexDigits hex digits of its SHA-256.
+//
+// This is what the log carries instead of the notification text. The text is
+// arbitrary child output — a program run in the terminal can emit
+// `ESC ] 9 ; <text>` — and the engine's sanitizeNotification only guarantees
+// INTEGRITY (it drops unsafe runes and rune-caps at 256, so a record cannot be
+// forged); it redacts nothing. A bounded EXCERPT was the previous answer and it
+// does not redact either: a short token or a device code fits inside any
+// excerpt, so the always-on stream still ended up holding a durable, queryable
+// copy of a credential in Loki (CWE-532), which retains far longer and is far
+// more searchable than PTY scrollback.
+//
+// A fingerprint keeps every diagnostic property the always-on record actually
+// needs — "a wording this app does not recognize appeared", "here are N
+// DISTINCT ones", "this is the same one as before / a different one", "it was
+// this many runes long" — while carrying none of the content. Recovering the
+// text is a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus
+// KWEB_LOG_LEVEL=debug), not a side effect of raising the log level.
+func notifyFingerprint(msg string) string {
+	sum := sha256.Sum256([]byte(msg))
+	return hex.EncodeToString(sum[:])[:notifyFingerprintHexDigits]
+}
+
+// notifyMetadata is the content-free description of a notification both the
+// Warn arm and the default (text-disabled) Debug arm log: which distinct
+// wording it was, and how long it was.
+func notifyMetadata(msg string) []any {
+	return []any{
+		"message_fingerprint", notifyFingerprint(msg),
+		"message_runes", utf8.RuneCountInString(msg),
 	}
-	return string(runes[:unrecognizedNotifyExcerptRunes]) + "…"
 }
 
 // notifyWarningState is newStatusClassifier's bounded warn budget for
@@ -463,7 +488,13 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // message is ignored. This mapping is the only kiro-cli-specific coupling; the
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
-func newStatusClassifier() func(string) (string, bool) {
+//
+// logText is the KWEB_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
+// whether the notification's TEXT may be logged at all. Off, every record is
+// content-free metadata (see notifyFingerprint); on, the Debug arm — and only
+// the Debug arm — carries the full sanitized text. Notification content never
+// reaches the default Warn stream in either mode.
+func newStatusClassifier(logText bool) func(string) (string, bool) {
 	warnings := notifyWarningState{warned: make(map[string]struct{}, unrecognizedNotifyCap)}
 	return func(msg string) (string, bool) {
 		switch msg {
@@ -479,14 +510,20 @@ func newStatusClassifier() func(string) (string, bool) {
 			// warns (visible at the default info level, up to unrecognizedNotifyCap
 			// distinct strings); the Debug line records every occurrence, so
 			// KWEB_LOG_LEVEL=debug is what shows the full set after a version bump.
-			// The Warn carries only a bounded EXCERPT of the text
-			// (unrecognizedNotifyExcerptRunes): the engine's sanitizeNotification
-			// guarantees the record cannot be FORGED (it drops every
-			// runesafe-unsafe rune -- C0/C1 controls, Bidi controls, U+2028/29 --
-			// and rune-caps at 256 before the classifier sees it) but it redacts
-			// nothing, and this text is arbitrary child output, so the always-on
-			// stream must not carry a token or a device code in full. Debug gets
-			// the whole thing, because raising the level is a deliberate act.
+			//
+			// Neither record carries the notification TEXT by default, and the Warn
+			// never does. The text is arbitrary child output: the engine's
+			// sanitizeNotification guarantees the record cannot be FORGED (it drops
+			// every runesafe-unsafe rune -- C0/C1 controls, Bidi controls,
+			// U+2028/29 -- and rune-caps at 256 before the classifier sees it) but
+			// it redacts NOTHING, so a token or a device code in that text would
+			// otherwise land in a log store that outlives and out-queries the PTY
+			// scrollback. A bounded excerpt was the previous answer and did not
+			// redact either (a short secret fits), so what ships now is a
+			// content-free fingerprint plus a rune count -- enough to tell the
+			// distinct wordings apart and correlate repeats, carrying none of the
+			// content. Recovering the text is the explicit KWEB_LOG_OSC_TEXT
+			// opt-in below, at Debug only.
 			//
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
@@ -496,14 +533,18 @@ func newStatusClassifier() func(string) (string, bool) {
 			switch {
 			case warnFirst:
 				slog.Warn(unrecognizedNotifyMsg,
-					"message_excerpt", notifyExcerpt(msg),
-					"hint", `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_LEVEL=debug for the full text`)
+					append(notifyMetadata(msg), "hint", unrecognizedNotifyHint)...)
 			case warnCapped:
 				slog.Warn(unrecognizedNotifyCapMsg, "distinct_limit", unrecognizedNotifyCap)
 			}
-			// Debug carries the message in FULL: whoever raised the level is
-			// investigating, and the excerpt above is deliberately lossy.
-			slog.Debug(unrecognizedNotifyMsg, "message", msg)
+			if logText {
+				// The deliberate diagnostic opt-in: whoever set BOTH
+				// KWEB_LOG_OSC_TEXT and the debug level accepted (and was warned at
+				// startup) that terminal notification text may contain secrets.
+				slog.Debug(unrecognizedNotifyMsg, "message", msg)
+			} else {
+				slog.Debug(unrecognizedNotifyMsg, notifyMetadata(msg)...)
+			}
 			return "", false
 		}
 	}

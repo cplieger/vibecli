@@ -381,6 +381,34 @@ func TestAPINoStore(t *testing.T) {
 	}
 }
 
+// TestAPINoStore_marksToolsInventoryUncacheable pins the surface apiNoStore
+// covers ALONE, which TestAPINoStore above cannot see: the engine sets no-store
+// on its own /api/sessions responses, so that test stays green with the
+// apiNoStore chain entry deleted. toolbelt's httpapi handler sets no
+// Cache-Control at all, so without the app's middleware a successful tools
+// inventory response is cacheable and a browser or intermediary can keep
+// serving stale tool state (an inventory an operator reads to decide whether an
+// install finished). Verified red against a build with only the apiNoStore chain
+// entry removed.
+func TestAPINoStore_marksToolsInventoryUncacheable(t *testing.T) {
+	deps := newToolsDeps(t)
+	mux, _, csp := mustRegisterRoutes(t, deps)
+	// Loopback peer AND loopback Host: the tools API's admission gate (see
+	// TestToolsAPI_LoopbackOnly) refuses anything else, and a 403 would not
+	// exercise the successful response this header policy applies to.
+	req := httptest.NewRequest(http.MethodGet, toolsPath, http.NoBody)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Host = "localhost:9848"
+	rec := httptest.NewRecorder()
+	buildHandler(mux, nil, csp, nil).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s: status = %d, want %d (body %s)", toolsPath, rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control on %s = %q, want %q; toolbelt's handler does not set this header, so apiNoStore must", toolsPath, got, "no-store")
+	}
+}
+
 // TestCSPScriptHashesMatchEmbeddedInlineScripts is the anti-drift guard for
 // the script-src hardening, ported from web-terminal-server: it independently
 // re-extracts every inline <script> in the REAL embedded index.html with a
@@ -657,7 +685,7 @@ func TestClassifyStatus(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			classify := newStatusClassifier()
+			classify := newStatusClassifier(false)
 			got, latch := classify(tc.msg)
 			if got != tc.want || latch != tc.wantLatch {
 				t.Errorf("newStatusClassifier()(%q) = (%q, %v), want (%q, %v)", tc.msg, got, latch, tc.want, tc.wantLatch)
@@ -1217,40 +1245,52 @@ func TestComposeGate_syncingResponseIncludesRetryAfter(t *testing.T) {
 	}
 }
 
-// TestNotifyExcerpt pins the log-hygiene bound the classifier applies to
-// arbitrary child output before any of it reaches the always-on (info) log
-// stream: a wording at or under unrecognizedNotifyExcerptRunes passes through
-// byte-identically and UNMARKED, so a short wording stays distinguishable from a
-// clipped one, while a longer one is cut to exactly that many RUNES plus the
-// truncation marker.
+// TestNotifyFingerprint pins the log-hygiene substitution the classifier applies
+// to arbitrary child output before ANY of it reaches the log: the notification
+// text is replaced by a fixed-width, content-free SHA-256 prefix. Three
+// properties carry the whole contract, and each has a distinct failure the
+// classifier's own tests cannot see:
 //
-// TestClassifyStatus_logsSanitizedNotificationText exercises this function only
-// through a live session emitting one 75-rune ASCII notification, so it pins
-// neither end of the contract that can actually move. Tightening the comparison
-// to < marks every short wording as clipped, sending an operator chasing a
-// kiro-cli wording drift after text that was never truncated; slicing bytes
-// instead of runes writes a U+FFFD-mangled excerpt into the shipped stream for
-// an ordinary non-ASCII notification, which is the defect the rune basis exists
-// to prevent and which no ASCII fixture can see.
-func TestNotifyExcerpt(t *testing.T) {
-	const bound = unrecognizedNotifyExcerptRunes
-	// 3 bytes per rune, so a byte-based slice at the bound splits one mid-rune.
-	multibyte := strings.Repeat("\u2192", bound+5)
-	for _, tc := range []struct {
-		name string
-		msg  string
-		want string
-	}{
-		{"a short wording passes through unmarked", "Response complete", "Response complete"},
-		{"an empty message passes through", "", ""},
-		{"exactly at the bound is not marked truncated", strings.Repeat("a", bound), strings.Repeat("a", bound)},
-		{"one rune past the bound is cut to the bound plus the marker", strings.Repeat("a", bound+1), strings.Repeat("a", bound) + "\u2026"},
-		{"multi-byte runes are counted, never split", multibyte, strings.Repeat("\u2192", bound) + "\u2026"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := notifyExcerpt(tc.msg); got != tc.want {
-				t.Errorf("notifyExcerpt(%q) = %q, want %q", tc.msg, got, tc.want)
+//   - fixed width and hex-only, so no amount of child output can widen or
+//     shape the record (a fingerprint that leaked input length or characters
+//     would be a partial copy of the secret it exists to withhold);
+//   - stable for equal input, which is what lets an operator correlate the
+//     Warn with its Debug twin and tell a repeat from a new wording;
+//   - distinct for different input, so two wordings are not conflated into
+//     "the same unrecognized notification".
+func TestNotifyFingerprint(t *testing.T) {
+	const secret = "verify at https://example.com/device?user_code=ABCD-EFGH"
+	inputs := map[string]string{
+		"empty":              "",
+		"short wording":      "Response complete",
+		"secret-shaped":      secret,
+		"multi-byte":         strings.Repeat("\u2192", 300),
+		"invalid utf-8":      "\xff\xfe not utf8",
+		"one rune different": "Response complet",
+	}
+	seen := make(map[string]string, len(inputs))
+	for name, msg := range inputs {
+		t.Run(name, func(t *testing.T) {
+			got := notifyFingerprint(msg)
+			if len(got) != notifyFingerprintHexDigits {
+				t.Errorf("notifyFingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
+			}
+			if strings.Trim(got, "0123456789abcdef") != "" {
+				t.Errorf("notifyFingerprint(%q) = %q, want lowercase hex only; anything else means child output reached the log verbatim", msg, got)
+			}
+			if again := notifyFingerprint(msg); again != got {
+				t.Errorf("notifyFingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
 			}
 		})
+		fp := notifyFingerprint(msg)
+		if other, dup := seen[fp]; dup {
+			t.Errorf("notifyFingerprint collides for %q and %q (both %q); two distinct wordings would read as one", msg, other, fp)
+		}
+		seen[fp] = msg
+	}
+	// The point of the whole substitution: a credential-shaped notification
+	// contributes none of its own characters to the record.
+	if fp := notifyFingerprint(secret); strings.Contains(fp, "ABCD") || strings.Contains(fp, "user_code") {
+		t.Errorf("notifyFingerprint(%q) = %q, which carries input text; the fingerprint exists so a token in child output never reaches the log store", secret, fp)
 	}
 }

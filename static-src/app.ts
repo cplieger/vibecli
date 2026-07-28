@@ -1,35 +1,3 @@
-// web-terminal-kiro client entry point.
-//
-// All terminal behavior lives in the shared packages: the
-// @cplieger/web-terminal-engine engine (render / scroll / connection / keyboard)
-// and the @cplieger/web-terminal-ui reference UI (the modular kernel plus opt-in
-// features). web-terminal-kiro is the thinnest possible consumer: createTerminal builds the
-// whole terminal UI inside the #terminal root element with the agent-shell
-// feature set (presetAgentTabbed: tabs + activity monitor + touch toolbar +
-// context menu + clipboard + scroll-to-bottom + predictive echo + connection
-// banner + animations). presetAgentTabbed and presetTabbed ship the SAME
-// features -- the library's buildTabbed always includes the activity monitor --
-// and differ only in presumeReports (every session here IS an agent that will
-// report OSC 9;4, so the activity dot shows from tab creation instead of popping
-// in once the agent has booted far enough to first report). Tab LABELS are not a
-// preset concern at all: the engine resolves each session's name server-side, and
-// this app's agent-shell tuning for that is routes.go's terminal.WithInputTitle()
-// (kiro-cli sets NO OSC 0/2 window title, so the engine's OSC rung is always empty
-// here and the label is the first substantial line the user submitted). Until that
-// first eligible line arrives -- 3+ characters, not a bare slash command -- the label
-// falls to the engine's own inference and every new tab reads "workspace",
-// "workspace 2", which is the state WithInputTitle exists to end. A generic shell
-// would use presetTabbed, whose dot stays hidden until a session actually
-// reports. Each browser tab drives its own independent kiro-cli chat session
-// over the shared server; kiro-cli's TUI is rendered verbatim through the raw PTY
-// stream.
-//
-// The session WebSocket ("/ws") and font (Monaspace) use createTerminal's
-// defaults and are left implicit. The options passed are `features` (the agent
-// preset), `theme` (web-terminal-kiro's purple tokens), and -- only when present --
-// `loading`, the overlay element createTerminal fades out once the first frame
-// renders.
-
 import { createTerminal } from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 
@@ -40,26 +8,9 @@ import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 // pinned by app.test.ts's brand-accent parity test instead.
 const ACCENT_HSL_COMPONENTS = "263.1683 100% 80%";
 
-// The inline watchdog in static/index.html may have already claimed the #loading
-// overlay as its fatal alertdialog -- most importantly for a failed
-// <link rel="stylesheet">, which is fatal (no /style.css means an unstyled,
-// unusable terminal) yet does NOT stop /app.js from evaluating, so control reaches
-// here with the recovery dialog already on screen. Booting anyway would hand that
-// dialog to createTerminal as `loading`; the UI kernel fades and REMOVES it on
-// first frame, leaving an unstyled page with no Reload affordance.
-// data-bootstrap-fatal is the watchdog-to-app handoff signal: an explicit protocol
-// marker rather than the dialog's ARIA role, so changing the fatal surface's a11y
-// shape cannot silently sever this handoff.
-//
-// This is the ONE startup condition this app still decides for itself, and it is
-// not a failure of the terminal -- it is "someone else already reported a failure
-// this module cannot see". Everything that IS a terminal startup failure now
-// belongs to createTerminal: it resolves "#terminal" and calls presetAgentTabbed
-// inside its own boundary, so a missing root element or a preset that throws
-// lowers the overlay and renders the library's recovery panel. This app used to
-// carry a hand-built copy of that panel for exactly those two cases, because the
-// old signature took a resolved element and an already-called preset and both
-// failures happened out here, before the library could see them.
+// A stylesheet failure does not stop app.js from evaluating. If the inline
+// watchdog already converted #loading into a recovery dialog, do not let the
+// UI kernel remove that dialog when its first frame renders.
 const loading = document.getElementById("loading");
 if (loading?.hasAttribute("data-bootstrap-fatal")) {
   throw new Error(
@@ -68,9 +19,9 @@ if (loading?.hasAttribute("data-bootstrap-fatal")) {
 }
 
 createTerminal("#terminal", {
-  // A FUNCTION, not a call: createTerminal invokes it inside its failure
-  // boundary, so a preset that throws renders the library's recovery panel
-  // instead of escaping to a page stuck on the loading spinner.
+  // Every session is an agent expected to report OSC 9;4, so show its activity
+  // dot from tab creation. Pass the function so preset failures remain inside
+  // createTerminal's recovery boundary.
   features: presetAgentTabbed,
   // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships the
   // neutral defaults). Recolors the ACTIVE tab (fill/edge/label, desktop strip

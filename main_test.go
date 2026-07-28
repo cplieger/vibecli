@@ -211,6 +211,60 @@ func TestStartTools_configDirMissing(t *testing.T) {
 	}
 }
 
+// TestStartTools_configDirUnusable pins the third and fourth stat outcomes,
+// which used to collapse into the missing-dir path: a config path that is a
+// regular FILE, and one whose stat FAILS for a reason other than absence (a
+// self-referential symlink is a deterministic ELOOP). Both are a broken mount
+// of a production subsystem, not the deliberate out-of-container disable, so
+// they follow degraded-not-dead: engine and syncing stay nil (sessions
+// ungated) but state() reports "degraded" so /api/health carries the
+// informational tools field instead of omitting it and presenting a failed
+// subsystem as intentionally off. Serial: mutates the global default logger.
+func TestStartTools_configDirUnusable(t *testing.T) {
+	loop := filepath.Join(t.TempDir(), "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Skipf("symlink unsupported here: %v", err)
+	}
+	file := filepath.Join(t.TempDir(), "config-as-file")
+	if err := os.WriteFile(file, []byte("not a dir\n"), 0o600); err != nil {
+		t.Fatalf("write file config path: %v", err)
+	}
+
+	for name, tc := range map[string]struct {
+		configDir string
+		wantMsg   string
+	}{
+		"regular file": {configDir: file, wantMsg: "tools engine config path is not a directory"},
+		"stat failure": {configDir: loop, wantMsg: "tools engine failed to inspect config dir"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+
+			rt := startTools(baseTools{
+				configDir:   tc.configDir,
+				catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
+			})
+
+			if rt.engine != nil {
+				t.Error("engine is non-nil for an unusable config path; want no engine")
+			}
+			if rt.syncing != nil {
+				t.Error("syncing is non-nil for an unusable config path; sessions must remain ungated")
+			}
+			if rt.state == nil {
+				t.Fatal("state is nil for an unusable config path; the health tools field would be omitted, hiding a broken mount")
+			}
+			if got := rt.state(); got != "degraded" {
+				t.Errorf("state = %q, want %q", got, "degraded")
+			}
+			rt.close()
+			if got := records.CountLevel(slog.LevelError, tc.wantMsg); got != 1 {
+				t.Errorf("log = %q, want exactly one %q Error (got %d)", records.Messages(), tc.wantMsg, got)
+			}
+		})
+	}
+}
+
 // TestStartTools_engineStartFailure pins degraded-not-dead: a config dir whose
 // tools.json is the retired v1 format fails toolbelt.New (strict v2 schema),
 // and startTools logs the Error and continues without an engine instead of

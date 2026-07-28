@@ -6,7 +6,7 @@ require (
 	github.com/cplieger/slogx v1.4.0
 	github.com/cplieger/toolbelt/v2 v2.2.10
 	github.com/cplieger/web-terminal-engine/v3 v3.2.1
-	github.com/cplieger/webhttp v1.18.0
+	github.com/cplieger/webhttp v1.18.1
 )
 
 require (

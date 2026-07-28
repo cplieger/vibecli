@@ -27,11 +27,23 @@ new_workdir >/dev/null
 
 REPO=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 MAIN="$REPO/main.go"
+# Overridable for the same reason lib.sh makes $ENTRYPOINT overridable: the
+# red-check a maintainer runs when adding a case here mutates a /tmp COPY of the
+# file and confirms the new assertion actually fails against it. Half of these
+# assertions read the Go side or the README, so without these seams that half
+# could not be red-checked at all -- and an assertion nobody has seen fail is not
+# evidence.
+GO_SOURCE_ROOT="${KWEB_GO_SOURCE_ROOT:-$REPO}"
+README="${KWEB_README:-$REPO/README.md}"
 # A precondition, not decoration: an unreadable main.go makes every cross-file
 # assertion below fail for the same reason a genuine drift would, so it has to be
 # fatal for the section rather than reported as a drift.
 if [ ! -r "$MAIN" ]; then
   printf 'harness error: main.go is not readable at %s\n' "$MAIN" >&2
+  exit 1
+fi
+if [ ! -r "$README" ] || [ ! -d "$GO_SOURCE_ROOT" ]; then
+  printf 'harness error: README (%s) or Go source root (%s) is unreadable\n' "$README" "$GO_SOURCE_ROOT" >&2
   exit 1
 fi
 
@@ -79,6 +91,29 @@ for var in KIRO_CLI_VERSION KIRO_CLI_SHA256 KIRO_CLI_SHA256_ARM64 KIRO_CLI_TOOLS
     no "$var read" "main.go does not mention \"$var\"; the exported pin reaches nothing"
   fi
 done
+
+# --- KIRO_CLI_PATH is GONE, on both surfaces --------------------------------
+# It was an operator env var whose whole effect was to stand the install manager
+# down: the server ran that binary verbatim and /api/health stopped reporting
+# kiro-cli readiness. Deleting the variable deleted that mode, so the manager is
+# now the only source of the binary path. Re-adding the read is the way the mode
+# comes back, and it comes back SILENTLY (the server still resolves *a* kiro-cli),
+# so its absence is asserted on both surfaces an operator or a developer would
+# reach for: the Go sources that could read it, and the README table that would
+# advertise it.
+#
+# Dot-directories are excluded because they are not source: .git, .github, and any
+# scratch tree a tool left behind (a stale COPY of main.go there would fail this
+# assertion while the shipped code is clean).
+if grep -rq --include='*.go' --exclude-dir='.*' 'KIRO_CLI_PATH' "$GO_SOURCE_ROOT"; then
+  no "KIRO_CLI_PATH in Go sources" "a Go source still mentions KIRO_CLI_PATH; reading it stands the install manager down and takes kiro-cli readiness off /api/health"
+else
+  ok "no Go source mentions KIRO_CLI_PATH: the install manager is the only source of the binary path"
+fi
+
+grep -q 'KIRO_CLI_PATH' "$README" \
+  && no "KIRO_CLI_PATH in the README" "the README still documents KIRO_CLI_PATH; an operator setting a variable the server ignores gets no error and no managed install either" \
+  || ok "the README config table does not offer KIRO_CLI_PATH"
 
 # --- the tools dir the server writes to is the one this script hardened -------
 # The manager creates version directories under $KIRO_CLI_TOOLS_DIR/opt/kiro-cli,

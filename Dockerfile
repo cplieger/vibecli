@@ -385,16 +385,6 @@ ENV HOME=/config/home
 # land in the bin dir via the engine's own GOBIN env at install time.
 ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-# KIRO_CLI_PATH is deliberately NOT set. There is no fixed path to set it to any
-# more: the server installs kiro-cli into a version-addressed directory
-# (/config/tools/opt/kiro-cli/<version>/) and runs that absolute path, so a
-# hardcoded /config/tools/bin/kiro-cli would name a convenience symlink the
-# manager republishes and never itself consults. The variable survives as an
-# OPERATOR ESCAPE HATCH: set it and the manager stands down entirely, the server
-# runs that binary verbatim, and /api/health stops reflecting kiro-cli readiness.
-# Setting it here would stand the manager down in every container.
-# `docker exec … kiro-cli --version` keeps working through the convenience
-# symlink at /config/tools/bin/kiro-cli, which is on the PATH above.
 ENV KWEB_WORK_DIR=/workspace
 ENV KWEB_ADDR=:9848
 

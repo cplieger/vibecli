@@ -99,6 +99,37 @@ through your own `PATH`, so the terminal works if you have one installed. In
 production `entrypoint.sh` exports the Renovate-pinned version and both per-arch
 digests, and the server installs from them.
 
+### Exercising the managed install without a 528 MB download
+
+No env var points the server at a binary you picked; the install manager is the
+only thing that resolves kiro-cli's path. What the manager does do is adopt a
+version directory that is already complete on disk, downloading nothing, and
+that's the seam to use locally and in tests. Populate it yourself:
+
+```text
+$KIRO_CLI_TOOLS_DIR/opt/kiro-cli/<version>/
+├── kiro-cli         # executable; must answer `--version` with <version>
+├── kiro-cli-chat    # executable; required, chat over a PTY is the product
+└── .complete        # the sentinel; written LAST, contains <version>
+```
+
+```sh
+export KIRO_CLI_TOOLS_DIR=/tmp/kweb-tools KIRO_CLI_VERSION=2.14.2
+V="$KIRO_CLI_TOOLS_DIR/opt/kiro-cli/$KIRO_CLI_VERSION"
+mkdir -p "$V"
+cp /path/to/kiro-cli /path/to/kiro-cli-chat "$V/"
+printf '%s\n' "$KIRO_CLI_VERSION" >"$V/.complete"
+KWEB_WORK_DIR=/path/to/workdir go run .
+```
+
+Both digest variables stay unset; nothing is fetched, so nothing is verified
+against them. `.complete` is what makes the directory a selection candidate, and
+the two per-boot gates still run against whatever you put there: `kiro-cli
+--version` must print the directory's own name, and `app.disableAutoupdates=true`
+must be assertable through `kiro-cli settings` or readiness is withheld. A shell
+script answering both is enough for a wiring check;
+`kirocli_wiring_test.go` builds exactly that fake dispatcher set.
+
 `/api/health` reports readiness. Under a bare `go run` it reflects only that the
 HTTP listener is up: with no pins there is no install to gate on, and the tools
 engine is disabled when the config dir is missing (`KWEB_CONFIG_DIR`, default

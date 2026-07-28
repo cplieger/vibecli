@@ -61,8 +61,9 @@ type routeDeps struct {
 	// verdict plus the reason to report when it is false (installing, retrying,
 	// terminally unavailable, or required settings unenforced). It gates
 	// /api/health AND session creation. Nil means this server does not own the
-	// install (the KIRO_CLI_PATH override, or a bare `go run`/test outside the
-	// container), which disables the gate and keeps pure-listener readiness.
+	// install, which happens only outside the container (a bare `go run` or a
+	// test with no pins), and then the gate is disabled and readiness stays
+	// pure-listener. Every container boot wires it.
 	kiroReady func() (bool, string)
 	// kiroRescan, when non-nil, re-derives the active kiro-cli version from disk
 	// without downloading anything. It backs kiroRescanPath.
@@ -330,8 +331,9 @@ func sessionEnvFor(deps *routeDeps) []string {
 	return deps.sessionEnv()
 }
 
-// kiroReadyNow reports whether kiro-cli is currently usable, treating an absent
-// manager (the KIRO_CLI_PATH override, a bare `go run`) as usable — the same
+// kiroReadyNow reports whether kiro-cli is currently usable. An absent manager
+// means no install to gate on at all, which only happens outside the container (a
+// bare `go run` or a test with no pins) and reads as usable, the same
 // gate-disabled semantics /api/health applies. The fast-death Warn keys on it so a
 // session that dies because the install is not finished yet does not fire a
 // broken-install alert; that state has its own 503 and its own log line.

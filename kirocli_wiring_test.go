@@ -311,9 +311,9 @@ func TestKiroRescan_reportsVerdictNotErrorText(t *testing.T) {
 }
 
 // TestKiroRescan_absentWithoutManager pins that the repair route only exists
-// where there is an install to repair. With no manager (the KIRO_CLI_PATH
-// override, or a bare `go run`) the route must not be registered at all, rather
-// than answering with a nil-dereference panic.
+// where there is an install to repair. With no manager (a bare `go run` with no
+// pins) the route must not be registered at all, rather than answering with a
+// nil-dereference panic.
 func TestKiroRescan_absentWithoutManager(t *testing.T) {
 	mux, _, _ := mustRegisterRoutes(t, newTestDeps(true))
 	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
@@ -326,40 +326,31 @@ func TestKiroRescan_absentWithoutManager(t *testing.T) {
 	}
 }
 
-// TestStartKiroCLI_shapes pins the three startup shapes and, most importantly,
-// which of them GATES readiness. Getting this wrong is silent in both
-// directions: a container that installs kiro-cli but reports ready before the
-// install finishes hands every tab a dead terminal behind a green health check,
-// and a bare `go run` that reports unready can never serve a session at all.
+// TestStartKiroCLI_shapes pins the two UNMANAGED startup shapes and, most
+// importantly, which of them GATES readiness (the managed shape is
+// TestStartKiroCLI_managedWiringActivatesAnInstalledVersion's). Getting this
+// wrong is silent in both directions: a container that installs kiro-cli but
+// reports ready before the install finishes hands every tab a dead terminal
+// behind a green health check, and a bare `go run` that reports unready can never
+// serve a session at all.
 func TestStartKiroCLI_shapes(t *testing.T) {
-	t.Run("KIRO_CLI_PATH override stands the manager down", func(t *testing.T) {
-		rt := startKiroCLI(&baseKiro{override: "/usr/local/bin/kiro-cli", chatArgs: []string{"--v3"}})
-		t.Cleanup(rt.stop)
-		if rt.ready != nil {
-			t.Error("override wired a readiness gate; this server does not own the install, so readiness must stay pure-listener")
-		}
-		if rt.rescan != nil {
-			t.Error("override wired a rescan hook; there is no managed install to rescan")
-		}
-		if got := rt.cmd()[3]; got != "/usr/local/bin/kiro-cli" {
-			t.Errorf("override argv cli path = %q, want the override verbatim", got)
-		}
-		if got := strings.Join(rt.cmd()[4:], " "); got != "--v3" {
-			t.Errorf("override argv chat args = %q, want --v3", got)
-		}
-		if rt.env != nil {
-			t.Error("override wired a PATH overlay; there is no version directory to lead with")
-		}
-	})
-
 	t.Run("no pins falls back to the bare name", func(t *testing.T) {
-		rt := startKiroCLI(&baseKiro{})
+		rt := startKiroCLI(&baseKiro{chatArgs: []string{"--v3"}})
 		t.Cleanup(rt.stop)
 		if rt.ready != nil {
 			t.Error("a pin-less run wired a readiness gate; a bare `go run` would then never be ready")
 		}
+		if rt.rescan != nil {
+			t.Error("a pin-less run wired a rescan hook; there is no managed install to rescan")
+		}
 		if got := rt.cmd()[3]; got != "kiro-cli" {
 			t.Errorf("pin-less argv cli path = %q, want the bare name for PATH resolution", got)
+		}
+		if got := strings.Join(rt.cmd()[4:], " "); got != "--v3" {
+			t.Errorf("pin-less argv chat args = %q, want --v3", got)
+		}
+		if rt.env != nil {
+			t.Error("a pin-less run wired a PATH overlay; there is no version directory to lead with")
 		}
 	})
 

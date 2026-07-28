@@ -83,8 +83,8 @@ func TestHealthEndpoint_reflectsReadiness(t *testing.T) {
 // server owns the install (main.go hands it the manager's Ready), /api/health
 // returns 503 while no version is active and 200 once one is — reflecting
 // web-terminal-kiro's core dependency from in-memory state, never launching
-// kiro-cli. A nil verdict skips the gate, so out-of-container runs (tests, bare
-// `go run`, the KIRO_CLI_PATH override) keep pure-listener readiness.
+// kiro-cli. A nil verdict skips the gate, so out-of-container runs (tests, a bare
+// `go run` with no pins) keep pure-listener readiness.
 func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 	newMux := func(verdict func() (bool, string)) *http.ServeMux {
 		deps := newTestDeps(true)

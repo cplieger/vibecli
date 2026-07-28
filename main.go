@@ -395,7 +395,6 @@ func main() {
 		sha256:      envx.String("KIRO_CLI_SHA256", ""),
 		sha256ARM64: envx.String("KIRO_CLI_SHA256_ARM64", ""),
 		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
-		override:    envx.String("KIRO_CLI_PATH", ""),
 		tainted:     envx.String("KIRO_CLI_TOOLS_TAINTED", "") == "1",
 		chatArgs:    chatArgs,
 	})
@@ -498,18 +497,13 @@ func main() {
 
 // baseKiro carries startKiroCLI's inputs: the three Renovate-pinned literals the
 // entrypoint exports, the tools tree they install into, the taint observation only
-// the entrypoint can make, the operator override, and this deployment's extra chat
-// flags.
+// the entrypoint can make, and this deployment's extra chat flags.
 type baseKiro struct {
 	version     string
 	sha256      string
 	sha256ARM64 string
 	toolsDir    string
-	// override is KIRO_CLI_PATH. Set to any non-empty value it stands the manager
-	// down entirely: the server runs that path verbatim and stops gating readiness
-	// on an install it no longer owns.
-	override string
-	chatArgs []string
+	chatArgs    []string
 	// tainted carries the entrypoint's tools-tree-was-writable observation.
 	tainted bool
 }
@@ -526,8 +520,8 @@ type kiroRuntime struct {
 	// add. The engine appends it last, so PATH here wins.
 	env func() []string
 	// ready is the /api/health and session-create verdict plus its 503 reason, or
-	// nil when this app does not own the install (the KIRO_CLI_PATH override, or a
-	// bare `go run` with no pins) and readiness stays pure-listener.
+	// nil when this app does not own the install (a bare `go run` with no pins)
+	// and readiness stays pure-listener.
 	ready func() (bool, string)
 	// rescan re-derives the active version from disk without downloading, or nil
 	// when there is no manager. It backs the loopback repair endpoint.
@@ -536,11 +530,14 @@ type kiroRuntime struct {
 	stop func()
 }
 
-// staticKiroRuntime is the runtime for a deployment whose kiro-cli this server does
-// NOT install: one fixed argv, no PATH overlay, and no readiness gate (nil ready),
-// so /api/health reflects only that the listener is up.
-func staticKiroRuntime(cliPath string, chatArgs []string) kiroRuntime {
-	argv := sessionCommand(cliPath, chatArgs...)
+// unmanagedKiroRuntime is the runtime for a process with no pins in its
+// environment: a bare `go run` outside the container. kiro-cli is resolved by
+// bare name through the developer's own PATH, there is no PATH overlay, and no
+// readiness gate (nil ready), so /api/health reflects only that the listener is
+// up. In the image entrypoint.sh always exports the pins, so this shape is
+// unreachable there.
+func unmanagedKiroRuntime(chatArgs []string) kiroRuntime {
+	argv := sessionCommand("kiro-cli", chatArgs...)
 	return kiroRuntime{
 		cmd:  func() []string { return argv },
 		stop: func() {},
@@ -568,20 +565,17 @@ func unavailableKiroRuntime() kiroRuntime {
 // refusing connections, and an operator can reach /api/health, the static UI and the
 // loopback APIs throughout.
 //
-// Three shapes come out of it, in precedence order: the KIRO_CLI_PATH override
-// (manager stands down), no pins at all (bare `go run` outside the container), and
-// the managed install.
+// Three shapes come out of it: no pins at all (a bare `go run` outside the
+// container), pins the manager cannot use (unready, so the fault is reported
+// rather than hidden), and the managed install. There is no operator input that
+// selects among them and no way to stand the manager down: inside the container
+// the pins are always exported, so a managed install is the only kiro-cli this
+// server ever runs, and the manager is the only source of its path.
 func startKiroCLI(cfg *baseKiro) kiroRuntime {
-	if cfg.override != "" {
-		slog.Info("KIRO_CLI_PATH is set: running that binary verbatim and installing nothing",
-			"cli_path", cfg.override,
-			"hint", "this stands the install manager down, so /api/health no longer reflects kiro-cli readiness; unset it to let the server install the pinned version")
-		return staticKiroRuntime(cfg.override, cfg.chatArgs)
-	}
 	if cfg.version == "" || cfg.toolsDir == "" {
 		slog.Warn("no kiro-cli pins in the environment: resolving kiro-cli by bare name and installing nothing",
 			"hint", "expected outside the container (bare `go run`); in the image entrypoint.sh exports KIRO_CLI_VERSION, both digests and KIRO_CLI_TOOLS_DIR")
-		return staticKiroRuntime("kiro-cli", cfg.chatArgs)
+		return unmanagedKiroRuntime(cfg.chatArgs)
 	}
 	mgr, err := kirocli.New(&kirocli.Config{
 		Version:     cfg.version,

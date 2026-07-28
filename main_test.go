@@ -869,6 +869,61 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	}
 }
 
+// TestParseBoolEnv_neverLogsRawValue pins the confidentiality property the
+// local parser exists for: KWEB_LOG_OSC_TEXT is a small enum an operator
+// fat-fingers, a compose expansion mistake can land a credential on it
+// (`KWEB_LOG_OSC_TEXT: "${DEBUG_FLAG}"`), and envx.Bool's malformed path logs
+// the RAW value — a durable, queryable copy in the log store (CWE-532). The
+// assertion is the property, not the wording: no captured record may CONTAIN
+// the raw string. It also pins the vocabulary (so the local parse stays
+// compatible with envx.Bool's) and the fail-closed direction on a bad value.
+// Serial: capture.Default mutates the process-global default logger.
+func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
+	const key = "KWEB_TEST_BOOL"
+	cases := map[string]struct {
+		raw       string
+		fallback  bool
+		wantValue bool
+		wantOK    bool
+	}{
+		"unset is not a parse failure": {raw: "", fallback: false, wantValue: false, wantOK: true},
+		"unset yields the fallback":    {raw: "", fallback: true, wantValue: true, wantOK: true},
+		"true":                         {raw: "true", wantValue: true, wantOK: true},
+		"1":                            {raw: "1", wantValue: true, wantOK: true},
+		"yes uppercase and padded":     {raw: "  YES  ", wantValue: true, wantOK: true},
+		"on":                           {raw: "on", wantValue: true, wantOK: true},
+		"false":                        {raw: "false", wantValue: false, wantOK: true},
+		"0":                            {raw: "0", wantValue: false, wantOK: true},
+		"no":                           {raw: "no", wantValue: false, wantOK: true},
+		"off":                          {raw: "off", wantValue: false, wantOK: true},
+		// The reason the parser is local: a token-shaped value must fail
+		// closed to the fallback AND leave no copy of itself anywhere.
+		"secret-shaped value fails closed": {
+			raw: "s3cr3t-token-abc123", fallback: false, wantValue: false, wantOK: false,
+		},
+		"secret-shaped value keeps a true fallback": {
+			raw: "s3cr3t-token-abc123", fallback: true, wantValue: true, wantOK: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+			t.Setenv(key, tc.raw)
+
+			value, ok := parseBoolEnv(key, tc.fallback)
+
+			if value != tc.wantValue || ok != tc.wantOK {
+				t.Errorf("parseBoolEnv(%q, %v) = (%v, %v), want (%v, %v)",
+					tc.raw, tc.fallback, value, ok, tc.wantValue, tc.wantOK)
+			}
+			if tc.raw != "" && records.Contains(tc.raw) {
+				t.Errorf("log = %q carries the raw %s value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why envx.Bool is not used here)",
+					records.Messages(), key)
+			}
+		})
+	}
+}
+
 // TestIsWebSocketUpgrade_requiresBothListTokens pins the access-log stream
 // predicate against the engine's own websocket.Accept parsing: both header
 // tokens are required, each may arrive in a repeated field line or a comma
@@ -932,4 +987,93 @@ func TestHealthEndpoint_unreadableMarkerWarnsOnce(t *testing.T) {
 	if got := records.CountLevel(slog.LevelWarn, "readiness marker unreadable"); got != 1 {
 		t.Errorf("unreadable-marker Warn count = %d, want 1 for repeated probes", got)
 	}
+}
+
+// TestWSAttachLog pins the audit record for the ONE request that presents the
+// session capability token. The access logger deliberately skips an admitted /ws
+// upgrade (a hijacked stream would log a bogus 200 with an hours-long duration),
+// and neither the engine's WebSocketHandler nor its per-session Handler logs an
+// attach — the engine's "process started" line comes from the eager start at
+// CREATE time, not from an attach. Without this middleware the /ws upgrade is the
+// only request to this server with no record anywhere, so a session id leaked
+// through a fronting proxy's access log could be replayed with nothing to show an
+// operator afterwards (CWE-778, OWASP A09).
+//
+// Three properties, each a distinct regression:
+//   - the record exists for an upgrade-shaped request, at Info, with client_ip
+//     and the request id the access log and the response header carry;
+//   - the session id is LogID-truncated, never the full token — the log store
+//     outlives and out-queries the PTY, so a full id here would just relocate
+//     the credential;
+//   - a NON-upgrade request to /ws produces no such record: that shape is the
+//     access logger's (it gets a real line with the engine's 426), and doubling
+//     it here would make the two records disagree about what a stream is.
+//
+// capture.Default swaps the global default logger, so this test must never call
+// t.Parallel.
+func TestWSAttachLog(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+terminal.WSPath, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK) // stands in for the engine's upgrade handler
+	})
+	// A session id long enough that LogID must truncate it: an id that fits
+	// under the truncation threshold would pass this test with no redaction at
+	// all.
+	const sessionID = "0123456789abcdef0123456789abcdef"
+
+	do := func(t *testing.T, upgrade bool) *capture.Recorder {
+		t.Helper()
+		records := capture.Default(t)
+		req := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+sessionID, http.NoBody)
+		if upgrade {
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Connection", "upgrade")
+		}
+		buildHandler(mux, nil, "default-src 'self'", nil).ServeHTTP(httptest.NewRecorder(), req)
+		return records
+	}
+
+	t.Run("upgrade attempt is recorded", func(t *testing.T) {
+		records := do(t, true)
+		if got := records.CountLevel(slog.LevelInfo, wsAttachMsg); got != 1 {
+			t.Fatalf("%q Info count = %d, want 1; the request that presents the session token must leave a record; log = %q",
+				wsAttachMsg, got, records.Messages())
+		}
+		wantID := terminal.LogID(sessionID)
+		if wantID == sessionID {
+			t.Fatalf("terminal.LogID(%q) returned the id unchanged; pick a longer fixture or the redaction assertion below proves nothing", sessionID)
+		}
+		for _, tc := range []struct{ key, want string }{
+			{"session", wantID},
+			{"client_ip", "192.0.2.1"}, // httptest.NewRequest's RemoteAddr, host only
+		} {
+			if got, ok := records.AttrValue(wsAttachMsg, tc.key); !ok || got != tc.want {
+				t.Errorf("attach record %s = %q (present=%v), want %q", tc.key, got, ok, tc.want)
+			}
+		}
+		if got, ok := records.AttrValue(wsAttachMsg, "request_id"); !ok || got == "" {
+			t.Errorf("attach record request_id = %q (present=%v), want the id the access log and the response header carry; without it the attach cannot be correlated", got, ok)
+		}
+		// The full token must not reach the log under ANY key or in the message:
+		// truncation is the whole point of routing the id through LogID.
+		for _, r := range records.Records() {
+			if strings.Contains(r.Message, sessionID) {
+				t.Errorf("record message %q carries the full session id", r.Message)
+			}
+			r.Attrs(func(a slog.Attr) bool {
+				if strings.Contains(a.Value.String(), sessionID) {
+					t.Errorf("record attr %q = %q carries the full session id; a leaked log line would be a working credential", a.Key, a.Value)
+				}
+				return true
+			})
+		}
+	})
+
+	t.Run("non-upgrade request is left to the access log", func(t *testing.T) {
+		records := do(t, false)
+		if got := records.CountLevel(slog.LevelInfo, wsAttachMsg); got != 0 {
+			t.Errorf("%q Info count = %d for a request without the upgrade headers, want 0; that shape is the access logger's, which logs it with the engine's 426; log = %q",
+				wsAttachMsg, got, records.Messages())
+		}
+	})
 }

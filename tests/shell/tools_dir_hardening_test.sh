@@ -27,11 +27,18 @@ new_workdir >/dev/null
 
 load_function secure_tools_dir
 
-# fatal() is the abort under test: record the call and return non-zero so the caller
-# unwinds the way `exit` would, without killing this harness.
+# fatal() is the abort under test: record the call and return non-zero instead of
+# killing this harness. It does NOT unwind the way `exit` would -- every call site in
+# secure_tools_dir is a bare `fatal ...`, so the function keeps running and the later
+# guards fire too (a dangling symlink at an owned dir records THREE refusals in one
+# call). FATALED therefore only answers "something refused"; FATAL_FIRST records the
+# refusal production would have exited on, and that is the oracle the owned cases use
+# wherever more than one guard can catch the same bait.
 FATALED=0
+FATAL_FIRST=""
 fatal() {
   FATALED=1
+  [ -n "$FATAL_FIRST" ] || FATAL_FIRST=$1
   return 1
 }
 tools_tree_was_writable=0
@@ -44,6 +51,7 @@ tools_tree_was_writable=0
 attempt() {
   local dir=$1 owned=$2
   FATALED=0
+  FATAL_FIRST=""
   tools_tree_was_writable=0
   WARNLOG="$WORK/warn.log"
   secure_tools_dir "$dir" 0 "$owned" >/dev/null 2>"$WARNLOG"
@@ -90,10 +98,17 @@ attempt "$R/seg" 0
   || no "unowned clean" "rc=$RC fataled=$FATALED"
 
 # --- owned (/config, $TOOLS, $TOOLS/bin): must STILL abort ----------------------
+# The refusal MESSAGE is the oracle here, not FATALED: a symlink also fails the
+# not-a-directory check when it dangles, and fails the mode check when it does not
+# (stat does not dereference, and a symlink's own mode is 0777), so no bait isolates
+# the -L guard by outcome -- with the branch deleted this case stayed green. Naming
+# the message is what makes it able to fail, the same reason kas_prune_test.sh
+# asserts which refusal its two redundant guards emitted.
 R=$(mk) && ln -s /nonexistent-target "$R/owned"
 attempt "$R/owned" 1
-[ "$FATALED" -eq 1 ] && ok "owned symlink: still aborts" \
-  || no "owned symlink" "did not abort -- the security gate was weakened"
+[ "$FATAL_FIRST" = 'refusing to use a symlinked tools directory; its target may be outside the /config mount' ] \
+  && ok "owned symlink: aborts BY the symlink guard" \
+  || no "owned symlink" "first refusal was '$FATAL_FIRST', not the symlink guard -- the security gate was weakened"
 
 R=$(mk) && : >"$R/owned"
 attempt "$R/owned" 1

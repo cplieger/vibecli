@@ -5,8 +5,6 @@ import (
 	"net/http/httptest"
 	"testing"
 	"testing/fstest"
-
-	"github.com/cplieger/webhttp"
 )
 
 // TestStaticCachePolicyServedOnResponses pins the WIRING of the app-owned
@@ -21,16 +19,12 @@ import (
 // must-revalidate (otherwise a deploy serves a stale bundle against a
 // changed server wire protocol).
 func TestStaticCachePolicyServedOnResponses(t *testing.T) {
-	var ready webhttp.Ready
-	ready.Set(true)
-	deps := &routeDeps{
-		staticFS: fstest.MapFS{
-			"static/index.html":              &fstest.MapFile{Data: []byte(testIndexHTML)},
-			"static/vendor/fonts/mono.woff2": &fstest.MapFile{Data: []byte("font-bytes")},
-		},
-		ready:   &ready,
-		workDir: "",
-		cmd:     []string{"/bin/cat"},
+	deps := newTestDeps(true)
+	// The font entry is what this test adds to the shared default tree: the
+	// two Cache-Control branches are fonts vs everything else.
+	deps.staticFS = fstest.MapFS{
+		"static/index.html":              &fstest.MapFile{Data: []byte(testIndexHTML)},
+		"static/vendor/fonts/mono.woff2": &fstest.MapFile{Data: []byte("font-bytes")},
 	}
 	mux, _, _ := mustRegisterRoutes(t, deps)
 

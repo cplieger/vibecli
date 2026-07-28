@@ -41,6 +41,11 @@ fi
 sed -n "${start},$((end + 2))p" "$ENTRYPOINT" >"$WORK/block.sh"
 extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 
+# RUN_CWD lets a case choose the directory the harness runs FROM. Empty means "here":
+# only the glob-suppression case below needs a controlled cwd, since that guard's
+# bait is a directory whose FILENAMES are what an unsuppressed '*' would expand to.
+RUN_CWD=""
+
 # run <update_rc> <pkgnames_mode> <APT_PACKAGES>
 #   pkgnames_mode: ok | empty | fail
 # -> INSTALLED (the argv apt-get install received), SKIPPED (warn count)
@@ -106,7 +111,7 @@ $(cat "$WORK/block.sh")
 HARNESS
   : >"$WORK/installed"
   : >"$WORK/calls"
-  SKIPPED=$(bash "$WORK/harness.sh" 2>&1 >/dev/null | grep -c 'level=warn.*skipping' || true)
+  SKIPPED=$(cd "${RUN_CWD:-$PWD}" && bash "$WORK/harness.sh" 2>&1 >/dev/null | grep -c 'level=warn.*skipping' || true)
   INSTALLED=$(tr '\n' ' ' <"$WORK/installed" | sed 's/ *$//')
   INSTALL_CALLS=$(grep -c 'install-call' "$WORK/calls" 2>/dev/null || true)
 }
@@ -171,5 +176,25 @@ case "$INSTALLED" in
       || no "grammar" "installed='$INSTALLED', want 'jq'"
     ;;
 esac
+
+# --- the glob-suppression guard: a stray '*' must stay LITERAL ----------------
+# entrypoint.sh runs with cwd=/workspace, so with pathname expansion live a '*'
+# token expands to filenames and any expansion that is grammar-valid AND a real
+# package gets apt-installed as root on every boot. The bait is what the UNGUARDED
+# code would actually take: a cwd holding a file named like a package the
+# known-name stub accepts. With `set -f` present the token stays literal, fails the
+# grammar (no '*' in its class) and is warn-skipped; with `set -f` gone this case
+# reports installed='jq gcc'.
+# The bait filename stays inside the stub's known-name list (`gcc`) so the assertion
+# fails at the INSTALL argv rather than being masked by the known-name gate, and
+# stays undotted so the degraded-path dotted-token drop cannot mask it either -- the
+# same canary discipline the grammar case documents for `jq-` and `etc/passwd`.
+mkdir -p "$WORK/globbait" && : >"$WORK/globbait/gcc"
+RUN_CWD="$WORK/globbait"
+run 0 ok 'jq *'
+RUN_CWD=""
+[ "$INSTALLED" = "jq" ] && [ "$SKIPPED" -eq 1 ] \
+  && ok "a stray '*' stays literal (set -f) and is warn-skipped" \
+  || no "glob suppression" "installed='$INSTALLED' skipped=$SKIPPED -- set -f may be gone"
 
 report

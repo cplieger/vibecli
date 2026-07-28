@@ -2,11 +2,36 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
+
+// TestDockerfileInvokesTheGate pins the gate's only execution site. run()'s verdict
+// is worthless if nothing runs it: a stage restructure that drops the RUN leaves
+// this package compiling and every test green while an incompatible Go/TS pair
+// ships and refuses every session at first connect (close 4002) behind a green
+// /api/health.
+func TestDockerfileInvokesTheGate(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	for _, want := range []string{
+		"go run ./scripts/wirecheck",
+		"-client-rev",
+		"-client-min-server",
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("Dockerfile no longer contains %q; the wire-floor gate is "+
+				"not invoked, so an incompatible Go/TS pair would build clean and "+
+				"refuse every session with close 4002 at runtime", want)
+		}
+	}
+}
 
 // TestRun_delegatesToTheEngineRule pins that the gate's verdict IS the
 // engine's verdict, in both directions and at the exclusive boundary. The
@@ -42,6 +67,16 @@ func TestRun_delegatesToTheEngineRule(t *testing.T) {
 			if gateCompatible := code == 0; gateCompatible != engineSaysCompatible {
 				t.Errorf("run(%d,%d) exit %d (compatible:%v) but the engine says compatible:%v; the gate does not follow the engine's rule",
 					tc.clientRev, tc.clientMinServer, code, gateCompatible, engineSaysCompatible)
+			}
+			// An incompatible pairing must be refused as a FLOOR violation (exit
+			// 1), never as the usage error (exit 2). The below-the-floor row
+			// derives its client revision as MinSupportedClientWireVersion-1,
+			// which reaches 0 if the engine ever lowers that floor to 1 -- the row
+			// would then exercise run's flag guard instead of the engine's rule
+			// and still pass, silently retiring the only negative-direction case.
+			if !tc.wantCompatible && code != 1 {
+				t.Errorf("run(%d,%d) = %d, want exit 1; an incompatible pairing must fail on the engine's floor rule, not on the usage guard (this case no longer tests the rule)",
+					tc.clientRev, tc.clientMinServer, code)
 			}
 		})
 	}

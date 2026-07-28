@@ -36,9 +36,9 @@ extract_function resolves_to_pinned_kiro_cli "$WORK/_resolve.sh" >/dev/null
 cat "$WORK/_resolve.sh" >>"$HELPERS"
 # The update transaction: the journal is what keeps an interrupted promotion from
 # leaving the OLD $BIN paired with the NEW chat sidecar.
-for _fn in kiro_cli_snapshot_one kiro_cli_restore_one kiro_cli_update_finish \
-  kiro_cli_update_begin kiro_cli_update_rollback recover_kiro_cli_update_journal \
-  publish_readiness_marker; do
+for _fn in is_self_contained_executable kiro_cli_snapshot_one kiro_cli_restore_one \
+  kiro_cli_update_finish kiro_cli_update_begin kiro_cli_update_rollback \
+  recover_kiro_cli_update_journal publish_readiness_marker; do
   extract_function "$_fn" "$WORK/_$_fn.sh" >/dev/null
   cat "$WORK/_$_fn.sh" >>"$HELPERS"
 done
@@ -70,7 +70,6 @@ setup() {
   STUB_VERSION=""
   FATALS=""
 }
-is_self_contained_executable() { [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]; }
 kiro_cli_version() {
   [ -n "$STUB_VERSION" ] || return 1
   printf '%s\n' "$STUB_VERSION"

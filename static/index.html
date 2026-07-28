@@ -126,6 +126,17 @@
       }
       #loading[role="alertdialog"] p {
         margin: 0;
+        /* Cap the measure and set the leading the way the library's own fatal
+           panel does (10-primitives.css .wt-fatal-card inline-size:
+           min(100%, 28rem), .wt-fatal-message line-height: 1.5) and the way
+           this same overlay's non-fatal status line does (page.css
+           .wt-loading-text max-inline-size: 34rem). The cause sentence is the
+           only diagnostic on this screen -- around 130 characters -- and an
+           uncapped centred paragraph in a full-viewport flex column sets it as
+           one edge-to-edge line on any desktop window. The flex column already
+           centres the block, so the cap alone places it. */
+        max-inline-size: 34rem;
+        line-height: 1.5;
       }
       /* The document <h1>'s permanent off-screen hide (a body-level sibling no
          builder clears). Same technique web-terminal-ui's kernel announcer uses

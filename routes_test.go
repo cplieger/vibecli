@@ -338,6 +338,14 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 	for _, want := range []string{
 		"default-src 'self'",
 		"img-src 'self' data:", "connect-src 'self'", "frame-ancestors 'none'",
+		// The four directives no other assertion reaches. Each is a distinct
+		// containment the hash pinning does not provide, and dropping any of
+		// them from cspTemplate leaves the whole package green: font-src keeps
+		// the Monaspace faces same-origin, base-uri stops an injected <base>
+		// from re-pointing every relative module URL at an attacker origin,
+		// object-src blocks plugin embedding, and form-action blocks POST
+		// exfiltration from an injected form.
+		"font-src 'self'", "base-uri 'none'", "object-src 'none'", "form-action 'none'",
 	} {
 		if !strings.Contains(servedCSP, want) {
 			t.Errorf("CSP = %q, want it to contain %q", servedCSP, want)
@@ -999,7 +1007,18 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	// suite green while the tools API (which executes manual install strings as
 	// root) becomes reachable from a browser. The empty and malformed Hosts pin
 	// the fail-closed path through webhttp.CanonicalHost.
-	for _, host := range []string{"evil.example", "evil.example:9848", "kiro.lan", "", "127.0.0.1:garbage"} {
+	for _, host := range []string{
+		"evil.example", "evil.example:9848", "kiro.lan", "", "127.0.0.1:garbage",
+		// Name-confusion shapes. Admission is exact-name equality, and every
+		// other rejected Host here shares no affix with "localhost", so a
+		// widening to prefix/suffix/substring matching -- the plausible "let
+		// *.localhost through" edit -- is invisible to the whole package.
+		// These are attacker-REGISTERABLE names that resolve to 127.0.0.1 as
+		// easily as any other, and the API behind this gate runs `manual`
+		// install strings as root.
+		"localhost.evil.example", "localhost.evil.example:9848",
+		"evil.localhost", "evil.localhost:9848", "notlocalhost",
+	} {
 		req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
 		req.RemoteAddr = "127.0.0.1:55555"
 		req.Host = host
@@ -1333,5 +1352,51 @@ func TestNotifyFingerprint(t *testing.T) {
 	}
 	if keyed := fp.metadata(deviceCode); len(keyed) != 4 || keyed[0] != "message_fingerprint" {
 		t.Errorf("keyed metadata(%q) = %v, want [message_fingerprint <hex> message_runes <n>]", deviceCode, keyed)
+	}
+}
+
+// TestComposeGate_syncingRefusalPreservesCreateBudget pins the composition
+// ORDER inside composeGate, which no existing test can see: the tools-syncing
+// refusal is checked OUTSIDE the create rate limit, so a client retrying
+// through a convergence window (bounded only by toolbelt's 30-minute job
+// timeout) spends no rate-limit tokens on refused attempts, and a full burst
+// succeeds the moment the gate lifts. Swapping the two layers -- a one-line
+// change in composeGate -- leaves every other test in this package green while
+// a retrying UI gets 429 "session creation rate exceeded" instead of the 503
+// "tools installing" that names the real cause, and then reaches convergence
+// with an empty bucket, so the terminal stays unusable for a further refill
+// window.
+func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
+	var syncing atomic.Bool
+	syncing.Store(true)
+	creates := 0
+	gated := composeGate(webhttp.SessionCreateRateLimit(terminal.SessionsPath), syncing.Load)(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			creates++
+			w.WriteHeader(http.StatusCreated)
+		}))
+	post := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))
+		return rec
+	}
+
+	// More refused attempts than the burst allows: every one must be the tools
+	// 503, never the rate limit's 429.
+	for attempt := 1; attempt <= sessionCreateBurst*2; attempt++ {
+		if rec := post(); rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("refused create %d = %d, want %d (body %s)", attempt, rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+		}
+	}
+	if creates != 0 {
+		t.Fatalf("inner handler ran %d times while tools were syncing, want 0", creates)
+	}
+
+	// The budget survived the refusals.
+	syncing.Store(false)
+	for attempt := 1; attempt <= sessionCreateBurst; attempt++ {
+		if rec := post(); rec.Code != http.StatusCreated {
+			t.Fatalf("create %d after the gate lifted = %d, want %d (body %s); the refused attempts must not have spent the burst", attempt, rec.Code, http.StatusCreated, rec.Body.String())
+		}
 	}
 }

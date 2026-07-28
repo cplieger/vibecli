@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 // TestSessionFastDeathWarn pins the operator-facing fast-death signal wired in
@@ -46,8 +47,8 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", http.NoBody))
-			if strings.Contains(rec.Body.String(), `"exited"`) {
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, terminal.SessionsPath, http.NoBody))
+			if strings.Contains(rec.Body.String(), `"status":"`+terminal.StatusExited+`"`) {
 				return records
 			}
 			if time.Now().After(deadline) {

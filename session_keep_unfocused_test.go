@@ -24,6 +24,11 @@ import (
 // the session is not torn down mid-write.
 func TestKeepUnfocusedWiredIntoSessionFactory(t *testing.T) {
 	if _, err := exec.LookPath("stty"); err != nil {
+		// A skip is right on a stripped dev machine, but under CI it would turn
+		// the ONLY check on terminal.WithKeepUnfocused() off with a green run.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("stty unavailable under CI: this is the only assertion on terminal.WithKeepUnfocused(), so it must not be skipped in the gate")
+		}
 		t.Skip("stty unavailable: the child cannot leave canonical mode, so it cannot read the focus-out bytes")
 	}
 	marker := filepath.Join(t.TempDir(), "focus-bytes")

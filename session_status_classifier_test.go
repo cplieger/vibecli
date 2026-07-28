@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,7 +82,7 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 // so this test must never call t.Parallel.
 func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T) {
 	records := capture.Default(t)
-	const message = "unrecognized kiro-cli OSC 9 notification"
+	const message = unrecognizedNotifyMsg
 	classify := newStatusClassifier(false)
 
 	got, latch := classify("New response wording")
@@ -107,6 +110,80 @@ func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T)
 	}
 }
 
+// TestClassifyStatus_recognizedNotificationTracesTheMapping pins the POSITIVE
+// half of the classifier trace. The unrecognized arm's Warn/Debug pair answers
+// "a wording this app does not recognize appeared"; nothing answered "a wording
+// it DOES recognize appeared", so an operator running the documented
+// KWEB_LOG_LEVEL=debug step after the tab status dots stop latching saw an empty
+// classifier trace with two incompatible meanings: kiro-cli emitted no OSC 9
+// notification at all (its notifier's focus gate, the engine's DEC 1004
+// unfocused pin, or kiro-cli dropping the TERM_PROGRAM identity from its OSC
+// allowlist) or every notification mapped fine and the dot is lost downstream
+// (the engine's latch, the status SSE, the client's render). Different owners, so
+// the investigation started by guessing which repo to open. The residual is
+// sharper once unrecognizedNotifyCap is spent, since a later reword then produces
+// no new record at all -- this trace is what still answers the question there.
+//
+// Deleting either Debug call must fail this test. capture.Default swaps the
+// global default logger, so this test must never call t.Parallel.
+func TestClassifyStatus_recognizedNotificationTracesTheMapping(t *testing.T) {
+	records := capture.Default(t)
+	classify := newStatusClassifier(false)
+
+	type mapping struct{ notification, status string }
+	want := []mapping{
+		{"Response complete", terminal.StatusDone},
+		{"Permission required", terminal.StatusInput},
+		{"Input required", terminal.StatusInput},
+	}
+	for _, tc := range want {
+		got, latch := classify(tc.notification)
+		if got != tc.status || !latch {
+			t.Errorf("classify(%q) = (%q, %v), want (%q, true)", tc.notification, got, latch, tc.status)
+		}
+	}
+
+	// One record per recognized notification, each naming WHICH wording matched
+	// and WHICH status it produced: the wording alone would not distinguish a
+	// mis-mapped switch arm from a correct one.
+	var got []mapping
+	for _, r := range records.Records() {
+		if !strings.Contains(r.Message, recognizedNotifyMsg) {
+			continue
+		}
+		if r.Level != slog.LevelDebug {
+			t.Errorf("recognized-notification trace logged at %s, want Debug; it fires at every turn boundary and must stay out of the shipped stream", r.Level)
+		}
+		var m mapping
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "notification":
+				m.notification = a.Value.String()
+			case "status":
+				m.status = a.Value.String()
+			}
+			return true
+		})
+		got = append(got, m)
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("recognized-notification trace = %v, want %v (one Debug record per recognized notification, naming the matched wording and the status it mapped to)", got, want)
+	}
+
+	// The two classifier messages must stay searchable apart: every
+	// confidentiality sweep in this file filters on unrecognizedNotifyMsg as a
+	// substring, so a positive-trace wording that contained it would be swept as
+	// an unrecognized record (and vice versa for a log search after a bump).
+	if strings.Contains(recognizedNotifyMsg, unrecognizedNotifyMsg) || strings.Contains(unrecognizedNotifyMsg, recognizedNotifyMsg) {
+		t.Errorf("recognizedNotifyMsg %q and unrecognizedNotifyMsg %q share a substring; a log search or a test matching one would match the other", recognizedNotifyMsg, unrecognizedNotifyMsg)
+	}
+	// A recognized notification is not a drift signal: nothing here may consume
+	// the warn budget or reach the default stream.
+	if n := records.CountLevel(slog.LevelWarn, unrecognizedNotifyMsg); n != 0 {
+		t.Errorf("recognized notifications produced %d unrecognized-notification Warn records, want 0", n)
+	}
+}
+
 // TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings pins the volume
 // bound that replaced the single latch. Without it, per-distinct warning would be
 // an unbounded log-volume AND unbounded-memory vector: the map key is child
@@ -114,7 +191,7 @@ func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T)
 // the seen-set for the container's lifetime.
 func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.T) {
 	records := capture.Default(t)
-	const message = "unrecognized kiro-cli OSC 9 notification"
+	const message = unrecognizedNotifyMsg
 	classify := newStatusClassifier(false)
 
 	// One more distinct message than the budget allows.
@@ -128,7 +205,7 @@ func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.
 	// silent stop is never mistaken for "nothing new appeared". This wording must
 	// not be a substring of the drift wording (or vice versa) or the counts above
 	// would double-count it -- the same confusion a log search would hit.
-	const capped = "kiro-cli OSC 9 notification warn budget exhausted"
+	const capped = unrecognizedNotifyCapMsg
 	if got := records.CountLevel(slog.LevelWarn, capped); got != 1 {
 		t.Errorf("budget-exhausted Warn count = %d, want 1", got)
 	}
@@ -184,7 +261,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 	// the unrecognized-notification message, and whether any such record exists.
 	attrOf := func(records *capture.Recorder, level slog.Level, key string) (value string, haveAttr, haveRecord bool) {
 		for _, r := range records.Records() {
-			if r.Level != level || !strings.Contains(r.Message, "unrecognized kiro-cli OSC 9 notification") {
+			if r.Level != level || !strings.Contains(r.Message, unrecognizedNotifyMsg) {
 				continue
 			}
 			haveRecord = true
@@ -200,6 +277,25 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 			}
 		}
 		return "", false, haveRecord
+	}
+
+	// assertOnlyAttrs pins WHICH attrs may describe a notification at a given
+	// level. A needle sweep only catches content it recognizes; an allowlist
+	// catches a content-bearing attr under ANY name and of ANY length.
+	assertOnlyAttrs := func(t *testing.T, records *capture.Recorder, level slog.Level, allowed ...string) {
+		t.Helper()
+		for _, r := range records.Records() {
+			if r.Level != level || !strings.Contains(r.Message, unrecognizedNotifyMsg) {
+				continue
+			}
+			r.Attrs(func(a slog.Attr) bool {
+				if !slices.Contains(allowed, a.Key) {
+					t.Errorf("%s record carries unexpected attr %q = %q; only %v may describe a "+
+						"notification, or child output reaches the log under a new key", level, a.Key, a.Value, allowed)
+				}
+				return true
+			})
+		}
 	}
 
 	t.Run("default logs no notification text at any level", func(t *testing.T) {
@@ -249,7 +345,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 				// The confidentiality assertion proper: no record at any level
 				// carries the text, an excerpt of it, or the unsafe rune.
 				for _, r := range records.Records() {
-					if !strings.Contains(r.Message, "unrecognized kiro-cli OSC 9 notification") {
+					if !strings.Contains(r.Message, unrecognizedNotifyMsg) {
 						continue
 					}
 					r.Attrs(func(a slog.Attr) bool {
@@ -263,6 +359,15 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						return true
 					})
 				}
+				// Any excerpt of the notification, however short, and wherever it
+				// lands: the 11-rune "evilwording" needle above misses a short
+				// prefix, and a device code fits in 9 characters.
+				if logContains(records, "evil") {
+					t.Errorf("log = %q carries a prefix of the notification text with KWEB_LOG_OSC_TEXT off; "+
+						"arbitrary child output may be a token or a device code", records.Messages())
+				}
+				assertOnlyAttrs(t, records, slog.LevelWarn, "message_fingerprint", "message_runes", "hint")
+				assertOnlyAttrs(t, records, slog.LevelDebug, "message_fingerprint", "message_runes")
 				return
 			}
 			if time.Now().After(deadline) {
@@ -291,6 +396,19 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 				if !haveText {
 					t.Fatalf("Debug record carries no message attr with KWEB_LOG_OSC_TEXT on; the opt-in exists to make the text recoverable after a kiro-cli wording bump; log = %q", records.Messages())
 				}
+				// The opt-in ADDS the text; it does not trade the correlation key
+				// away for it. The Warn is what sends an operator here, and with a
+				// warn budget of unrecognizedNotifyCap distinct wordings several
+				// Warn/Debug pairs can be in flight at once, so without a shared
+				// fingerprint the logged text cannot be attributed to the wording
+				// that warned and the wrong classifier string gets updated.
+				warnFP, haveWarnFP, _ := attrOf(records, slog.LevelWarn, "message_fingerprint")
+				debugFP, haveDebugFP, _ := attrOf(records, slog.LevelDebug, "message_fingerprint")
+				if !haveDebugFP {
+					t.Errorf("Debug record carries no message_fingerprint with KWEB_LOG_OSC_TEXT on; the opt-in must ADD the text to the default record, not replace the key that pairs it with its Warn")
+				} else if haveWarnFP && warnFP != debugFP {
+					t.Errorf("Warn message_fingerprint = %q but Debug = %q; one classifier instance must stamp both records identically or an operator cannot pair them", warnFP, debugFP)
+				}
 				// COMPLETE, not truncated: recovering the whole wording is the only
 				// reason to accept the exposure.
 				if full != wantFull {
@@ -305,7 +423,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 					t.Errorf("Warn record carries a message attr (%q) with KWEB_LOG_OSC_TEXT on; notification content must never reach the default stream, which is what makes the opt-in bounded", warnText)
 				}
 				for _, r := range records.Records() {
-					if r.Level != slog.LevelWarn || !strings.Contains(r.Message, "unrecognized kiro-cli OSC 9 notification") {
+					if r.Level != slog.LevelWarn || !strings.Contains(r.Message, unrecognizedNotifyMsg) {
 						continue
 					}
 					r.Attrs(func(a slog.Attr) bool {
@@ -315,6 +433,8 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						return true
 					})
 				}
+				assertOnlyAttrs(t, records, slog.LevelWarn, "message_fingerprint", "message_runes", "hint")
+				assertOnlyAttrs(t, records, slog.LevelDebug, "message_fingerprint", "message_runes", "message")
 				return
 			}
 			if time.Now().After(deadline) {
@@ -323,4 +443,64 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+}
+
+// TestNotifyWarningState_concurrentObserveHonoursTheBudget pins the
+// SYNCHRONIZATION of the warn budget, which every other classifier test
+// exercises single-threaded. registerRoutes wires ONE classifier into
+// terminal.NewSessionManager, and the engine calls it from every session's own
+// event goroutine, so observe's seen-set is shared mutable state across tabs.
+// Nothing asserted that: removing the mutex keeps the whole suite green while a
+// container with a few busy tabs takes a "concurrent map writes" fatal error --
+// unrecoverable, so every session dies at once -- and the budget itself stops
+// holding (more than unrecognizedNotifyCap first-occurrence Warn decisions, or a
+// second budget-exhausted announcement).
+//
+// Counting observe's DECISIONS rather than the emitted records keeps this on the
+// method's own contract, so it needs no logger capture and no serial execution.
+// The rounds loop is the confidence knob, not decoration: one round of
+// unsynchronized writes escapes detection often enough to be useless as a gate
+// (measured: 2 of 6 runs failed at one round), while 50 rounds failed 6 of 6 and
+// still costs ~10ms. Red-green verified against a mutated copy of routes.go with
+// the lock removed.
+func TestNotifyWarningState_concurrentObserveHonoursTheBudget(t *testing.T) {
+	const (
+		distinct   = unrecognizedNotifyCap * 4 // more distinct wordings than the budget
+		perMessage = 8                         // several tabs report the same wording at once
+		rounds     = 50                        // see the doc comment: the confidence knob
+	)
+	for range rounds {
+		state := notifyWarningState{warned: make(map[string]struct{}, unrecognizedNotifyCap)}
+		var warnFirsts, warnCappeds atomic.Int64
+		var release, finished sync.WaitGroup
+		release.Add(1)
+		for i := range distinct {
+			for range perMessage {
+				finished.Add(1)
+				go func(i int) {
+					defer finished.Done()
+					release.Wait() // start every caller at once, so the writes really overlap
+					warnFirst, warnCapped := state.observe(fmt.Sprintf("wording variant %d", i))
+					if warnFirst {
+						warnFirsts.Add(1)
+					}
+					if warnCapped {
+						warnCappeds.Add(1)
+					}
+				}(i)
+			}
+		}
+		release.Done()
+		finished.Wait()
+
+		if got := warnFirsts.Load(); got != unrecognizedNotifyCap {
+			t.Fatalf("first-occurrence Warn decisions = %d, want exactly %d (the cap); a duplicate means one wording warns twice, a shortfall means a wording never warns", got, unrecognizedNotifyCap)
+		}
+		if got := warnCappeds.Load(); got != 1 {
+			t.Fatalf("budget-exhausted Warn decisions = %d, want exactly 1 (announced once, whatever the concurrency)", got)
+		}
+		if got := len(state.warned); got != unrecognizedNotifyCap {
+			t.Fatalf("seen-set size = %d, want %d; the set is keyed by child output, so exceeding the cap is an unbounded-memory path", got, unrecognizedNotifyCap)
+		}
+	}
 }

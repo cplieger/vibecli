@@ -407,9 +407,9 @@ EXPOSE 9848
 # FOREGROUND path before the server binds; it satisfies the smoke-harness
 # sizing rule (tests/image-smoke.conf SMOKE_TIMEOUT 1260 = 1200 + two 30s
 # probe intervals). The derivation below sums the explicit foreground timeout
-# ALLOWANCES only — it is not a ceiling: untimed local work (sha-256
-# verification, unzip; the binary promotion is an O(1) same-filesystem rename)
-# runs outside the sums. Single-attempt allowance-sum: kiro-cli download (curl
+# ALLOWANCES only — it is not a ceiling: untimed local work (the binary
+# promotion is an O(1) same-filesystem rename) runs outside the sums.
+# Single-attempt allowance-sum: kiro-cli download (curl
 # --max-time 3600, the absolute backstop behind --speed-limit/--speed-time stall
 # detection) + install.sh (120, +15 kill-after) + version/settings probes
 # (150: four --version checks on the worst-case UPGRADE boot — the drift check,
@@ -421,15 +421,16 @@ EXPOSE 9848
 # nothing to probe — plus SIX settings
 # calls, the five applied after
 # promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
-# assertion — at 10s each, +5s kill-after) + optional APT_PACKAGES (apt-get
+# assertion — at 10s each, +5s kill-after) + local archive work (sha256sum 300,
+# +15 kill-after; unzip 600, +15 kill-after) + optional APT_PACKAGES (apt-get
 # update 300, +30 kill-after; apt-cache pkgnames 60, +10 kill-after; apt-get
-# install 600, +30 kill-after) = 4915s with
-# APT_PACKAGES, 3885s without — so the 20m (1200s) start-period does NOT cover
+# install 600, +30 kill-after) = 5845s with
+# APT_PACKAGES, 4815s without — so the 20m (1200s) start-period does NOT cover
 # even the single-attempt path. The download also runs with --retry 3 bounded by
 # --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
 # begun just under the limit still runs to --max-time 3600, putting the download
-# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 10315s with
-# APT_PACKAGES (≈ 9285s without).
+# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 11245s with
+# APT_PACKAGES (≈ 10215s without).
 #
 # THE BUDGETS ARE DELIBERATELY LEFT BELOW THAT SUM (decided 2026-07). The two
 # budgets protect different things and only one has teeth:
@@ -446,7 +447,7 @@ EXPOSE 9848
 #     minutes. A smoke boot that exceeds this start-period means something is
 #     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not
 #     a false negative on a healthy image.
-# Raising both budgets to cover the ~10315s retry envelope was considered and
+# Raising both budgets to cover the ~11245s retry envelope was considered and
 # rejected: it would make a genuinely hung CI job burn ~3 hours of Actions time
 # before failing, which is a real recurring cost against a theoretical worst case
 # (CI cost matters on the free plan; validation is meant to stay minutes, not

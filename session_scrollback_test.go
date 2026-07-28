@@ -1,0 +1,123 @@
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+)
+
+// resumeAck frame offsets (the engine's encodeResumeAck layout):
+// [0] msg type, [1:9] ack, [9:17] epoch, [17:25] committed, [25:33] oldestIndex.
+const resumeAckMsgType byte = 2
+
+const (
+	resumeAckMinLen        = 33
+	resumeAckCommittedAt   = 17
+	resumeAckOldestIndexAt = 25
+)
+
+// TestSessionScrollbackCapacityWiredIntoSessionFactory pins the LAST session
+// option nothing asserted: terminal.WithScrollbackCapacity(5000) in
+// registerRoutes' factory. The engine's own default is 1000 lines, so deleting
+// the option silently cuts retained history to a fifth while every other test
+// stays green -- a reconnect then restores a truncated /chat transcript, which
+// is the one thing this app's in-memory-only session model has to get right
+// (there is no on-disk store to fall back on).
+//
+// The observable is the engine's resumeAck frame, which carries the absolute
+// bounds of retained history (committed, oldestIndex) -- the same pair the
+// browser client uses to detect an eviction gap. The child emits more lines
+// than the engine default retains but fewer than the app's policy does, so
+// zero eviction is a property only the wired option produces (verified by
+// deleting it: oldestIndex then trails committed by exactly the 1000-line
+// default and only this test fails).
+//
+// haveThrough is set far in the future so the server replays no history: this
+// exchange is only asked for the bounds. Polling re-sends the resume until the
+// scrollback has committed enough lines, rather than sleeping a guessed
+// interval.
+func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
+	const (
+		emitted       = 2500 // more than the engine's 1000-line default, fewer than the app's 5000
+		wantCommitted = 2000
+	)
+	deps := newTestDeps(true)
+	deps.cmd = []string{"/bin/sh", "-c", fmt.Sprintf(
+		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted)}
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
+	id, err := mgr.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	quietTeardown(t, deps)
+
+	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
+	t.Cleanup(srv.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx,
+		"ws"+strings.TrimPrefix(srv.URL, "http")+"/ws?session="+id,
+		&websocket.DialOptions{HTTPClient: srv.Client()})
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial /ws: %v", err)
+	}
+	defer conn.CloseNow()
+	// The window frame plus modes/title easily exceeds coder/websocket's 32 KiB
+	// default read limit on a 120-column screen; without this the library closes
+	// the connection mid-exchange and the assertion never runs.
+	conn.SetReadLimit(1 << 22)
+
+	resume := append([]byte{0x00}, []byte(
+		`{"type":"resume","sessionId":"`+id+`","haveThrough":1000000000,"protocolVersion":4}`)...)
+
+	deadline := time.Now().Add(20 * time.Second)
+	var committed, oldest uint64
+	for {
+		if err := conn.Write(ctx, websocket.MessageBinary, resume); err != nil {
+			t.Fatalf("write resume control: %v", err)
+		}
+		if c, o, ok := readResumeAckBounds(ctx, t, conn); ok {
+			committed, oldest = c, o
+			if committed >= wantCommitted {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scrollback never committed %d lines (committed=%d oldest=%d); the child must emit %d lines",
+				wantCommitted, committed, oldest, emitted)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if oldest != 0 {
+		t.Errorf("oldest retained scrollback index = %d with only %d lines committed (retained %d), want 0 -- terminal.WithScrollbackCapacity(5000) is missing from the session factory, so the engine's 1000-line default evicts a reconnecting tab's transcript",
+			oldest, committed, committed-oldest)
+	}
+}
+
+// readResumeAckBounds reads frames until the engine's resumeAck arrives and
+// returns the absolute bounds of retained history it carries.
+func readResumeAckBounds(ctx context.Context, t *testing.T, conn *websocket.Conn) (committed, oldest uint64, ok bool) {
+	t.Helper()
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for {
+		_, msg, err := conn.Read(readCtx)
+		if err != nil {
+			return 0, 0, false
+		}
+		if len(msg) >= resumeAckMinLen && msg[0] == resumeAckMsgType {
+			return binary.LittleEndian.Uint64(msg[resumeAckCommittedAt:]),
+				binary.LittleEndian.Uint64(msg[resumeAckOldestIndexAt:]), true
+		}
+	}
+}

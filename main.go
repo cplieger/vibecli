@@ -130,6 +130,26 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 	return policy
 }
 
+// parseBoolEnv reads a boolean env var, accepting the same vocabulary as
+// envx.Bool (true/1/yes/on, false/0/no/off, case-insensitive) and reporting
+// whether the value parsed. It exists so an unparseable value is warned about
+// by NAME only: envx.Bool logs the RAW value on its malformed path, and a
+// compose expansion mistake could put a credential there, so the raw string
+// never reaches the log (see parseTrustedProxies for the same reasoning).
+// An unset or blank value is not a parse failure — it yields the fallback.
+func parseBoolEnv(key string, fallback bool) (value, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(envx.String(key, ""))) {
+	case "":
+		return fallback, true
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off":
+		return false, true
+	default:
+		return fallback, false
+	}
+}
+
 // sessionCommand builds the per-session PTY command: `kiro-cli chat` behind a
 // sign-in guard. When no identity is present (`whoami` exits non-zero, verified
 // against the pinned build: 0 logged in, 1 not), the guard first runs
@@ -262,7 +282,17 @@ func main() {
 	// the Debug record, which is why it warns at startup rather than logging
 	// silently: raising KWEB_LOG_LEVEL alone must not widen what content
 	// reaches the log store.
-	logOSCText := envx.Bool("KWEB_LOG_OSC_TEXT", false)
+	//
+	// Parsed locally rather than with envx.Bool: envx warns with the RAW value
+	// on an unparseable boolean, and a compose expansion mistake could put a
+	// secret on this key -- the same reason KWEB_LOG_LEVEL is read as a string
+	// and parsed here. Unparseable falls back to false (off), the fail-closed
+	// direction.
+	logOSCText, logOSCTextOK := parseBoolEnv("KWEB_LOG_OSC_TEXT", false)
+	if !logOSCTextOK {
+		slog.Warn("unparseable KWEB_LOG_OSC_TEXT; keeping notification text out of the log (the default)",
+			"hint", "use true or false")
+	}
 	if logOSCText {
 		slog.Warn("KWEB_LOG_OSC_TEXT is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
 			"hint", "leave it off outside an active diagnostic session; the default records a content-free fingerprint that still distinguishes kiro-cli wording drift")
@@ -423,8 +453,19 @@ type toolsRuntime struct {
 // field entirely). Named once because startTools reports it from several
 // distinct failures — an unusable config path, a failed engine start, a
 // reconcile that could not be enqueued — and a health consumer keys on the
-// literal.
-const toolsStateDegraded = "degraded"
+// literal. The same reasoning names the other two verdicts of the same field:
+// "ok" is written from two functions since awaitBootConvergence was extracted,
+// and "syncing" is the third documented value of the enum.
+const (
+	// toolsStateSyncing is the verdict while the boot convergence pass runs
+	// (the window in which POST /api/sessions answers 503 "tools installing").
+	toolsStateSyncing = "syncing"
+	// toolsStateOK is the converged verdict, reported both when the boot
+	// reconcile finishes clean and when an empty manifest leaves nothing to
+	// converge.
+	toolsStateOK       = "ok"
+	toolsStateDegraded = "degraded"
+)
 
 // degradedRuntime is the engine-less runtime a startTools failure returns:
 // engine and syncing stay nil (no /api/tools mount, sessions ungated) while
@@ -499,7 +540,7 @@ func startTools(cfg baseTools) toolsRuntime {
 
 	var syncing atomic.Bool
 	var verdict atomic.Value // string: syncing | ok | degraded
-	verdict.Store("syncing")
+	verdict.Store(toolsStateSyncing)
 	finish := func(v string) {
 		verdict.Store(v)
 		syncing.Store(false)
@@ -512,7 +553,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		finish(toolsStateDegraded)
 		warnIfNoLSPEnabled(eng)
 	case job == nil: // empty manifest: nothing to converge
-		finish("ok")
+		finish(toolsStateOK)
 		warnIfNoLSPEnabled(eng)
 	default:
 		syncing.Store(true)
@@ -552,13 +593,31 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 	case werr != nil:
 		slog.Warn("tools: boot reconcile wait failed", "error", werr)
 		finish(toolsStateDegraded)
+	case final.State == toolbelt.JobCancelled:
+		// Cancellation is not a fault: toolbelt cancels the active job from
+		// Engine.Close (the shutdown path this app takes on SIGTERM and on the
+		// Serve-error path), and otherwise only on an explicit operator
+		// CancelJob. Reporting it at Warn as "degraded" is the same false
+		// broken-install alert the session-side WithOnProcessExit hook gates
+		// away on every deploy -- and a restart during a first-boot install is
+		// routine, since the install window is budgeted at 20 minutes by the
+		// image HEALTHCHECK and bounded only by toolbelt's 30-minute job
+		// timeout. The verdict still degrades (the pass did not converge), but
+		// the RECORD stays Info. The post-convergence tail is skipped: on the
+		// shutdown path Update() can only fail with "engine shutting down" and
+		// the LSP nudge has no reader, and after an operator cancel neither is
+		// wanted either.
+		slog.Info("tools: boot convergence cancelled; not a tool failure",
+			"hint", "expected during shutdown (the engine cancels the running job on Close) or after an explicit tools-API job cancel")
+		finish(toolsStateDegraded)
+		return
 	case final.State != toolbelt.JobDone:
 		slog.Warn("tools: boot reconcile finished degraded",
 			"state", final.State, "error", final.Error)
 		finish(toolsStateDegraded)
 	default:
 		slog.Info("tools: boot reconcile converged")
-		finish("ok")
+		finish(toolsStateOK)
 	}
 	if _, uerr := eng.Update(); uerr != nil {
 		slog.Warn("tools: update pass not enqueued", "error", uerr)
@@ -628,15 +687,16 @@ func apiNoStore(next http.Handler) http.Handler {
 
 // buildHandler wraps the route mux in web-terminal-kiro's middleware stack via
 // webhttp.Chain. Chain(h, A, B, C, D) == A(B(C(D(h)))), so the first entry is
-// the outermost wrapper; a request flows Logging -> Recoverer ->
+// the outermost wrapper; a request flows Logging -> Recoverer -> wsAttachLog ->
 // SecurityHeaders -> apiNoStore -> host allowlist -> CrossOriginProtection ->
 // mux, and the response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
 //     403. Its four policies are configured, and each justified, at the call
-//     sites in the body below: the stream skips (/ws upgrades and the SSE
-//     stream emit no access lines), ProbeLogLevel for /api/health, the
+//     sites in the body below: the stream skips (an ADMITTED /ws upgrade or SSE
+//     stream emits no access line; one rejected by the Host allowlist still
+//     does, since it never becomes a stream), ProbeLogLevel for /api/health, the
 //     WithTemplatePathsUnder redaction that keeps a live session id out of
 //     the token-bearing /api/sessions/ subtree's lines, and WithClientIP over
 //     the TRUSTED_PROXIES set (see parseTrustedProxies for the trust-nothing
@@ -644,6 +704,12 @@ func apiNoStore(next http.Handler) http.Handler {
 //     skipped stream paths.
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
 //     so the access line records the 500, not the recorder's default 200).
+//   - wsAttachLog — one Info record per /ws upgrade attempt, at request START
+//     (see wsAttachLog: the access logger skips admitted streams and the engine
+//     logs no attach, so the request that presents the session capability token
+//     would otherwise be the only unrecorded request on this server). Outside
+//     the host/origin gates so a rejected Host or rejected origin still leaves a
+//     record, inside Logging so the request id matches the access log's.
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
 //     Referrer-Policy) plus Cross-Origin-Opener-Policy, a Permissions-Policy
 //     denying the browser features a terminal never uses, and the app's
@@ -679,9 +745,20 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// request that arrives WITHOUT them (the classic reverse-proxy
 			// misconfiguration: no `proxy_set_header Upgrade`) is logged with the
 			// 426 the engine's websocket.Accept writes.
-			webhttp.WithSkipPaths(terminal.SessionEventsPath),
+			// Skip only a request that will actually REACH the stream handler.
+			// The skip is decided before the chain runs (Logging returns early
+			// without a StatusRecorder), so an unconditional skip also swallows
+			// the 403 hostPolicy.Middleware writes below -- WriteError logs
+			// nothing itself and the engine handler never runs -- leaving a
+			// wrong-Host or DNS-rebound attempt on this unauthenticated PTY with
+			// no record anywhere, the same silence this predicate exists to
+			// remove for the non-upgrade 426. Allows is nil- and inactive-safe
+			// (it returns true), so an unset KWEB_ALLOWED_HOSTS keeps today's
+			// behavior exactly.
 			webhttp.WithSkipFunc(func(r *http.Request) bool {
-				return r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r)
+				stream := r.URL.Path == terminal.SessionEventsPath ||
+					(r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r))
+				return stream && hostPolicy.Allows(r)
 			}),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
@@ -709,6 +786,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			webhttp.WithClientIP(trustedProxies...),
 		),
 		webhttp.Recoverer(webhttp.WithRecoverLogger(slog.Default())),
+		wsAttachLog(trustedProxies),
 		webhttp.SecurityHeaders(
 			webhttp.WithCSP(csp),
 			// Cross-Origin-Opener-Policy: same-origin severs window.opener for
@@ -747,6 +825,38 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)
+}
+
+// wsAttachMsg is the message of the /ws attach record wsAttachLog emits. A
+// const so a test can pin the exact wording without a second copy of the
+// literal (goconst) drifting from this one.
+const wsAttachMsg = "terminal attach attempt"
+
+// wsAttachLog records one line per /ws UPGRADE attempt. The access logger
+// deliberately skips those (a hijacked stream would log a bogus 200 with an
+// hours-long duration), and neither the engine's WebSocketHandler nor the
+// per-session Handler logs an attach — the engine's "process started" line is
+// emitted at CREATE time by the eager start, not on attach. So without this the
+// request that PRESENTS the session capability token is the only request to this
+// server with no record at all: an id leaked through a fronting proxy's access
+// log can be replayed with nothing to show an operator afterwards (CWE-778).
+// Logged at request start, so the line exists for a rejected Host / rejected
+// origin / unknown-session close too; the id is LogID-truncated, the same
+// treatment the session logger and the engine give it. The session query param
+// is attacker-chosen (LogID only truncates), so it stays an attribute value the
+// slog handler quotes and is never interpolated into the message.
+func wsAttachLog(trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r) {
+				slog.Info(wsAttachMsg,
+					"session", terminal.LogID(r.URL.Query().Get("session")),
+					"client_ip", webhttp.ClientIP(r, trustedProxies...),
+					"request_id", webhttp.RequestIDFromContext(r.Context()))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cplieger/slogx"
 	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
@@ -165,14 +166,37 @@ func logContains(records *capture.Recorder, s string) bool {
 	return false
 }
 
+// firstAttrValue returns the value of the first occurrence of key across the
+// captured records, and whether any record carried it. Attribute equality is
+// what an access-log field assertion needs; the rendered-line substring form
+// also accepts a value that merely STARTS with the expectation.
+func firstAttrValue(records *capture.Recorder, key string) (string, bool) {
+	for _, r := range records.Records() {
+		var value string
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == key {
+				value, found = a.Value.String(), true
+				return false
+			}
+			return true
+		})
+		if found {
+			return value, true
+		}
+	}
+	return "", false
+}
+
 // captureTextLog swaps the process-global default logger for a text handler
 // writing into the returned buffer and restores the previous logger on
 // cleanup. buildHandler binds WithLogger(slog.Default()) at CONSTRUCTION, so
 // the capture must be installed before the handler is built; and because the
 // default logger is process-global, callers must not use t.Parallel.
 //
-// A TEXT handler at the DEFAULT level, not the slogx/capture recorder this file
-// uses elsewhere, and that is load-bearing: two assertions here turn on level
+// A TEXT handler at the DEFAULT level — slogx's, the same constructor main.go
+// installs through slogx.Setup — not the slogx/capture recorder this file uses
+// elsewhere, and that is load-bearing: two assertions here turn on level
 // FILTERING rather than on capture. TestBuildHandlerSkipsAccessLogForStreams
 // proves a HEALTHY /api/health probe never reaches the shipped stream, which is
 // only true because the handler drops the Debug record ProbeLogLevel demotes it
@@ -183,8 +207,13 @@ func logContains(records *capture.Recorder, s string) bool {
 func captureTextLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
+	// The fleet-standard handler constructor main.go installs through
+	// slogx.Setup: text/logfmt, Info by default, UTC-normalized timestamps.
+	// The returned LevelVar is unused -- these tests assert against the
+	// DEFAULT level, which is what makes the probe-demotion drop observable.
+	handler, _ := slogx.NewHandler(slogx.Options{Output: &buf})
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	slog.SetDefault(slog.New(handler))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	return &buf
 }
@@ -204,14 +233,16 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 		xffIP  = "203.0.113.7" // the "real" client behind a proxy
 	)
 	cases := []struct {
-		name    string
-		trusted []*net.IPNet
-		wantIP  string
+		name       string
+		trusted    []*net.IPNet
+		wantIP     string
+		mustNotLog string // a value no record may carry, in any attr
 	}{
 		{
-			name:    "unset trusts nothing: client_ip is the socket peer, XFF ignored",
-			trusted: nil,
-			wantIP:  peerIP,
+			name:       "unset trusts nothing: client_ip is the socket peer, XFF ignored",
+			trusted:    nil,
+			wantIP:     peerIP,
+			mustNotLog: xffIP,
 		},
 		{
 			name:    "trusted peer resolves the real client from X-Forwarded-For",
@@ -221,7 +252,7 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			buf := captureTextLog(t)
+			records := capture.Default(t)
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
@@ -231,14 +262,29 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/probe", http.NoBody)
 			req.Header.Set("X-Forwarded-For", xffIP)
 			// Synchronous ServeHTTP: the deferred access-log line fires before it
-			// returns, so buf is populated with no goroutine race. The CSP value
-			// is irrelevant to client-IP resolution; a fixed policy keeps the
+			// returns, so the record is captured with no goroutine race. The CSP
+			// value is irrelevant to client-IP resolution; a fixed policy keeps the
 			// stack shape production-true.
 			buildHandler(mux, tc.trusted, "default-src 'self'", nil).ServeHTTP(httptest.NewRecorder(), req)
 
-			want := "client_ip=" + tc.wantIP
-			if !strings.Contains(buf.String(), want) {
-				t.Errorf("access log = %q, want it to contain %q", buf.String(), want)
+			got, ok := firstAttrValue(records, "client_ip")
+			if !ok {
+				t.Fatalf("no access-log record carries a client_ip attr; log = %q", records.Messages())
+			}
+			// EQUALITY, not containment: the field is the resolved HOST, so the old
+			// host:port "remote" form (or a value with the forwarded chain appended)
+			// has the expected IP as a PREFIX -- a substring check on the rendered
+			// line accepts both, and client_ip is the last attr on the line.
+			if got != tc.wantIP {
+				t.Errorf("access log client_ip = %q, want exactly %q", got, tc.wantIP)
+			}
+			// The spoof-safe half, which the positive check cannot make: with
+			// nothing trusted, the client-supplied header value is
+			// attacker-controlled and must not appear in the record at all -- not as
+			// client_ip, and not as some extra forwarded-for attr a library bump
+			// starts recording (CWE-117).
+			if tc.mustNotLog != "" && logContains(records, tc.mustNotLog) {
+				t.Errorf("access log = %q carries the untrusted X-Forwarded-For value %q; an attacker-supplied string must not enter the aggregated log stream", records.Messages(), tc.mustNotLog)
 			}
 		})
 	}

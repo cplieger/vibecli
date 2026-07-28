@@ -49,7 +49,7 @@ func main() {
 // compatibility verdict (exit 1, "bump a pin").
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	if clientRev <= 0 || clientMinServer <= 0 {
-		fmt.Fprintln(stderr, "wirecheck: -client-rev and -client-min-server are required positive integers")
+		fmt.Fprintln(stderr, "ERROR wire-floor-gate-usage: -client-rev and -client-min-server are required positive integers (the Dockerfile's extraction from the vendored engine artifact's src/wire-compatibility.ts is broken — fix the gate, do not bump a pin)")
 		return 2
 	}
 	if reason := terminal.WirePairIncompatibility(

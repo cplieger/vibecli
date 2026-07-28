@@ -98,7 +98,11 @@ fatal() {
 # deletes the staging tree: a REGULAR executable file, not a symlink. -f/-x both
 # FOLLOW symlinks, so a link into $stage passes them, is mv'd to its destination AS
 # A LINK, and dangles the moment the trap fires. Single home for the rule so the
-# four sites that depend on it cannot drift.
+# four staging-tree sites that depend on it cannot drift -- and the four $BIN sites
+# (needs_kiro_cli_install, the failed-install fallback, the kiro_setting block and
+# the readiness version probe) share it too: a bare -x is also true for a DIRECTORY,
+# which the quarantine sweep passes (a 0755 dir has no group/other write bit) and
+# which would otherwise spend ~60s of foreground boot allowance trying to execute it.
 is_self_contained_executable() {
   [ ! -L "$1" ] && [ -f "$1" ] && [ -x "$1" ]
 }
@@ -718,6 +722,37 @@ for existing in "$TOOLS/bin"/kiro-cli*; do
       "$existing" "${existing_mode:-unknown}" >&2
   fi
 done
+# Directory modes and the kiro-cli loop above still leave every OTHER binary in
+# $TOOLS/bin unexamined -- and this dir LEADS PATH for the server, every PTY session
+# and root (Dockerfile ENV PATH). The argument the loop above makes applies verbatim
+# to them: a group/other-writable file is rewritable in place with no write access to
+# the directory, and the toolbelt engine really does leave group-writable modes on
+# some volumes. Tighten what we can. Warn, never fatal, and never quarantine: these
+# files are the engine's, it reinstalls what is MISSING, and deleting the operator's
+# own tools is the productivity harm the dev-box failure posture forbids.
+# stat -L / chmod deliberately DEREFERENCE: $TOOLS/bin is mostly symlinks into the
+# engine's opt/<tool>/<ver>/ trees, and the target's mode is the one that decides
+# whether a foreign host user can rewrite what root executes.
+loose_tool_bins=0
+for tool_bin in "$TOOLS/bin"/*; do
+  # An unmatched glob, or a dangling symlink -- nothing that can be executed.
+  [ -e "$tool_bin" ] || continue
+  # Already handled, with its own stricter symlink rule, by the loop above.
+  case "${tool_bin##*/}" in kiro-cli*) continue ;; esac
+  tool_bin_mode=$(stat -Lc '%a' "$tool_bin" 2>/dev/null) || tool_bin_mode=""
+  if [ -n "$tool_bin_mode" ] && [ $((8#$tool_bin_mode & 0022)) -eq 0 ]; then
+    continue
+  fi
+  loose_tool_bins=$((loose_tool_bins + 1))
+  if ! chmod go-w "$tool_bin"; then
+    printf 'level=warn msg="failed to strip group/other write bits from a binary on the first-on-PATH tools tree; a foreign host user could rewrite it in place and this container runs it as root" path="%s" mode=%s component=entrypoint\n' \
+      "$tool_bin" "${tool_bin_mode:-unknown}" >&2
+  fi
+done
+if [ "$loose_tool_bins" -ne 0 ]; then
+  printf 'level=warn msg="tightened group/other-writable binaries on the first-on-PATH tools tree; they were rewritable in place by any host user in their group" dir="%s" count=%d component=entrypoint\n' \
+    "$TOOLS/bin" "$loose_tool_bins" >&2
+fi
 if [ "$tools_tree_was_writable" -eq 1 ]; then
   # The directories are private now, but anything already inside them was
   # writable by another host user, so its --version answer proves nothing.
@@ -899,8 +934,25 @@ install_kiro_cli() (
   # Verify SHA-256 per arch: KIRO_CLI_SHA256 (x86_64) / KIRO_CLI_SHA256_ARM64
   # (aarch64), both from the install manifest and kept in lockstep with
   # KIRO_CLI_VERSION by Renovate (one grouped PR moves all three literals).
-  local actual expected
-  actual=$(sha256sum "$zip" | awk '{print $1}')
+  local actual expected sha_out sha_rc
+  # Bounded like every other external command in this blocking foreground path:
+  # no listener exists yet, so a wedged read (failing overlay store, IO pressure)
+  # would otherwise stall boot forever with no diagnostic, and restart policies
+  # never fire because nothing exits. The status is captured SEPARATELY from the
+  # awk pipeline for the reason kiro_cli_version documents: awk exits 0 whatever
+  # its producer did, so piping straight into it loses a TERM/KILL or an EIO and
+  # renders the failure as an empty actual= in the mismatch error below.
+  sha_out=$(timeout --signal=TERM --kill-after=15s 300s sha256sum "$zip")
+  sha_rc=$?
+  if [ "$sha_rc" -ne 0 ]; then
+    if [ "$sha_rc" -eq 124 ] || [ "$sha_rc" -eq 137 ]; then
+      printf 'level=error msg="sha256sum of the kiro-cli zip exceeded its 300s deadline and was terminated (wedged or very slow storage?)" rc=%d component=entrypoint\n' "$sha_rc" >&2
+    else
+      printf 'level=error msg="failed to read the kiro-cli zip for sha256 verification; cannot verify the pinned digest" path="%s" rc=%d component=entrypoint\n' "$zip" "$sha_rc" >&2
+    fi
+    return 1
+  fi
+  actual=$(printf '%s\n' "$sha_out" | awk '{print $1}')
   printf 'level=info msg="kiro-cli zip downloaded" sha256=%s url="%s" component=entrypoint\n' "$actual" "$zip_url" >&2
   case "$arch" in
     x86_64-linux) expected="$KIRO_CLI_SHA256" ;;
@@ -913,8 +965,16 @@ install_kiro_cli() (
   fi
   printf 'level=info msg="kiro-cli SHA-256 verified against pinned hash" arch=%s component=entrypoint\n' "$arch" >&2
 
-  if ! unzip -q "$zip" -d "$tmpdir"; then
-    printf 'level=error msg="failed to extract kiro-cli zip" component=entrypoint\n' >&2
+  # Same deadline reasoning as the sha256sum above: half a gigabyte written
+  # through the container layer, before any listener exists.
+  local unzip_rc=0
+  timeout --signal=TERM --kill-after=15s 600s unzip -q "$zip" -d "$tmpdir" || unzip_rc=$?
+  if [ "$unzip_rc" -ne 0 ]; then
+    if [ "$unzip_rc" -eq 124 ] || [ "$unzip_rc" -eq 137 ]; then
+      printf 'level=error msg="unzip of the kiro-cli archive exceeded its 600s deadline and was terminated (wedged or very slow storage?)" rc=%d component=entrypoint\n' "$unzip_rc" >&2
+    else
+      printf 'level=error msg="failed to extract kiro-cli zip" rc=%d component=entrypoint\n' "$unzip_rc" >&2
+    fi
     return 1
   fi
 
@@ -1060,7 +1120,18 @@ install_kiro_cli() (
   # Past this point the new set is what recovery keeps, so a term failure can only be the
   # warn it already is.
   if [ ! -e "$term_sidecar" ]; then
-    printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?)" sidecar="kiro-cli-term" component=entrypoint\n' >&2
+    # This pin ships no term dispatcher, so any copy on the volume belongs to an
+    # older version: it is a RETIRED name, and the retired-name sweep below skips
+    # kiro-cli-term unconditionally, so reclaim it here or it stays first on PATH
+    # (unpinned, wrong version) for the container's lifetime. Only THIS branch can
+    # prove the name is retired for this pin: an invalid staged term or a failed mv
+    # (below) may coexist with a good pinned copy already in place, and this path
+    # holds no version fact about it.
+    printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?); removing any copy left by an older version" sidecar="kiro-cli-term" component=entrypoint\n' >&2
+    if ! rm -rf "$TOOLS/bin/kiro-cli-term"; then
+      printf 'level=warn msg="failed to remove a kiro-cli-term dispatcher left by an older version; an unpinned copy stays first on PATH" path="%s" component=entrypoint\n' \
+        "$TOOLS/bin/kiro-cli-term" >&2
+    fi
   elif ! is_self_contained_executable "$term_sidecar"; then
     printf 'level=warn msg="install.sh produced an invalid optional kiro-cli-term sidecar dispatcher; skipping promotion" src="%s" sidecar="kiro-cli-term" component=entrypoint\n' \
       "$term_sidecar" >&2
@@ -1119,7 +1190,7 @@ kiro_cli_dispatcher_set_complete() {
 # leave exactly that state, and the version-only predicate repaired none of them:
 # it returned 1 forever while every session exited at chat).
 needs_kiro_cli_install() {
-  if [ ! -x "$BIN" ]; then
+  if ! is_self_contained_executable "$BIN"; then
     return 0
   fi
   local current
@@ -1186,10 +1257,19 @@ if needs_kiro_cli_install; then
   # allowance for a string that appears in one log line.
   kiro_cli_previous="$kiro_cli_measured_version"
   if ! install_kiro_cli; then
-    if [ -x "$BIN" ]; then
+    if is_self_contained_executable "$BIN"; then
       kiro_cli_update_failed=1
-      printf 'level=warn msg="kiro-cli update failed; keeping the version already on the volume and continuing boot (the pin is NOT in force until an update succeeds)" installed=%s pinned=%s component=entrypoint\n' \
-        "${kiro_cli_previous:-unknown}" "$KIRO_CLI_VERSION" >&2
+      if [ "$kiro_cli_previous" = "$KIRO_CLI_VERSION" ]; then
+        # Not a version fallback: $BIN was already at the pin and the install was a
+        # REPAIR of an incomplete dispatcher set (needs_kiro_cli_install's third
+        # trigger). Naming it as a kept older version sends the operator at the pin
+        # literals instead of at the sidecar/marker the readiness section reports on.
+        printf 'level=warn msg="kiro-cli repair install failed; the binary already at the pin stays in place, but the dispatcher set it belongs to was not completed by this pin" installed=%s pinned=%s component=entrypoint\n' \
+          "$kiro_cli_previous" "$KIRO_CLI_VERSION" >&2
+      else
+        printf 'level=warn msg="kiro-cli update failed; keeping the version already on the volume and continuing boot (the pin is NOT in force until an update succeeds)" installed=%s pinned=%s component=entrypoint\n' \
+          "${kiro_cli_previous:-unknown}" "$KIRO_CLI_VERSION" >&2
+      fi
     else
       printf 'level=warn msg="kiro-cli install failed and no previous version is present; web UI starts but the terminal errors until kiro-cli is present" component=entrypoint\n' >&2
     fi
@@ -1275,7 +1355,7 @@ kiro_setting() {
 # still re-assert it — and a failure there means the binary may replace itself,
 # so readiness is withheld below rather than merely warned about.
 kiro_cli_pin_enforced=1
-if [ -x "$BIN" ]; then
+if is_self_contained_executable "$BIN"; then
   kiro_setting telemetry.enabled false
   # app.disableAutoupdates is not a preference: it is what keeps the running
   # binary from replacing itself and invalidating the verified sha. Unlike the
@@ -1326,7 +1406,7 @@ fi
 # Resolve the on-disk version ONCE: a second probe here would add another 10s
 # to the foreground boot allowance the Dockerfile HEALTHCHECK comment sums.
 kiro_cli_installed=""
-if [ -x "$BIN" ]; then
+if is_self_contained_executable "$BIN"; then
   kiro_cli_installed=$(kiro_cli_version "$BIN")
 fi
 # Reclaim superseded agent runtimes now that the version that will actually run is

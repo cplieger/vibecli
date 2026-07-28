@@ -357,6 +357,19 @@ const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab sta
 // the other.
 const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set KWEB_LOG_LEVEL=debug)"
 
+// recognizedNotifyMsg is the POSITIVE half of the classifier trace. Without it
+// the classifier is observable only when it fails to match, so a debug session
+// that sees no classifier records cannot tell "kiro-cli emitted no OSC 9
+// notification at all" (the notifier's focus gate, the engine's DEC 1004
+// unfocused pin, or kiro-cli's TERM_PROGRAM allowlist) from "notifications
+// mapped fine, so the dot is lost downstream" — two different owners. That
+// negative is the only signal that separates them, and it is what still answers
+// the question once the unrecognizedNotifyCap warn budget is spent. Deliberately
+// shares no substring with unrecognizedNotifyMsg so a log search or a test
+// matching one never matches the other. The value logged is the matched literal
+// from the closed switch in newStatusClassifier, never arbitrary child output.
+const recognizedNotifyMsg = "kiro-cli OSC 9 notification mapped to a tab status"
+
 // unrecognizedNotifyCap bounds how many DISTINCT unrecognized notifications are
 // promoted to Warn. It bounds two things, and the second is why a cap is
 // mandatory rather than tidy: log volume (at most this many lines per container
@@ -542,18 +555,24 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // working/idle from output activity).
 //
 // logText is the KWEB_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
-// whether the notification's TEXT may be logged at all. Off, every record is
-// content-free metadata (see notifyFingerprinter); on, the Debug arm — and only
-// the Debug arm — carries the full sanitized text. Notification content never
-// reaches the default Warn stream in either mode.
+// whether an UNRECOGNIZED notification's TEXT may be logged at all. Off, every
+// unrecognized-arm record is content-free metadata (see notifyFingerprinter);
+// on, the Debug arm — and only the Debug arm — carries the full sanitized text,
+// alongside the same metadata so the record still pairs with its Warn.
+// Notification content never reaches the default Warn stream in either mode. The
+// recognized arms' Debug trace (recognizedNotifyMsg) is outside this lever: it
+// logs the matched literal from the closed switch below, which is this app's own
+// compile-time string and not the arbitrary child bytes logText guards.
 func newStatusClassifier(logText bool) func(string) (string, bool) {
 	warnings := notifyWarningState{warned: make(map[string]struct{}, unrecognizedNotifyCap)}
 	fingerprints := newNotifyFingerprinter()
 	return func(msg string) (string, bool) {
 		switch msg {
 		case "Response complete":
+			slog.Debug(recognizedNotifyMsg, "notification", msg, "status", terminal.StatusDone)
 			return terminal.StatusDone, true
 		case "Permission required", "Input required":
+			slog.Debug(recognizedNotifyMsg, "notification", msg, "status", terminal.StatusInput)
 			return terminal.StatusInput, true
 		default:
 			// Any OSC 9 text the pinned kiro-cli build does not emit for turn-end or
@@ -597,7 +616,12 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 				// The deliberate diagnostic opt-in: whoever set BOTH
 				// KWEB_LOG_OSC_TEXT and the debug level accepted (and was warned at
 				// startup) that terminal notification text may contain secrets.
-				slog.Debug(unrecognizedNotifyMsg, "message", msg)
+				// The metadata rides along rather than being replaced: the
+				// fingerprint is what pairs this record with the Warn that sent
+				// the operator here, and the opt-in must ADD the text, not trade
+				// the correlation key for it.
+				slog.Debug(unrecognizedNotifyMsg,
+					append(fingerprints.metadata(msg), "message", msg)...)
 			} else {
 				slog.Debug(unrecognizedNotifyMsg, fingerprints.metadata(msg)...)
 			}

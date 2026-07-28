@@ -54,18 +54,17 @@ function hslToHex(hsl: string): string {
   const c = (1 - Math.abs(2 * l - 1)) * s;
   const hp = h / 60;
   const x = c * (1 - Math.abs((hp % 2) - 1));
-  const [r1, g1, b1]: [number, number, number] =
-    hp < 1
-      ? [c, x, 0]
-      : hp < 2
-        ? [x, c, 0]
-        : hp < 3
-          ? [0, c, x]
-          : hp < 4
-            ? [0, x, c]
-            : hp < 5
-              ? [x, 0, c]
-              : [c, 0, x];
+  // The standard HSL->RGB piecewise table, indexed by hue sector (hp clamped to
+  // the last sector so h = 360 lands where hp = 6 would fall off the end).
+  const rgbByHueSector: [number, number, number][] = [
+    [c, x, 0],
+    [x, c, 0],
+    [0, c, x],
+    [0, x, c],
+    [x, 0, c],
+    [c, 0, x],
+  ];
+  const [r1, g1, b1] = rgbByHueSector[Math.min(Math.floor(hp), 5)]!;
   const m0 = l - c / 2;
   const to = (v: number) =>
     Math.round((v + m0) * 255)
@@ -74,14 +73,43 @@ function hslToHex(hsl: string): string {
   return `#${to(r1)}${to(g1)}${to(b1)}`;
 }
 
-// Read a static asset next to static-src. Resolve from INIT_CWD (set by the
-// npm/npx launcher to the real static-src directory) so the fixture is found
-// even when the runner changes process.cwd() — Stryker's dry run executes
-// inside its .stryker-tmp sandbox, where a cwd-relative read ENOENTs. This is
-// the single fixture-location policy for every static asset the suite reads.
+// The single fixture-location policy for every file this suite reads. INIT_CWD is
+// set by the npm/npx launcher to the real static-src directory, so fixtures are
+// found even when the runner changes process.cwd() — Stryker's dry run executes
+// inside its .stryker-tmp sandbox, where a cwd-relative read ENOENTs.
+function fixtureRoot(): string {
+  return process.env["INIT_CWD"] ?? process.cwd();
+}
+
+// Read one of the SERVED static assets next to static-src.
 function readStaticAsset(name: string): string {
-  const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-  return readFileSync(resolve(sourceRoot, `../static/${name}`), "utf8");
+  return readFileSync(resolve(fixtureRoot(), `../static/${name}`), "utf8");
+}
+
+// The UI package's shipped stylesheets, assembled from its own css/MANIFEST --
+// exactly the member list scripts/css-bundle.sh concatenates into the served
+// /style.css -- with CSS comments stripped so a name that survives only in prose
+// can never satisfy a parity assertion. Rooted at node_modules rather than
+// ../static, which is why this is not a readStaticAsset() call.
+function readUiCssBundle(): string {
+  const readCss = (name: string): string =>
+    readFileSync(
+      resolve(fixtureRoot(), `node_modules/@cplieger/web-terminal-ui/css/${name}`),
+      "utf8",
+    );
+  const members = readCss("MANIFEST")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  expect(members.length).toBeGreaterThan(0);
+  return members
+    .map(readCss)
+    .join("\n")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function declaredCustomProperties(bundle: string): string[] {
+  return [...bundle.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((match) => match[1] as string);
 }
 
 // The fatal-overlay alertdialog contract of the inline pre-module bootstrap
@@ -437,6 +465,14 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expectFatalOverlayShape(overlay, root);
     const description = overlay.querySelector("#bootstrap-failure-message");
     expect(description?.textContent).toContain("Web Terminal for Kiro failed to load");
+    // ...and it names THIS cause. Every branch shares the prefix above, so a
+    // prefix-only assertion cannot tell the program-load message from the
+    // runtime-error one: swapping the two arms of index.html's message ternary
+    // keeps the whole suite green while a failed /app.js fetch stops telling the
+    // user to check their connection.
+    expect(description?.textContent).toContain(
+      "failed to load its program (/app.js or a module it imports)",
+    );
     // The watchdog's Reload button must actually reload -- the same contract
     // the library's own fatal-panel tests pin for its Reload button. A
     // dead click listener would leave a dead-end recovery CTA on the only
@@ -727,6 +763,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
       "Web Terminal for Kiro failed to load",
     );
+    // ...and the runtime-error arm of the ternary, not the program-load arm: the
+    // shared prefix is identical, so only this substring separates them.
+    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "its program stopped with an error before the terminal appeared",
+    );
   });
 
   it("watchdog stands down after createTerminal has built UI inside #terminal", () => {
@@ -809,36 +850,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(terminalRoot).not.toBeNull();
     expect(terminalRoot?.firstElementChild).toBeNull();
   });
-
-  // The UI package's shipped stylesheets, assembled from its own css/MANIFEST --
-  // exactly the member list scripts/css-bundle.sh concatenates into the served
-  // /style.css -- with CSS comments stripped so a name that survives only in
-  // prose can never satisfy a parity assertion below. readStaticAsset's
-  // INIT_CWD policy is repeated rather than reused because that helper is rooted
-  // at ../static (the served assets) while these files live under node_modules;
-  // both readers resolve from the same source root for the same Stryker-sandbox
-  // reason.
-  function readUiCssBundle(): string {
-    const sourceRoot = process.env["INIT_CWD"] ?? process.cwd();
-    const readCss = (name: string): string =>
-      readFileSync(
-        resolve(sourceRoot, `node_modules/@cplieger/web-terminal-ui/css/${name}`),
-        "utf8",
-      );
-    const members = readCss("MANIFEST")
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line !== "" && !line.startsWith("#"));
-    expect(members.length).toBeGreaterThan(0);
-    return members
-      .map(readCss)
-      .join("\n")
-      .replace(/\/\*[\s\S]*?\*\//g, "");
-  }
-
-  function declaredCustomProperties(bundle: string): string[] {
-    return [...bundle.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((match) => match[1] as string);
-  }
 
   it("themes only custom properties the shipped UI package declares and reads", () => {
     // The theme object is Readonly<Record<string, string>> on the library side:

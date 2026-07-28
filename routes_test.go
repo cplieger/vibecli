@@ -203,13 +203,7 @@ func TestStaticETagRevalidation(t *testing.T) {
 // -- also proving the SecurityHeaders/Recoverer layers stay transparent to the
 // SSE stream.
 func TestSSEStreamsThroughLoggingMiddleware(t *testing.T) {
-	deps := newTestDeps(true)
-	mux, mgr, csp := mustRegisterRoutes(t, deps)
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -544,8 +538,6 @@ func newWSUpgradeRequest(t *testing.T, srvURL, id, origin string) *http.Request 
 // guard: a future WithAcceptOptions{InsecureSkipVerify:true} would silently
 // re-open cross-site WebSocket hijacking. This test fails if that happens.
 func TestWSRejectsCrossOrigin(t *testing.T) {
-	deps := newTestDeps(true)
-	mux, mgr, csp := mustRegisterRoutes(t, deps)
 	// Drive the guard on a REAL session: the shape a malicious page in the
 	// victim's browser would actually target. The pinned engine runs the
 	// same-origin check on EVERY upgrade -- an unknown id is reported after the
@@ -553,12 +545,7 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 	// way, so the response is no session-existence oracle -- so the 403 below is
 	// websocket.Accept's origin refusal (nil AcceptOptions) on a session that
 	// exists and is attachable, not an artifact of a missing session.
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	quietTeardown(t, deps)
+	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -581,13 +568,7 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 // that 403'd unconditionally would still pass the negative test. This pins that
 // the 403 is specifically the same-origin (CSWSH) check, not a blanket refusal.
 func TestWSAcceptsSameOrigin(t *testing.T) {
-	deps := newTestDeps(true)
-	mux, mgr, csp := mustRegisterRoutes(t, deps)
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -618,7 +599,6 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 // registerRoutes is the only place that catches a dropped option; a unit test
 // of the engine's deriver passes either way.
 func TestSessionTitleDerivesFromInput(t *testing.T) {
-	mux := http.NewServeMux()
 	var ready webhttp.Ready
 	ready.Set(true)
 	deps := &routeDeps{
@@ -629,16 +609,7 @@ func TestSessionTitleDerivesFromInput(t *testing.T) {
 		// client SENDS, so what the program does with them is irrelevant.
 		cmd: []string{"/bin/cat"},
 	}
-	mgr, csp, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
-	t.Cleanup(mgr.Shutdown)
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mux, mgr, csp, id := mustStartSession(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -888,6 +859,45 @@ func mustRegisterRoutes(t *testing.T, deps *routeDeps) (*http.ServeMux, *termina
 func quietTeardown(t *testing.T, deps *routeDeps) {
 	t.Helper()
 	t.Cleanup(func() { deps.ready.Set(false) })
+}
+
+// readMarkerWithin polls a marker file the session's child process writes and
+// returns its bytes once it holds at least minBytes, failing the test at the
+// deadline with what the child never did. The option pins that observe an engine
+// option THROUGH the child (working directory, DEC 1004 focus-out) both need this
+// wait, and neither should re-implement the deadline bookkeeping around its own
+// one-line assertion.
+func readMarkerWithin(t *testing.T, path string, minBytes int, what string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		b, err := os.ReadFile(path) // #nosec G304 -- test-owned temp path
+		if err == nil && len(b) >= minBytes {
+			return b
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child never %s (marker %q holds %d bytes, read error %v)", what, path, len(b), err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// mustStartSession wires deps on a fresh mux, creates ONE live session, and
+// registers the readiness pre-drain teardown, returning the mux, manager, CSP
+// policy and session id. Binding the three steps is deliberate: quietTeardown is
+// a contract every test leaving a live session owes the next test's log capture,
+// and four tests in this file had silently dropped it (a teardown kill then
+// injected a stray fast-death Warn into a later test's exact-count assertion).
+// A session started through this helper cannot forget it.
+func mustStartSession(t *testing.T, deps *routeDeps) (*http.ServeMux, *terminal.SessionManager, string, string) {
+	t.Helper()
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
+	id, err := mgr.Create()
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	quietTeardown(t, deps)
+	return mux, mgr, csp, id
 }
 
 // newToolsDeps builds routeDeps with a real toolbelt engine on temp dirs

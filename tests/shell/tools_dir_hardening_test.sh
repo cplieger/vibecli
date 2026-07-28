@@ -14,11 +14,9 @@
 # an assumption:
 #   SC2015 - the assertion form `[ cond ] && ok "..." || no "..."` cannot mis-fire,
 #     because lib.sh's ok/no return 0 unconditionally by design (see their comment).
-#   SC2034 - the variables set below are the INPUTS to entrypoint.sh code that is
-#     extracted and sourced at RUNTIME, so shellcheck cannot see the reads.
 #   SC2329 - the stat/chmod stubs below are invoked INDIRECTLY, by the extracted
 #     function they shadow, which shellcheck cannot see.
-# shellcheck disable=SC2015,SC2034,SC2329
+# shellcheck disable=SC2015,SC2329
 set -u
 
 # shellcheck source-path=SCRIPTDIR

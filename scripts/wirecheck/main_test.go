@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,14 +29,7 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 	// block above the RUN already mentions scripts/wirecheck. Requiring all three
 	// needles on ONE uncommented line also proves both flags are still attached
 	// to the gate invocation rather than surviving somewhere else in the file.
-	invoked := false
-	for line := range strings.SplitSeq(string(b), "\n") {
-		if lineInvokesTheGate(line) {
-			invoked = true
-			break
-		}
-	}
-	if !invoked {
+	if !slices.ContainsFunc(dockerfileLogicalLines(string(b)), lineInvokesTheGate) {
 		t.Error("Dockerfile has no un-commented `go run ./scripts/wirecheck " +
 			"-client-rev ... -client-min-server ...` line; the wire-floor gate is " +
 			"not invoked (deleted OR commented out), so an incompatible Go/TS pair " +
@@ -43,18 +37,22 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 	}
 }
 
-// lineInvokesTheGate reports whether one Dockerfile line RUNS the wire-floor gate
-// with both flags attached. The executable is anchored at the START of the trimmed
-// line rather than merely contained in it: a substring test counts inert shell data
-// as an invocation, so `echo go run ./scripts/wirecheck …` (the reversible edit a
-// person makes while debugging a build) would print the command, exit 0, and leave
-// this file's parity test green while the gate no longer runs. A future Dockerfile
-// restructure that legitimately puts another shell construct before the command
-// fails the parity test until this assertion is consciously updated -- the intended
-// trade, since the alternative silently ships an incompatible Go/TS pair. A line
-// carrying `||` is rejected for the same reason in the other direction: it still
-// runs the gate but discards the verdict, so the build survives an incompatible
-// pair.
+// lineInvokesTheGate reports whether one LOGICAL Dockerfile line (see
+// dockerfileLogicalLines) RUNS the wire-floor gate with both flags attached. The
+// executable is anchored at the start of an `&&` SEGMENT rather than merely
+// contained in the line: a substring test counts inert shell data as an
+// invocation, so `echo go run ./scripts/wirecheck …` (the reversible edit a
+// person makes while debugging a build) would print the command, exit 0, and
+// leave this file's parity test green while the gate no longer runs. Segment
+// anchoring is what lets the live chain shape (`RUN … && go run …`) match
+// without weakening that: a shell construct WRAPPING the command still fails
+// the parity test until the assertion is consciously updated -- the intended
+// trade, since the alternative silently ships an incompatible Go/TS pair. A
+// logical line carrying `||` is rejected for the same reason in the other
+// direction: it still runs the gate but discards the verdict, so the build
+// survives an incompatible pair. That refusal is judged over the WHOLE logical
+// line, so a `||` on any segment of the chain is refused too -- a false failure
+// is loud and gets fixed, a false pass ships an incompatible pair in silence.
 func lineInvokesTheGate(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "#") {
@@ -65,9 +63,56 @@ func lineInvokesTheGate(line string) bool {
 		// check and then exits 0 on an incompatible pair.
 		return false
 	}
-	return strings.HasPrefix(trimmed, "go run ./scripts/wirecheck ") &&
-		strings.Contains(trimmed, "-client-rev") &&
-		strings.Contains(trimmed, "-client-min-server")
+	segments := strings.Split(trimmed, "&&")
+	for i, seg := range segments {
+		seg = strings.TrimSpace(seg)
+		if !strings.HasPrefix(seg, "go run ./scripts/wirecheck ") ||
+			!strings.Contains(seg, "-client-rev") ||
+			!strings.Contains(seg, "-client-min-server") {
+			continue
+		}
+		// `;` discards the verdict the same way `||` does (`go run ... ; true`
+		// exits 0 on an incompatible pair, and the RUN is a `&&` chain so a
+		// trailing `;` command supplies the whole step's exit status), but it is
+		// refused from the gate's own segment ONWARD rather than over the whole
+		// logical line: a `;` in an EARLIER segment cannot touch the gate's exit
+		// status, and the live chain has several -- inside the quoted sed scripts
+		// that read the client constants out of the vendored artifact.
+		if strings.Contains(strings.Join(segments[i:], "&&"), ";") {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// dockerfileLogicalLines folds each backslash-continued line into the single
+// LOGICAL line a shell executes. Scanning PHYSICAL lines is what let the
+// recognizer's `||` refusal be bypassed, and this Dockerfile is the shape that
+// makes it reachable: the gate is the last link of a seven-line `RUN … \` chain,
+// so appending `|| true` on one further continuation line leaves the gate's own
+// physical line untouched, matches it, and swallows the verdict with this file's
+// only parity test still green.
+func dockerfileLogicalLines(dockerfile string) []string {
+	var (
+		logical []string
+		b       strings.Builder
+	)
+	for line := range strings.SplitSeq(dockerfile, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if head, continued := strings.CutSuffix(trimmed, `\`); continued {
+			b.WriteString(strings.TrimSpace(head))
+			b.WriteByte(' ')
+			continue
+		}
+		b.WriteString(trimmed)
+		logical = append(logical, b.String())
+		b.Reset()
+	}
+	if b.Len() > 0 {
+		logical = append(logical, b.String())
+	}
+	return logical
 }
 
 // TestLineInvokesTheGate_rejectsInertForms pins the recognizer itself, which is
@@ -89,6 +134,16 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"prose mentioning the gate":     {"# public Go API inside scripts/wirecheck (no source scraping)", false},
 		"another command of the binary": {"    go build ./scripts/wirecheck " + flags, false},
 		"verdict swallowed by || true":  {"    go run ./scripts/wirecheck " + flags + " || true", false},
+		"verdict discarded by ; true":   {"    go run ./scripts/wirecheck " + flags + " ; true", false},
+		"the live chained form": {
+			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && go run ./scripts/wirecheck ` + flags, true,
+		},
+		"a chain whose verdict is swallowed": {
+			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && go run ./scripts/wirecheck ` + flags + ` || true`, false,
+		},
+		"a chain whose verdict is discarded by a trailing ;": {
+			`RUN WIRE_TS=x && go run ./scripts/wirecheck ` + flags + ` ; true`, false,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -235,5 +290,28 @@ func TestRun_exitCodeContract(t *testing.T) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tc.wantStderr)
 			}
 		})
+	}
+}
+
+// TestDockerfileLogicalLines_foldsAContinuedChain pins the joiner the parity scan
+// depends on. The gate is the last link of a multi-line `RUN … \` chain, so a
+// `|| true` appended on one FURTHER continuation line must be seen as part of the
+// same logical command; scanning physical lines reported exactly that fragment as
+// a live invocation, because the gate's own line carried no `||`.
+func TestDockerfileLogicalLines_foldsAContinuedChain(t *testing.T) {
+	const flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+	live := "RUN --mount=type=cache,target=/root/go/pkg/mod \\\n" +
+		"    CLIENT_REV=$(sed -n 's|a|b|p' \"$WIRE_TS\") && \\\n" +
+		"    go run ./scripts/wirecheck " + flags + "\n"
+	swallowed := strings.TrimSuffix(live, "\n") + " \\\n    || true\n"
+
+	invoked := func(dockerfile string) bool {
+		return slices.ContainsFunc(dockerfileLogicalLines(dockerfile), lineInvokesTheGate)
+	}
+	if !invoked(live) {
+		t.Errorf("the live continued-chain shape is not recognized as an invocation; logical lines = %q", dockerfileLogicalLines(live))
+	}
+	if invoked(swallowed) {
+		t.Errorf("a verdict swallowed by a continuation-line `|| true` was recognized as a live gate; logical lines = %q", dockerfileLogicalLines(swallowed))
 	}
 }

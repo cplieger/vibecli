@@ -53,12 +53,7 @@ func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
 	deps := newTestDeps(true)
 	deps.cmd = []string{"/bin/sh", "-c", fmt.Sprintf(
 		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted)}
-	mux, mgr, csp := mustRegisterRoutes(t, deps)
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mux, _, csp, id := mustStartSession(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)

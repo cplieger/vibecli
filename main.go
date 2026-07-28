@@ -68,7 +68,10 @@ var staticFS embed.FS
 // raw value could carry a misplaced credential) at Warn and skipped, and the
 // valid subset is used, rather than aborting startup — one typo
 // in an operator's proxy list must not disable proxy awareness entirely, and it
-// must never fall open. An unset or empty var yields nil, i.e. "trust nothing",
+// must never fall open. A DEFAULT ROUTE is kept on the same terms: it parses,
+// so it is used, but it can never describe a proxy set and it is warned about
+// once per boot (see the loop below). An unset or empty var yields nil, i.e.
+// "trust nothing",
 // so ClientIP ignores X-Forwarded-For and logs the spoof-proof socket peer — the
 // correct default for a directly-exposed deployment. Behind a reverse proxy, set
 // the var to the proxy's CIDR(s) so the access log records the real client.
@@ -86,6 +89,22 @@ func parseTrustedProxies() []*net.IPNet {
 		slog.Warn("ignoring malformed "+key+" entries; using the valid proxy set",
 			"invalid_count", len(invalid),
 			"hint", "each entry must be a CIDR (e.g. 10.0.0.0/8) or a bare IP (e.g. 192.168.1.5)")
+	}
+	// A default route (0.0.0.0/0 or ::/0) parses cleanly but can never describe a
+	// proxy SET, and it breaks client-IP resolution both ways: ClientIP skips every
+	// X-Forwarded-For hop it considers trusted, so a same-family chain exhausts the
+	// walk and falls back to the socket peer (the proxy — exactly what setting this
+	// var was meant to stop logging), while an entry of the OTHER address family is
+	// never skipped, so a forged `X-Forwarded-For: 2001:db8::1` becomes the logged
+	// client_ip of an unauthenticated PTY request and outranks the true client
+	// address the real proxy appended. Warn by PREFIX LENGTH only, never the raw
+	// entry, for the same reason the malformed-entry warning above is count-only.
+	for _, n := range nets {
+		if ones, _ := n.Mask.Size(); ones == 0 {
+			slog.Warn(key+" contains a default route (0.0.0.0/0 or ::/0); every peer counts as a proxy, so client_ip logs the proxy itself and a forged X-Forwarded-For of the other address family can choose the logged client",
+				"hint", "list only the reverse proxy's own address(es), e.g. 10.0.0.0/8 or 192.0.2.10; leave "+key+" unset to log the unspoofable socket peer")
+			break
+		}
 	}
 	return nets
 }
@@ -148,6 +167,32 @@ func parseBoolEnv(key string, fallback bool) (value, ok bool) {
 	default:
 		return fallback, false
 	}
+}
+
+// parseCatalogRefresh reads TOOL_CATALOG_REFRESH and delegates to toolbelt's
+// canonical parser — but only for values that parser ACCEPTS. toolbelt calls
+// scheduler.ParseInterval without scheduler.WithRedactedValue, so its fallback
+// warning echoes the RAW value (scheduler warnFallback), and a compose expansion
+// mistake could put a credential on this key — the same reason KWEB_LOG_LEVEL is
+// read as a string and KWEB_LOG_OSC_TEXT goes through parseBoolEnv. A value the
+// library would reject is warned about HERE by name only and replaced with "" so
+// the library applies its documented default silently. Accepted values are passed
+// through untouched, so the default, the "off"/"disabled"/"0" disable words and
+// the [MinCatalogRefresh, MaxCatalogRefresh] clamp stay toolbelt's policy alone
+// (its clamp warning echoes only a duration that already parsed, which cannot be
+// a secret).
+func parseCatalogRefresh(raw string) time.Duration {
+	const key = "TOOL_CATALOG_REFRESH"
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", "off", "disabled":
+	default:
+		if d, err := time.ParseDuration(v); err != nil || d < 0 {
+			slog.Warn("unusable "+key+"; using the built-in catalog refresh cadence",
+				"hint", `use a Go duration (e.g. 24h, 90m) or "off" to disable the schedule`)
+			raw = ""
+		}
+	}
+	return toolbelt.ParseCatalogRefresh(raw, key)
 }
 
 // parseLogOSCText reads the KWEB_LOG_OSC_TEXT knob (default false) and emits the
@@ -283,9 +328,8 @@ func main() {
 		// manual refresh). Every fetched catalog re-verifies the
 		// embedded required-tools list before it replaces the current
 		// one, and the last good catalog stands on any failure.
-		catalogURL: envx.String("TOOL_CATALOG_URL", toolbelt.DefaultCatalogURL),
-		refreshInterval: toolbelt.ParseCatalogRefresh(
-			envx.String("TOOL_CATALOG_REFRESH", ""), "TOOL_CATALOG_REFRESH"),
+		catalogURL:      envx.String("TOOL_CATALOG_URL", toolbelt.DefaultCatalogURL),
+		refreshInterval: parseCatalogRefresh(envx.String("TOOL_CATALOG_REFRESH", "")),
 	})
 
 	// TRUSTED_PROXIES names the reverse proxies (CIDRs or bare IPs) whose
@@ -462,14 +506,9 @@ type toolsRuntime struct {
 	state func() string
 }
 
-// toolsStateDegraded is the /api/health informational tools verdict for a tools
-// subsystem that FAILED (as opposed to one deliberately absent, which omits the
-// field entirely). Named once because startTools reports it from several
-// distinct failures — an unusable config path, a failed engine start, a
-// reconcile that could not be enqueued — and a health consumer keys on the
-// literal. The same reasoning names the other two verdicts of the same field:
-// "ok" is written from two functions since awaitBootConvergence was extracted,
-// and "syncing" is the third documented value of the enum.
+// The three documented values of /api/health's informational tools field. Each is
+// named rather than inlined because every one of them is written from more than
+// one site and a health consumer keys on the literal.
 const (
 	// toolsStateSyncing is the verdict while the boot convergence pass runs
 	// (the window in which POST /api/sessions answers 503 "tools installing").
@@ -477,7 +516,12 @@ const (
 	// toolsStateOK is the converged verdict, reported both when the boot
 	// reconcile finishes clean and when an empty manifest leaves nothing to
 	// converge.
-	toolsStateOK       = "ok"
+	toolsStateOK = "ok"
+	// toolsStateDegraded is the verdict for a tools subsystem that FAILED, as
+	// opposed to one deliberately absent (which omits the field entirely).
+	// Reported from an unusable config path, a failed engine start and a
+	// reconcile that could not be enqueued (startTools), and from a wait
+	// failure, a cancellation and a non-Done job (awaitBootConvergence).
 	toolsStateDegraded = "degraded"
 )
 
@@ -773,7 +817,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// behavior exactly.
 			webhttp.WithSkipFunc(func(r *http.Request) bool {
 				stream := r.URL.Path == terminal.SessionEventsPath ||
-					(r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r))
+					(r.URL.Path == terminal.WSPath && willUpgrade(r))
 				return stream && hostPolicy.Allows(r)
 			}),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
@@ -878,17 +922,42 @@ func wsAttachLog(trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
 }
 
 // isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal
-// (Upgrade: websocket plus the Upgrade connection option). It is the access
-// log's "this is a long-lived stream" test for /ws: a real upgrade is skipped
-// (one open-to-close line would report a bogus 200 with an hours-long
-// duration, since the handler hijacks the connection), while a request that
-// reaches /ws WITHOUT the upgrade headers is a short request whose refusal
-// deserves an access line — today it produces NO record anywhere, in either
-// the app or the engine, so a proxy that strips the upgrade headers presents
-// as a page that loads normally, a UI stuck reconnecting, and a silent log.
+// (Upgrade: websocket plus the Upgrade connection option). It is wsAttachLog's
+// "this request is trying to attach" test: the session capability token is in
+// the query string, so every attempt that LOOKS like an attach gets its record
+// even when the handshake is malformed in some other way. The access log's skip
+// test is the stricter willUpgrade — a request that reaches /ws without a
+// COMPLETE handshake is answered short (426 without these headers, 405/400 with
+// them but not a valid GET/13/keyed handshake) and must keep its access line,
+// or a proxy that mangles the handshake presents as a page that loads normally,
+// a UI stuck reconnecting, and no status anywhere in the log.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return headerHasToken(r, "Upgrade", "websocket") &&
 		headerHasToken(r, "Connection", "upgrade")
+}
+
+// willUpgrade reports whether r satisfies EVERY pre-hijack condition the
+// engine's websocket.Accept checks before it hijacks the connection: the RFC
+// 6455 header signal (isWebSocketUpgrade), plus GET, HTTP/1.1 or later,
+// Sec-WebSocket-Version: 13, and exactly one Sec-WebSocket-Key field. It is
+// the access log's skip test, and it is deliberately STRICTER than
+// isWebSocketUpgrade: a request carrying the upgrade headers but failing any of
+// these gets a SHORT error response from Accept (405 for a non-GET, 400 for a
+// missing/duplicated key or a wrong version, 426 for HTTP/1.0) exactly like the
+// no-upgrade-headers 426 — so it must keep its access line rather than be
+// mistaken for a hijacked stream and skipped. Every condition here is NECESSARY
+// for Accept to succeed, so no request that really does become a stream can be
+// logged with the bogus 200-and-hours-long-duration line the skip exists to
+// prevent. The one Accept check deliberately not mirrored is the base64/16-byte
+// validity of the key VALUE: mirroring it would copy upstream decoding detail,
+// and a proxy either forwards or drops that header rather than corrupting its
+// value.
+func willUpgrade(r *http.Request) bool {
+	return isWebSocketUpgrade(r) &&
+		r.Method == http.MethodGet &&
+		r.ProtoAtLeast(1, 1) &&
+		r.Header.Get("Sec-WebSocket-Version") == "13" &&
+		len(r.Header.Values("Sec-WebSocket-Key")) == 1
 }
 
 // headerHasToken reports whether any field value of the named header carries

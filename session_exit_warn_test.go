@@ -58,7 +58,7 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		}
 	}
 
-	const warnMsg = "exited almost immediately"
+	const warnMsg = sessionFastDeathMsg
 
 	t.Run("spontaneous fast death while serving warns once", func(t *testing.T) {
 		records := runFastDeathSession(t, true)

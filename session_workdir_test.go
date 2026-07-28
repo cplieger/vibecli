@@ -1,11 +1,9 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestSessionWorkDirWiredIntoSessionFactory pins terminal.WithWorkDir in
@@ -30,24 +28,10 @@ func TestSessionWorkDirWiredIntoSessionFactory(t *testing.T) {
 	deps := newTestDeps(true)
 	deps.workDir = workDir
 	deps.cmd = []string{"/bin/sh", "-c", `pwd -P > '` + marker + `'; exec cat`}
-	_, mgr, _ := mustRegisterRoutes(t, deps)
-	if _, err := mgr.Create(); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mustStartSession(t, deps)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		b, readErr := os.ReadFile(marker) // #nosec G304 -- test-owned temp path
-		if readErr == nil && len(b) > 0 {
-			if got := strings.TrimSpace(string(b)); got != workDir {
-				t.Errorf("session working directory = %q, want %q -- terminal.WithWorkDir(deps.workDir) is missing from the session factory, so every session starts in the server's cwd instead of KWEB_WORK_DIR", got, workDir)
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("child never reported its working directory; the session command must run pwd -P into the marker")
-		}
-		time.Sleep(10 * time.Millisecond)
+	got := strings.TrimSpace(string(readMarkerWithin(t, marker, 1, "report its working directory; the session command must run pwd -P into the marker")))
+	if got != workDir {
+		t.Errorf("session working directory = %q, want %q -- terminal.WithWorkDir(deps.workDir) is missing from the session factory, so every session starts in the server's cwd instead of KWEB_WORK_DIR", got, workDir)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -37,12 +38,15 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 }
 
 // TestParseTrustedProxies pins the TRUSTED_PROXIES parsing that feeds
-// webhttp.WithClientIP via the shared webhttp.ParseCIDRs helper. Three
+// webhttp.WithClientIP via the shared webhttp.ParseCIDRs helper. Four
 // contracts: an unset/blank var yields nil (so ClientIP ignores X-Forwarded-For
 // and logs the spoof-proof socket peer — the directly-exposed default), a valid
-// CIDR + bare-IP mix parses into containment-correct nets, and a malformed entry
-// is warned count-only and skipped while the valid subset is kept — startup is
-// never aborted and never falls open. The malformed case mutates the
+// CIDR + bare-IP mix parses into containment-correct nets, a malformed entry
+// is warned count-only and skipped while the valid subset is kept, and a
+// SEMANTICALLY impossible entry (a default route, which parses cleanly and then
+// makes client_ip either the proxy itself or a value the caller forged) is
+// warned about by prefix class while still being kept — startup is
+// never aborted and never falls open. The warning cases mutate the
 // process-global default logger, so the subtests run serially (no t.Parallel).
 func TestParseTrustedProxies(t *testing.T) {
 	t.Run("unset/empty yields nil (socket-peer default)", func(t *testing.T) {
@@ -128,6 +132,59 @@ func TestParseTrustedProxies(t *testing.T) {
 				t.Errorf("log carries rejected raw entry %q; malformed values may hold credentials and must never be logged", raw)
 			}
 		}
+		// The needles above only catch the two values this test knows. The allowlist
+		// catches a rejected entry that reaches the log truncated, transformed, or
+		// under a new key -- the shape a library bump or a well-meant "log a sample"
+		// edit would take.
+		assertOnlyAttrs(t, records, slog.LevelWarn, "ignoring malformed", "invalid_count", "hint")
+	})
+
+	// A default route is syntactically perfect and semantically impossible: it
+	// makes every X-Forwarded-For hop of its own family "our own hop" (so ClientIP
+	// exhausts the walk and falls back to logging the PROXY), while an entry of the
+	// OTHER family is never skipped and is returned as the client — so an
+	// unauthenticated caller picks the client_ip recorded for its own request. The
+	// warning is the only signal an operator gets; today's parser is silent.
+	// Lenient by design: the set is NOT rejected, so this asserts the warning and
+	// the unchanged behavior together.
+	t.Run("a default route is warned about by prefix length, entries kept", func(t *testing.T) {
+		records := capture.Default(t)
+		// The sibling is a plausible real proxy address: the warning names the
+		// default-route CLASS in fixed wording, so what must be checked is that it
+		// never ENUMERATES the operator's own entries (any of which can be a
+		// compose-interpolated credential, CWE-532).
+		const sibling = "198.51.100.7"
+		t.Setenv("TRUSTED_PROXIES", "0.0.0.0/0,"+sibling)
+		nets := parseTrustedProxies()
+
+		if len(nets) != 2 {
+			t.Fatalf("parseTrustedProxies len = %d, want 2 (the warning must not reject the set)", len(nets))
+		}
+		warns := 0
+		for _, r := range records.Records() {
+			if r.Level == slog.LevelWarn && strings.Contains(r.Message, "default route") {
+				warns++
+			}
+		}
+		if warns != 1 {
+			t.Errorf("log = %q, want exactly 1 default-route Warn (got %d; one per boot, not one per entry)", records.Messages(), warns)
+		}
+		if logContains(records, sibling) {
+			t.Error("log enumerates the configured TRUSTED_PROXIES entries; this var can hold a compose-interpolated credential, so the warning must name the var and the prefix class only")
+		}
+	})
+
+	t.Run("narrower entries emit no default-route warning", func(t *testing.T) {
+		records := capture.Default(t)
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,192.0.2.10,::/128")
+		if got := len(parseTrustedProxies()); got != 3 {
+			t.Fatalf("parseTrustedProxies len = %d, want 3", got)
+		}
+		for _, r := range records.Records() {
+			if r.Level == slog.LevelWarn && strings.Contains(r.Message, "default route") {
+				t.Errorf("log = %q, want no default-route Warn for a correctly narrow proxy set", records.Messages())
+			}
+		}
 	})
 }
 
@@ -164,6 +221,28 @@ func logContains(records *capture.Recorder, s string) bool {
 		}
 	}
 	return false
+}
+
+// assertOnlyAttrs pins WHICH attrs may describe the records at level whose
+// message contains msgSub. A needle sweep only catches content it recognizes; an
+// allowlist catches a content-bearing attr under ANY name and of ANY length,
+// which is the leak shape a truncated or renamed value slips past. Shared by the
+// package's two credential boundaries (a rejected TRUSTED_PROXIES entry and a
+// classifier notification), so one implementation covers both.
+func assertOnlyAttrs(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, allowed ...string) {
+	t.Helper()
+	for _, r := range records.Records() {
+		if r.Level != level || !strings.Contains(r.Message, msgSub) {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if !slices.Contains(allowed, a.Key) {
+				t.Errorf("%s record %q carries unexpected attr %q = %q; only %v may describe it, "+
+					"or untrusted content reaches the log under a new key", level, r.Message, a.Key, a.Value, allowed)
+			}
+			return true
+		})
+	}
 }
 
 // firstAttrValue returns the value of the first occurrence of key across the
@@ -371,14 +450,36 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 		h.ServeHTTP(httptest.NewRecorder(),
 			httptest.NewRequestWithContext(ctx, req.method, req.path, http.NoBody))
 	}
-	// A REAL upgrade attempt is the stream shape, so it stays skipped.
+	// A COMPLETE upgrade attempt is the stream shape, so it stays skipped. Every
+	// header websocket.Accept requires before it hijacks is present: a request
+	// missing any of them gets a short 4xx from Accept instead of becoming a
+	// stream, and willUpgrade keeps its access line (asserted below).
+	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key whose value
+	// willUpgrade never inspects (it counts the field, see its doc comment).
+	const wsKey = "AAAAAAAAAAAAAAAAAAAAAA=="
 	upgrade := httptest.NewRequest(http.MethodGet, "/ws", http.NoBody)
 	upgrade.Header.Set("Upgrade", "websocket")
 	upgrade.Header.Set("Connection", "keep-alive, Upgrade")
+	upgrade.Header.Set("Sec-WebSocket-Version", "13")
+	upgrade.Header.Set("Sec-WebSocket-Key", wsKey)
 	h.ServeHTTP(httptest.NewRecorder(), upgrade)
 
+	// A request carrying the upgrade HEADERS that Accept still refuses short
+	// (here: not a GET, so Accept answers 405) is NOT a stream, so its access
+	// line must survive — the same silence the no-upgrade-headers 426 case
+	// exists to remove.
+	badUpgrade := httptest.NewRequest(http.MethodPost, "/ws", http.NoBody)
+	badUpgrade.Header.Set("Upgrade", "websocket")
+	badUpgrade.Header.Set("Connection", "Upgrade")
+	badUpgrade.Header.Set("Sec-WebSocket-Version", "13")
+	badUpgrade.Header.Set("Sec-WebSocket-Key", wsKey)
+	h.ServeHTTP(httptest.NewRecorder(), badUpgrade)
+
 	log := buf.String()
-	for _, skipped := range []string{"path=/ws", "path=/api/sessions/events"} {
+	if !strings.Contains(log, "method=POST path=/ws") {
+		t.Errorf("access log = %q, want a line for a non-GET /ws request carrying upgrade headers (Accept refuses it short; only a real hijacked stream may be skipped)", log)
+	}
+	for _, skipped := range []string{"method=GET path=/ws", "path=/api/sessions/events"} {
 		if strings.Contains(log, skipped) {
 			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream lines out)", log, skipped)
 		}
@@ -408,7 +509,7 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	if n := strings.Count(log, "path=/api/sessions/{id}/title"); n != 1 {
 		t.Errorf("access log = %q, got %d title-template lines, want exactly 1 (the malformed /extra/title path must not be classified as the title route)", log, n)
 	}
-	if !strings.Contains(log, "path=/api/sessions/{id}") {
+	if !strings.Contains(log, "path=/api/sessions/{id} ") {
 		t.Errorf("access log = %q, want a template-path access line for the id route (the subtree's telemetry is kept, redacted)", log)
 	}
 	// Both rename verbs record the SAME template, since the method is its own

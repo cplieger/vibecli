@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // TestKeepUnfocusedWiredIntoSessionFactory pins the OTHER half of the OSC 9
@@ -37,24 +36,9 @@ func TestKeepUnfocusedWiredIntoSessionFactory(t *testing.T) {
 		"/bin/sh", "-c",
 		`stty raw -echo 2>/dev/null; printf '\033[?1004h'; dd bs=1 count=3 of='` + marker + `' 2>/dev/null; exec cat`,
 	}
-	_, mgr, _ := mustRegisterRoutes(t, deps)
-	if _, err := mgr.Create(); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mustStartSession(t, deps)
 
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		b, err := os.ReadFile(marker) // #nosec G304 -- test-owned temp path
-		if err == nil && len(b) >= 3 {
-			if got := string(b); got != "\x1b[O" {
-				t.Errorf("child received %q, want the DEC 1004 focus-out %q", got, "\x1b[O")
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("child never received a DEC 1004 focus-out after enabling focus reporting; registerRoutes must pass terminal.WithKeepUnfocused() or kiro-cli stops emitting the OSC 9 notifications that latch the tab status dots")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if got := string(readMarkerWithin(t, marker, 3, "receive a DEC 1004 focus-out after enabling focus reporting; registerRoutes must pass terminal.WithKeepUnfocused() or kiro-cli stops emitting the OSC 9 notifications that latch the tab status dots")); got != "\x1b[O" {
+		t.Errorf("child received %q, want the DEC 1004 focus-out %q", got, "\x1b[O")
 	}
 }

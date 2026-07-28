@@ -54,11 +54,17 @@
            short landscape window, a large user font size) the message and the
            Reload button overflow BOTH ends of an unscrollable box. `safe
            center` degrades the centring to start-alignment exactly when the
-           content overflows and overflow-y makes the remainder reachable; a UA
-           without `safe` drops the declaration and keeps today's centring. The
-           insets honour this page's viewport-fit=cover (the UI bundle does the
-           same for its own chrome via --safe-top/--safe-bottom), so the button
-           never sits under a notch or the home-indicator gesture strip. */
+           content overflows and overflow-y makes the remainder reachable. It is
+           declared TWICE because `safe center` is one value: a UA that does not
+           know the `safe` keyword drops the whole declaration, and with no
+           earlier `justify-content` in this rule that leaves the initial
+           `normal` (top-aligned), not centring -- page.css's .wt-loading
+           supplies `center` only when /style.css LOADED, which is the one case
+           these self-sufficient rules must not depend on. The insets honour
+           this page's viewport-fit=cover (the UI bundle does the same for its
+           own chrome via --safe-top/--safe-bottom), so the button never sits
+           under a notch or the home-indicator gesture strip. */
+        justify-content: center;
         justify-content: safe center;
         gap: 1rem;
         padding: max(1rem, env(safe-area-inset-top))
@@ -169,10 +175,24 @@
         inset: 0;
         z-index: 300;
         display: flex;
-        align-items: center;
-        justify-content: center;
+        /* `safe` degrades the CROSS-axis centring (this row-direction box centres
+           vertically with align-items, not justify-content) to start-alignment
+           exactly when the message is taller than the viewport -- 400% zoom, a
+           short landscape window, a large user font size -- and overflow-y makes
+           the remainder reachable in an otherwise unscrollable fixed inset:0 box.
+           Same hardening #loading[role="alertdialog"] above carries, and the same
+           reason: a UA without `safe` drops the declaration and keeps today's
+           centring. The insets honour this page's viewport-fit=cover so the
+           sentence never sits under a notch or the home-indicator strip. */
+        align-items: safe center;
+        justify-content: safe center;
         margin: 0;
-        padding: 1rem;
+        padding: max(1rem, env(safe-area-inset-top))
+          max(1rem, env(safe-area-inset-right))
+          max(1rem, env(safe-area-inset-bottom))
+          max(1rem, env(safe-area-inset-left));
+        overflow-y: auto;
+        overscroll-behavior: contain;
         background: #000;
         /* brand accent (matches #loading's --wt-loading-accent and the
            createTerminal theme) */

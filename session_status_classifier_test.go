@@ -38,11 +38,7 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 	// (ESC ] 9 ; text BEL); `exec cat` then keeps the process alive so the
 	// session stays listed while the status latches.
 	deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;Response complete\a'; exec cat`}
-	mux, mgr, _ := mustRegisterRoutes(t, deps)
-	if _, err := mgr.Create(); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mux, _, _, _ := mustStartSession(t, deps)
 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -279,34 +275,15 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 		return "", false, haveRecord
 	}
 
-	// assertOnlyAttrs pins WHICH attrs may describe a notification at a given
-	// level. A needle sweep only catches content it recognizes; an allowlist
-	// catches a content-bearing attr under ANY name and of ANY length.
-	assertOnlyAttrs := func(t *testing.T, records *capture.Recorder, level slog.Level, allowed ...string) {
-		t.Helper()
-		for _, r := range records.Records() {
-			if r.Level != level || !strings.Contains(r.Message, unrecognizedNotifyMsg) {
-				continue
-			}
-			r.Attrs(func(a slog.Attr) bool {
-				if !slices.Contains(allowed, a.Key) {
-					t.Errorf("%s record carries unexpected attr %q = %q; only %v may describe a "+
-						"notification, or child output reaches the log under a new key", level, a.Key, a.Value, allowed)
-				}
-				return true
-			})
-		}
-	}
+	// The attr allowlist that pins WHICH attrs may describe a notification at a
+	// given level is the package-shared assertOnlyAttrs (trusted_proxies_test.go),
+	// used with unrecognizedNotifyMsg as the message filter below.
 
 	t.Run("default logs no notification text at any level", func(t *testing.T) {
 		records := capture.Default(t)
 		deps := newTestDeps(true) // logOSCText defaults false, like an unset env
 		deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;` + emitted + `\a'; exec cat`}
-		_, mgr, _ := mustRegisterRoutes(t, deps)
-		if _, err := mgr.Create(); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
-		quietTeardown(t, deps)
+		mustStartSession(t, deps)
 
 		// The production key is drawn inside newStatusClassifier and never
 		// logged, so the expected fingerprint is not computable here — by
@@ -366,8 +343,8 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 					t.Errorf("log = %q carries a prefix of the notification text with KWEB_LOG_OSC_TEXT off; "+
 						"arbitrary child output may be a token or a device code", records.Messages())
 				}
-				assertOnlyAttrs(t, records, slog.LevelWarn, "message_fingerprint", "message_runes", "hint")
-				assertOnlyAttrs(t, records, slog.LevelDebug, "message_fingerprint", "message_runes")
+				assertOnlyAttrs(t, records, slog.LevelWarn, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "hint")
+				assertOnlyAttrs(t, records, slog.LevelDebug, unrecognizedNotifyMsg, "message_fingerprint", "message_runes")
 				return
 			}
 			if time.Now().After(deadline) {
@@ -382,11 +359,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 		deps := newTestDeps(true)
 		deps.logOSCText = true // KWEB_LOG_OSC_TEXT=true
 		deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;` + emitted + `\a'; exec cat`}
-		_, mgr, _ := mustRegisterRoutes(t, deps)
-		if _, err := mgr.Create(); err != nil {
-			t.Fatalf("Create: %v", err)
-		}
-		quietTeardown(t, deps)
+		mustStartSession(t, deps)
 
 		deadline := time.Now().Add(10 * time.Second)
 		for {
@@ -433,8 +406,8 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						return true
 					})
 				}
-				assertOnlyAttrs(t, records, slog.LevelWarn, "message_fingerprint", "message_runes", "hint")
-				assertOnlyAttrs(t, records, slog.LevelDebug, "message_fingerprint", "message_runes", "message")
+				assertOnlyAttrs(t, records, slog.LevelWarn, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "hint")
+				assertOnlyAttrs(t, records, slog.LevelDebug, unrecognizedNotifyMsg, "message_fingerprint", "message_runes", "message")
 				return
 			}
 			if time.Now().After(deadline) {

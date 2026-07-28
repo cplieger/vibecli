@@ -900,8 +900,11 @@ func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
 		"0":                            {raw: "0", wantValue: false, wantOK: true},
 		"no":                           {raw: "no", wantValue: false, wantOK: true},
 		"off":                          {raw: "off", wantValue: false, wantOK: true},
-		// The reason the parser is local: a token-shaped value must fail
-		// closed to the fallback AND leave no copy of itself anywhere.
+		// The shape that motivates the local parser, on the half this table
+		// can actually pin: a token-shaped value must fail closed to the
+		// fallback. Whether the raw value stays out of the log is a property
+		// of the CALLER's warning, pinned by
+		// TestParseLogOSCText_warnsByNameOnly.
 		"secret-shaped value fails closed": {
 			raw: "s3cr3t-token-abc123", fallback: false, wantValue: false, wantOK: false,
 		},
@@ -920,8 +923,8 @@ func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
 				t.Errorf("parseBoolEnv(%q, %v) = (%v, %v), want (%v, %v)",
 					tc.raw, tc.fallback, value, ok, tc.wantValue, tc.wantOK)
 			}
-			if tc.raw != "" && records.Contains(tc.raw) {
-				t.Errorf("log = %q carries the raw %s value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why envx.Bool is not used here)",
+			if tc.raw != "" && logContains(records, tc.raw) {
+				t.Errorf("log = %q carries the raw %s value; parseBoolEnv must stay log-free — echoing the raw value is exactly what envx.Bool's malformed path does (CWE-532) and why this parser is local; the operator-facing warning belongs to the caller, pinned by TestParseLogOSCText_warnsByNameOnly",
 					records.Messages(), key)
 			}
 		})
@@ -969,7 +972,7 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 			if tc.wantMsg != "" && records.CountLevel(slog.LevelWarn, tc.wantMsg) != 1 {
 				t.Errorf("log = %q, want a Warn containing %q", records.Messages(), tc.wantMsg)
 			}
-			if tc.raw == token && (records.Contains(token) || records.AttrContains("", "", token)) {
+			if tc.raw == token && logContains(records, token) {
 				t.Errorf("log = %q carries the raw KWEB_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why envx.Bool is not used here)",
 					records.Messages())
 			}
@@ -977,13 +980,57 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	}
 }
 
-// TestIsWebSocketUpgrade_requiresBothListTokens pins the access-log stream
-// predicate against the engine's own websocket.Accept parsing: both header
-// tokens are required, each may arrive in a repeated field line or a comma
-// list, matching is case- and whitespace-insensitive, and a token SUBSTRING
-// must not match. A divergence here is silent both ways — a one-sided
-// malformed handshake vanishes from the access log, or a repeated-field real
-// upgrade produces a bogus hours-long 200 access record.
+// TestParseCatalogRefresh_warnsByNameOnly pins that no supplied
+// TOOL_CATALOG_REFRESH value reaches a log record, and that every value toolbelt
+// ACCEPTS still gets toolbelt's answer. The wrapper exists only because
+// toolbelt's parser calls scheduler.ParseInterval WITHOUT
+// scheduler.WithRedactedValue, so its own fallback warning echoes the raw string
+// — the CWE-532 shape the KWEB_LOG_OSC_TEXT remedy closed on a knob of exactly
+// this kind. Dropping the wrapper (calling toolbelt.ParseCatalogRefresh
+// directly) leaves every other test green.
+// Serial: capture.Default mutates the process-global default logger.
+func TestParseCatalogRefresh_warnsByNameOnly(t *testing.T) {
+	const token = "s3cr3t-token-abc123"
+	cases := map[string]struct {
+		raw       string
+		want      time.Duration
+		wantWarns int
+	}{
+		"token-shaped value falls back and warns by name": {token, toolbelt.DefaultCatalogRefresh, 1},
+		"negative duration falls back and warns by name":  {"-5m", toolbelt.DefaultCatalogRefresh, 1},
+		"unset is the silent default":                     {"", toolbelt.DefaultCatalogRefresh, 0},
+		"off disables the schedule silently":              {"off", 0, 0},
+		"zero disables the schedule silently":             {"0", 0, 0},
+		// Passed through untouched, so the clamp and the default stay toolbelt's
+		// policy alone: "6h" is inside [MinCatalogRefresh, MaxCatalogRefresh] and
+		// comes back unchanged.
+		"a valid duration is passed through": {"6h", 6 * time.Hour, 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+
+			if got := parseCatalogRefresh(tc.raw); got != tc.want {
+				t.Errorf("parseCatalogRefresh(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			if got := records.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
+				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), tc.wantWarns, got)
+			}
+			if tc.raw != "" && logContains(records, tc.raw) {
+				t.Errorf("log = %q carries the raw TOOL_CATALOG_REFRESH value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only (this is why toolbelt's parser is not called directly)",
+					records.Messages())
+			}
+		})
+	}
+}
+
+// TestIsWebSocketUpgrade_requiresBothListTokens pins wsAttachLog's
+// "an attach was attempted" predicate: both header tokens are required, each
+// may arrive in a repeated field line or a comma list, matching is case- and
+// whitespace-insensitive, and a token SUBSTRING must not match. The access
+// log's skip test is the stricter willUpgrade below; a divergence here is
+// silent, dropping the attach record for a request that presented a session
+// capability token.
 func TestIsWebSocketUpgrade_requiresBothListTokens(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -1008,6 +1055,61 @@ func TestIsWebSocketUpgrade_requiresBothListTokens(t *testing.T) {
 			}
 			if got := isWebSocketUpgrade(req); got != tc.want {
 				t.Errorf("isWebSocketUpgrade(Upgrade=%q, Connection=%q) = %v, want %v", tc.upgrade, tc.connection, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWillUpgrade_mirrorsAcceptPreconditions pins the access-log skip predicate
+// against every condition the engine's websocket.Accept checks BEFORE it hijacks
+// the connection. Each case drops exactly one of them from an otherwise complete
+// handshake, so the request is one Accept answers short (405/400/426) rather than
+// one that becomes a stream — and a short refusal must keep its access line, or a
+// proxy that mangles the handshake presents as a terminal that never connects
+// with no status recorded anywhere. Widening this back to isWebSocketUpgrade
+// passes every other test.
+func TestWillUpgrade_mirrorsAcceptPreconditions(t *testing.T) {
+	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key whose value
+	// willUpgrade never inspects (it counts the field, see its doc comment).
+	const key = "AAAAAAAAAAAAAAAAAAAAAA=="
+	complete := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, terminal.WSPath, http.NoBody)
+		r.Header.Set("Upgrade", "websocket")
+		r.Header.Set("Connection", "keep-alive, Upgrade")
+		r.Header.Set("Sec-WebSocket-Version", "13")
+		r.Header.Set("Sec-WebSocket-Key", key)
+		return r
+	}
+	cases := map[string]struct {
+		mangle func(*http.Request)
+		want   bool
+	}{
+		"a complete handshake is the only skippable shape": {mangle: func(*http.Request) {}, want: true},
+		"a non-GET is answered 405, so it keeps its line": {
+			mangle: func(r *http.Request) { r.Method = http.MethodPost },
+		},
+		"HTTP/1.0 is answered 426, so it keeps its line": {
+			mangle: func(r *http.Request) { r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/1.0", 1, 0 },
+		},
+		"a missing Sec-WebSocket-Key is answered 400": {
+			mangle: func(r *http.Request) { r.Header.Del("Sec-WebSocket-Key") },
+		},
+		"a DUPLICATED Sec-WebSocket-Key is answered 400": {
+			mangle: func(r *http.Request) { r.Header.Add("Sec-WebSocket-Key", key) },
+		},
+		"a wrong Sec-WebSocket-Version is answered 400": {
+			mangle: func(r *http.Request) { r.Header.Set("Sec-WebSocket-Version", "8") },
+		},
+		"missing upgrade headers are answered 426": {
+			mangle: func(r *http.Request) { r.Header.Del("Upgrade") },
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := complete()
+			tc.mangle(req)
+			if got := willUpgrade(req); got != tc.want {
+				t.Errorf("willUpgrade() = %v, want %v (only a request that really becomes a hijacked stream may be skipped)", got, tc.want)
 			}
 		})
 	}
@@ -1129,4 +1231,75 @@ func TestWSAttachLog(t *testing.T) {
 				wsAttachMsg, got, records.Messages())
 		}
 	})
+}
+
+// TestIsWebSocketUpgrade_agreesWithTheEngineHandshake cross-checks the app's
+// header-matching predicate — the half willUpgrade and wsAttachLog both build on
+// — against the ONLY implementation that decides whether a /ws request really
+// becomes a stream: the engine's coder/websocket handshake, driven over a real
+// server. TestIsWebSocketUpgrade_requiresBothListTokens
+// states what THIS app believes an upgrade is; nothing asserts the engine agrees,
+// and every disagreement is silent -- a request the engine refuses with 426 that
+// the predicate calls a stream leaves no access line anywhere (the CWE-778 silence
+// wsAttachLog and this skip exist to remove), and one the engine upgrades that the
+// predicate calls a plain request emits a bogus 200 with an hours-long duration.
+// The expectations here are DERIVED from the handshake rather than restated, so a
+// coder/websocket or engine bump that changes header matching fails this test
+// instead of quietly re-opening that silence.
+//
+// Only the two upgrade headers vary; method, Sec-WebSocket-Version,
+// Sec-WebSocket-Key and Origin are held at the values a real handshake carries,
+// because those are the engine's OTHER refusal reasons and this predicate
+// deliberately does not model them — willUpgrade does, and
+// TestWillUpgrade_mirrorsAcceptPreconditions covers them.
+func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
+	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
+
+	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
+	t.Cleanup(srv.Close)
+
+	cases := []struct {
+		name       string
+		upgrade    []string
+		connection []string
+	}{
+		{name: "canonical handshake", upgrade: []string{"websocket"}, connection: []string{"Upgrade"}},
+		{name: "comma lists", upgrade: []string{"h2c, websocket"}, connection: []string{"keep-alive, upgrade"}},
+		{name: "repeated field lines, mixed case, padded", upgrade: []string{"h2c", " WebSocket "}, connection: []string{"keep-alive", "UPGRADE"}},
+		{name: "token substrings only", upgrade: []string{"websocket-v2"}, connection: []string{"upgrader"}},
+		{name: "upgrade header alone", upgrade: []string{"websocket"}},
+		{name: "connection header alone", connection: []string{"upgrade"}},
+		{name: "no upgrade headers at all"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
+			req.Header.Del("Upgrade")
+			req.Header.Del("Connection")
+			for _, v := range tc.upgrade {
+				req.Header.Add("Upgrade", v)
+			}
+			for _, v := range tc.connection {
+				req.Header.Add("Connection", v)
+			}
+
+			// The same header set the server will see, so the predicate is
+			// judged on exactly the request the handshake judges.
+			probe := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+id, http.NoBody)
+			probe.Header = req.Header.Clone()
+			predicate := isWebSocketUpgrade(probe)
+
+			resp, doErr := srv.Client().Do(req)
+			if doErr != nil {
+				t.Fatalf("/ws handshake: %v", doErr)
+			}
+			defer resp.Body.Close()
+			upgraded := resp.StatusCode == http.StatusSwitchingProtocols
+
+			if predicate != upgraded {
+				t.Errorf("isWebSocketUpgrade = %v but the engine handshake returned %d (upgraded=%v); the access-log skip and the real upgrade must never disagree",
+					predicate, resp.StatusCode, upgraded)
+			}
+		})
+	}
 }

@@ -519,7 +519,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // The marker-less converted overlay: this fixture deliberately omits
     // data-bootstrap-fatal, so it is NOT the full claimed-overlay
     // shape -- it isolates the older missing-.wt-loading-bar fallback
-    // clause, complementing the marker-only stand-down test above.
+    // clause, complementing the marker-only "watchdog stands down when a
+    // fatal dialog already owns the overlay" test below.
     const overlay = document.createElement("div");
     overlay.id = "loading";
     overlay.setAttribute("role", "alertdialog");
@@ -633,7 +634,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   });
 
   it("does not boot over the watchdog's fatal stylesheet dialog", async () => {
-    // The second half of the stylesheet flow the test above stops short of: a
+    // The second half of the stylesheet flow the "watchdog fires on a failed
+    // <link rel=stylesheet> (/style.css)" test stops short of: a
     // failed /style.css does NOT prevent /app.js from evaluating, so app.ts
     // runs with the watchdog's alertdialog already on screen and #terminal
     // inerted. It must recognize that handoff and abort instead of passing the
@@ -812,6 +814,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect((manifest as { theme_color: string }).theme_color).toBe(ACCENT_HEX);
   });
 
+  it("keeps the served no-JS fallback wired to the class its critical CSS styles", () => {
+    // The accent test above pins the .noscript-fallback CSS RULE; nothing pinned
+    // the markup that opts into it. That class is what lifts the message over the
+    // still-animating loading overlay (position: fixed, inset: 0, z-index: 300,
+    // opaque background), so renaming it -- or dropping the <noscript> block --
+    // leaves a JS-disabled visitor watching the infinite loading bar with no
+    // explanation, while the surviving rule keeps the parity test green.
+    // The stylesheet link is stripped before parsing for the same reason as the
+    // pristine-overlay test: happy-dom would try to fetch its href.
+    const html = readStaticAsset("index.html").replace(
+      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
+      "",
+    );
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const fallback = doc.querySelector("noscript .noscript-fallback");
+    expect(fallback?.tagName).toBe("P");
+    expect(fallback?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "Web Terminal for Kiro needs JavaScript to run the terminal. Enable JavaScript and reload.",
+    );
+  });
+
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
     // Why this test exists: the watchdog's stand-down guards read index.html's
     // REAL markup (a .wt-loading-bar child, no .fade) while appendPristineOverlay()
@@ -849,6 +872,38 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const terminalRoot = doc.getElementById("terminal");
     expect(terminalRoot).not.toBeNull();
     expect(terminalRoot?.firstElementChild).toBeNull();
+  });
+
+  it("declares an importmap entry for every bare specifier app.ts imports", () => {
+    // app.ts ships as a plain tsc emit -- no bundler rewrites its bare
+    // specifiers -- so the browser resolves every one of them through
+    // index.html's inline importmap alone. This suite mocks both packages and
+    // the image build only checks three hardcoded emit paths, so importing a
+    // subpath the importmap does not name compiles, ships, and then fails at
+    // module load for every visitor (the watchdog's own fatal dialog) with
+    // every test above still green.
+    const source = readFileSync(resolve(fixtureRoot(), "app.ts"), "utf8");
+    const specifiers = [...source.matchAll(/^\s*import\b[^;]*?from\s*["']([^"']+)["']/gm)]
+      .map((match) => match[1] as string)
+      .filter((specifier) => !specifier.startsWith(".") && !specifier.startsWith("/"));
+    // Guard the extractor itself: a regex that silently matched nothing would
+    // leave the loop below asserting over an empty list and passing forever.
+    expect(specifiers).toContain("@cplieger/web-terminal-ui");
+    expect(specifiers).toContain("@cplieger/web-terminal-ui/presets");
+
+    const html = readStaticAsset("index.html");
+    const map = /<script\b[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script\s*>/i.exec(html);
+    const parsed: unknown = JSON.parse(map?.[1] ?? "null");
+    const keys = Object.keys((parsed as { imports?: Record<string, string> })?.imports ?? {});
+    for (const specifier of specifiers) {
+      // The browser's own resolution rule: an exact key, or a trailing-slash
+      // prefix key the specifier starts with -- so switching the map to prefix
+      // form stays green.
+      expect(
+        keys.some((key) => key === specifier || (key.endsWith("/") && specifier.startsWith(key))),
+        `no importmap entry in static/index.html resolves ${specifier}`,
+      ).toBe(true);
+    }
   });
 
   it("themes only custom properties the shipped UI package declares and reads", () => {
@@ -891,8 +946,9 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // progressive status line into, and the one --wt-loading-accent token that
     // carries the brand into the pre-JS screen. Those names are hardcoded in a
     // static HTML file no compiler reads, so a library rename leaves the first
-    // screen of every load unstyled with every test above still green -- the test
-    // at the end of this file pins index.html's half of the same contract.
+    // screen of every load unstyled with every test above still green -- the
+    // "index.html's pristine overlay satisfies the watchdog's stand-down
+    // guards" test pins index.html's half of the same contract.
     const bundle = readUiCssBundle();
 
     for (const selector of [".wt-loading", ".wt-loading-bar", ".wt-loading-text"]) {

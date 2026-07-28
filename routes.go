@@ -221,7 +221,7 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// shutdowns keep the engine's normal INFO exit record.
 			terminal.WithOnProcessExit(func(err error) {
 				if err != nil && deps.ready.Ready() && time.Since(start) < 10*time.Second {
-					sessionLogger.Warn("session process exited almost immediately after start; kiro-cli may be missing or broken",
+					sessionLogger.Warn(sessionFastDeathMsg,
 						"error", err,
 						"hint", "check /api/health and the kiro-cli install under /config/tools/bin")
 				}
@@ -344,6 +344,12 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		webhttp.WriteJSON(w, healthResponse("ok", ""))
 	}
 }
+
+// sessionFastDeathMsg is the fast-death Warn's wording, named for the same reason
+// the classifier's messages are: session_exit_warn_test.go asserts on it, and its
+// quiet branch asserts an ABSENCE, which a reworded literal would satisfy
+// vacuously.
+const sessionFastDeathMsg = "session process exited almost immediately after start; kiro-cli may be missing or broken"
 
 // unrecognizedNotifyMsg is the one wording both the bounded Warn and the
 // per-occurrence Debug emit, so the two records a log search correlates cannot
@@ -612,19 +618,18 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 					"distinct_limit", unrecognizedNotifyCap,
 					"hint", unrecognizedNotifyHint)
 			}
+			// ONE Debug record either way; the KWEB_LOG_OSC_TEXT opt-in only ADDS
+			// the text. Whoever set BOTH it and the debug level accepted (and was
+			// warned at startup) that terminal notification text may contain
+			// secrets. The metadata rides along rather than being replaced: the
+			// fingerprint is what pairs this record with the Warn that sent the
+			// operator here, so the opt-in must not trade the correlation key for
+			// the text.
+			attrs := fingerprints.metadata(msg)
 			if logText {
-				// The deliberate diagnostic opt-in: whoever set BOTH
-				// KWEB_LOG_OSC_TEXT and the debug level accepted (and was warned at
-				// startup) that terminal notification text may contain secrets.
-				// The metadata rides along rather than being replaced: the
-				// fingerprint is what pairs this record with the Warn that sent
-				// the operator here, and the opt-in must ADD the text, not trade
-				// the correlation key for it.
-				slog.Debug(unrecognizedNotifyMsg,
-					append(fingerprints.metadata(msg), "message", msg)...)
-			} else {
-				slog.Debug(unrecognizedNotifyMsg, fingerprints.metadata(msg)...)
+				attrs = append(attrs, "message", msg)
 			}
+			slog.Debug(unrecognizedNotifyMsg, attrs...)
 			return "", false
 		}
 	}

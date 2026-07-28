@@ -127,7 +127,7 @@ is_self_contained_executable() {
 # mixed-set bug this exists to prevent.
 kiro_cli_snapshot_one() {
   local src="$1" backup="$2" absent="$2.absent"
-  rm -f "$backup" "$absent" || return 1
+  rm -rf "$backup" "$absent" || return 1
   # A symlink is deliberately NOT snapshotted: the boot quarantine treats one at
   # these paths as untrusted, so restoring it would put back a file this script
   # already refuses to authenticate. It is tombstoned rather than ignored for the
@@ -154,10 +154,19 @@ kiro_cli_snapshot_one() {
 kiro_cli_restore_one() {
   local backup="$1" dest="$2" absent="$1.absent"
   if [ -f "$absent" ] && [ ! -L "$absent" ]; then
-    rm -f -- "$dest" "$absent" || return 1
+    rm -rf -- "$dest" "$absent" || return 1
     return 0
   fi
   if [ ! -e "$backup" ] || [ -L "$backup" ]; then
+    return 0
+  fi
+  # A backup that is not a regular file is not one this script wrote. A DIRECTORY
+  # is the reachable shape (mkdir needs no privilege on a tree that once permitted
+  # foreign writes): `mv` would rename it over $dest, and `rm -f` could never
+  # remove it, so the journal would never close and every later boot would re-fail
+  # the repair. Discard it and report "no snapshot" rather than promoting it.
+  if [ ! -f "$backup" ]; then
+    rm -rf "$backup"
     return 0
   fi
   # Same inode => this component was never promoted, so the backup IS the live file
@@ -165,7 +174,7 @@ kiro_cli_restore_one() {
   # `mv`, which refuses a same-file rename with an error ("are the same file") and
   # would otherwise turn every partial rollback into a reported failure.
   if [ "$backup" -ef "$dest" ]; then
-    rm -f "$backup"
+    rm -rf "$backup"
     return
   fi
   mv -f "$backup" "$dest"
@@ -178,11 +187,11 @@ kiro_cli_restore_one() {
 # `.absent` tombstones are backups too -- an orphaned one would make the next
 # recovery pass DELETE a committed component -- so they are dropped here as well.
 kiro_cli_update_finish() {
-  if ! rm -f "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
+  if ! rm -rf "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
     "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; then
     printf 'level=warn msg="failed to remove kiro-cli update backups; they keep occupying the /config volume" dir="%s" component=entrypoint\n' "$TOOLS" >&2
   fi
-  if ! rm -f "$KIRO_CLI_UPDATE_JOURNAL"; then
+  if ! rm -rf "$KIRO_CLI_UPDATE_JOURNAL"; then
     printf 'level=warn msg="failed to clear the kiro-cli update journal; the next boot will run an unnecessary recovery pass" journal="%s" component=entrypoint\n' "$KIRO_CLI_UPDATE_JOURNAL" >&2
     return 1
   fi
@@ -799,7 +808,7 @@ if [ "$tools_tree_was_writable" -eq 1 ]; then
   # authority on whether this pin's full set was promoted. A marker written while the tree
   # was foreign-writable must not answer that question; its absence is already a
   # first-class state (rc 2), and the reinstall below rewrites it at 0600.
-  if ! rm -f "$KIRO_CLI_INSTALL_MARKER" \
+  if ! rm -rf "$KIRO_CLI_INSTALL_MARKER" \
     "$KIRO_CLI_UPDATE_JOURNAL" "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
     "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; then
     printf 'level=warn msg="failed to remove the kiro-cli install-completion marker, update journal and backups from a previously group/other-writable tools tree" dir="%s" component=entrypoint\n' "$TOOLS" >&2
@@ -811,6 +820,16 @@ if [ "$tools_tree_was_writable" -eq 1 ]; then
   for tainted in "$TOOLS/bin"/kiro-cli*; do
     [ -e "$tainted" ] || [ -L "$tainted" ] || continue
     fatal 'a tainted kiro-cli payload survived quarantine; refusing to trust its version output' "path=\"$tainted\""
+  done
+  # Same assertion as the loop above, for the artifacts the sweep's glob cannot
+  # reach: a surviving journal or backup is restored INTO $BIN by the recovery pass
+  # a few lines below, so leaving it is strictly worse than the kiro-cli* case the
+  # loop already refuses.
+  for tainted in "$KIRO_CLI_INSTALL_MARKER" "$KIRO_CLI_UPDATE_JOURNAL" \
+    "$BIN_PREV" "$CHAT_SIDECAR_PREV" "$KIRO_CLI_INSTALL_MARKER_PREV" \
+    "$BIN_PREV.absent" "$CHAT_SIDECAR_PREV.absent" "$KIRO_CLI_INSTALL_MARKER_PREV.absent"; do
+    [ -e "$tainted" ] || [ -L "$tainted" ] || continue
+    fatal 'a kiro-cli update journal or backup survived quarantine; refusing to let the boot recovery restore it over the pinned binary' "path=\"$tainted\""
   done
 fi
 
@@ -1271,16 +1290,28 @@ kiro_cli_measured_version=""
 # readiness section can publish over the OLD version instead of withholding the marker
 # and leaving a working terminal answering 503 for the container's lifetime.
 kiro_cli_update_failed=0
-if [ "$kiro_cli_recovery_failed" -eq 1 ]; then
-  # An earlier update could not be rolled back, so the journal and backups still on the
-  # volume are the only record of the previous dispatcher set. Installing now would
+if [ "${kiro_cli_recovery_failed:-0}" -eq 1 ] \
+  || [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] || [ -L "$KIRO_CLI_UPDATE_JOURNAL" ]; then
+  # An earlier update could not be rolled back -- or its journal survived the attempt to
+  # clear it -- so the journal and backups still on the volume are the only record of
+  # the previous dispatcher set. Installing now would
   # start a transaction that deletes those backups and snapshots the already-mixed live
   # set (see kiro_cli_update_begin's own guard, which refuses this independently), and
   # a promotion failure would then roll back TO the mixed set. Skip the install and let
   # the next boot retry the repair with the evidence intact; readiness is withheld
   # below either way, so the container serves degraded rather than reporting healthy
   # over an unverified set.
-  printf 'level=warn msg="skipping the kiro-cli install: an earlier update could not be rolled back, so its journal and backups are the only record of the previous dispatcher set; readiness stays withheld until a later boot completes the repair" journal="%s" pinned=%s component=entrypoint\n' \
+  # The journal is tested DIRECTLY as well as through the recovery flag, and with the
+  # same `-e OR -L` predicate as kiro_cli_update_begin and the readiness chain below:
+  # recovery's no-transaction branch returns 0 unconditionally, so it reports success
+  # even when kiro_cli_update_finish could not remove the journal (an immutable or
+  # separately-mounted entry -- the write probe proves the DIRECTORY, not the entry).
+  # Without the direct test that state downloads the ~528 MB zip on every boot only for
+  # kiro_cli_update_begin to refuse it afterwards, blowing the HEALTHCHECK start-period
+  # for nothing while readiness is withheld anyway. (`${...:-0}` matches the readiness
+  # chain: the boot flag is out of scope when the chain is sourced standalone by
+  # tests/shell.)
+  printf 'level=warn msg="skipping the kiro-cli install: an earlier update could not be rolled back, or its journal could not be cleared, so its journal and backups are the only record of the previous dispatcher set; readiness stays withheld until a later boot completes the repair" journal="%s" pinned=%s component=entrypoint\n' \
     "$KIRO_CLI_UPDATE_JOURNAL" "$KIRO_CLI_VERSION" >&2
 elif needs_kiro_cli_install; then
   # DOWNLOAD-THEN-SWAP. install_kiro_cli fetches the ~528 MB zip, verifies it
@@ -1494,7 +1525,7 @@ if [ "${kiro_cli_recovery_failed:-0}" -eq 1 ] \
     "$KIRO_CLI_UPDATE_JOURNAL" "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
 elif [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
   if [ "$kiro_cli_update_failed" -eq 1 ] && [ -n "$kiro_cli_installed" ] && [ "$kiro_cli_set_rc" -ne 1 ] \
-    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]; then
+    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] && [ ! -L "$KIRO_CLI_UPDATE_JOURNAL" ]; then
     # An update failed and the previous version is still installed and answering
     # --version. The terminal genuinely works, so readiness describes the terminal:
     # withholding here would mean a container that boots, serves a working shell, and
@@ -1526,7 +1557,7 @@ elif [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
   fi
 elif [ "$kiro_cli_set_rc" -ne 0 ]; then
   if [ "$kiro_cli_update_failed" -eq 1 ] && [ "$kiro_cli_set_rc" -eq 2 ] \
-    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]; then
+    && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] && [ ! -L "$KIRO_CLI_UPDATE_JOURNAL" ]; then
     # $BIN is at the pin and the chat sidecar is usable; only the completion marker
     # does not name this pin (an inherited pre-marker volume). The update that would
     # have written it failed, so serve the working terminal rather than answering 503

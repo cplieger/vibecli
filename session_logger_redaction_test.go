@@ -40,11 +40,7 @@ func TestSessionLoggerRedactsCommand(t *testing.T) {
 	// readiness first -- the contract every test leaving a live session owes the
 	// next test's log capture.
 	deps.cmd = []string{"/bin/sh", "-c", "exec cat", "sh", "--token=" + secret}
-	_, mgr, _ := mustRegisterRoutes(t, deps)
-	if _, err := mgr.Create(); err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	mustStartSession(t, deps)
 
 	// EVERY command attr must be the placeholder, not merely the last one
 	// seen: a record carrying the real argv anywhere in the stream is the leak.
@@ -84,12 +80,7 @@ func TestSessionLoggerTruncatesSessionID(t *testing.T) {
 	records := capture.Default(t)
 	deps := newTestDeps(true)
 	deps.cmd = []string{"/bin/sh", "-c", "exec cat"}
-	_, mgr, _ := mustRegisterRoutes(t, deps)
-	id, err := mgr.Create()
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	quietTeardown(t, deps)
+	_, _, _, id := mustStartSession(t, deps)
 	if len(id) <= 8 {
 		t.Fatalf("session id %q is too short to exercise truncation", id)
 	}

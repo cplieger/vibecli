@@ -51,11 +51,19 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 // this file's parity test green while the gate no longer runs. A future Dockerfile
 // restructure that legitimately puts another shell construct before the command
 // fails the parity test until this assertion is consciously updated -- the intended
-// trade, since the alternative silently ships an incompatible Go/TS pair.
+// trade, since the alternative silently ships an incompatible Go/TS pair. A line
+// carrying `||` is rejected for the same reason in the other direction: it still
+// runs the gate but discards the verdict, so the build survives an incompatible
+// pair.
 func lineInvokesTheGate(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "#") {
 		return false // a commented-out invocation is not an invocation
+	}
+	if strings.Contains(trimmed, "||") {
+		// A swallowed verdict is not a gate: `go run ... || true` runs the
+		// check and then exits 0 on an incompatible pair.
+		return false
 	}
 	return strings.HasPrefix(trimmed, "go run ./scripts/wirecheck ") &&
 		strings.Contains(trimmed, "-client-rev") &&
@@ -80,6 +88,7 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"missing the min-server flag":   {`    go run ./scripts/wirecheck -client-rev "$CLIENT_REV"`, false},
 		"prose mentioning the gate":     {"# public Go API inside scripts/wirecheck (no source scraping)", false},
 		"another command of the binary": {"    go build ./scripts/wirecheck " + flags, false},
+		"verdict swallowed by || true":  {"    go run ./scripts/wirecheck " + flags + " || true", false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

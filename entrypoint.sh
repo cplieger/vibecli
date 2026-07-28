@@ -839,8 +839,8 @@ fi
 # KIRO_CLI_UPDATE_JOURNAL). Runs ahead of the bare-name identity check, the drift
 # predicate and the readiness decision, all of which would otherwise read the mixed
 # state. Warn-not-fatal, like the sweeps around it: a repair this boot could not
-# finish keeps the journal, so the next boot retries it, and the drift check
-# reinstalls from the pinned archive either way.
+# finish keeps the journal, so the next boot retries it before anything reads a
+# version off the volume.
 #
 # The result is RECORDED rather than discarded, and it is authoritative for the rest of
 # boot. A failed rollback leaves the dispatcher set unverified AND leaves the original

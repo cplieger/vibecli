@@ -87,6 +87,39 @@ ready_published() {
   [ -f "$KIRO_CLI_READY_MARKER" ]
 }
 
+# The stderr-capturing sibling, for the cases where the OUTCOME cannot identify the
+# mechanism. The brace group is what makes the intent unambiguous (and SC2069-clean):
+# stdout is dropped INSIDE the group, then the group's stderr becomes the command
+# substitution's stdout, so only the chain's warns are captured.
+ready_warns() {
+  rm -f "$KIRO_CLI_READY_MARKER"
+  # shellcheck disable=SC1090  # extracted chain, path is computed
+  { . "$WORK/readiness.sh" >/dev/null; } 2>&1
+}
+
+# One chain run, reported as (which branch decided, what it did with the marker).
+# Needed because the readiness chain has THREE branches that withhold on an open
+# journal and every one of them leaves the same absent marker, so `ready_published`
+# alone cannot tell a case that exercised the intended guard from one that fell
+# through to a different refusal. Each branch is keyed on a distinct fragment of its
+# own warn -- the messages are the only externally visible difference.
+journal_decision() {
+  journal_warn=$(ready_warns)
+  case "$journal_warn" in
+    *"unresolved kiro-cli update transaction is on the volume"*) journal_branch=leading ;;
+    *"older than the pin after a failed update"*) journal_branch=old-version-fallback ;;
+    *"predates this pin"*) journal_branch=pre-marker-fallback ;;
+    *"not verified at pinned version"*) journal_branch=version-mismatch ;;
+    *"dispatcher set incomplete"*) journal_branch=set-incomplete ;;
+    *) journal_branch=other ;;
+  esac
+  if [ -f "$KIRO_CLI_READY_MARKER" ]; then
+    marker_state=published
+  else
+    marker_state=withheld
+  fi
+}
+
 # shellcheck disable=SC1090
 . "$WORK/helpers.sh"
 
@@ -231,8 +264,18 @@ ready_published && no "failed update, old version, sidecar missing" \
 # the one state that leaves the journal OPEN, and it is the one state where an
 # executable $BIN plus a usable sidecar is still not evidence of a verified set: the
 # old $BIN can sit beside an already-promoted NEW sidecar, which set_complete
-# deliberately never version-probes. Both fallback branches must refuse to publish
-# over it; the next boot's recovery pass repairs the set and publishes then.
+# deliberately never version-probes. The chain must refuse to publish over it; the
+# next boot's recovery pass repairs the set and publishes then.
+#
+# Which branch does that refusing changed, and the assertions had to change with it.
+# The LEADING unresolved-transaction branch now fires first on exactly this state, so
+# it -- not the two fallbacks' own `[ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]` clauses -- is
+# the live mechanism, and the clauses are unreachable-as-false defense-in-depth behind
+# it. Do not read their presence as what these two cases test: an outcome-only
+# assertion passed with BOTH clauses deleted (measured: 27 passed, 0 failed against a
+# mutated copy), because the leading branch withheld the marker either way. So each
+# case pins WHICH warn fired -- the repo's redundant-guard rule from the KAS cases --
+# and the clauses themselves are pinned by the source assertion after the pair.
 setup
 : >"$BIN" && chmod +x "$BIN"
 : >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
@@ -240,9 +283,11 @@ printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
 STUB_VERSION="2.13.0"
 kiro_cli_update_failed=1
 : >"$KIRO_CLI_UPDATE_JOURNAL"
-ready_published && no "failed update, old version, open journal" \
-  "marker published over a mixed set whose rollback never completed" \
-  || ok "readiness WITHHELD on the old-version fallback while the update journal is open"
+journal_decision
+[ "$marker_state" = withheld ] && [ "$journal_branch" = leading ] \
+  && ok "readiness WITHHELD by the leading unresolved-transaction branch, old-version fallback shape" \
+  || no "failed update, old version, open journal" \
+    "expected the leading journal branch to withhold over a mixed set whose rollback never completed; got branch=$journal_branch marker=$marker_state"
 
 setup
 : >"$BIN" && chmod +x "$BIN"
@@ -250,9 +295,48 @@ setup
 STUB_VERSION="$KIRO_CLI_VERSION"
 kiro_cli_update_failed=1
 : >"$KIRO_CLI_UPDATE_JOURNAL"
-ready_published && no "pre-marker volume, open journal" \
-  "marker published over a mixed set whose rollback never completed" \
-  || ok "readiness WITHHELD on the pre-marker fallback while the update journal is open"
+journal_decision
+[ "$marker_state" = withheld ] && [ "$journal_branch" = leading ] \
+  && ok "readiness WITHHELD by the leading unresolved-transaction branch, pre-marker fallback shape" \
+  || no "pre-marker volume, open journal" \
+    "expected the leading journal branch to withhold over a mixed set whose rollback never completed; got branch=$journal_branch marker=$marker_state"
+
+# A SYMLINKED journal counts as open for the same reason recovery distrusts one, and
+# it is the one open-journal shape `[ -e ]` alone answers `false` for when the target
+# is absent -- so this is the case that keeps the leading branch's `[ -L ... ]` clause
+# from being deleted silently. Bait the unguarded code would take: with `-L` dropped,
+# a dangling symlink journal reads as no journal at all and the old-version fallback
+# publishes.
+setup
+: >"$BIN" && chmod +x "$BIN"
+: >"$CHAT_SIDECAR" && chmod +x "$CHAT_SIDECAR"
+printf '2.13.0\n' >"$KIRO_CLI_INSTALL_MARKER"
+STUB_VERSION="2.13.0"
+kiro_cli_update_failed=1
+ln -s "$ROOT/no-such-journal-target" "$KIRO_CLI_UPDATE_JOURNAL"
+journal_decision
+[ "$marker_state" = withheld ] && [ "$journal_branch" = leading ] \
+  && ok "readiness WITHHELD when the update journal is a DANGLING SYMLINK, not a regular file" \
+  || no "dangling symlink journal" \
+    "expected the leading journal branch to withhold; dropping its [ -L ] clause publishes here -- got branch=$journal_branch marker=$marker_state"
+
+# The two fallbacks' own open-journal exclusions, which NO scenario above can reach:
+# the leading branch fires first on every state they exclude, so they are redundant by
+# construction and no outcome or message assertion can separate them from it. That is
+# exactly the shape the repo's shell.md flags -- and unlike the KAS pair, here the
+# redundant guard produces no distinguishable observable at all, so the only assertion
+# that can fail when it is deleted is a SOURCE assertion over the extracted chain (the
+# same technique as the Dockerfile wire-floor parity test). Keeping the clauses is
+# deliberate: they are the defense that survives a future edit narrowing, reordering,
+# or removing the leading branch, and this case is what makes dropping them a
+# conscious act rather than an invisible one. Read from $ENTRYPOINT via the same
+# extraction the scenarios run, so a red-check against a mutated copy sees the mutation.
+# shellcheck disable=SC2016  # a FIXED pattern matched against shell SOURCE text; expanding it is exactly what must not happen
+journal_exclusions=$(grep -c -F '! -e "$KIRO_CLI_UPDATE_JOURNAL"' "$WORK/readiness.sh")
+[ "$journal_exclusions" -eq 2 ] \
+  && ok "both failed-update fallbacks keep their open-journal exclusion, behind the leading branch" \
+  || no "fallback open-journal exclusions" \
+    "expected 2 open-journal exclusions in the readiness chain (one per failed-update fallback), found $journal_exclusions"
 
 # Auto-update could not be disabled -> withhold (unchanged behaviour).
 setup

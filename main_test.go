@@ -869,14 +869,18 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	}
 }
 
-// TestParseBoolEnv_neverLogsRawValue pins the confidentiality property the
-// local parser exists for: KWEB_LOG_OSC_TEXT is a small enum an operator
-// fat-fingers, a compose expansion mistake can land a credential on it
-// (`KWEB_LOG_OSC_TEXT: "${DEBUG_FLAG}"`), and envx.Bool's malformed path logs
-// the RAW value — a durable, queryable copy in the log store (CWE-532). The
-// assertion is the property, not the wording: no captured record may CONTAIN
-// the raw string. It also pins the vocabulary (so the local parse stays
-// compatible with envx.Bool's) and the fail-closed direction on a bad value.
+// TestParseBoolEnv_neverLogsRawValue pins the parser's VOCABULARY (so the local
+// parse stays compatible with envx.Bool's) and its fail-closed direction on a bad
+// value: a token-shaped value must yield the fallback with ok=false.
+//
+// It does NOT pin the confidentiality property, and must not be read as doing so:
+// parseBoolEnv emits no records at all, so the no-raw-value assertion below is
+// satisfied vacuously here. That property lives in the PRODUCTION knob read and is
+// pinned by TestParseLogOSCText_warnsByNameOnly. The assertion stays as a
+// regression guard for the one thing it can still catch — parseBoolEnv itself
+// gaining a log site that echoes the raw value, which is exactly what envx.Bool's
+// malformed path does (CWE-532: a durable, queryable copy in the log store) and why
+// this parser is local.
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
 	const key = "KWEB_TEST_BOOL"

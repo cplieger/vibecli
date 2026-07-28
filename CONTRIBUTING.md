@@ -16,7 +16,7 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   `startKiroCLI` (main.go) builds it from the pins `entrypoint.sh` exports and
   runs it in the background after the listener binds, the same bind-first shape
   `startTools` uses. It owns the download and its SHA-256 verification, the
-  version-addressed layout under `/config/tools/opt/kiro-cli/<version>/`,
+  version-addressed layout under `/config/tools/kiro-cli-versions/<version>/`,
   version selection, the kiro-cli settings the app depends on, pruning, and the
   purge of the pre-2026-07 `/config/tools/bin` layout. Its verdict is what
   `/api/health` and the session-create gate read, its active version directory
@@ -107,7 +107,7 @@ version directory that is already complete on disk, downloading nothing, and
 that's the seam to use locally and in tests. Populate it yourself:
 
 ```text
-$KIRO_CLI_TOOLS_DIR/opt/kiro-cli/<version>/
+$KIRO_CLI_TOOLS_DIR/kiro-cli-versions/<version>/
 ├── kiro-cli         # executable; must answer `--version` with <version>
 ├── kiro-cli-chat    # executable; required, chat over a PTY is the product
 └── .complete        # the sentinel; written LAST, contains <version>
@@ -115,7 +115,7 @@ $KIRO_CLI_TOOLS_DIR/opt/kiro-cli/<version>/
 
 ```sh
 export KIRO_CLI_TOOLS_DIR=/tmp/kweb-tools KIRO_CLI_VERSION=2.14.2
-V="$KIRO_CLI_TOOLS_DIR/opt/kiro-cli/$KIRO_CLI_VERSION"
+V="$KIRO_CLI_TOOLS_DIR/kiro-cli-versions/$KIRO_CLI_VERSION"
 mkdir -p "$V"
 cp /path/to/kiro-cli /path/to/kiro-cli-chat "$V/"
 printf '%s\n' "$KIRO_CLI_VERSION" >"$V/.complete"

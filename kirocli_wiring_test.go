@@ -41,8 +41,8 @@ func TestSessionPathEnv_versionDirectoryLeads(t *testing.T) {
 		t.Errorf("sessionPathEnv(\"\") = %v, want nil: with no active version there is nothing to prepend and the child must keep the server's own PATH", got)
 	}
 
-	got := sessionPathEnv("/config/tools/opt/kiro-cli/2.14.2")
-	want := "PATH=/config/tools/opt/kiro-cli/2.14.2:/config/tools/bin:/config/tools/go/bin:/usr/bin"
+	got := sessionPathEnv("/config/tools/kiro-cli-versions/2.14.2")
+	want := "PATH=/config/tools/kiro-cli-versions/2.14.2:/config/tools/bin:/config/tools/go/bin:/usr/bin"
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("sessionPathEnv = %q, want [%q]", got, want)
 	}
@@ -91,9 +91,9 @@ func TestSessionCommand_perSessionPicksUpVersionSwitch(t *testing.T) {
 	if got := before[cliArg]; got != "" {
 		t.Fatalf("argv before activation carries cli path %q, want the empty path the manager reports with no active version", got)
 	}
-	active.Store("/config/tools/opt/kiro-cli/2.14.2/kiro-cli")
+	active.Store("/config/tools/kiro-cli-versions/2.14.2/kiro-cli")
 	after := cmd()
-	if got := after[cliArg]; got != "/config/tools/opt/kiro-cli/2.14.2/kiro-cli" {
+	if got := after[cliArg]; got != "/config/tools/kiro-cli-versions/2.14.2/kiro-cli" {
 		t.Errorf("argv after activation carries cli path %q, want the newly active version's binary -- the factory is closing over a boot constant instead of asking per session", got)
 	}
 	if before[1] != after[1] || before[2] != after[2] {
@@ -284,7 +284,7 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 func TestKiroRescan_reportsVerdictNotErrorText(t *testing.T) {
 	deps := newTestDeps(true)
 	deps.kiroRescan = func(context.Context) (bool, error) {
-		return false, errors.New("/config/tools/opt/kiro-cli/2.14.2: permission denied")
+		return false, errors.New("/config/tools/kiro-cli-versions/2.14.2: permission denied")
 	}
 	deps.kiroReady = func() (bool, string) { return false, kirocli.ReasonUnavailable }
 	mux, _, _ := mustRegisterRoutes(t, deps)
@@ -381,7 +381,7 @@ func TestStartKiroCLI_shapes(t *testing.T) {
 func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 	const version = "9.9.9"
 	toolsDir := t.TempDir()
-	versionDir := filepath.Join(toolsDir, "opt", "kiro-cli", version)
+	versionDir := filepath.Join(toolsDir, "kiro-cli-versions", version)
 	if err := os.MkdirAll(versionDir, 0o750); err != nil {
 		t.Fatalf("create version dir: %v", err)
 	}

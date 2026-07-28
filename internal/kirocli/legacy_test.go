@@ -10,8 +10,10 @@ import (
 
 // legacyFixture is the full inherited layout: the shell installer's dispatchers
 // in $TOOLS/bin, its hard-linked backups and absence tombstones, the update
-// journal, both install-completion markers, the readiness marker, a retired
-// dispatcher name, and an orphan staging tree.
+// journal, both install-completion markers, the readiness marker, and an orphan
+// staging tree. Every entry is in the SHAPE the shell installer left it in
+// (regular files, and a directory for the staging tree), which is what the
+// sweep now requires before it removes anything.
 func legacyFixture(t *testing.T, tools string) []string {
 	t.Helper()
 	dirs := []string{
@@ -27,7 +29,6 @@ func legacyFixture(t *testing.T, tools string) []string {
 		"bin/kiro-cli",
 		"bin/kiro-cli-chat",
 		"bin/kiro-cli-term",
-		"bin/kiro-cli-legacyname", // a retired dispatcher name no fixed list knows
 		"bin/.kiro-cli.prev",
 		"bin/.kiro-cli-chat.prev.absent",
 		".kiro-cli-installed",
@@ -69,6 +70,29 @@ func TestPurgeLegacyDeletesTheWholeLayout(t *testing.T) {
 	// kiro-cli names, never the directory.
 	if !exists(filepath.Join(env.tools, "bin")) {
 		t.Error("the purge removed $TOOLS/bin, which the toolbelt engine co-owns")
+	}
+}
+
+// TestPurgeLegacyLeavesAnUnknownDispatcherName pins the trade the scoped sweep
+// makes deliberately. The `bin/kiro-cli*` prefix sweep it replaces could reclaim
+// a retired dispatcher name no fixed list knows about — and could equally
+// unlink a toolbelt-owned bin/kiro-cli-<anything> symlink while the engine's
+// state row still claimed it. Only the three names the shell installer actually
+// promoted are swept now; anything else is inert, dot-free residue costing disk,
+// which is the correct price for never deleting another owner's live entry.
+func TestPurgeLegacyLeavesAnUnknownDispatcherName(t *testing.T) {
+	env := newFakeEnv(t)
+	legacyFixture(t, env.tools)
+	unknown := filepath.Join(env.tools, binSubdir, mainBinary+"-legacyname")
+	if err := os.WriteFile(unknown, []byte("legacy\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%s): %v", unknown, err)
+	}
+	m := env.manager()
+
+	m.purgeLegacy()
+
+	if !exists(unknown) {
+		t.Error("the sweep removed a bin/kiro-cli* name the shell installer never promoted; the prefix sweep is back, and with it the deletion of foreign symlinks in the co-owned bin dir")
 	}
 }
 

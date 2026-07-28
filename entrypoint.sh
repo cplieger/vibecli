@@ -4,7 +4,7 @@
 # /config present, private and writable, export the pins, and exec the Go web
 # server. The server OWNS the kiro-cli install (internal/kirocli): it downloads
 # the pinned archive, verifies its SHA-256, installs it into a
-# version-addressed directory under /config/tools/opt/kiro-cli, and decides
+# version-addressed directory under /config/tools/kiro-cli-versions, and decides
 # readiness. It does that AFTER the listener binds, so a slow first-boot
 # download answers 503 with a reason instead of refusing connections.
 #
@@ -93,7 +93,7 @@ harden_config_dir() {
 
 # --- persistent tool-tree integrity ---------------------------------------------
 # $TOOLS/bin leads PATH (see the Dockerfile's ENV PATH) and the version-addressed
-# install root lives one level over at $TOOLS/opt/kiro-cli, so the tree HOLDING
+# install root sits beside it at $TOOLS/kiro-cli-versions, so the tree HOLDING
 # kiro-cli is part of the integrity story, not just the download. The server's
 # install manager accepts an already-present version directory on the strength of
 # its own `.complete` sentinel, and a sentinel is trivially forgeable, unlike a
@@ -115,9 +115,9 @@ secure_tools_dir() {
   # web-terminal-kiro.md), so a broken state must be able to heal itself or at worst
   # be fixable from INSIDE the container. Aborting boot fails that test -- there is no
   # way in to repair it, and nothing recreates these trees.
-  #   owned=1  /config, $TOOLS, $TOOLS/bin, $TOOLS/opt, $TOOLS/opt/kiro-cli -- created
-  #            by this entrypoint, so a symlink or a plain file there is unambiguously
-  #            anomalous and a reinstall repairs the contents. Fatal.
+  #   owned=1  /config, $TOOLS, $TOOLS/bin, $TOOLS/opt, $TOOLS/kiro-cli-versions --
+  #            created by this entrypoint, so a symlink or a plain file there is
+  #            unambiguously anomalous and a reinstall repairs the contents. Fatal.
   #   owned=0  the legacy PATH segments -- never created, never repaired, and holding
   #            no integrity-gated binary. Warn and skip, matching
   #            prune_superseded_kas_runtimes' explicit "disk hygiene must not brick
@@ -399,11 +399,19 @@ make_config_dir "$TOOLS"
 make_config_dir "$TOOLS/bin"
 # The version-addressed install root the server's manager writes into. It is created
 # and validated HERE, one component at a time, rather than by the manager's own
-# MkdirAll: a symlink planted at $TOOLS/opt on an inherited volume would silently
-# redirect a root-owned tree of executables (and the manager's prune) outside the mount,
-# and MkdirAll cannot see that.
+# MkdirAll: a symlink planted on an inherited volume would silently redirect a
+# root-owned tree of executables (and the manager's prune) outside the mount, and
+# MkdirAll cannot see that.
+#
+# It is a SIBLING of $TOOLS/opt, never a child. $TOOLS/opt belongs to the toolbelt
+# engine, whose per-tool prune deletes every version directory under opt/<tool> that
+# is not the one it just installed -- so a manifest entry named `kiro-cli` (the engine
+# accepts any name, and tools.json is hand-editable) used to be able to delete the
+# active kiro-cli and its retained predecessor. $TOOLS/opt itself is still created and
+# hardened below: it holds engine binaries that $TOOLS/bin symlinks into and root
+# executes.
 make_config_dir "$TOOLS/opt"
-make_config_dir "$TOOLS/opt/kiro-cli"
+make_config_dir "$TOOLS/kiro-cli-versions"
 make_config_dir "$HOME/.local"
 make_config_dir "$HOME/.local/bin"
 make_config_dir "$HOME/.ssh"
@@ -442,7 +450,7 @@ secure_tools_dir /config
 secure_tools_dir "$TOOLS"
 secure_tools_dir "$TOOLS/bin"
 secure_tools_dir "$TOOLS/opt"
-secure_tools_dir "$TOOLS/opt/kiro-cli"
+secure_tools_dir "$TOOLS/kiro-cli-versions"
 # The Dockerfile's ENV PATH puts ONE more /config-resident dir ahead of /usr/bin
 # for the server, its PTY sessions and the toolbelt engine: $TOOLS/go/bin, i.e.
 # GOPATH/bin. (The two runtimes/{go,node}/bin segments were dropped from ENV PATH

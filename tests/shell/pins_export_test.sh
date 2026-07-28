@@ -116,7 +116,7 @@ grep -q 'KIRO_CLI_PATH' "$README" \
   || ok "the README config table does not offer KIRO_CLI_PATH"
 
 # --- the tools dir the server writes to is the one this script hardened -------
-# The manager creates version directories under $KIRO_CLI_TOOLS_DIR/opt/kiro-cli,
+# The manager creates version directories under $KIRO_CLI_TOOLS_DIR/kiro-cli-versions,
 # and the symlink + mode guards only cover it because the same path is walked
 # here. Exporting a different path would move the install outside everything this
 # script proved about it.
@@ -124,7 +124,13 @@ grep -q '^KIRO_CLI_TOOLS_DIR="\$TOOLS"$' "$ENTRYPOINT" \
   && ok "the exported tools dir is \$TOOLS itself" \
   || no "exported tools dir" "KIRO_CLI_TOOLS_DIR is not \$TOOLS, so the server may write outside the hardened tree"
 
-for dir in '"$TOOLS/opt"' '"$TOOLS/opt/kiro-cli"'; do
+# The install root is a SIBLING of the toolbelt engine's opt/ tree, not a child of
+# it. The engine's per-tool prune removes every version directory under
+# opt/<tool> that is not the one it just installed, and it accepts any tool name
+# from a hand-editable manifest -- so an entry named `kiro-cli` under opt/ would
+# delete the active kiro-cli and its retained predecessor. Both dirs are still
+# created and hardened; only the kiro-cli root moved out from under opt/.
+for dir in '"$TOOLS/opt"' '"$TOOLS/kiro-cli-versions"'; do
   grep -qF "make_config_dir $dir" "$ENTRYPOINT" \
     && ok "make_config_dir walks $dir before the server writes into it" \
     || no "make_config_dir $dir" "the install root is not created component-by-component, so a symlink planted there is followed"
@@ -132,6 +138,12 @@ for dir in '"$TOOLS/opt"' '"$TOOLS/opt/kiro-cli"'; do
     && ok "secure_tools_dir hardens $dir" \
     || no "secure_tools_dir $dir" "the install root's mode is never enforced"
 done
+
+# The install root must not be reachable as a child of a toolbelt tree, whatever
+# it is named. A nested root is what the collision was.
+grep -qE 'make_config_dir "\$TOOLS/(opt|npm|python|bin)/' "$ENTRYPOINT" \
+  && no "install root under a toolbelt tree" "a directory is created INSIDE one of the toolbelt engine's own trees (opt/npm/python/bin); the engine's per-tool prune and bin republish own everything under those" \
+  || ok "no directory is created inside a toolbelt-engine tree, so the engine's prune cannot reach the kiro-cli install"
 
 # --- the taint flag carries the observation, not a constant ------------------
 # The flag is the only thing that stops a forged `.complete` sentinel on a

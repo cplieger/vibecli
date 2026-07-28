@@ -1,11 +1,11 @@
 // Package kirocli owns the whole kiro-cli lifecycle: it downloads the pinned
 // archive, proves its SHA-256 against the pin, installs it into a
-// version-addressed directory under $TOOLS/opt/kiro-cli, selects which
+// version-addressed directory under $TOOLS/kiro-cli-versions, selects which
 // installed version is active, reasserts the settings the pin depends on,
 // prunes superseded versions, and purges the legacy $TOOLS/bin layout the
 // shell installer left behind.
 //
-// The unit of installation is $TOOLS/opt/kiro-cli/<version>/. It is populated
+// The unit of installation is $TOOLS/kiro-cli-versions/<version>/. It is populated
 // only from a verified archive, published by a single same-filesystem rename,
 // and marked by a `.complete` sentinel written LAST — so an interrupted
 // install is detectable by absence of the sentinel and never becomes a
@@ -103,9 +103,19 @@ const (
 	// lives INSIDE the directory it describes, so it cannot drift from the
 	// binaries it vouches for, and it is written LAST.
 	sentinelName = ".complete"
-	// optSubdir is the version-addressed installation root, relative to the
-	// tools dir.
-	optSubdir = "opt/kiro-cli"
+	// versionsSubdir is the version-addressed installation root, relative to
+	// the tools dir.
+	//
+	// It is a SIBLING of the toolbelt engine's trees, never a child of them.
+	// The engine owns `opt/<tool>/<version>/` and `bin/<tool>`, and its
+	// pruneOldVersions removes every directory under `opt/<tool>` that is not
+	// the version it just installed — so a manifest entry named `kiro-cli`
+	// (the engine accepts any name, and its manifest is hand-editable) would
+	// have deleted this manager's ACTIVE version and its retained predecessor
+	// out from under it. The engine creates and enumerates exactly `bin`,
+	// `opt`, `npm` and `python` under the tools dir and never scans the tools
+	// dir itself, so no tool of any name can reach a path under this one.
+	versionsSubdir = "kiro-cli-versions"
 	// binSubdir holds the non-authoritative convenience symlink, relative to
 	// the tools dir. It is co-owned by the toolbelt engine.
 	binSubdir = "bin"
@@ -451,7 +461,7 @@ func (m *Manager) EnsureWithRetry(ctx context.Context) error {
 	if ready, _ := m.Ready(); !ready && lastErr != nil {
 		slog.Error("kiro-cli is unavailable and the bounded install retries are exhausted; the server stays up so the install can be repaired in place",
 			"pinned", m.cfg.Version, "attempts", m.cfg.MaxAttempts, "error", lastErr,
-			"hint", "docker exec into the container, fix or remove /config/tools/opt/kiro-cli, then restart the container or hit the manager's rescan")
+			"hint", "docker exec into the container, fix or remove /config/tools/kiro-cli-versions, then restart the container or hit the manager's rescan")
 	}
 	return lastErr
 }
@@ -557,7 +567,7 @@ func (m *Manager) CLIPath() string {
 
 // versionsRoot is the version-addressed installation root.
 func (m *Manager) versionsRoot() string {
-	return filepath.Join(m.cfg.ToolsDir, optSubdir)
+	return filepath.Join(m.cfg.ToolsDir, versionsSubdir)
 }
 
 // versionDir is the absolute directory for one version.

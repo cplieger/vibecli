@@ -321,7 +321,7 @@ func (e *fakeEnv) placePartial(version string) string {
 	return dir
 }
 
-func (e *fakeEnv) versionsRoot() string { return filepath.Join(e.tools, optSubdir) }
+func (e *fakeEnv) versionsRoot() string { return filepath.Join(e.tools, versionsSubdir) }
 
 func (e *fakeEnv) versionDir(version string) string {
 	return filepath.Join(e.versionsRoot(), version)

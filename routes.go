@@ -315,7 +315,7 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 				if err != nil && deps.ready.Ready() && kiroReadyNow(deps) && time.Since(start) < 10*time.Second {
 					sessionLogger.Warn(sessionFastDeathMsg,
 						"error", err,
-						"hint", "check /api/health and the kiro-cli install under /config/tools/opt/kiro-cli")
+						"hint", "check /api/health and the kiro-cli install under /config/tools/kiro-cli-versions")
 				}
 			}),
 		)

@@ -37,7 +37,7 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 	// printf emits the OSC 9 notification kiro-cli sends at turn end
 	// (ESC ] 9 ; text BEL); `exec cat` then keeps the process alive so the
 	// session stays listed while the status latches.
-	deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;Response complete\a'; exec cat`}
+	deps.cmd = staticCmd("/bin/sh", "-c", `printf '\033]9;Response complete\a'; exec cat`)
 	mux, _, _, _ := mustStartSession(t, deps)
 
 	deadline := time.Now().Add(10 * time.Second)
@@ -283,7 +283,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 	t.Run("default logs no notification text at any level", func(t *testing.T) {
 		records := capture.Default(t)
 		deps := newTestDeps(true) // logOSCText defaults false, like an unset env
-		deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;` + emitted + `\a'; exec cat`}
+		deps.cmd = staticCmd("/bin/sh", "-c", `printf '\033]9;`+emitted+`\a'; exec cat`)
 		mustStartSession(t, deps)
 
 		// The production key is drawn inside newStatusClassifier and never
@@ -366,7 +366,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 		records := capture.Default(t)
 		deps := newTestDeps(true)
 		deps.logOSCText = true // KWEB_LOG_OSC_TEXT=true
-		deps.cmd = []string{"/bin/sh", "-c", `printf '\033]9;` + emitted + `\a'; exec cat`}
+		deps.cmd = staticCmd("/bin/sh", "-c", `printf '\033]9;`+emitted+`\a'; exec cat`)
 		mustStartSession(t, deps)
 
 		deadline := time.Now().Add(10 * time.Second)

@@ -1119,35 +1119,6 @@ func TestWillUpgrade_mirrorsAcceptPreconditions(t *testing.T) {
 	}
 }
 
-// TestHealthEndpoint_unreadableMarkerWarnsOnce pins handleHealth's
-// non-ErrNotExist marker branch and its warn-once bound: an unreadable
-// readiness marker (an unmounted or read-only /config, an I/O error) is
-// otherwise indistinguishable from the expected first-boot absent marker,
-// and an unbounded diagnostic would repeat every 30s for the life of the
-// fault. A self-referential symlink yields ELOOP deterministically, even as
-// root. Serial: capture.Default mutates the process-global default logger.
-func TestHealthEndpoint_unreadableMarkerWarnsOnce(t *testing.T) {
-	records := capture.Default(t)
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "loop")
-	if err := os.Symlink("loop", marker); err != nil {
-		t.Fatalf("create self-referential marker symlink: %v", err)
-	}
-	deps := newTestDeps(true)
-	deps.kiroReadyMarker = marker
-	handler := handleHealth(deps)
-	for range 2 {
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("unreadable marker status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
-		}
-	}
-	if got := records.CountLevel(slog.LevelWarn, "readiness marker unreadable"); got != 1 {
-		t.Errorf("unreadable-marker Warn count = %d, want 1 for repeated probes", got)
-	}
-}
-
 // TestWSAttachLog pins the audit record for the ONE request that presents the
 // session capability token. The access logger deliberately skips an admitted /ws
 // upgrade (a hijacked stream would log a bogus 200 with an hours-long duration),

@@ -22,6 +22,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -79,18 +80,15 @@ func TestHealthEndpoint_reflectsReadiness(t *testing.T) {
 
 // TestHealthEndpoint_reflectsKiroCliReadiness pins the kiro-cli readiness gate
 // added for the deferred readiness-decoupled-from-kiro-cli finding. When the
-// server is handed a marker path (as entrypoint.sh does via
-// KIRO_CLI_READY_MARKER), /api/health returns 503 while the marker is absent (a
-// failed/incomplete kiro-cli install) and 200 once it exists — reflecting
-// web-terminal-kiro's core dependency with a cheap Stat, never launching kiro-cli. An
-// empty marker path skips the gate, so out-of-container runs (tests, bare
-// `go run`) keep pure-listener readiness.
+// server owns the install (main.go hands it the manager's Ready), /api/health
+// returns 503 while no version is active and 200 once one is — reflecting
+// web-terminal-kiro's core dependency from in-memory state, never launching
+// kiro-cli. A nil verdict skips the gate, so out-of-container runs (tests, bare
+// `go run`, the KIRO_CLI_PATH override) keep pure-listener readiness.
 func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
-	marker := filepath.Join(t.TempDir(), ".kiro-cli-ready")
-
-	newMux := func(markerPath string) *http.ServeMux {
+	newMux := func(verdict func() (bool, string)) *http.ServeMux {
 		deps := newTestDeps(true)
-		deps.kiroReadyMarker = markerPath
+		deps.kiroReady = verdict
 		mux, _, _ := mustRegisterRoutes(t, deps)
 		return mux
 	}
@@ -100,22 +98,20 @@ func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 		return rec.Code
 	}
 
-	// Marker path set but file absent -> kiro-cli unavailable -> 503.
-	if code := status(newMux(marker)); code != http.StatusServiceUnavailable {
-		t.Errorf("marker absent: status = %d, want %d", code, http.StatusServiceUnavailable)
+	// No active version -> kiro-cli unavailable -> 503.
+	unready := func() (bool, string) { return false, kirocli.ReasonUnavailable }
+	if code := status(newMux(unready)); code != http.StatusServiceUnavailable {
+		t.Errorf("no active version: status = %d, want %d", code, http.StatusServiceUnavailable)
 	}
 
-	// Marker present -> ready -> 200.
-	if err := os.WriteFile(marker, nil, 0o644); err != nil {
-		t.Fatalf("write marker: %v", err)
-	}
-	if code := status(newMux(marker)); code != http.StatusOK {
-		t.Errorf("marker present: status = %d, want %d", code, http.StatusOK)
+	// A version active with its required settings asserted -> ready -> 200.
+	if code := status(newMux(func() (bool, string) { return true, "" })); code != http.StatusOK {
+		t.Errorf("version active: status = %d, want %d", code, http.StatusOK)
 	}
 
-	// Empty marker path -> gate disabled -> 200 even with no file on disk.
-	if code := status(newMux("")); code != http.StatusOK {
-		t.Errorf("marker gate disabled: status = %d, want %d", code, http.StatusOK)
+	// Nil verdict -> gate disabled -> 200.
+	if code := status(newMux(nil)); code != http.StatusOK {
+		t.Errorf("kiro-cli gate disabled: status = %d, want %d", code, http.StatusOK)
 	}
 }
 
@@ -246,7 +242,7 @@ const sessionCreateBurst = 6
 // could not detect.
 func TestCreateRateLimit(t *testing.T) {
 	deps := newTestDeps(false)
-	deps.cmd = []string{"/bin/true"}
+	deps.cmd = staticCmd("/bin/true")
 	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	for attempt := 1; attempt <= sessionCreateBurst; attempt++ {
@@ -607,7 +603,7 @@ func TestSessionTitleDerivesFromInput(t *testing.T) {
 		workDir:  "",
 		// /bin/cat stands in for kiro-cli: the deriver reads the bytes the
 		// client SENDS, so what the program does with them is irrelevant.
-		cmd: []string{"/bin/cat"},
+		cmd: staticCmd("/bin/cat"),
 	}
 	mux, mgr, csp, id := mustStartSession(t, deps)
 
@@ -682,18 +678,23 @@ func TestClassifyStatus(t *testing.T) {
 }
 
 // TestHealthEndpoint_reasonDistinguishesUnreadyCause pins the reason body of
-// the two 503 paths, which TestHealthEndpoint_reflectsReadiness and
+// every 503 path, which TestHealthEndpoint_reflectsReadiness and
 // TestHealthEndpoint_reflectsKiroCliReadiness leave unchecked: both assert only
-// the status code, so the startup 503 and the kiro-cli-unavailable 503 are
+// the status code, so the startup 503 and the kiro-cli 503s are
 // indistinguishable in the suite. The reason is the operator-facing diagnostic
 // (documented as surfacing to docker ps / the monitoring probe), so a
 // regression that emitted the wrong reason on the wrong branch -- or the same
-// reason for both -- would lose the "wait for startup" vs "alert: kiro-cli
-// broken" signal with no failing test. This pins each 503 branch to its reason.
+// reason for every branch -- would lose the "wait for startup" vs "still
+// installing" vs "alert: kiro-cli broken" signal with no failing test.
+//
+// The kiro-cli reasons come from the install manager's own exported constants,
+// so this pins the pass-through, not a copy of the wording: a manager that
+// reworded a reason changes both sides at once, while a handler that dropped the
+// reason and hardcoded one fails here.
 func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
-	newMux := func(ready bool, markerPath string) *http.ServeMux {
+	newMux := func(ready bool, verdict func() (bool, string)) *http.ServeMux {
 		deps := newTestDeps(ready)
-		deps.kiroReadyMarker = markerPath
+		deps.kiroReady = verdict
 		mux, _, _ := mustRegisterRoutes(t, deps)
 		return mux
 	}
@@ -702,19 +703,34 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/health", http.NoBody))
 		return rec.Code, rec.Body.String()
 	}
+	unready := func(reason string) func() (bool, string) {
+		return func() (bool, string) { return false, reason }
+	}
 
 	// Not-ready (startup/shutdown): the ready gate short-circuits before the
-	// marker check, so 503 with the startup reason regardless of the marker.
-	code, b := body(newMux(false, filepath.Join(t.TempDir(), ".absent")))
+	// kiro-cli check, so 503 with the startup reason regardless of the verdict.
+	code, b := body(newMux(false, unready(kirocli.ReasonUnavailable)))
 	if code != http.StatusServiceUnavailable || !strings.Contains(b, "starting up or shutting down") {
 		t.Errorf("not-ready: (status %d, body %q), want 503 with reason %q", code, b, "starting up or shutting down")
 	}
 
-	// Ready but kiro-cli marker absent: 503 with the kiro-cli reason, which must
-	// differ from the startup reason so a probe can tell the two causes apart.
-	code, b = body(newMux(true, filepath.Join(t.TempDir(), ".absent")))
-	if code != http.StatusServiceUnavailable || !strings.Contains(b, "kiro-cli unavailable") {
-		t.Errorf("kiro-cli-absent: (status %d, body %q), want 503 with reason %q", code, b, "kiro-cli unavailable")
+	// Ready, but the manager has no usable version. Each phase reports a
+	// DIFFERENT reason: a first-boot download in flight is not an alert, an
+	// exhausted retry budget is, and unenforced required settings point at a
+	// third remedy entirely.
+	for _, reason := range []string{
+		kirocli.ReasonInstalling,
+		kirocli.ReasonRetrying,
+		kirocli.ReasonUnavailable,
+		kirocli.ReasonSettings,
+	} {
+		code, b = body(newMux(true, unready(reason)))
+		if code != http.StatusServiceUnavailable || !strings.Contains(b, reason) {
+			t.Errorf("kiro-cli %q: (status %d, body %q), want 503 with that reason", reason, code, b)
+		}
+		if strings.Contains(b, "starting up or shutting down") {
+			t.Errorf("kiro-cli %q: body %q reports the startup reason, which hides the real cause", reason, b)
+		}
 	}
 }
 
@@ -816,7 +832,7 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 // newTestDeps returns the minimal routeDeps the route tests build
 // repeatedly: the index fixture that satisfies the fail-loud CSP build,
 // a ready flag, and a short-lived cat as the session command. Tests
-// tweak fields (cmd, kiroReadyMarker) before registering.
+// tweak fields (cmd, kiroReady) before registering.
 func newTestDeps(ready bool) *routeDeps {
 	var r webhttp.Ready
 	r.Set(ready)
@@ -824,8 +840,14 @@ func newTestDeps(ready bool) *routeDeps {
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &r,
 		workDir:  "",
-		cmd:      []string{"/bin/cat"},
+		cmd:      staticCmd("/bin/cat"),
 	}
+}
+
+// staticCmd is the fixed-argv session command a test wants where production
+// resolves the active kiro-cli version per session.
+func staticCmd(argv ...string) func() []string {
+	return func() []string { return argv }
 }
 
 // unreadyDepsWithTools is an UNREADY handler with a tools engine wired: the
@@ -920,7 +942,7 @@ func newToolsDeps(t *testing.T) *routeDeps {
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &ready,
 		workDir:  "",
-		cmd:      []string{"/bin/cat"},
+		cmd:      staticCmd("/bin/cat"),
 		tools:    eng,
 	}
 }
@@ -1147,7 +1169,8 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	// detector rightly flags.
 	syncing.Store(false)
 	inner := 0
-	gate := composeGate(func(next http.Handler) http.Handler { return next }, syncing.Load)
+	gate := composeGate(func(next http.Handler) http.Handler { return next },
+		func() (bool, string) { return syncing.Load(), "tools installing" })
 	gated := gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		inner++
 		w.WriteHeader(http.StatusCreated)
@@ -1176,7 +1199,7 @@ func TestRegisterRoutes_failsLoudOnMalformedStatic(t *testing.T) {
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}},
 		ready:    &ready,
 		workDir:  "",
-		cmd:      []string{"/bin/cat"},
+		cmd:      staticCmd("/bin/cat"),
 	}
 	if _, _, err := registerRoutes(mux, deps); err == nil {
 		t.Fatal("registerRoutes returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
@@ -1184,13 +1207,13 @@ func TestRegisterRoutes_failsLoudOnMalformedStatic(t *testing.T) {
 }
 
 // TestComposeGate_narrowsToCreateOnly pins the narrowing contract the gate's
-// doc comment states but no test asserts: while tools are syncing, ONLY
+// doc comment states but no test asserts: while a dependency is unready, ONLY
 // session creation (POST terminal.SessionsPath) is 503'd — list (GET on the
 // same path) and requests to other paths pass through to the inner chain,
 // matching the engine's WithCreateGate contract (list/close/title flow
 // through the same doubly-mounted handler).
 func TestComposeGate_narrowsToCreateOnly(t *testing.T) {
-	syncing := func() bool { return true }
+	syncing := func() (bool, string) { return true, "tools installing" }
 	identity := func(next http.Handler) http.Handler { return next }
 
 	cases := []struct {
@@ -1255,7 +1278,7 @@ func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
 		staticFS: failOpenFS{FS: base, failPath: "static/broken.js"},
 		ready:    &ready,
 		workDir:  "",
-		cmd:      []string{"/bin/cat"},
+		cmd:      staticCmd("/bin/cat"),
 	}
 	if _, _, err := registerRoutes(mux, deps); err == nil {
 		t.Fatal("registerRoutes returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
@@ -1269,7 +1292,7 @@ func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
 // only bound is toolbelt's 30-minute job timeout.
 func TestComposeGate_syncingResponseIncludesRetryAfter(t *testing.T) {
 	identity := func(next http.Handler) http.Handler { return next }
-	gated := composeGate(identity, func() bool { return true })(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	gated := composeGate(identity, func() (bool, string) { return true, "tools installing" })(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("inner handler called while tools are syncing")
 	}))
 	rec := httptest.NewRecorder()
@@ -1400,7 +1423,8 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 	var syncing atomic.Bool
 	syncing.Store(true)
 	creates := 0
-	gated := composeGate(webhttp.SessionCreateRateLimit(terminal.SessionsPath), syncing.Load)(
+	gated := composeGate(webhttp.SessionCreateRateLimit(terminal.SessionsPath),
+		func() (bool, string) { return syncing.Load(), "tools installing" })(
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			creates++
 			w.WriteHeader(http.StatusCreated)

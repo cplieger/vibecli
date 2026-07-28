@@ -38,7 +38,7 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		t.Helper()
 		records := capture.Default(t) // before registerRoutes: the factory derives its logger from slog.Default()
 		deps := newTestDeps(ready)
-		deps.cmd = []string{"/bin/false"} // exits 1 instantly: the broken-install signature (non-nil Wait error, well under 10s)
+		deps.cmd = staticCmd("/bin/false") // exits 1 instantly: the broken-install signature (non-nil Wait error, well under 10s)
 		mux, mgr, _ := mustRegisterRoutes(t, deps)
 		if _, err := mgr.Create(); err != nil {
 			t.Fatalf("Create: %v", err)

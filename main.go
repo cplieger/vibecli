@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -36,6 +37,7 @@ import (
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -258,6 +260,12 @@ func parseLogOSCText() bool {
 // or inject into the script. chatArgs (operator flags from KIRO_CLI_CHAT_ARGS,
 // e.g. --v3) are appended to the chat invocation only — login and whoami never
 // see them.
+//
+// Called once per SESSION, not once per process: cliPath is the manager's active
+// version directory path, which changes when the active version does, so a boot
+// constant would pin every tab to whatever was installed first. An empty cliPath
+// (no version active) degrades into the guard's own "not installed" message, which
+// only a caller that bypassed the session-create gate can reach.
 func sessionCommand(cliPath string, chatArgs ...string) []string {
 	const script = `if ! command -v "$0" >/dev/null 2>&1; then
 printf '%s\n' 'kiro-cli is not installed or not on PATH. The first-boot install may have failed; check the container logs and /api/health.'
@@ -298,12 +306,7 @@ func main() {
 			"addr", addr,
 			"hint", "any client that can reach this port gets a kiro-cli PTY with filesystem access to /workspace and the /config home (auth tokens, ssh keys, gitconfig)")
 	}
-	cliPath := envx.String("KIRO_CLI_PATH", "kiro-cli")
 	workDir := envx.String("KWEB_WORK_DIR", "/workspace")
-	// Readiness marker written by entrypoint.sh after it verifies a runnable,
-	// correctly-versioned kiro-cli. Empty outside the container (bare `go run`,
-	// tests) so /api/health keeps pure-listener readiness there.
-	kiroReadyMarker := envx.String("KIRO_CLI_READY_MARKER", "")
 
 	fi, statErr := os.Stat(workDir)
 	switch {
@@ -383,26 +386,41 @@ func main() {
 	// back tomorrow. Any reaper window short enough to bound a runaway creator is
 	// short enough to break that, and the create-rate limiter in routes.go is the
 	// bound we chose instead. Reviewed and re-affirmed 2026-07.
-	cmd := sessionCommand(cliPath, chatArgs...)
+	//
+	// kiro-cli itself is installed and selected by the manager startKiroCLI builds:
+	// the per-session argv and PATH come from it, so a version switch is picked up by
+	// the next tab rather than being frozen at boot.
+	kiro := startKiroCLI(&baseKiro{
+		version:     envx.String("KIRO_CLI_VERSION", ""),
+		sha256:      envx.String("KIRO_CLI_SHA256", ""),
+		sha256ARM64: envx.String("KIRO_CLI_SHA256_ARM64", ""),
+		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
+		override:    envx.String("KIRO_CLI_PATH", ""),
+		tainted:     envx.String("KIRO_CLI_TOOLS_TAINTED", "") == "1",
+		chatArgs:    chatArgs,
+	})
 
 	mux := http.NewServeMux()
 	var ready webhttp.Ready
 
 	mgr, cspPolicy, err := registerRoutes(mux, &routeDeps{
-		staticFS:        staticFS,
-		cmd:             cmd,
-		workDir:         workDir,
-		ready:           &ready,
-		kiroReadyMarker: kiroReadyMarker,
-		logOSCText:      logOSCText,
-		tools:           tools.engine,
-		toolsSyncing:    tools.syncing,
-		toolsState:      tools.state,
+		staticFS:     staticFS,
+		cmd:          kiro.cmd,
+		sessionEnv:   kiro.env,
+		workDir:      workDir,
+		ready:        &ready,
+		kiroReady:    kiro.ready,
+		kiroRescan:   kiro.rescan,
+		logOSCText:   logOSCText,
+		tools:        tools.engine,
+		toolsSyncing: tools.syncing,
+		toolsState:   tools.state,
 	})
 	if err != nil {
 		slog.Error("route registration failed; the embedded static tree is unusable",
 			"error", err,
 			"hint", "this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block; rebuild the image (go generate ./... plus the Dockerfile static build). The container will crash-loop under its restart policy until it is rebuilt.")
+		kiro.stop()
 		tools.close()
 		os.Exit(1)
 	}
@@ -414,6 +432,7 @@ func main() {
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		slog.Error("listen failed", "addr", addr, "error", err)
+		kiro.stop()
 		tools.close()
 		os.Exit(1)
 	}
@@ -445,7 +464,7 @@ func main() {
 		os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("web-terminal-kiro listening", "addr", addr, "cli_path", cliPath, "work_dir", workDir)
+	slog.Info("web-terminal-kiro listening", "addr", addr, "work_dir", workDir)
 	ready.Set(true)
 
 	// The pre-drain hook flips readiness false and cancels in-flight request
@@ -469,10 +488,169 @@ func main() {
 		// do the same or a teardown would emit a false broken-install alert).
 		ready.Set(false)
 		mgr.Shutdown()
+		kiro.stop()
 		tools.close()
 		os.Exit(1) //nolint:gocritic // exitAfterDefer: a failed Serve must exit non-zero; the deferred stop()/cancelBase() only release signal+context state the process exit reclaims anyway.
 	}
+	kiro.stop()
 	tools.close()
+}
+
+// baseKiro carries startKiroCLI's inputs: the three Renovate-pinned literals the
+// entrypoint exports, the tools tree they install into, the taint observation only
+// the entrypoint can make, the operator override, and this deployment's extra chat
+// flags.
+type baseKiro struct {
+	version     string
+	sha256      string
+	sha256ARM64 string
+	toolsDir    string
+	// override is KIRO_CLI_PATH. Set to any non-empty value it stands the manager
+	// down entirely: the server runs that path verbatim and stops gating readiness
+	// on an install it no longer owns.
+	override string
+	chatArgs []string
+	// tainted carries the entrypoint's tools-tree-was-writable observation.
+	tainted bool
+}
+
+// kiroRuntime is the running kiro-cli subsystem handed to the routes. Every field
+// is a function because the answers CHANGE while the server runs: the install
+// completes after the listener binds, so an argv or a PATH captured at boot would
+// freeze the first (empty) answer forever.
+type kiroRuntime struct {
+	// cmd builds one session's argv. Called per session, so the next tab picks up
+	// a version switch.
+	cmd func() []string
+	// env is the per-session environment overlay, or nil when there is nothing to
+	// add. The engine appends it last, so PATH here wins.
+	env func() []string
+	// ready is the /api/health and session-create verdict plus its 503 reason, or
+	// nil when this app does not own the install (the KIRO_CLI_PATH override, or a
+	// bare `go run` with no pins) and readiness stays pure-listener.
+	ready func() (bool, string)
+	// rescan re-derives the active version from disk without downloading, or nil
+	// when there is no manager. It backs the loopback repair endpoint.
+	rescan func(context.Context) (bool, error)
+	// stop cancels the background install.
+	stop func()
+}
+
+// staticKiroRuntime is the runtime for a deployment whose kiro-cli this server does
+// NOT install: one fixed argv, no PATH overlay, and no readiness gate (nil ready),
+// so /api/health reflects only that the listener is up.
+func staticKiroRuntime(cliPath string, chatArgs []string) kiroRuntime {
+	argv := sessionCommand(cliPath, chatArgs...)
+	return kiroRuntime{
+		cmd:  func() []string { return argv },
+		stop: func() {},
+	}
+}
+
+// unavailableKiroRuntime is the runtime for a container that CANNOT install
+// kiro-cli: the pins it was handed are unusable, so no version can ever be
+// activated. It reports unready rather than pretending, which gates session
+// creation and surfaces the fault on /api/health instead of letting every terminal
+// die one by one. Degraded, never fatal: the HTTP surface and the `docker exec`
+// repair path stay alive, per this app's failure posture.
+func unavailableKiroRuntime() kiroRuntime {
+	return kiroRuntime{
+		cmd:   func() []string { return sessionCommand("kiro-cli") },
+		ready: func() (bool, string) { return false, kirocli.ReasonUnavailable },
+		stop:  func() {},
+	}
+}
+
+// startKiroCLI builds the kiro-cli install manager and starts the install in the
+// background, bind-first: the listener comes up immediately and only readiness and
+// SESSION CREATION wait, the same shape startTools uses for the toolbelt boot
+// reconcile. A first-boot download therefore answers 503 with a reason instead of
+// refusing connections, and an operator can reach /api/health, the static UI and the
+// loopback APIs throughout.
+//
+// Three shapes come out of it, in precedence order: the KIRO_CLI_PATH override
+// (manager stands down), no pins at all (bare `go run` outside the container), and
+// the managed install.
+func startKiroCLI(cfg *baseKiro) kiroRuntime {
+	if cfg.override != "" {
+		slog.Info("KIRO_CLI_PATH is set: running that binary verbatim and installing nothing",
+			"cli_path", cfg.override,
+			"hint", "this stands the install manager down, so /api/health no longer reflects kiro-cli readiness; unset it to let the server install the pinned version")
+		return staticKiroRuntime(cfg.override, cfg.chatArgs)
+	}
+	if cfg.version == "" || cfg.toolsDir == "" {
+		slog.Warn("no kiro-cli pins in the environment: resolving kiro-cli by bare name and installing nothing",
+			"hint", "expected outside the container (bare `go run`); in the image entrypoint.sh exports KIRO_CLI_VERSION, both digests and KIRO_CLI_TOOLS_DIR")
+		return staticKiroRuntime("kiro-cli", cfg.chatArgs)
+	}
+	mgr, err := kirocli.New(&kirocli.Config{
+		Version:     cfg.version,
+		SHA256:      cfg.sha256,
+		SHA256ARM64: cfg.sha256ARM64,
+		ToolsDir:    cfg.toolsDir,
+		Tainted:     cfg.tainted,
+		// This app's best-effort preferences. app.disableAutoupdates is NOT here:
+		// the manager adds it as Required itself, so no caller can configure the
+		// integrity gate away. The two notification settings are load-bearing for
+		// the per-tab status dots (routes.go's OSC 9 classifier only sees a
+		// notification kiro-cli was told to emit inline), and terminalTitle=false
+		// is what lets the tabs feature name each tab after the user's own input
+		// instead of the cwd.
+		Settings: []kirocli.Setting{
+			boolSetting("telemetry.enabled", false),
+			boolSetting("chat.enableNotifications", true),
+			{Key: "chat.notificationMethod", Value: "osc9"},
+			boolSetting("chat.terminalTitle", false),
+		},
+	})
+	if err != nil {
+		slog.Error("kiro-cli install manager could not be built from the exported pins; no version can be installed, so sessions stay gated",
+			"error", err,
+			"hint", "this is an image defect: check the KIRO_CLI_VERSION / KIRO_CLI_SHA256 / KIRO_CLI_SHA256_ARM64 literals in entrypoint.sh")
+		return unavailableKiroRuntime()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// The error is already logged by EnsureWithRetry (with the attempt count
+		// and the in-container repair hint), and there is nothing here that could
+		// act on it: the server must stay up either way.
+		_ = mgr.EnsureWithRetry(ctx)
+	}()
+	// Copied out of cfg so the long-lived closure below owns its own value rather
+	// than a pointer into the composition root's config.
+	chatArgs := cfg.chatArgs
+	return kiroRuntime{
+		cmd: func() []string { return sessionCommand(mgr.CLIPath(), chatArgs...) },
+		env: func() []string { return sessionPathEnv(mgr.PathEntry()) },
+		// Ready, not Phase, is the authority: Phase only explains a "no".
+		ready:  mgr.Ready,
+		rescan: mgr.Rescan,
+		stop:   cancel,
+	}
+}
+
+// boolSetting is one boolean kiro-cli setting. The settings CLI takes its value
+// as a string, so keeping the app's intent as a Go bool lets the compiler catch a
+// typo the CLI would silently accept as "not true".
+func boolSetting(key string, on bool) kirocli.Setting {
+	return kirocli.Setting{Key: key, Value: strconv.FormatBool(on)}
+}
+
+// sessionPathEnv returns the per-session environment overlay that puts the active
+// kiro-cli version directory FIRST on PATH, or nil when no version is active.
+//
+// Leading is the point, not a detail. That directory holds only kiro-cli's own
+// dispatchers, so it shadows nothing else, while $TOOLS/bin is co-owned by the
+// toolbelt engine and $TOOLS/go/bin is GOPATH/bin, where a `go install` can land
+// anything -- including a stale kiro-cli-chat from a restored backup volume. With the
+// version directory first, `kiro-cli chat` resolves its sidecar out of the same
+// verified install whether it looks for a sibling of its own executable or for a bare
+// name on PATH.
+func sessionPathEnv(entry string) []string {
+	if entry == "" {
+		return nil
+	}
+	return []string{"PATH=" + entry + string(os.PathListSeparator) + os.Getenv("PATH")}
 }
 
 // baseTools carries startTools's inputs (env-resolved paths + the

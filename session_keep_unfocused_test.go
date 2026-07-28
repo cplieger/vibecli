@@ -32,10 +32,10 @@ func TestKeepUnfocusedWiredIntoSessionFactory(t *testing.T) {
 	}
 	marker := filepath.Join(t.TempDir(), "focus-bytes")
 	deps := newTestDeps(true)
-	deps.cmd = []string{
+	deps.cmd = staticCmd(
 		"/bin/sh", "-c",
-		`stty raw -echo 2>/dev/null; printf '\033[?1004h'; dd bs=1 count=3 of='` + marker + `' 2>/dev/null; exec cat`,
-	}
+		`stty raw -echo 2>/dev/null; printf '\033[?1004h'; dd bs=1 count=3 of='`+marker+`' 2>/dev/null; exec cat`,
+	)
 	mustStartSession(t, deps)
 
 	if got := string(readMarkerWithin(t, marker, 3, "receive a DEC 1004 focus-out after enabling focus reporting; registerRoutes must pass terminal.WithKeepUnfocused() or kiro-cli stops emitting the OSC 9 notifications that latch the tab status dots")); got != "\x1b[O" {

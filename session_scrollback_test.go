@@ -51,8 +51,8 @@ func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
 		wantCapacity  = 5000 // the app's policy, matching the client's own retention cap
 	)
 	deps := newTestDeps(true)
-	deps.cmd = []string{"/bin/sh", "-c", fmt.Sprintf(
-		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted)}
+	deps.cmd = staticCmd("/bin/sh", "-c", fmt.Sprintf(
+		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted))
 	mux, _, csp, id := mustStartSession(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))

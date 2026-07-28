@@ -15,11 +15,16 @@
 # rationale lives here.
 #
 # entrypoint.sh IS the product's boot path, and its most consequential
-# branches are the ones that fail CLOSED — an unremovable stale binary, a
-# non-private /config, a failed kiro-cli download, a package index that cannot be
+# branches are the ones that fail CLOSED — a non-private /config, an
+# unowned PATH segment that resists hardening, a package index that cannot be
 # read — and a smoke test can never reach them, because a healthy image never
 # takes them. tests/image-smoke.sh builds an image and asserts it boots; these
 # assert what happens when it should NOT.
+#
+# The kiro-cli INSTALL is no longer part of that surface: the Go server owns it
+# (internal/kirocli), so its failure branches are Go tests. What stays here is
+# what the entrypoint still does — directory hardening, the KAS runtime prune,
+# and the APT_PACKAGES validation.
 #
 # Each *_test.sh is a separate process, so one test's stubs, traps and shell
 # options cannot leak into another's. All of them run even when an early one

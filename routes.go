@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,7 +12,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +20,7 @@ import (
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/toolbelt/v2/httpapi"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -38,6 +39,11 @@ const (
 	// toolsPath is the loopback tools API mount; httpapi.Handler is told the
 	// same base path so its own routing matches where it is mounted.
 	toolsPath = apiPrefix + "tools"
+	// kiroRescanPath is the loopback kiro-cli repair hook: it makes an install
+	// fixed INSIDE the container observable to the running server. Admitted
+	// exactly like toolsPath (loopback socket peers only) and registered with a
+	// method pattern, so anything but POST is a 405 rather than a silent no-op.
+	kiroRescanPath = apiPrefix + "kiro-cli/rescan"
 )
 
 type routeDeps struct {
@@ -51,14 +57,25 @@ type routeDeps struct {
 	tools        *toolbelt.Engine
 	toolsSyncing func() bool
 	toolsState   func() string
-	workDir      string
-	// kiroReadyMarker, when non-empty, is a file the entrypoint touches only
-	// after verifying a runnable, correctly-versioned kiro-cli is installed
-	// (see entrypoint.sh). /api/health Stats it to reflect web-terminal-kiro's core
-	// dependency. Empty (e.g. `go run`/tests outside the container) skips the
-	// gate, preserving pure-listener readiness semantics.
-	kiroReadyMarker string
-	cmd             []string
+	// kiroReady, when non-nil, is the kiro-cli install manager's readiness
+	// verdict plus the reason to report when it is false (installing, retrying,
+	// terminally unavailable, or required settings unenforced). It gates
+	// /api/health AND session creation. Nil means this server does not own the
+	// install (the KIRO_CLI_PATH override, or a bare `go run`/test outside the
+	// container), which disables the gate and keeps pure-listener readiness.
+	kiroReady func() (bool, string)
+	// kiroRescan, when non-nil, re-derives the active kiro-cli version from disk
+	// without downloading anything. It backs kiroRescanPath.
+	kiroRescan func(context.Context) (bool, error)
+	// cmd builds one session's argv. A FUNCTION, not a slice: the active kiro-cli
+	// version can change while the server runs, so the factory below must ask at
+	// session-create time rather than close over a boot constant.
+	cmd func() []string
+	// sessionEnv, when non-nil, returns the per-session environment overlay (the
+	// active version directory leading PATH). Nil, or a nil result, leaves the
+	// child with the server's own environment.
+	sessionEnv func() []string
+	workDir    string
 	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
 	// OSC 9 notification's full text is logged at Debug. Default false — the
 	// text is arbitrary child output that may carry a token or device code, so
@@ -119,17 +136,32 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// topology lives in the engine, the throttle policy in webhttp; this app
 	// just composes the two.
 	//
-	// The create gate composes two layers: the fleet-standard create
-	// rate limit (inner), and — checked before it while the tools boot convergence runs —
-	// a 503 that keeps the FIRST kiro-cli session from spawning before
-	// the manifest's language servers are on PATH (kiro-cli scans PATH
-	// once at session start). Static assets, /api/health, and the tools
-	// API stay reachable throughout: the container is observable during
-	// installs instead of connection-refused (the old blocking
-	// setup-tools.sh window).
+	// The create gate composes three layers, checked outermost first: the kiro-cli
+	// install gate, then — while the tools boot convergence runs — a 503 that keeps
+	// the FIRST kiro-cli session from spawning before the manifest's language
+	// servers are on PATH (kiro-cli scans PATH once at session start), then the
+	// fleet-standard create rate limit (innermost). kiro-cli is checked first
+	// because it is the dependency a session cannot start without at all, and its
+	// reason distinguishes installing from retrying from terminally unavailable.
+	//
+	// Without the kiro-cli layer every session created during the first-boot
+	// download would run the sign-in guard, print "kiro-cli is not installed" and
+	// exit 1, which reads to a user as "the app loads and every terminal dies
+	// instantly" and to an operator as one broken-install alert per tab. 503 with a
+	// reason is the honest answer. Static assets, /api/health, and the tools API
+	// stay reachable throughout: the container is observable during installs
+	// instead of connection-refused.
 	createGate := webhttp.SessionCreateRateLimit(terminal.SessionsPath)
 	if deps.toolsSyncing != nil {
-		createGate = composeGate(createGate, deps.toolsSyncing)
+		createGate = composeGate(createGate, func() (bool, string) {
+			return deps.toolsSyncing(), "tools installing"
+		})
+	}
+	if deps.kiroReady != nil {
+		createGate = composeGate(createGate, func() (bool, string) {
+			ready, reason := deps.kiroReady()
+			return !ready, reason
+		})
 	}
 	mgr.MountAPI(mux, terminal.WithCreateGate(createGate))
 
@@ -147,16 +179,67 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 		mux.Handle(toolsPath+"/", toolsAPI)
 	}
 
+	// kiro-cli repair hook, admitted the same way and for the same consumer: an
+	// agent or operator INSIDE the container (kiro-cli's ! shell escape + curl
+	// localhost:9848). A one-shot background install that exhausted its retries
+	// leaves the server answering 503 forever, and a repair made inside the
+	// container — a restored version directory, a replaced binary — is invisible to
+	// it until the container is recreated. This is the endpoint that makes such a
+	// repair observable without a recreate. It downloads nothing.
+	if deps.kiroRescan != nil {
+		mux.Handle("POST "+kiroRescanPath, loopbackOnly(handleKiroRescan(deps)))
+	}
+
 	mux.HandleFunc(healthPath, handleHealth(deps))
 
 	return mgr, cspPolicy, nil
 }
 
+// kiroRescanBody is the repair hook's response envelope, matching healthBody's key
+// order and vocabulary (status first, then the reason) so an operator reads the same
+// shape from both surfaces.
+type kiroRescanBody struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// handleKiroRescan re-derives the active kiro-cli version from what is on disk right
+// now and reports the resulting readiness. 200 when a version is active afterwards,
+// 503 with the manager's own reason when none is: the same verdict /api/health will
+// serve from the next probe, so a caller gets its answer without polling.
+func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// A rescan probes the candidate binary and reasserts the required
+		// settings, so it is not free; it is also not cacheable under any
+		// circumstances.
+		w.Header().Set("Cache-Control", "no-store")
+		ok, err := deps.kiroRescan(r.Context())
+		if ok {
+			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
+			return
+		}
+		// The manager has already logged the specific fault (and every path it
+		// took) at Warn or Error, so this reports the verdict rather than the
+		// error text: err can name a filesystem path, and this response is not
+		// the place to widen what a caller learns about the volume.
+		reason := kirocli.ReasonUnavailable
+		if deps.kiroReady != nil {
+			if _, r := deps.kiroReady(); r != "" {
+				reason = r
+			}
+		}
+		slog.Warn("kiro-cli rescan found no usable version", "reason", reason, "error", err)
+		webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
+			kiroRescanBody{Status: "unready", Reason: reason})
+	}
+}
+
 // newSessionFactory builds the per-session handler factory the session manager
 // calls once per tab: one independent PTY-backed kiro-cli chat process with its
-// own VT screen and scrollback. It owns three session-scoped policies — the
+// own VT screen and scrollback. It owns four session-scoped policies — the
+// argv and PATH resolved from the install manager AT session-create time, the
 // LogID-truncated per-session logger (the session id is the /ws attach/resume
-// capability token), the WithCommandLogValue argv redaction (deps.cmd carries
+// capability token), the WithCommandLogValue argv redaction (the argv carries
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
@@ -183,19 +266,27 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 		// may be logged), test-pinned there.
 		safeID := terminal.LogID(id)
 		// The engine logs the session's full argv as the "command" attr when
-		// the process starts (Handler.ensureStarted), and deps.cmd carries
+		// the process starts (Handler.ensureStarted), and the argv carries
 		// the operator's KIRO_CLI_CHAT_ARGS values — a value-bearing flag
 		// there could hold a credential from a compose interpolation mistake
 		// (CWE-532) — so the engine is told to record the fixed "[redacted]"
 		// marker instead (WithCommandLogValue), the same way main.go's own
 		// startup line logs only chat_args_count.
 		sessionLogger := slog.Default().With("session", safeID)
-		return terminal.NewHandler(deps.cmd,
+		return terminal.NewHandler(deps.cmd(),
 			terminal.WithWorkDir(deps.workDir),
 			terminal.WithScrollbackCapacity(5000),
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
+			// Put the active kiro-cli version's own directory first on the
+			// child's PATH. The engine appends WithEnv LAST when it composes
+			// os.Environ() plus its TERM identity, so this PATH wins — which is
+			// what makes `kiro-cli chat` dispatch its sidecar out of the same
+			// digest-verified install rather than out of a stale $TOOLS/bin copy
+			// left by a restored backup volume. A nil result (no version active,
+			// or no manager) leaves the server's own environment untouched.
+			terminal.WithEnv(sessionEnvFor(deps)),
 			// Name each tab after the first substantial thing the user asked
 			// for. This app is the engine's session-per-CONVERSATION consumer,
 			// which is the exact shape WithInputTitle is for: kiro-cli sets no
@@ -220,38 +311,36 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// exits while still serving are promoted to Warn; intentional
 			// shutdowns keep the engine's normal INFO exit record.
 			terminal.WithOnProcessExit(func(err error) {
-				if err != nil && deps.ready.Ready() && time.Since(start) < 10*time.Second {
+				if err != nil && deps.ready.Ready() && kiroReadyNow(deps) && time.Since(start) < 10*time.Second {
 					sessionLogger.Warn(sessionFastDeathMsg,
 						"error", err,
-						"hint", "check /api/health and the kiro-cli install under /config/tools/bin")
+						"hint", "check /api/health and the kiro-cli install under /config/tools/opt/kiro-cli")
 				}
 			}),
 		)
 	}
 }
 
-// kiroMarkerUnavailable reports whether the env-gated kiro-cli readiness marker
-// says kiro-cli is unusable, and is the marker half of /api/health's readiness
-// decision, extracted so handleHealth reads as top-down orchestration. An empty
-// marker (bare `go run`/tests outside the container) means "gate disabled" and
-// is never unavailable. A stat that fails for any reason OTHER than "not created
-// yet" is reported through statErrOnce, the caller-owned latch that bounds the
-// diagnostic to one line per handler instance.
-func kiroMarkerUnavailable(marker string, statErrOnce *sync.Once) bool {
-	if marker == "" {
-		return false
+// sessionEnvFor returns the per-session environment overlay, or nil when this
+// server does not own the kiro-cli install.
+func sessionEnvFor(deps *routeDeps) []string {
+	if deps.sessionEnv == nil {
+		return nil
 	}
-	if _, err := os.Stat(marker); err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			statErrOnce.Do(func() {
-				slog.Warn("kiro-cli readiness marker unreadable (not merely absent); reporting unready",
-					"marker", marker, "error", err,
-					"hint", "check that the /config volume is mounted and writable; the entrypoint writes this marker after verifying kiro-cli")
-			})
-		}
+	return deps.sessionEnv()
+}
+
+// kiroReadyNow reports whether kiro-cli is currently usable, treating an absent
+// manager (the KIRO_CLI_PATH override, a bare `go run`) as usable — the same
+// gate-disabled semantics /api/health applies. The fast-death Warn keys on it so a
+// session that dies because the install is not finished yet does not fire a
+// broken-install alert; that state has its own 503 and its own log line.
+func kiroReadyNow(deps *routeDeps) bool {
+	if deps.kiroReady == nil {
 		return true
 	}
-	return false
+	ready, _ := deps.kiroReady()
+	return ready
 }
 
 // healthBody is /api/health's response envelope. A struct, not a map, for the
@@ -276,23 +365,10 @@ type healthBody struct {
 }
 
 // handleHealth returns the /api/health readiness handler. It reflects, in
-// order: listener readiness (deps.ready), the env-gated kiro-cli readiness
-// marker (deps.kiroReadyMarker; see the entrypoint), and the INFORMATIONAL
-// tools field (deps.toolsState) — tool convergence never gates readiness.
+// order: listener readiness (deps.ready), the kiro-cli install manager's verdict
+// (deps.kiroReady), and the INFORMATIONAL tools field (deps.toolsState) — tool
+// convergence never gates readiness.
 func handleHealth(deps *routeDeps) http.HandlerFunc {
-	// kiroMarkerStatErrOnce bounds the readiness-marker stat diagnostic to one
-	// line per handler (exactly one per process in production): /api/health is
-	// probed every 30s, so an unbounded Warn would repeat forever while the
-	// fault lasts, but a marker stat that fails for any reason OTHER than "not
-	// created yet" (an unmounted or read-only /config, an I/O error) is an
-	// anomaly the operator cannot otherwise tell apart from the expected
-	// first-boot/broken-install case, since both render as the same
-	// "kiro-cli unavailable" body and the same Warn access line. The latch
-	// lives in the closure, not a package var, for the same reason
-	// newStatusClassifier's does: its lifetime is the instance the composition
-	// root wires, so a test builds a fresh handler instead of resetting package
-	// state.
-	var kiroMarkerStatErrOnce sync.Once
 	// One constructor for both outcomes, so the INFORMATIONAL tools field cannot
 	// diverge between them (and neither can any field added later). It belongs on
 	// the 503 bodies too: tool convergence never GATES readiness, but an operator
@@ -322,20 +398,24 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 			unready("starting up or shutting down")
 			return
 		}
-		// kiro-cli readiness (env-gated via kiroReadyMarker). web-terminal-kiro's core job
-		// is spawning kiro-cli chat PTYs, but the HTTP listener comes up even when
-		// the first-boot install failed (degraded-not-dead start). Reflect the
-		// entrypoint's boot-time verdict here so a broken kiro-cli surfaces as
-		// unready to `docker ps` and the monitoring probe. A cheap Stat keeps this
-		// spawn-free: kiro-cli was verified once at boot via --version, never
-		// relaunched per probe (a per-probe spawn of a heavy PTY process would be
-		// an anti-pattern). This is a READINESS signal, not liveness — under
+		// kiro-cli readiness, straight from the install manager. web-terminal-kiro's
+		// core job is spawning kiro-cli chat PTYs, and the HTTP listener now binds
+		// BEFORE the install runs (bind-first, so a first-boot download is
+		// observable rather than connection-refused), so this is what tells
+		// `docker ps` and the monitoring probe apart from "serving". The manager's
+		// reason distinguishes installing / retrying / terminally unavailable /
+		// required settings unenforced, so a 503 says which. Reading it is a mutex
+		// and two field loads: the version was probed once when it was selected,
+		// never per probe (spawning a heavy PTY process on every health check would
+		// be an anti-pattern). This is a READINESS signal, not liveness — under
 		// `restart: unless-stopped` nothing restarts on the resulting unhealthy
 		// state, so there is no restart loop; if ever run under Swarm/k8s, wire
 		// this to a readinessProbe, not a livenessProbe.
-		if kiroMarkerUnavailable(deps.kiroReadyMarker, &kiroMarkerStatErrOnce) {
-			unready("kiro-cli unavailable")
-			return
+		if deps.kiroReady != nil {
+			if ok, reason := deps.kiroReady(); !ok {
+				unready(reason)
+				return
+			}
 		}
 		// The tools field is INFORMATIONAL: tool convergence never gates
 		// readiness (kiro-cli is the only core dependency), so monitoring
@@ -721,31 +801,37 @@ func buildCSPPolicy(sub fs.FS) (string, error) {
 	return fmt.Sprintf(cspTemplate, strings.Join(hashes, " "), styleHashes[0]), nil
 }
 
-// composeGate wraps the session-create gate with the tools-syncing
-// check: while the boot convergence pass runs, only SESSION CREATION
-// (POST terminal.SessionsPath) answers 503, so kiro-cli never spawns
-// before the manifest's tools are on PATH; list/close/title requests
-// routed through the same doubly-mounted handler pass through, matching
-// the engine's WithCreateGate contract. The inner gate (the create rate
-// limit) applies once syncing is over. The 503 speaks the standard
-// webhttp.WriteError envelope with an empty code, like every app-owned
+// composeGate wraps a session-create gate with one more blocking check:
+// while `blocked` reports true, only SESSION CREATION
+// (POST terminal.SessionsPath) answers 503 — so kiro-cli never spawns
+// before its own install finishes or before the manifest's tools are on PATH;
+// list/close/title requests routed through the same doubly-mounted handler pass
+// through, matching the engine's WithCreateGate contract. The inner gate applies
+// once this layer clears, which is how the two blocking checks and the create rate
+// limit stack into one gate without knowing about each other. `blocked` returns its
+// own reason so each layer names the dependency it is waiting on. The 503 speaks the
+// standard webhttp.WriteError envelope with an empty code, like every app-owned
 // error response here (the two 403 gates), plus a Retry-After hint, like the
 // inner rate limit's 429; /api/health's
 // {status, reason} document is a health-probe contract, not an error.
-func composeGate(inner func(http.Handler) http.Handler, syncing func() bool) func(http.Handler) http.Handler {
+func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, string)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		gated := inner(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if syncing() && r.Method == http.MethodPost && r.URL.Path == terminal.SessionsPath {
+			if r.Method != http.MethodPost || r.URL.Path != terminal.SessionsPath {
+				gated.ServeHTTP(w, r)
+				return
+			}
+			if block, reason := blocked(); block {
 				// Retry-After matches the inner rate limit's 429 contract
 				// (webhttp.SessionCreateRateLimit sets it too), so both arms of
 				// this gate tell a client, a proxy, and the UI's retry logic when
 				// to come back instead of leaving them to poll blind. A fixed
-				// short hint: convergence has no predictable remaining time (the
-				// only bound is toolbelt's 30-minute job timeout), so a cheap
-				// re-poll beats an HTTP-date the server cannot honestly compute.
+				// short hint: neither a tools convergence nor a kiro-cli download
+				// has a predictable remaining time, so a cheap re-poll beats an
+				// HTTP-date the server cannot honestly compute.
 				w.Header().Set("Retry-After", "5")
-				webhttp.WriteError(w, r, http.StatusServiceUnavailable, "", "tools installing")
+				webhttp.WriteError(w, r, http.StatusServiceUnavailable, "", reason)
 				return
 			}
 			gated.ServeHTTP(w, r)

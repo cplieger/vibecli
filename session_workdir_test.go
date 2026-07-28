@@ -27,7 +27,7 @@ func TestSessionWorkDirWiredIntoSessionFactory(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "cwd")
 	deps := newTestDeps(true)
 	deps.workDir = workDir
-	deps.cmd = []string{"/bin/sh", "-c", `pwd -P > '` + marker + `'; exec cat`}
+	deps.cmd = staticCmd("/bin/sh", "-c", `pwd -P > '`+marker+`'; exec cat`)
 	mustStartSession(t, deps)
 
 	got := strings.TrimSpace(string(readMarkerWithin(t, marker, 1, "report its working directory; the session command must run pwd -P into the marker")))

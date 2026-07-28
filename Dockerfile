@@ -385,7 +385,16 @@ ENV HOME=/config/home
 # land in the bin dir via the engine's own GOBIN env at install time.
 ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-ENV KIRO_CLI_PATH=/config/tools/bin/kiro-cli
+# KIRO_CLI_PATH is deliberately NOT set. There is no fixed path to set it to any
+# more: the server installs kiro-cli into a version-addressed directory
+# (/config/tools/opt/kiro-cli/<version>/) and runs that absolute path, so a
+# hardcoded /config/tools/bin/kiro-cli would name a convenience symlink the
+# manager republishes and never itself consults. The variable survives as an
+# OPERATOR ESCAPE HATCH: set it and the manager stands down entirely, the server
+# runs that binary verbatim, and /api/health stops reflecting kiro-cli readiness.
+# Setting it here would stand the manager down in every container.
+# `docker exec … kiro-cli --version` keeps working through the convenience
+# symlink at /config/tools/bin/kiro-cli, which is on the PATH above.
 ENV KWEB_WORK_DIR=/workspace
 ENV KWEB_ADDR=:9848
 
@@ -403,63 +412,67 @@ COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
 WORKDIR /workspace
 EXPOSE 9848
 
-# start-period is the SELECTED startup tolerance for the entrypoint's blocking
-# FOREGROUND path before the server binds; it satisfies the smoke-harness
-# sizing rule (tests/image-smoke.conf SMOKE_TIMEOUT 1260 = 1200 + two 30s
-# probe intervals). The derivation below sums the explicit foreground timeout
-# ALLOWANCES only — it is not a ceiling: untimed local work (the binary
-# promotion is an O(1) same-filesystem rename) runs outside the sums.
-# Single-attempt allowance-sum: kiro-cli download (curl
-# --max-time 3600, the absolute backstop behind --speed-limit/--speed-time stall
-# detection) + install.sh (120, +15 kill-after) + version/settings probes
-# (150: four --version checks on the worst-case UPGRADE boot — the drift check,
-# install_kiro_cli's staged verify, the POST-install bare-name resolution check, and
-# the readiness probe. The every-boot resolution check before the install runs in
-# identity mode and probes nothing: asking the version there warned about a suspected
-# stale binary on every routine bump, and dropping the probe is what keeps this at
-# four. A first boot with no $BIN present runs three, since the drift check finds
-# nothing to probe — plus SIX settings
-# calls, the five applied after
-# promotion plus install_kiro_cli's gated pre-promotion app.disableAutoupdates
-# assertion — at 10s each, +5s kill-after) + local archive work (sha256sum 300,
-# +15 kill-after; unzip 600, +15 kill-after) + optional APT_PACKAGES (apt-get
-# update 300, +30 kill-after; apt-cache pkgnames 60, +10 kill-after; apt-get
-# install 600, +30 kill-after) = 5845s with
-# APT_PACKAGES, 4815s without — so the 20m (1200s) start-period does NOT cover
-# even the single-attempt path. The download also runs with --retry 3 bounded by
-# --retry-max-time 5400 — which only bars STARTING a new attempt, so an attempt
-# begun just under the limit still runs to --max-time 3600, putting the download
-# leg's ceiling at ≈ 9000s and the retry-inflated allowance-sum at ≈ 11245s with
-# APT_PACKAGES (≈ 10215s without).
+# start-period is the SELECTED startup tolerance for reaching a HEALTHY
+# /api/health, which means a completed kiro-cli install; it satisfies the
+# smoke-harness sizing rule (tests/image-smoke.conf SMOKE_TIMEOUT 1260 = 1200 +
+# two 30s probe intervals). KEPT AT 20m across the move of the installer into the
+# server: the work the budget has to cover is the same ~528MB download plus
+# install, and only its PLACE changed.
 #
-# THE BUDGETS ARE DELIBERATELY LEFT BELOW THAT SUM (decided 2026-07). The two
-# budgets protect different things and only one has teeth:
+# What the ordering changed is the shape of a probe DURING that work, and it moved
+# in the operator's favour. The entrypoint no longer installs anything: it hardens
+# /config, optionally installs APT_PACKAGES, prunes superseded kiro-cli agent
+# runtimes, writes the theme and execs the server, so the listener binds within
+# seconds on a boot with no APT_PACKAGES. The install then runs in the background,
+# and a probe against it answers 503 with a reason (kiro-cli installing / install
+# retrying / unavailable) instead of being refused outright for want of a listener.
+# Health still only reports 200 once a version is active, so neither this budget
+# nor the smoke timeout got looser.
+#
+# FOREGROUND allowance-sum before the listener binds, explicit timeouts only:
+# APT_PACKAGES (apt-get update 300, +30 kill-after; apt-cache pkgnames 60, +10
+# kill-after; apt-get install 600, +30 kill-after) = 1030s with APT_PACKAGES, and
+# effectively zero without — every remaining step is untimed local work (directory
+# walks, stat/chmod, the agent-runtime prune, a small file write). That is a
+# ~4800s reduction against the pre-move sum, and it is why the container is now
+# observable during a first-boot download rather than connection-refused.
+#
+# BACKGROUND allowance-sum for one install attempt, all AFTER the bind: the
+# archive fetch (bounded by a 60s no-progress stall guard and a 20s handshake
+# deadline rather than a wall-clock cap, so a slow-but-progressing link is not cut
+# off), local unzip and streaming SHA-256 (untimed, ~528MB), install.sh (120s),
+# one --version probe on the staged binary plus one per selection candidate (10s
+# each), and the settings calls (10s each: one required before publication, then
+# five against the active binary). The manager then retries a failed attempt up to
+# 4 times with 30s/60s/120s backoff, so a persistently failing install keeps the
+# server up for the container's lifetime and reports the reason on /api/health.
+#
+# THE BUDGET IS DELIBERATELY BELOW THE WORST CASE (decided 2026-07, unchanged by
+# the move). The two budgets protect different things and only one has teeth:
 #   - At RUNTIME `unhealthy` is cosmetic. The restart policy acts on process exit,
 #     not health status, so a very slow first boot shows unhealthy, keeps
-#     downloading, and converges once the readiness marker is written. Mind the
-#     phase boundary: during the FOREGROUND kiro-cli download no HTTP listener
-#     exists yet, so a probe is refused outright — Docker reports unhealthy after
-#     the start period and, with `restart: unless-stopped`, does not restart it.
-#     Only AFTER the server binds is /api/health reachable, and from then on tool
-#     installs converge in the BACKGROUND (only session creation waits on them)
-#     while health reports the install state in its informational "tools" field.
+#     downloading, and converges once a version is active. /api/health is
+#     reachable throughout and names the phase, so the state is diagnosable while
+#     it lasts. Tool installs converge in the BACKGROUND alongside it (only
+#     session creation waits on them) and report through the informational "tools"
+#     field.
 #   - In CI the download runs on a GitHub-hosted runner over a fast link and takes
 #     minutes. A smoke boot that exceeds this start-period means something is
 #     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not
 #     a false negative on a healthy image.
-# Raising both budgets to cover the ~11245s retry envelope was considered and
+# Raising both budgets to cover the retry envelope was considered and
 # rejected: it would make a genuinely hung CI job burn ~3 hours of Actions time
 # before failing, which is a real recurring cost against a theoretical worst case
 # (CI cost matters on the free plan; validation is meant to stay minutes, not
-# hours). Bounding or dropping --retry was also rejected: stall detection already
-# aborts a link that stops making progress, so --retry exists for the case worth
-# keeping, a connection DROPPED mid-528MB.
+# hours). Bounding or dropping the retries was also rejected: the stall guard
+# already aborts a link that stops making progress, so the retries exist for the
+# case worth keeping, a connection DROPPED mid-528MB.
 # What this accepts, stated plainly: a download slow enough to outlast the
 # start-period fails the smoke job, and an operator on a genuinely slow link sees
 # an unhealthy interval on first boot before it converges. Both are the intended
 # outcomes, not a gap awaiting a decision.
 # Keep this comment and tests/image-smoke.conf's header in lockstep whenever a
-# foreground timeout changes.
+# timeout on either side of the exec changes.
 # Under `restart: unless-stopped`, health failures are reported
 # but do not restart the container (restart policies react to process exit,
 # not health status); under a liveness-acting orchestrator, wire /api/health

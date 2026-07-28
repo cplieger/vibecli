@@ -39,7 +39,7 @@ func TestSessionLoggerRedactsCommand(t *testing.T) {
 	// KILL does trip that hook (readiness is still set), so quietTeardown clears
 	// readiness first -- the contract every test leaving a live session owes the
 	// next test's log capture.
-	deps.cmd = []string{"/bin/sh", "-c", "exec cat", "sh", "--token=" + secret}
+	deps.cmd = staticCmd("/bin/sh", "-c", "exec cat", "sh", "--token="+secret)
 	mustStartSession(t, deps)
 
 	// EVERY command attr must be the placeholder, not merely the last one
@@ -79,7 +79,7 @@ func TestSessionLoggerRedactsCommand(t *testing.T) {
 func TestSessionLoggerTruncatesSessionID(t *testing.T) {
 	records := capture.Default(t)
 	deps := newTestDeps(true)
-	deps.cmd = []string{"/bin/sh", "-c", "exec cat"}
+	deps.cmd = staticCmd("/bin/sh", "-c", "exec cat")
 	_, _, _, id := mustStartSession(t, deps)
 	if len(id) <= 8 {
 		t.Fatalf("session id %q is too short to exercise truncation", id)

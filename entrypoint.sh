@@ -175,9 +175,16 @@ kiro_cli_restore_one() {
   # restored while one component is still the new one -- the mixed dispatcher set
   # this whole transaction exists to prevent. Deleting it makes the set visibly
   # INCOMPLETE instead: readiness is withheld and the drift check reinstalls.
+  # $dest goes FIRST and the malformed backup LAST, so the arm is retry-safe: the
+  # backup is the only artifact that distinguishes this component from a
+  # never-snapshotted one, so consuming it before the destination removal succeeds
+  # would leave the next recovery pass reading "no snapshot" over a possibly
+  # promoted $dest -- it would report success, close the journal, and publish
+  # readiness over the mixed set. In this order a refused $dest removal leaves both
+  # the backup and the journal in place and the next boot repeats the same repair.
   if [ ! -f "$backup" ]; then
-    rm -rf "$backup" || return 1
     rm -rf -- "$dest" || return 1
+    rm -rf "$backup" || return 1
     return 0
   fi
   # Same inode => this component was never promoted, so the backup IS the live file

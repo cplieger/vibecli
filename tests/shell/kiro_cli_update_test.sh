@@ -543,8 +543,13 @@ journal_rc=$?
 # ...and when the $dest removal is what cannot complete, the failure PROPAGATES for the
 # same reason the backup's does: a $BIN nobody could remove is still possibly the NEW
 # component, so closing the journal here would report the old set restored over a
-# transaction that never finished. The refusal is aimed at $BIN so the backup discard
-# succeeds first and only the second removal fails.
+# transaction that never finished. The refusal is aimed at $BIN, the FIRST of the arm's
+# two removals, which is also what makes the arm RETRY-SAFE: the malformed backup must
+# still be on disk afterwards, because it is the only artifact that distinguishes this
+# component from a never-snapshotted one. Consume it first (the pre-fix order) and the
+# next pass reads "no snapshot", returns success over a possibly promoted $BIN, and
+# closes the journal -- so the second pass below is the assertion that a later boot
+# actually completes this repair instead of forgetting why the journal stayed open.
 plant_old_set
 : >"$KIRO_CLI_UPDATE_JOURNAL"
 mkdir "$BIN_PREV"
@@ -552,10 +557,16 @@ refuse_rm_of "$BIN"
 kiro_cli_update_rollback >/dev/null 2>&1
 journal_rc=$?
 stop_refusing_rm
-[ "$journal_rc" -ne 0 ] && [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
-  && ok "an unremovable \$BIN fails the rollback and KEEPS the journal for the next boot" \
+[ "$journal_rc" -ne 0 ] && [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && [ -d "$BIN_PREV" ] \
+  && ok "an unremovable \$BIN fails the rollback, KEEPS the journal AND keeps the malformed backup for the next boot" \
   || no "unremovable dest" \
-    "the rollback reported success or closed the journal over a \$BIN it could not remove (rc=$journal_rc, journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+    "the rollback reported success, closed the journal, or consumed the malformed backup over a \$BIN it could not remove (rc=$journal_rc, journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed), backup=$([ -e "$BIN_PREV" ] && echo present || echo ABSENT))"
+kiro_cli_update_rollback >/dev/null 2>&1
+journal_rc=$?
+[ "$journal_rc" -eq 0 ] && [ ! -e "$BIN" ] && [ ! -e "$BIN_PREV" ] && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
+  && ok "the NEXT boot's pass completes the same repair: unprovable \$BIN and malformed backup gone, journal closed" \
+  || no "retry after unremovable dest" \
+    "the retried rollback did not finish the repair (rc=$journal_rc, bin=$([ -e "$BIN" ] && echo present || echo absent), backup=$([ -e "$BIN_PREV" ] && echo present || echo absent), journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
 rm -rf "$BIN_PREV"
 
 # ...and when that discard cannot complete, the failure must PROPAGATE: an artifact

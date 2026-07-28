@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import ts from "typescript";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 // The real constant from the real package -- NOT mocked below. The point is to
 // compare the served HTML against what the library actually ships.
@@ -84,6 +85,37 @@ function fixtureRoot(): string {
 // Read one of the SERVED static assets next to static-src.
 function readStaticAsset(name: string): string {
   return readFileSync(resolve(fixtureRoot(), `../static/${name}`), "utf8");
+}
+
+// Every module specifier the BROWSER resolves at load time, read from the
+// TypeScript AST rather than matched by regex. app.ts ships as a plain tsc emit,
+// so every static import survives verbatim -- including forms a clause-shaped
+// pattern silently drops, such as the legal quoted import name
+// `import { "x" as x } from "@scope/pkg"`, whose specifier a regex that stops at
+// the first quote never sees. An extractor that returns nothing for a real import
+// leaves its caller asserting over an empty list and passing forever, so the
+// parser that emits the code is the only extractor that cannot fall behind it.
+// `import type` is excluded because tsc erases it, so it never reaches module
+// resolution; side-effect imports and dynamic `import()` string literals are
+// included because the browser resolves both.
+function browserResolvedSpecifiers(source: string): string[] {
+  const parsed = ts.createSourceFile("app.ts", source, ts.ScriptTarget.ESNext, true);
+  const specifiers: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) {
+      if (node.importClause?.isTypeOnly !== true && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        specifiers.push(node.moduleSpecifier.text);
+      }
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const first = node.arguments[0];
+      if (first !== undefined && ts.isStringLiteralLike(first)) {
+        specifiers.push(first.text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(parsed, visit);
+  return specifiers;
 }
 
 // The UI package's shipped stylesheets, assembled from its own css/MANIFEST --
@@ -883,19 +915,36 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // module load for every visitor (the watchdog's own fatal dialog) with
     // every test above still green.
     const source = readFileSync(resolve(fixtureRoot(), "app.ts"), "utf8");
-    // Every form the BROWSER resolves through the importmap: a `from` clause, a
-    // bare side-effect import, and a dynamic import(). `import type` is skipped
-    // because tsc erases it, so it never reaches module resolution.
-    const specifiers = [
-      ...source.matchAll(/^\s*import\b(?!\s+type\b)(?:[^;"']*?from)?\s*["']([^"']+)["']/gm),
-      ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/g),
-    ]
-      .map((match) => match[1] as string)
-      .filter((specifier) => !specifier.startsWith(".") && !specifier.startsWith("/"));
-    // Guard the extractor itself: a regex that silently matched nothing would
-    // leave the loop below asserting over an empty list and passing forever.
+    const specifiers = browserResolvedSpecifiers(source).filter(
+      (specifier) => !specifier.startsWith(".") && !specifier.startsWith("/"),
+    );
+    // Guard the extractor itself: an extractor that silently matched nothing
+    // would leave the loop below asserting over an empty list and passing forever.
     expect(specifiers).toContain("@cplieger/web-terminal-ui");
     expect(specifiers).toContain("@cplieger/web-terminal-ui/presets");
+    // ...and pin its reach against a fixture of every form tsc emits unchanged,
+    // so no supported import syntax can fall out of the extractor unnoticed. The
+    // quoted import name is the one a clause-shaped regex dropped; the type-only
+    // import is absent because tsc erases it, and the relative specifier is kept
+    // here (the bare-specifier filter above is the caller's, not the extractor's).
+    expect(
+      browserResolvedSpecifiers(
+        [
+          `import { "x" as x } from "@scope/quoted-name";`,
+          `import "@scope/side-effect";`,
+          `import def, { named } from "@scope/clause";`,
+          `import type { T } from "@scope/erased";`,
+          `void import("@scope/dynamic");`,
+          `import { local } from "./local.js";`,
+        ].join("\n"),
+      ),
+    ).toEqual([
+      "@scope/quoted-name",
+      "@scope/side-effect",
+      "@scope/clause",
+      "@scope/dynamic",
+      "./local.js",
+    ]);
 
     const html = readStaticAsset("index.html");
     const map = /<script\b[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script\s*>/i.exec(html);

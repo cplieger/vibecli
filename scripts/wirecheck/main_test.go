@@ -85,16 +85,16 @@ func lineInvokesTheGate(line string) bool {
 		// character: `go run … & wait` discards the verdict just as thoroughly
 		// (in POSIX `sh`, `false & wait` exits 0), so a shape test on the last
 		// character would accept it. Splitting on `&&` has already removed the
-		// legitimate chain separators from the gate's own segment, and the live
-		// gate arguments contain no ampersand, so any `&` left in that segment
-		// is a background operator. The trailing-`&` check is kept alongside it
-		// because `&` applies to the whole AND-list: a `&` at the END of a LATER
-		// segment (`go run … && true &`) backgrounds the gate too, without
-		// putting an ampersand in the gate's own segment.
+		// legitimate chain separators from the gate's ONWARD text, and the live
+		// gate arguments contain no ampersand, so any `&` left anywhere in those
+		// segments is a background operator. The check is therefore over the
+		// gate-onward segments joined WITHOUT the `&&` separator, which refuses an
+		// `&` in ANY position of ANY later segment: `&` applies to the whole
+		// AND-list, so both `go run … && true &` and `go run … && true & echo done`
+		// background the gate without putting an ampersand in its own segment.
 		rest := strings.Join(segments[i:], "&&")
 		if strings.ContainsAny(rest, ";|") ||
-			strings.Contains(seg, "&") ||
-			strings.HasSuffix(strings.TrimSpace(rest), "&") {
+			strings.Contains(strings.Join(segments[i:], ""), "&") {
 			return false
 		}
 		return true
@@ -164,6 +164,13 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		// backgrounds the gate as well, without appearing in the gate's segment.
 		"a chain backgrounded by a trailing & on a later segment": {
 			"    go run ./scripts/wirecheck " + flags + " && true &", false,
+		},
+		// ...and an `&` INTERIOR to a later segment backgrounds the AND-list just
+		// the same: `A && B & C` parses as `(A && B) & C`, so the gate's verdict is
+		// never waited for even though the ampersand is neither in the gate's
+		// segment nor at the end of the line.
+		"a chain backgrounded by an interior & on a later segment": {
+			"    go run ./scripts/wirecheck " + flags + " && true & echo done", false,
 		},
 		"the live chained form": {
 			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && go run ./scripts/wirecheck ` + flags, true,

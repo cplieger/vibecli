@@ -285,8 +285,10 @@ func isNotifyFingerprint(v slog.Value) bool {
 // message contains msgSub: every attr must be in the schema (an unexpected key
 // fails), every attr's value must pass its check (a truncated or transformed
 // value under an ALLOWED key fails — the leak a key-only allowlist cannot see),
-// and every schema key must actually appear (a required attr disappearing is a
-// regression too, and if no record matched at all, every key reports missing).
+// and every schema key must actually appear in EACH matching record (a required
+// attr disappearing is a regression too; the accounting is per record, so two
+// matching records cannot split the schema between them and pass on their union,
+// and a message that matched nothing at all fails on its own).
 // A needle sweep only catches content the test already knows; this catches
 // content under any name, of any length, in any shape. Shared by the package's
 // two credential boundaries (a rejected TRUSTED_PROXIES entry and a classifier
@@ -294,11 +296,17 @@ func isNotifyFingerprint(v slog.Value) bool {
 func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, schema map[string]attrCheck) {
 	t.Helper()
 	expected := slices.Sorted(maps.Keys(schema))
-	seen := make(map[string]bool, len(schema))
+	matched := false
 	for _, r := range records.Records() {
 		if r.Level != level || !strings.Contains(r.Message, msgSub) {
 			continue
 		}
+		matched = true
+		// A FRESH map per matching record: accounting shared across records would let
+		// two of them split the schema between them and pass on their union, so a
+		// record carrying only invalid_count and another carrying only hint would
+		// satisfy a guarantee neither one meets.
+		seen := make(map[string]bool, len(schema))
 		r.Attrs(func(a slog.Attr) bool {
 			check, ok := schema[a.Key]
 			if !ok {
@@ -314,12 +322,16 @@ func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level,
 			}
 			return true
 		})
-	}
-	for _, key := range expected {
-		if !seen[key] {
-			t.Errorf("no %s record matching %q carried the required attr %q (want %v); a withheld-credential guarantee "+
-				"is worthless if the attrs that carry the diagnosis can silently disappear", level, msgSub, key, expected)
+		for _, key := range expected {
+			if !seen[key] {
+				t.Errorf("%s record %q is missing the required attr %q (want %v); a withheld-credential guarantee "+
+					"is worthless if the attrs that carry the diagnosis can silently disappear", level, r.Message, key, expected)
+			}
 		}
+	}
+	if !matched {
+		t.Errorf("no %s record matching %q was captured; the attrs that carry the withheld-credential diagnosis "+
+			"(%v) cannot be checked if the record itself is gone", level, msgSub, expected)
 	}
 }
 

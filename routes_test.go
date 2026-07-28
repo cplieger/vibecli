@@ -1247,19 +1247,34 @@ func TestComposeGate_syncingResponseIncludesRetryAfter(t *testing.T) {
 
 // TestNotifyFingerprint pins the log-hygiene substitution the classifier applies
 // to arbitrary child output before ANY of it reaches the log: the notification
-// text is replaced by a fixed-width, content-free SHA-256 prefix. Three
+// text is replaced by a fixed-width, content-free HMAC-SHA-256 prefix, KEYED
+// with a per-classifier secret that never appears in the log stream. Four
 // properties carry the whole contract, and each has a distinct failure the
 // classifier's own tests cannot see:
 //
 //   - fixed width and hex-only, so no amount of child output can widen or
 //     shape the record (a fingerprint that leaked input length or characters
 //     would be a partial copy of the secret it exists to withhold);
-//   - stable for equal input, which is what lets an operator correlate the
-//     Warn with its Debug twin and tell a repeat from a new wording;
+//   - stable for equal input under one key, which is what lets an operator
+//     correlate the Warn with its Debug twin and tell a repeat from a new
+//     wording;
 //   - distinct for different input, so two wordings are not conflated into
-//     "the same unrecognized notification".
+//     "the same unrecognized notification";
+//   - KEY-DEPENDENT, which is the property an unkeyed digest lacked: the
+//     plaintext here is low-entropy by nature (a device code, a short token),
+//     so an unkeyed hash lets a log reader enumerate candidates offline and
+//     confirm one by comparing digests. Under a key the log does not carry,
+//     that oracle does not exist — and this assertion is what would fail if
+//     someone "simplified" the HMAC back to a plain SHA-256.
+//
+// The keys below are injected by the test rather than drawn: the production key
+// is generated per classifier and deliberately unreachable (see
+// notifyFingerprinter), so these properties are pinned against keys the test
+// owns.
 func TestNotifyFingerprint(t *testing.T) {
 	const secret = "verify at https://example.com/device?user_code=ABCD-EFGH"
+	fp := notifyFingerprinter{key: []byte("test-key-one-0123456789abcdef0123")}
+	otherKey := notifyFingerprinter{key: []byte("test-key-two-0123456789abcdef0123")}
 	inputs := map[string]string{
 		"empty":              "",
 		"short wording":      "Response complete",
@@ -1271,26 +1286,52 @@ func TestNotifyFingerprint(t *testing.T) {
 	seen := make(map[string]string, len(inputs))
 	for name, msg := range inputs {
 		t.Run(name, func(t *testing.T) {
-			got := notifyFingerprint(msg)
+			got, ok := fp.fingerprint(msg)
+			if !ok {
+				t.Fatalf("fingerprint(%q) reported no key on a keyed fingerprinter; the Warn and Debug records would lose their only identifier", msg)
+			}
 			if len(got) != notifyFingerprintHexDigits {
-				t.Errorf("notifyFingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
+				t.Errorf("fingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
 			}
+			// Hex-only is the confidentiality assertion proper: no character of
+			// the notification (a token, a device code) can appear in the record.
 			if strings.Trim(got, "0123456789abcdef") != "" {
-				t.Errorf("notifyFingerprint(%q) = %q, want lowercase hex only; anything else means child output reached the log verbatim", msg, got)
+				t.Errorf("fingerprint(%q) = %q, want lowercase hex only; anything else means child output reached the log verbatim", msg, got)
 			}
-			if again := notifyFingerprint(msg); again != got {
-				t.Errorf("notifyFingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
+			if again, _ := fp.fingerprint(msg); again != got {
+				t.Errorf("fingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
 			}
 		})
-		fp := notifyFingerprint(msg)
-		if other, dup := seen[fp]; dup {
-			t.Errorf("notifyFingerprint collides for %q and %q (both %q); two distinct wordings would read as one", msg, other, fp)
+		got, _ := fp.fingerprint(msg)
+		if other, dup := seen[got]; dup {
+			t.Errorf("fingerprint collides for %q and %q (both %q); two distinct wordings would read as one", msg, other, got)
 		}
-		seen[fp] = msg
+		seen[got] = msg
 	}
-	// The point of the whole substitution: a credential-shaped notification
-	// contributes none of its own characters to the record.
-	if fp := notifyFingerprint(secret); strings.Contains(fp, "ABCD") || strings.Contains(fp, "user_code") {
-		t.Errorf("notifyFingerprint(%q) = %q, which carries input text; the fingerprint exists so a token in child output never reaches the log store", secret, fp)
+
+	// The property the key exists for, stated on the input class that motivated
+	// it: a device code is short and drawn from a small alphabet, so an UNKEYED
+	// digest of it is recoverable by offline enumeration. Two keys must not
+	// agree on it — a plain hash would.
+	const deviceCode = "ABCD-EFGH"
+	underOneKey, _ := fp.fingerprint(deviceCode)
+	underAnotherKey, _ := otherKey.fingerprint(deviceCode)
+	if underOneKey == underAnotherKey {
+		t.Errorf("fingerprint(%q) = %q under two different keys; the identifier is unkeyed, so anyone reading the log can enumerate short candidates offline and confirm the notification's text", deviceCode, underOneKey)
+	}
+
+	// Fail-closed: a fingerprinter with no key (crypto/rand unavailable at
+	// construction) must omit the identifier rather than emit a predictable one,
+	// and must still report the rune count so the record stays diagnosable.
+	unkeyed := notifyFingerprinter{}
+	if got, ok := unkeyed.fingerprint(deviceCode); ok || got != "" {
+		t.Errorf("unkeyed fingerprint(%q) = (%q, %v), want (%q, false); a keyless fallback would be a guessable copy of child output", deviceCode, got, ok, "")
+	}
+	attrs := unkeyed.metadata(deviceCode)
+	if len(attrs) != 2 || attrs[0] != "message_runes" || attrs[1] != len([]rune(deviceCode)) {
+		t.Errorf("unkeyed metadata(%q) = %v, want exactly [message_runes %d]; the record must drop the fingerprint and keep the length", deviceCode, attrs, len([]rune(deviceCode)))
+	}
+	if keyed := fp.metadata(deviceCode); len(keyed) != 4 || keyed[0] != "message_fingerprint" {
+		t.Errorf("keyed metadata(%q) = %v, want [message_fingerprint <hex> message_runes <n>]", deviceCode, keyed)
 	}
 }

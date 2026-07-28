@@ -777,9 +777,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // re-creates that markup by hand. If index.html's overlay ever loses the
     // .wt-loading-bar (or #terminal ships a pre-JS child), the watchdog silently
     // never fires in production while every watchdog test above still passes
-    // against
-    // its own fabricated overlay -- so pin the hand-built fixture to the
-    // served file here.
+    // against its own fabricated overlay -- so pin the hand-built fixture to
+    // the served file here.
     // Drop the external stylesheet link before parsing: happy-dom fetches
     // <link rel=stylesheet> hrefs off a parsed document, which would make this
     // assertion attempt a real HTTP request. The guards below live entirely in

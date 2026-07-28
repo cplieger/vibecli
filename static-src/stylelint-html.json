@@ -1,5 +1,5 @@
 {
-  "comment": "App-owned HTML lint config. It lives HERE, not in the repo-root .stylelintrc.json, because that file is a SYNCED copy of cplieger/ci's configs/stylelint.json -- the nightly sync would revert an override placed there while the repo-owned lint:stylelint script survived, turning a green gate into a CssSyntaxError. Deliberately NOT named .stylelintrc* so cosmiconfig never auto-discovers it for CI's plain CSS run; only lint:stylelint passes it explicitly.",
+  "comment": "App-owned HTML lint config. It lives HERE, not in the repo-root .stylelintrc.json, because that file is a SYNCED copy of cplieger/ci's configs/stylelint.json -- the nightly sync would revert an override placed there while the repo-owned lint:stylelint script survived, so the script would fail with a CssSyntaxError (postcss-html gone). It is a developer-run check, not a CI gate: ci's ts-ci web-lint step stylelints only **/*.css and html-validate handles the HTML, so nothing in CI covers the CSS embedded in static/index.html. Deliberately NOT named .stylelintrc* so cosmiconfig never auto-discovers it for CI's plain CSS run; only lint:stylelint passes it explicitly.",
   "extends": "../.stylelintrc.json",
   "overrides": [
     {

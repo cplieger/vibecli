@@ -212,7 +212,13 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 		}
 		quietTeardown(t, deps)
 
-		wantFingerprint := notifyFingerprint(wantFull)
+		// The production key is drawn inside newStatusClassifier and never
+		// logged, so the expected fingerprint is not computable here — by
+		// design (an unkeyed digest of low-entropy child output would be
+		// recoverable by offline enumeration). What the live session must show
+		// is that ONE classifier instance stamps BOTH records with the SAME
+		// well-formed identifier, which is the correlation property the
+		// fingerprint replaced the text to preserve.
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			warnFP, haveWarnFP, haveWarn := attrOf(records, slog.LevelWarn, "message_fingerprint")
@@ -233,9 +239,12 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						t.Errorf("%s record carries no message_fingerprint; an unrecognized wording would be unidentifiable, which is what the fingerprint replaced the text to preserve", tc.level)
 						continue
 					}
-					if tc.fp != wantFingerprint {
-						t.Errorf("%s message_fingerprint = %q, want %q (the fingerprint of the sanitized text)", tc.level, tc.fp, wantFingerprint)
+					if len(tc.fp) != notifyFingerprintHexDigits || strings.Trim(tc.fp, "0123456789abcdef") != "" {
+						t.Errorf("%s message_fingerprint = %q, want exactly %d lowercase hex digits; any other shape means child output shaped the record", tc.level, tc.fp, notifyFingerprintHexDigits)
 					}
+				}
+				if haveWarnFP && haveDebugFP && warnFP != debugFP {
+					t.Errorf("Warn message_fingerprint = %q but Debug = %q; one classifier instance must stamp both records identically or an operator cannot pair them", warnFP, debugFP)
 				}
 				// The confidentiality assertion proper: no record at any level
 				// carries the text, an excerpt of it, or the unsafe rune.

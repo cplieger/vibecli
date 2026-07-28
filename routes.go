@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -370,43 +372,93 @@ const unrecognizedNotifyCap = 8
 const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_OSC_TEXT=true with KWEB_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
 
 // notifyFingerprintHexDigits bounds the fingerprint written in place of the
-// notification text. 16 hex digits (64 bits of SHA-256) is far more than enough
-// to tell a handful of distinct wordings apart — the warn budget is
+// notification text. 16 hex digits (64 bits of HMAC-SHA-256) is far more than
+// enough to tell a handful of distinct wordings apart — the warn budget is
 // unrecognizedNotifyCap — while staying short enough to read in a log line.
 const notifyFingerprintHexDigits = 16
 
-// notifyFingerprint returns a stable, CONTENT-FREE identifier for msg: the
-// leading notifyFingerprintHexDigits hex digits of its SHA-256.
+// notifyFingerprintKeyBytes is the width of the per-classifier HMAC key. 32
+// bytes is SHA-256's block-appropriate full-strength key; the key is generated
+// at classifier construction and NEVER logged, so nothing in the log stream
+// helps an attacker reproduce a fingerprint.
+const notifyFingerprintKeyBytes = 32
+
+// notifyFingerprinter renders the stable, content-free identifier the log
+// carries INSTEAD of an unrecognized notification's text.
 //
-// This is what the log carries instead of the notification text. The text is
-// arbitrary child output — a program run in the terminal can emit
+// The text is arbitrary child output — a program run in the terminal can emit
 // `ESC ] 9 ; <text>` — and the engine's sanitizeNotification only guarantees
 // INTEGRITY (it drops unsafe runes and rune-caps at 256, so a record cannot be
-// forged); it redacts nothing. A bounded EXCERPT was the previous answer and it
-// does not redact either: a short token or a device code fits inside any
-// excerpt, so the always-on stream still ended up holding a durable, queryable
-// copy of a credential in Loki (CWE-532), which retains far longer and is far
-// more searchable than PTY scrollback.
+// forged); it redacts nothing. A bounded EXCERPT was the first answer and does
+// not redact: a short token or a device code fits inside any excerpt, so the
+// always-on stream still ended up holding a durable, queryable copy of a
+// credential in Loki (CWE-532), which retains far longer and is far more
+// searchable than PTY scrollback.
 //
-// A fingerprint keeps every diagnostic property the always-on record actually
-// needs — "a wording this app does not recognize appeared", "here are N
-// DISTINCT ones", "this is the same one as before / a different one", "it was
-// this many runes long" — while carrying none of the content. Recovering the
-// text is a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus
-// KWEB_LOG_LEVEL=debug), not a side effect of raising the log level.
-func notifyFingerprint(msg string) string {
-	sum := sha256.Sum256([]byte(msg))
-	return hex.EncodeToString(sum[:])[:notifyFingerprintHexDigits]
+// An UNKEYED digest was the second answer and does not redact either, which is
+// why the key exists: the plaintext here is low-entropy by nature (a device
+// code, a short token, a templated URL with a code in it), so a reader holding
+// SHA-256(msg) can enumerate candidates offline and compare — a password-hash
+// problem, and "message_runes" hands the search its length. Keying with a
+// secret the log never contains removes the offline oracle: without the key no
+// amount of guessing confirms a candidate (CWE-760, unsalted one-way hash).
+//
+// What the identifier keeps is every diagnostic property the always-on record
+// actually needs — "a wording this app does not recognize appeared", "here are
+// N DISTINCT ones", "this is the same one as before / a different one", "it was
+// this many runes long" — while carrying none of the content. The key's
+// lifetime is the classifier INSTANCE (one per process in production), so
+// fingerprints correlate across the Warn and Debug records of one run and
+// deliberately do NOT correlate across restarts; recovering the text itself is
+// a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus KWEB_LOG_LEVEL=debug),
+// not a side effect of raising the log level.
+//
+// A zero-value notifyFingerprinter (no key) is the FAIL-CLOSED state: it
+// produces no identifier at all rather than a predictable one, so a keying
+// failure costs the correlation hint and never the confidentiality property.
+type notifyFingerprinter struct {
+	key []byte
 }
 
-// notifyMetadata is the content-free description of a notification both the
-// Warn arm and the default (text-disabled) Debug arm log: which distinct
-// wording it was, and how long it was.
-func notifyMetadata(msg string) []any {
-	return []any{
-		"message_fingerprint", notifyFingerprint(msg),
-		"message_runes", utf8.RuneCountInString(msg),
+// newNotifyFingerprinter draws the per-classifier key. crypto/rand.Read does
+// not report failure on any supported platform (Go 1.24+ panics instead of
+// returning an error), so the error arm is a floor rather than a reachable
+// path: it exists so that a future or alternate source degrades to omitting the
+// identifier instead of silently keying every fingerprint with zeros.
+func newNotifyFingerprinter() notifyFingerprinter {
+	key := make([]byte, notifyFingerprintKeyBytes)
+	if _, err := rand.Read(key); err != nil {
+		slog.Warn("notification fingerprint key unavailable; unrecognized-notification records will carry a rune count only (a predictable fingerprint would be a guessable copy of arbitrary child output)",
+			"error", err)
+		return notifyFingerprinter{}
 	}
+	return notifyFingerprinter{key: key}
+}
+
+// fingerprint returns the leading notifyFingerprintHexDigits hex digits of
+// HMAC-SHA-256(key, msg), and false when this fingerprinter holds no key (see
+// the type's fail-closed note).
+func (f notifyFingerprinter) fingerprint(msg string) (string, bool) {
+	if len(f.key) == 0 {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, f.key)
+	// hash.Hash.Write is documented never to return an error.
+	_, _ = mac.Write([]byte(msg))
+	return hex.EncodeToString(mac.Sum(nil))[:notifyFingerprintHexDigits], true
+}
+
+// metadata is the content-free description of a notification both the Warn arm
+// and the default (text-disabled) Debug arm log: which distinct wording it was,
+// and how long it was. The fingerprint attribute is omitted entirely when
+// keying failed; the rune count is always present, so a record never degrades
+// to "something unrecognized happened, no detail at all".
+func (f notifyFingerprinter) metadata(msg string) []any {
+	attrs := make([]any, 0, 4)
+	if fp, ok := f.fingerprint(msg); ok {
+		attrs = append(attrs, "message_fingerprint", fp)
+	}
+	return append(attrs, "message_runes", utf8.RuneCountInString(msg))
 }
 
 // notifyWarningState is newStatusClassifier's bounded warn budget for
@@ -491,11 +543,12 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 //
 // logText is the KWEB_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
 // whether the notification's TEXT may be logged at all. Off, every record is
-// content-free metadata (see notifyFingerprint); on, the Debug arm — and only
+// content-free metadata (see notifyFingerprinter); on, the Debug arm — and only
 // the Debug arm — carries the full sanitized text. Notification content never
 // reaches the default Warn stream in either mode.
 func newStatusClassifier(logText bool) func(string) (string, bool) {
 	warnings := notifyWarningState{warned: make(map[string]struct{}, unrecognizedNotifyCap)}
+	fingerprints := newNotifyFingerprinter()
 	return func(msg string) (string, bool) {
 		switch msg {
 		case "Response complete":
@@ -520,10 +573,11 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			// otherwise land in a log store that outlives and out-queries the PTY
 			// scrollback. A bounded excerpt was the previous answer and did not
 			// redact either (a short secret fits), so what ships now is a
-			// content-free fingerprint plus a rune count -- enough to tell the
-			// distinct wordings apart and correlate repeats, carrying none of the
-			// content. Recovering the text is the explicit KWEB_LOG_OSC_TEXT
-			// opt-in below, at Debug only.
+			// KEYED, content-free fingerprint plus a rune count -- enough to tell
+			// the distinct wordings apart and correlate repeats within this
+			// process, carrying none of the content and offering no offline
+			// guessing oracle. Recovering the text is the explicit
+			// KWEB_LOG_OSC_TEXT opt-in below, at Debug only.
 			//
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
@@ -533,9 +587,11 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			switch {
 			case warnFirst:
 				slog.Warn(unrecognizedNotifyMsg,
-					append(notifyMetadata(msg), "hint", unrecognizedNotifyHint)...)
+					append(fingerprints.metadata(msg), "hint", unrecognizedNotifyHint)...)
 			case warnCapped:
-				slog.Warn(unrecognizedNotifyCapMsg, "distinct_limit", unrecognizedNotifyCap)
+				slog.Warn(unrecognizedNotifyCapMsg,
+					"distinct_limit", unrecognizedNotifyCap,
+					"hint", unrecognizedNotifyHint)
 			}
 			if logText {
 				// The deliberate diagnostic opt-in: whoever set BOTH
@@ -543,7 +599,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 				// startup) that terminal notification text may contain secrets.
 				slog.Debug(unrecognizedNotifyMsg, "message", msg)
 			} else {
-				slog.Debug(unrecognizedNotifyMsg, notifyMetadata(msg)...)
+				slog.Debug(unrecognizedNotifyMsg, fingerprints.metadata(msg)...)
 			}
 			return "", false
 		}

@@ -23,25 +23,22 @@ const (
 	resumeAckOldestIndexAt = 25
 )
 
-// TestSessionScrollbackCapacityWiredIntoSessionFactory pins the LAST session
-// option nothing asserted: terminal.WithScrollbackCapacity(5000) in
-// registerRoutes' factory. The engine's own default is 1000 lines, so deleting
-// the option silently cuts retained history to a fifth while every other test
-// stays green -- a reconnect then restores a truncated /chat transcript, which
-// is the one thing this app's in-memory-only session model has to get right
-// (there is no on-disk store to fall back on).
+// TestSessionScrollbackCapacityWiredIntoSessionFactory pins the exact 5000-line
+// retention policy wired into registerRoutes' session factory:
+// terminal.WithScrollbackCapacity(5000). The engine's own default is 1000 lines,
+// and the browser's own LineStore retains 5000, so a smaller server capacity
+// silently truncates a reconnect while a larger one wastes memory the client will
+// never retain -- and this app's in-memory-only session model has no on-disk store
+// to fall back on. 5000 is therefore the pin because it is the CLIENT's retention
+// cap, not because it is merely "more than the engine default".
 //
 // The observable is the engine's resumeAck frame, which carries the absolute
-// bounds of retained history (committed, oldestIndex) -- the same pair the
-// browser client uses to detect an eviction gap. The child emits more lines
-// than the engine default retains but fewer than the app's policy does, so
-// zero eviction fails the moment the option is DELETED (verified: oldestIndex
-// then trails committed by exactly the 1000-line default and only this test
-// fails). What is pinned is therefore "the capacity is at least the emitted
-// line count", not the literal 5000 -- a REDUCTION to any value above ~2500
-// still passes here, because eviction only becomes observable past capacity.
-// Pinning 5000 exactly would mean emitting >5000 lines and asserting
-// oldestIndex == committed-5000.
+// bounds of retained history (committed, oldestIndex) -- the same pair the browser
+// client uses to detect an eviction gap. The child emits PAST the configured
+// capacity, so eviction is observable and committed-oldest reports the capacity
+// exactly: deleting the option fails (the 1000-line default retains a fifth), and
+// so does REDUCING it, which the older ">= emitted lines" form could not see
+// (it emitted 2500 and asserted oldest == 0, so any capacity above ~2500 passed).
 //
 // haveThrough is set far in the future so the server replays no history: this
 // exchange is only asked for the bounds. Polling re-sends the resume until the
@@ -49,8 +46,9 @@ const (
 // interval.
 func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
 	const (
-		emitted       = 2500 // more than the engine's 1000-line default, fewer than the app's 5000
-		wantCommitted = 2000
+		emitted       = 5250 // past the app-owned 5000-line capacity, so eviction is observable
+		wantCommitted = 5100 // enough evicted lines that committed-oldest IS the capacity
+		wantCapacity  = 5000 // the app's policy, matching the client's own retention cap
 	)
 	deps := newTestDeps(true)
 	deps.cmd = []string{"/bin/sh", "-c", fmt.Sprintf(
@@ -104,9 +102,9 @@ func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if oldest != 0 {
-		t.Errorf("oldest retained scrollback index = %d with only %d lines committed (retained %d), want 0 -- terminal.WithScrollbackCapacity(5000) is missing from the session factory, so the engine's 1000-line default evicts a reconnecting tab's transcript",
-			oldest, committed, committed-oldest)
+	if got := committed - oldest; got != wantCapacity {
+		t.Errorf("retained scrollback lines = %d (committed=%d oldest=%d), want exactly %d -- terminal.WithScrollbackCapacity must stay wired to the app's 5000-line reconnect policy, which is the client store's own retention cap",
+			got, committed, oldest, wantCapacity)
 	}
 }
 

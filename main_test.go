@@ -602,8 +602,8 @@ func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 // TestWarnIfNoLSPEnabled pins both silent branches of the code-intelligence
 // nudge, which the boot-convergence path only exercises on the warning side:
 // an ENABLED catalog-marked language server must silence the Warn (the whole
-// point of the Lsp inventory marker), and an inventory read failure must skip
-// the nudge quietly (Debug only) instead of warning spuriously. Serial:
+// point of the Lsp inventory marker), while an inventory read failure must report
+// its own manifest-unreadable Warn without emitting the no-LSP nudge. Serial:
 // mutates the process-global default logger.
 func TestWarnIfNoLSPEnabled(t *testing.T) {
 	const warnMsg = "no language servers enabled"

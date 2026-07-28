@@ -203,11 +203,13 @@ func TestStaticETagRevalidation(t *testing.T) {
 // -- also proving the SecurityHeaders/Recoverer layers stay transparent to the
 // SSE stream.
 func TestSSEStreamsThroughLoggingMiddleware(t *testing.T) {
-	mux, mgr, csp := mustRegisterRoutes(t, newTestDeps(true))
+	deps := newTestDeps(true)
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
 	id, err := mgr.Create()
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	quietTeardown(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -542,7 +544,8 @@ func newWSUpgradeRequest(t *testing.T, srvURL, id, origin string) *http.Request 
 // guard: a future WithAcceptOptions{InsecureSkipVerify:true} would silently
 // re-open cross-site WebSocket hijacking. This test fails if that happens.
 func TestWSRejectsCrossOrigin(t *testing.T) {
-	mux, mgr, csp := mustRegisterRoutes(t, newTestDeps(true))
+	deps := newTestDeps(true)
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
 	// Drive the guard on a REAL session: the shape a malicious page in the
 	// victim's browser would actually target. The pinned engine runs the
 	// same-origin check on EVERY upgrade -- an unknown id is reported after the
@@ -554,6 +557,8 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+
+	quietTeardown(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -576,11 +581,13 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 // that 403'd unconditionally would still pass the negative test. This pins that
 // the 403 is specifically the same-origin (CSWSH) check, not a blanket refusal.
 func TestWSAcceptsSameOrigin(t *testing.T) {
-	mux, mgr, csp := mustRegisterRoutes(t, newTestDeps(true))
+	deps := newTestDeps(true)
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
 	id, err := mgr.Create()
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	quietTeardown(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
@@ -631,6 +638,7 @@ func TestSessionTitleDerivesFromInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	quietTeardown(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)

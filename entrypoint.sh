@@ -195,6 +195,23 @@ kiro_cli_update_finish() {
 # completion marker's.
 kiro_cli_update_begin() {
   local journal_tmp=''
+  # Refuse to open a transaction on top of an unresolved one. A journal still on disk
+  # here means the previous update neither committed nor finished rolling back, and its
+  # backups plus `.absent` tombstones are the ONLY record of what the pre-update set
+  # was. Starting anyway would destroy that record twice over: kiro_cli_snapshot_one
+  # deletes each fixed-name backup before linking a new one, and the snapshot it takes
+  # is of the already-MIXED live set -- so a later promotion failure would "roll back"
+  # to the mixed state instead of to a set that ever existed. Return WITHOUT calling
+  # kiro_cli_update_finish (unlike the two failure paths below, which close a
+  # transaction THIS call opened): finishing would clear the very journal the next
+  # boot's recovery pass needs to attempt the repair again. A symlink counts as present
+  # for the same reason recovery distrusts one -- this script did not write it, so it
+  # cannot be read as "no transaction" either.
+  if [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] || [ -L "$KIRO_CLI_UPDATE_JOURNAL" ]; then
+    printf 'level=error msg="refusing to start a kiro-cli update transaction while an unresolved one is journalled; its backups are the only record of the previous dispatcher set" journal="%s" component=entrypoint\n' \
+      "$KIRO_CLI_UPDATE_JOURNAL" >&2
+    return 1
+  fi
   if ! kiro_cli_snapshot_one "$BIN" "$BIN_PREV" \
     || ! kiro_cli_snapshot_one "$CHAT_SIDECAR" "$CHAT_SIDECAR_PREV" \
     || ! kiro_cli_snapshot_one "$KIRO_CLI_INSTALL_MARKER" "$KIRO_CLI_INSTALL_MARKER_PREV"; then
@@ -824,7 +841,15 @@ fi
 # state. Warn-not-fatal, like the sweeps around it: a repair this boot could not
 # finish keeps the journal, so the next boot retries it, and the drift check
 # reinstalls from the pinned archive either way.
-recover_kiro_cli_update_journal || true
+#
+# The result is RECORDED rather than discarded, and it is authoritative for the rest of
+# boot. A failed rollback leaves the dispatcher set unverified AND leaves the original
+# journal/backups as the only record of the pre-update set, so this boot must neither
+# start a new transaction over that record (the install below is skipped) nor publish
+# readiness over the mixed set (the readiness decision withholds the marker). Degraded,
+# never fatal: the container stays up and repairable from inside, per "Failure posture".
+kiro_cli_recovery_failed=0
+recover_kiro_cli_update_journal || kiro_cli_recovery_failed=1
 
 # Same hygiene argument, applied to the one residue class the sweep above omits:
 # binaries an EARLIER image version staged into $HOME/.local/bin (that install ran with
@@ -1246,7 +1271,18 @@ kiro_cli_measured_version=""
 # readiness section can publish over the OLD version instead of withholding the marker
 # and leaving a working terminal answering 503 for the container's lifetime.
 kiro_cli_update_failed=0
-if needs_kiro_cli_install; then
+if [ "$kiro_cli_recovery_failed" -eq 1 ]; then
+  # An earlier update could not be rolled back, so the journal and backups still on the
+  # volume are the only record of the previous dispatcher set. Installing now would
+  # start a transaction that deletes those backups and snapshots the already-mixed live
+  # set (see kiro_cli_update_begin's own guard, which refuses this independently), and
+  # a promotion failure would then roll back TO the mixed set. Skip the install and let
+  # the next boot retry the repair with the evidence intact; readiness is withheld
+  # below either way, so the container serves degraded rather than reporting healthy
+  # over an unverified set.
+  printf 'level=warn msg="skipping the kiro-cli install: an earlier update could not be rolled back, so its journal and backups are the only record of the previous dispatcher set; readiness stays withheld until a later boot completes the repair" journal="%s" pinned=%s component=entrypoint\n' \
+    "$KIRO_CLI_UPDATE_JOURNAL" "$KIRO_CLI_VERSION" >&2
+elif needs_kiro_cli_install; then
   # DOWNLOAD-THEN-SWAP. install_kiro_cli fetches the ~528 MB zip, verifies it
   # against the pinned sha, stages it off PATH under $TOOLS, and only then
   # promotes by rename -- and every promotion is `mv -f`, which replaces the old
@@ -1441,7 +1477,22 @@ prune_superseded_kas_runtimes "${kiro_cli_installed:-$KIRO_CLI_VERSION}" || true
 # no boot allowance even on paths that end up not consulting it.
 kiro_cli_set_rc=0
 kiro_cli_dispatcher_set_complete || kiro_cli_set_rc=$?
-if [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
+if [ "${kiro_cli_recovery_failed:-0}" -eq 1 ] \
+  || [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] || [ -L "$KIRO_CLI_UPDATE_JOURNAL" ]; then
+  # FIRST, ahead of every version and set fallback below: an unresolved update
+  # transaction makes the on-disk dispatcher set unverified BY CONSTRUCTION -- an old
+  # $BIN can sit beside an already-promoted new chat sidecar, and neither the version
+  # probe nor the set check version-probes the sidecar. Both the "looks clean" branch
+  # (right version, complete set) and the two failed-update fallbacks would otherwise
+  # publish readiness over exactly that state: the clean branch never consults the
+  # journal at all, and a failed rollback can leave the mixed set looking whole.
+  # Withhold instead, and say so -- the next boot's recovery pass repairs the set and
+  # publishes then. (`${...:-0}` because the readiness chain is also sourced standalone
+  # by tests/shell, where the boot flag above is out of scope; a symlink counts as an
+  # open journal for the same reason recovery distrusts one.)
+  printf 'level=warn msg="an unresolved kiro-cli update transaction is on the volume, so the dispatcher set is unverified; readiness marker withheld and /api/health will report kiro-cli unavailable until a later boot completes the repair" journal="%s" installed=%s pinned=%s component=entrypoint\n' \
+    "$KIRO_CLI_UPDATE_JOURNAL" "${kiro_cli_installed:-none}" "$KIRO_CLI_VERSION" >&2
+elif [ "$kiro_cli_installed" != "$KIRO_CLI_VERSION" ]; then
   if [ "$kiro_cli_update_failed" -eq 1 ] && [ -n "$kiro_cli_installed" ] && [ "$kiro_cli_set_rc" -ne 1 ] \
     && [ ! -e "$KIRO_CLI_UPDATE_JOURNAL" ]; then
     # An update failed and the previous version is still installed and answering

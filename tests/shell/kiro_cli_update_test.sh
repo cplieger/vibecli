@@ -98,6 +98,31 @@ kiro_cli_dispatcher_set_complete >/dev/null 2>&1
 [ $? -eq 0 ] && ok "set_complete rc0 when sidecar ok + marker at pin" \
   || no "set_complete rc0" "expected 0"
 
+# The two sidecar SHAPES only is_self_contained_executable's own clauses reject, each
+# planted so no second guard can answer instead: the marker sits at the pin, so rc2 is
+# unreachable and an accepted shape would show up as rc0. Every other scenario in this
+# file uses an absent or plainly-regular sidecar, which leaves both clauses free to be
+# deleted with the suite still green.
+# An executable symlink to a regular executable passes -f and -x, so ONLY ! -L rejects
+# it; the promoted link would otherwise be certified complete and dangle once the
+# update's cleanup removed its target.
+setup
+chat_target="$ROOT/chat-target"
+: >"$chat_target" && chmod +x "$chat_target"
+ln -s "$chat_target" "$CHAT_SIDECAR"
+printf '%s\n' "$KIRO_CLI_VERSION" >"$KIRO_CLI_INSTALL_MARKER"
+kiro_cli_dispatcher_set_complete >/dev/null 2>&1
+[ $? -eq 1 ] && ok "set_complete rc1 for an executable symlink sidecar" \
+  || no "set_complete symlink sidecar" "expected rc1 -- dropping ! -L would accept it"
+
+# A directory passes ! -L and -x (dirs are searchable), so ONLY -f rejects it.
+setup
+mkdir "$CHAT_SIDECAR"
+printf '%s\n' "$KIRO_CLI_VERSION" >"$KIRO_CLI_INSTALL_MARKER"
+kiro_cli_dispatcher_set_complete >/dev/null 2>&1
+[ $? -eq 1 ] && ok "set_complete rc1 for an executable directory sidecar" \
+  || no "set_complete directory sidecar" "expected rc1 -- dropping -f would accept it"
+
 setup
 mkdir -p "$TOOLS/bin"
 printf '%s\n' "$KIRO_CLI_VERSION" >"$KIRO_CLI_INSTALL_MARKER"

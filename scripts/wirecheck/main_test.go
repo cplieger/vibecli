@@ -30,13 +30,7 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 	// to the gate invocation rather than surviving somewhere else in the file.
 	invoked := false
 	for line := range strings.SplitSeq(string(b), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue // a commented-out invocation is not an invocation
-		}
-		if strings.Contains(trimmed, "go run ./scripts/wirecheck") &&
-			strings.Contains(trimmed, "-client-rev") &&
-			strings.Contains(trimmed, "-client-min-server") {
+		if lineInvokesTheGate(line) {
 			invoked = true
 			break
 		}
@@ -46,6 +40,53 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 			"-client-rev ... -client-min-server ...` line; the wire-floor gate is " +
 			"not invoked (deleted OR commented out), so an incompatible Go/TS pair " +
 			"would build clean and refuse every session with close 4002 at runtime")
+	}
+}
+
+// lineInvokesTheGate reports whether one Dockerfile line RUNS the wire-floor gate
+// with both flags attached. The executable is anchored at the START of the trimmed
+// line rather than merely contained in it: a substring test counts inert shell data
+// as an invocation, so `echo go run ./scripts/wirecheck …` (the reversible edit a
+// person makes while debugging a build) would print the command, exit 0, and leave
+// this file's parity test green while the gate no longer runs. A future Dockerfile
+// restructure that legitimately puts another shell construct before the command
+// fails the parity test until this assertion is consciously updated -- the intended
+// trade, since the alternative silently ships an incompatible Go/TS pair.
+func lineInvokesTheGate(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") {
+		return false // a commented-out invocation is not an invocation
+	}
+	return strings.HasPrefix(trimmed, "go run ./scripts/wirecheck ") &&
+		strings.Contains(trimmed, "-client-rev") &&
+		strings.Contains(trimmed, "-client-min-server")
+}
+
+// TestLineInvokesTheGate_rejectsInertForms pins the recognizer itself, which is
+// what makes TestDockerfileInvokesTheGate's verdict mean "the gate runs" rather
+// than "the gate's name appears somewhere". Each negative is a shape that leaves
+// the text intact while the build stops executing it.
+func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
+	const flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+	cases := map[string]struct {
+		line string
+		want bool
+	}{
+		"the live Dockerfile form":      {"    go run ./scripts/wirecheck " + flags, true},
+		"echoed, so never executed":     {"    echo go run ./scripts/wirecheck " + flags, false},
+		"quoted into a no-op builtin":   {"    : 'go run ./scripts/wirecheck " + flags + "'", false},
+		"commented out":                 {"#    go run ./scripts/wirecheck " + flags, false},
+		"missing the client-rev flag":   {`    go run ./scripts/wirecheck -client-min-server "$CLIENT_MIN_SERVER"`, false},
+		"missing the min-server flag":   {`    go run ./scripts/wirecheck -client-rev "$CLIENT_REV"`, false},
+		"prose mentioning the gate":     {"# public Go API inside scripts/wirecheck (no source scraping)", false},
+		"another command of the binary": {"    go build ./scripts/wirecheck " + flags, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := lineInvokesTheGate(tc.line); got != tc.want {
+				t.Errorf("lineInvokesTheGate(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
 	}
 }
 

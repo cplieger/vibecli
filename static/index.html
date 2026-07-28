@@ -113,10 +113,14 @@
         outline: 2px solid currentcolor;
         outline-offset: 3px;
       }
-      /* Hover gated to real hover pointers, matching the family convention
-         (web-terminal-ui 31-switcher.css: sticky :hover after tap on touch);
-         press feedback on touch comes from :active. */
-      @media (hover: hover) {
+      /* Hover gated on ANY-hover, never (hover: hover): `hover` reports only the
+         PRIMARY input, so iPadOS answers `hover: none` with a Magic Keyboard
+         trackpad attached and would drop this rule on a device that can hover.
+         `any-hover` still answers `none` on a bare touchscreen, so it keeps the
+         sticky-:hover-after-tap protection the gate exists for (web.md; the
+         library's own css/*.css still gates on `hover` and is its repo's fix).
+         Press feedback on touch comes from :active either way. */
+      @media (any-hover: hover) {
         #loading[role="alertdialog"] button:hover {
           background: color-mix(in oklch, currentcolor 28%, transparent);
         }

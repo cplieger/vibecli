@@ -150,6 +150,40 @@ func parseBoolEnv(key string, fallback bool) (value, ok bool) {
 	}
 }
 
+// parseLogOSCText reads the KWEB_LOG_OSC_TEXT knob (default false) and emits the
+// startup warnings that go with it, returning whether notification TEXT may be
+// logged.
+//
+// KWEB_LOG_OSC_TEXT is the confidentiality opt-in for terminal notification
+// TEXT. An unrecognized OSC 9 notification is arbitrary child output — any
+// program run in the terminal can emit `ESC ] 9 ; <text>` — and it can carry a
+// token or a device code, so by default the classifier logs only a content-free
+// fingerprint plus a rune count (see newStatusClassifier). Turning this on adds
+// the full text to the Debug record, which is why it warns at startup rather
+// than logging silently: raising KWEB_LOG_LEVEL alone must not widen what
+// content reaches the log store.
+//
+// Parsed with parseBoolEnv rather than envx.Bool: envx warns with the RAW value
+// on an unparseable boolean, and a compose expansion mistake could put a secret
+// on this key -- the same reason KWEB_LOG_LEVEL is read as a string and parsed
+// here. Unparseable falls back to false (off), the fail-closed direction.
+//
+// The read and its warnings live here, not inline in main, so a test can assert
+// the malformed path emits exactly one Warn and no copy of the raw value: the
+// property is the warning's, and parseBoolEnv itself logs nothing at all.
+func parseLogOSCText() bool {
+	logOSCText, ok := parseBoolEnv("KWEB_LOG_OSC_TEXT", false)
+	if !ok {
+		slog.Warn("unparseable KWEB_LOG_OSC_TEXT; keeping notification text out of the log (the default)",
+			"hint", "use true or false")
+	}
+	if logOSCText {
+		slog.Warn("KWEB_LOG_OSC_TEXT is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
+			"hint", "leave it off outside an active diagnostic session; the default records a content-free fingerprint that still distinguishes kiro-cli wording drift")
+	}
+	return logOSCText
+}
+
 // sessionCommand builds the per-session PTY command: `kiro-cli chat` behind a
 // sign-in guard. When no identity is present (`whoami` exits non-zero, verified
 // against the pinned build: 0 logged in, 1 not), the guard first runs
@@ -274,29 +308,9 @@ func main() {
 	}
 
 	// KWEB_LOG_OSC_TEXT (default false) is the confidentiality opt-in for
-	// terminal notification TEXT. An unrecognized OSC 9 notification is
-	// arbitrary child output — any program run in the terminal can emit
-	// `ESC ] 9 ; <text>` — and it can carry a token or a device code, so by
-	// default the classifier logs only a content-free fingerprint plus a rune
-	// count (see newStatusClassifier). Turning this on adds the full text to
-	// the Debug record, which is why it warns at startup rather than logging
-	// silently: raising KWEB_LOG_LEVEL alone must not widen what content
-	// reaches the log store.
-	//
-	// Parsed locally rather than with envx.Bool: envx warns with the RAW value
-	// on an unparseable boolean, and a compose expansion mistake could put a
-	// secret on this key -- the same reason KWEB_LOG_LEVEL is read as a string
-	// and parsed here. Unparseable falls back to false (off), the fail-closed
-	// direction.
-	logOSCText, logOSCTextOK := parseBoolEnv("KWEB_LOG_OSC_TEXT", false)
-	if !logOSCTextOK {
-		slog.Warn("unparseable KWEB_LOG_OSC_TEXT; keeping notification text out of the log (the default)",
-			"hint", "use true or false")
-	}
-	if logOSCText {
-		slog.Warn("KWEB_LOG_OSC_TEXT is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
-			"hint", "leave it off outside an active diagnostic session; the default records a content-free fingerprint that still distinguishes kiro-cli wording drift")
-	}
+	// terminal notification TEXT; the knob's rationale, its fail-closed
+	// direction and its startup warnings are all in parseLogOSCText.
+	logOSCText := parseLogOSCText()
 
 	// KIRO_CLI_CHAT_ARGS appends extra launch flags to the per-session
 	// `kiro-cli chat` command (whitespace-separated, e.g. "--v3" or
@@ -708,8 +722,10 @@ func apiNoStore(next http.Handler) http.Handler {
 //     (see wsAttachLog: the access logger skips admitted streams and the engine
 //     logs no attach, so the request that presents the session capability token
 //     would otherwise be the only unrecorded request on this server). Outside
-//     the host/origin gates so a rejected Host or rejected origin still leaves a
-//     record, inside Logging so the request id matches the access log's.
+//     the host and origin gates so a rejected Host still leaves a record (the
+//     origin gate cannot reject one: an RFC 6455 upgrade is a GET, and
+//     CrossOriginProtection always allows the safe methods), inside Logging so
+//     the request id matches the access log's.
 //   - SecurityHeaders — the fleet baseline (nosniff, X-Frame-Options: DENY,
 //     Referrer-Policy) plus Cross-Origin-Opener-Policy, a Permissions-Policy
 //     denying the browser features a terminal never uses, and the app's
@@ -840,8 +856,10 @@ const wsAttachMsg = "terminal attach attempt"
 // request that PRESENTS the session capability token is the only request to this
 // server with no record at all: an id leaked through a fronting proxy's access
 // log can be replayed with nothing to show an operator afterwards (CWE-778).
-// Logged at request start, so the line exists for a rejected Host / rejected
-// origin / unknown-session close too; the id is LogID-truncated, the same
+// Logged at request start, so the line exists for a rejected Host or an
+// unknown-session close too (an origin rejection is not reachable here: the
+// upgrade is a GET and CrossOriginProtection always allows the safe methods);
+// the id is LogID-truncated, the same
 // treatment the session logger and the engine give it. The session query param
 // is attacker-chosen (LogID only truncates), so it stays an attribute value the
 // slog handler quotes and is never interpolated into the message.

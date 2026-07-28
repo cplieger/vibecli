@@ -924,6 +924,55 @@ func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
 	}
 }
 
+// TestParseLogOSCText_warnsByNameOnly pins the PRODUCTION knob read, which is
+// where the confidentiality property actually lives: parseBoolEnv emits no
+// records at all, so a test that captures slog around it alone satisfies the
+// "no raw value in the log" claim vacuously and would stay green if main went
+// back to envx.Bool. This drives parseLogOSCText — the function main calls —
+// and asserts the malformed path emits exactly ONE Warn carrying neither the
+// raw value in its message nor in any attribute, that the opt-in path warns
+// about widened content, and that the default path is silent.
+// Serial: capture.Default mutates the process-global default logger.
+func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
+	const token = "s3cr3t-token-abc123"
+	cases := map[string]struct {
+		raw       string
+		wantValue bool
+		wantWarns int
+		wantMsg   string
+	}{
+		"token-shaped value fails closed and warns by name": {
+			raw: token, wantValue: false, wantWarns: 1,
+			wantMsg: "unparseable KWEB_LOG_OSC_TEXT",
+		},
+		"opt-in warns that notification text is logged": {
+			raw: "true", wantValue: true, wantWarns: 1,
+			wantMsg: "KWEB_LOG_OSC_TEXT is on",
+		},
+		"unset is the silent default": {raw: "", wantValue: false, wantWarns: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+			t.Setenv("KWEB_LOG_OSC_TEXT", tc.raw)
+
+			if got := parseLogOSCText(); got != tc.wantValue {
+				t.Errorf("parseLogOSCText() with %q = %v, want %v", tc.raw, got, tc.wantValue)
+			}
+			if got := records.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
+				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), tc.wantWarns, got)
+			}
+			if tc.wantMsg != "" && records.CountLevel(slog.LevelWarn, tc.wantMsg) != 1 {
+				t.Errorf("log = %q, want a Warn containing %q", records.Messages(), tc.wantMsg)
+			}
+			if tc.raw == token && (records.Contains(token) || records.AttrContains("", "", token)) {
+				t.Errorf("log = %q carries the raw KWEB_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why envx.Bool is not used here)",
+					records.Messages())
+			}
+		})
+	}
+}
+
 // TestIsWebSocketUpgrade_requiresBothListTokens pins the access-log stream
 // predicate against the engine's own websocket.Accept parsing: both header
 // tokens are required, each may arrive in a repeated field line or a comma

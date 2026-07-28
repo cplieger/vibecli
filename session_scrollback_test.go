@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 // resumeAck frame offsets (the engine's encodeResumeAck layout):
@@ -34,9 +35,13 @@ const (
 // bounds of retained history (committed, oldestIndex) -- the same pair the
 // browser client uses to detect an eviction gap. The child emits more lines
 // than the engine default retains but fewer than the app's policy does, so
-// zero eviction is a property only the wired option produces (verified by
-// deleting it: oldestIndex then trails committed by exactly the 1000-line
-// default and only this test fails).
+// zero eviction fails the moment the option is DELETED (verified: oldestIndex
+// then trails committed by exactly the 1000-line default and only this test
+// fails). What is pinned is therefore "the capacity is at least the emitted
+// line count", not the literal 5000 -- a REDUCTION to any value above ~2500
+// still passes here, because eviction only becomes observable past capacity.
+// Pinning 5000 exactly would mean emitting >5000 lines and asserting
+// oldestIndex == committed-5000.
 //
 // haveThrough is set far in the future so the server replays no history: this
 // exchange is only asked for the bounds. Polling re-sends the resume until the
@@ -77,8 +82,9 @@ func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
 	// the connection mid-exchange and the assertion never runs.
 	conn.SetReadLimit(1 << 22)
 
-	resume := append([]byte{0x00}, []byte(
-		`{"type":"resume","sessionId":"`+id+`","haveThrough":1000000000,"protocolVersion":4}`)...)
+	resume := append([]byte{0x00}, fmt.Sprintf(
+		`{"type":"resume","sessionId":%q,"haveThrough":1000000000,"protocolVersion":%d}`,
+		id, terminal.WireProtocolVersion)...)
 
 	deadline := time.Now().Add(20 * time.Second)
 	var committed, oldest uint64

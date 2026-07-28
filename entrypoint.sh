@@ -102,7 +102,8 @@ fatal() {
 # (needs_kiro_cli_install, the failed-install fallback, the kiro_setting block and
 # the readiness version probe) share it too: a bare -x is also true for a DIRECTORY,
 # which the quarantine sweep passes (a 0755 dir has no group/other write bit) and
-# which would otherwise spend ~60s of foreground boot allowance trying to execute it.
+# which the fallback would otherwise misreport as a kept previous version (exec of
+# a directory fails instantly with rc 126, so the cost is misattribution, not time).
 is_self_contained_executable() {
   [ ! -L "$1" ] && [ -f "$1" ] && [ -x "$1" ]
 }
@@ -733,7 +734,7 @@ done
 # stat -L / chmod deliberately DEREFERENCE: $TOOLS/bin is mostly symlinks into the
 # engine's opt/<tool>/<ver>/ trees, and the target's mode is the one that decides
 # whether a foreign host user can rewrite what root executes.
-loose_tool_bins=0
+tightened_tool_bins=0
 for tool_bin in "$TOOLS/bin"/*; do
   # An unmatched glob, or a dangling symlink -- nothing that can be executed.
   [ -e "$tool_bin" ] || continue
@@ -743,15 +744,26 @@ for tool_bin in "$TOOLS/bin"/*; do
   if [ -n "$tool_bin_mode" ] && [ $((8#$tool_bin_mode & 0022)) -eq 0 ]; then
     continue
   fi
-  loose_tool_bins=$((loose_tool_bins + 1))
-  if ! chmod go-w "$tool_bin"; then
-    printf 'level=warn msg="failed to strip group/other write bits from a binary on the first-on-PATH tools tree; a foreign host user could rewrite it in place and this container runs it as root" path="%s" mode=%s component=entrypoint\n' \
-      "$tool_bin" "${tool_bin_mode:-unknown}" >&2
+  loose_mode=$tool_bin_mode
+  chmod_rc=0
+  chmod go-w "$tool_bin" || chmod_rc=$?
+  # Trust the RESULT, not chmod's status -- the same postcondition secure_tools_dir
+  # asserts, and for the same reason: a bind-mounted or foreign filesystem can
+  # acknowledge a chmod without applying it, so a zero status proves nothing. A mode
+  # that is still loose, or that cannot be re-read at all, stays OUT of the count
+  # (chmod_rc separates a refused chmod from a silently ignored one), so the
+  # aggregate below is true of every file it counts.
+  tool_bin_mode=$(stat -Lc '%a' "$tool_bin" 2>/dev/null) || tool_bin_mode=""
+  if [ -z "$tool_bin_mode" ] || [ $((8#$tool_bin_mode & 0022)) -ne 0 ]; then
+    printf 'level=warn msg="a binary on the first-on-PATH tools tree is still group/other-writable, or its mode cannot be verified after tightening; a foreign host user could rewrite it in place and this container runs it as root" path="%s" mode=%s was=%s chmod_rc=%d component=entrypoint\n' \
+      "$tool_bin" "${tool_bin_mode:-unknown}" "${loose_mode:-unknown}" "$chmod_rc" >&2
+    continue
   fi
+  tightened_tool_bins=$((tightened_tool_bins + 1))
 done
-if [ "$loose_tool_bins" -ne 0 ]; then
+if [ "$tightened_tool_bins" -ne 0 ]; then
   printf 'level=warn msg="tightened group/other-writable binaries on the first-on-PATH tools tree; they were rewritable in place by any host user in their group" dir="%s" count=%d component=entrypoint\n' \
-    "$TOOLS/bin" "$loose_tool_bins" >&2
+    "$TOOLS/bin" "$tightened_tool_bins" >&2
 fi
 if [ "$tools_tree_was_writable" -eq 1 ]; then
   # The directories are private now, but anything already inside them was
@@ -1119,7 +1131,7 @@ install_kiro_cli() (
   # pair -- a mixed set the completeness check and the bare-name check both look past.
   # Past this point the new set is what recovery keeps, so a term failure can only be the
   # warn it already is.
-  if [ ! -e "$term_sidecar" ]; then
+  if [ ! -e "$term_sidecar" ] && [ ! -L "$term_sidecar" ]; then
     # This pin ships no term dispatcher, so any copy on the volume belongs to an
     # older version: it is a RETIRED name, and the retired-name sweep below skips
     # kiro-cli-term unconditionally, so reclaim it here or it stays first on PATH
@@ -1127,6 +1139,11 @@ install_kiro_cli() (
     # prove the name is retired for this pin: an invalid staged term or a failed mv
     # (below) may coexist with a good pinned copy already in place, and this path
     # holds no version fact about it.
+    #
+    # -L as well as -e, the file's idiom for "absent in any form" (and load-bearing
+    # here because this is the only presence test that DELETES): -e is false for a
+    # DANGLING staged link, which is an INVALID term handled by the next branch, not
+    # evidence that this pin retired the name.
     printf 'level=warn msg="install.sh produced no optional kiro-cli-term sidecar dispatcher (upstream dispatcher set changed?); removing any copy left by an older version" sidecar="kiro-cli-term" component=entrypoint\n' >&2
     if ! rm -rf "$TOOLS/bin/kiro-cli-term"; then
       printf 'level=warn msg="failed to remove a kiro-cli-term dispatcher left by an older version; an unpinned copy stays first on PATH" path="%s" component=entrypoint\n' \

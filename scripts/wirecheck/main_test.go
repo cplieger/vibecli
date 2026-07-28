@@ -11,25 +11,41 @@ import (
 )
 
 // TestDockerfileInvokesTheGate pins the gate's only execution site. run()'s verdict
-// is worthless if nothing runs it: a stage restructure that drops the RUN leaves
-// this package compiling and every test green while an incompatible Go/TS pair
-// ships and refuses every session at first connect (close 4002) behind a green
-// /api/health.
+// is worthless if nothing runs it: a stage restructure that drops OR COMMENTS OUT
+// the RUN leaves this package compiling and every test green while an incompatible
+// Go/TS pair ships and refuses every session at first connect (close 4002) behind a
+// green /api/health.
 func TestDockerfileInvokesTheGate(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
 	if err != nil {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
-	for _, want := range []string{
-		"go run ./scripts/wirecheck",
-		"-client-rev",
-		"-client-min-server",
-	} {
-		if !strings.Contains(string(b), want) {
-			t.Errorf("Dockerfile no longer contains %q; the wire-floor gate is "+
-				"not invoked, so an incompatible Go/TS pair would build clean and "+
-				"refuse every session with close 4002 at runtime", want)
+	// One LIVE line must carry the invocation and both flags. A whole-file
+	// substring sweep would pass on a commented-out RUN (`#    go run
+	// ./scripts/wirecheck …`) — the other half of the silent case this test
+	// exists for, and the likelier one during a stage restructure, since it is
+	// the reversible edit a person makes while debugging a build — and the prose
+	// block above the RUN already mentions scripts/wirecheck. Requiring all three
+	// needles on ONE uncommented line also proves both flags are still attached
+	// to the gate invocation rather than surviving somewhere else in the file.
+	invoked := false
+	for line := range strings.SplitSeq(string(b), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue // a commented-out invocation is not an invocation
 		}
+		if strings.Contains(trimmed, "go run ./scripts/wirecheck") &&
+			strings.Contains(trimmed, "-client-rev") &&
+			strings.Contains(trimmed, "-client-min-server") {
+			invoked = true
+			break
+		}
+	}
+	if !invoked {
+		t.Error("Dockerfile has no un-commented `go run ./scripts/wirecheck " +
+			"-client-rev ... -client-min-server ...` line; the wire-floor gate is " +
+			"not invoked (deleted OR commented out), so an incompatible Go/TS pair " +
+			"would build clean and refuse every session with close 4002 at runtime")
 	}
 }
 

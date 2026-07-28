@@ -335,12 +335,18 @@ journal_decision
 # or removing the leading branch, and this case is what makes dropping them a
 # conscious act rather than an invisible one. Read from $ENTRYPOINT via the same
 # extraction the scenarios run, so a red-check against a mutated copy sees the mutation.
+# BOTH spellings are counted: the `! -L` companion beside each `! -e` covers the shape
+# `-e` alone reads as absent (a DANGLING SYMLINK journal), and it is redundant behind
+# the leading branch in exactly the same way, so it needs the same source assertion or
+# deleting it stays invisible.
 # shellcheck disable=SC2016  # a FIXED pattern matched against shell SOURCE text; expanding it is exactly what must not happen
 journal_exclusions=$(grep -c -F '! -e "$KIRO_CLI_UPDATE_JOURNAL"' "$WORK/readiness.sh")
-[ "$journal_exclusions" -eq 2 ] \
-  && ok "both failed-update fallbacks keep their open-journal exclusion, behind the leading branch" \
+# shellcheck disable=SC2016  # same: SOURCE text, not an expansion
+journal_symlink_exclusions=$(grep -c -F '! -L "$KIRO_CLI_UPDATE_JOURNAL"' "$WORK/readiness.sh")
+[ "$journal_exclusions" -eq 2 ] && [ "$journal_symlink_exclusions" -eq 2 ] \
+  && ok "both failed-update fallbacks keep their open-journal exclusion AND its symlink companion, behind the leading branch" \
   || no "fallback open-journal exclusions" \
-    "expected 2 open-journal exclusions in the readiness chain (one per failed-update fallback), found $journal_exclusions"
+    "expected 2 open-journal exclusions and 2 symlink companions in the readiness chain (one pair per failed-update fallback), found -e=$journal_exclusions -L=$journal_symlink_exclusions"
 
 # Auto-update could not be disabled -> withhold (unchanged behaviour).
 setup
@@ -476,5 +482,29 @@ journal_rc=$?
   && ok "recovery discards a DIRECTORY-shaped backup instead of restoring it over \$BIN" \
   || no "directory backup" \
     "a non-regular backup was adopted or wedged the journal (rc=$journal_rc, bin=$([ -d "$BIN" ] && echo DIRECTORY || echo "$(cat "$BIN" 2>/dev/null)"), journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+
+# ...and when that discard cannot complete, the failure must PROPAGATE: an artifact
+# `rm -rf` leaves behind is still in the way of the next boot's repair, so reporting
+# the component restored would close the journal over a transaction that never
+# finished -- the one outcome the whole journal exists to prevent. The refusal is
+# baited with an `rm` override rather than a mode change because the suite runs as
+# root, where no permission bit makes `rm -rf` fail.
+plant_old_set
+: >"$KIRO_CLI_UPDATE_JOURNAL"
+mkdir "$BIN_PREV"
+rm() {
+  case " $* " in
+  *" $BIN_PREV "*) return 1 ;;
+  esac
+  command rm "$@"
+}
+kiro_cli_update_rollback >/dev/null 2>&1
+journal_rc=$?
+unset -f rm
+[ "$journal_rc" -ne 0 ] && [ -e "$KIRO_CLI_UPDATE_JOURNAL" ] \
+  && ok "an undeletable non-regular backup fails the rollback and KEEPS the journal for the next boot" \
+  || no "undeletable backup" \
+    "the rollback reported success or closed the journal over an artifact it could not discard (rc=$journal_rc, journal=$([ -e "$KIRO_CLI_UPDATE_JOURNAL" ] && echo open || echo closed))"
+command rm -rf "$BIN_PREV"
 
 report

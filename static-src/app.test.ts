@@ -883,7 +883,13 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // module load for every visitor (the watchdog's own fatal dialog) with
     // every test above still green.
     const source = readFileSync(resolve(fixtureRoot(), "app.ts"), "utf8");
-    const specifiers = [...source.matchAll(/^\s*import\b[^;]*?from\s*["']([^"']+)["']/gm)]
+    // Every form the BROWSER resolves through the importmap: a `from` clause, a
+    // bare side-effect import, and a dynamic import(). `import type` is skipped
+    // because tsc erases it, so it never reaches module resolution.
+    const specifiers = [
+      ...source.matchAll(/^\s*import\b(?!\s+type\b)(?:[^;"']*?from)?\s*["']([^"']+)["']/gm),
+      ...source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']/g),
+    ]
       .map((match) => match[1] as string)
       .filter((specifier) => !specifier.startsWith(".") && !specifier.startsWith("/"));
     // Guard the extractor itself: a regex that silently matched nothing would

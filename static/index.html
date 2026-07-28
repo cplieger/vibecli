@@ -180,11 +180,16 @@
            exactly when the message is taller than the viewport -- 400% zoom, a
            short landscape window, a large user font size -- and overflow-y makes
            the remainder reachable in an otherwise unscrollable fixed inset:0 box.
-           Same hardening #loading[role="alertdialog"] above carries, and the same
-           reason: a UA without `safe` drops the declaration and keeps today's
-           centring. The insets honour this page's viewport-fit=cover so the
-           sentence never sits under a notch or the home-indicator strip. */
+           Same hardening #loading[role="alertdialog"] above carries, including
+           its two-declaration form: `safe center` is one value, so a UA that
+           does not know the `safe` keyword drops the whole declaration and
+           falls back to the initial `normal` (top/start-aligned), not centring
+           -- and no library CSS covers this rule, so the plain `center` pair
+           has to be here. The insets honour this page's viewport-fit=cover so
+           the sentence never sits under a notch or the home-indicator strip. */
+        align-items: center;
         align-items: safe center;
+        justify-content: center;
         justify-content: safe center;
         margin: 0;
         padding: max(1rem, env(safe-area-inset-top))

@@ -71,10 +71,10 @@ var staticFS embed.FS
 // must never fall open. A DEFAULT ROUTE is kept on the same terms: it parses,
 // so it is used, but it can never describe a proxy set and it is warned about
 // once per boot (see the loop below). An unset or empty var yields nil, i.e.
-// "trust nothing",
-// so ClientIP ignores X-Forwarded-For and logs the spoof-proof socket peer — the
-// correct default for a directly-exposed deployment. Behind a reverse proxy, set
-// the var to the proxy's CIDR(s) so the access log records the real client.
+// "trust nothing", so ClientIP ignores X-Forwarded-For and logs the spoof-proof
+// socket peer — the correct default for a directly-exposed deployment. Behind a
+// reverse proxy, set the var to the proxy's CIDR(s) so the access log records
+// the real client.
 func parseTrustedProxies() []*net.IPNet {
 	const key = "TRUSTED_PROXIES"
 	v := envx.String(key, "")
@@ -183,10 +183,16 @@ func parseBoolEnv(key string, fallback bool) (value, ok bool) {
 // a secret).
 func parseCatalogRefresh(raw string) time.Duration {
 	const key = "TOOL_CATALOG_REFRESH"
-	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	trimmed := strings.TrimSpace(raw)
+	switch strings.ToLower(trimmed) {
 	case "", "off", "disabled":
 	default:
-		if d, err := time.ParseDuration(v); err != nil || d < 0 {
+		// Parse the TRIMMED but NOT lowercased value: scheduler.ParseInterval
+		// lowercases only for the off/disabled sentinels and hands the trimmed
+		// string to time.ParseDuration, whose units are case-sensitive. Gating on
+		// a lowercased copy would pass "24H" through to the library's
+		// value-echoing warnFallback.
+		if d, err := time.ParseDuration(trimmed); err != nil || d < 0 {
 			slog.Warn("unusable "+key+"; using the built-in catalog refresh cadence",
 				"hint", `use a Go duration (e.g. 24h, 90m) or "off" to disable the schedule`)
 			raw = ""
@@ -801,10 +807,12 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			webhttp.WithLogger(slog.Default()),
 			// SSE stays blanket-skipped: a plain GET is indistinguishable from the
 			// stream itself, so there is no non-stream shape to keep. /ws HAS one —
-			// the upgrade headers — so only real upgrade attempts are skipped and a
-			// request that arrives WITHOUT them (the classic reverse-proxy
-			// misconfiguration: no `proxy_set_header Upgrade`) is logged with the
-			// 426 the engine's websocket.Accept writes.
+			// a request becomes a stream only when the handshake is COMPLETE — so the
+			// skip test is the stricter willUpgrade, and every shape Accept answers
+			// short keeps its access line: the 426 for missing upgrade headers (the
+			// classic reverse-proxy misconfiguration: no `proxy_set_header Upgrade`)
+			// and the 405/400 for a non-GET, a wrong Sec-WebSocket-Version or a
+			// missing/duplicated Sec-WebSocket-Key.
 			// Skip only a request that will actually REACH the stream handler.
 			// The skip is decided before the chain runs (Logging returns early
 			// without a StatusRecorder), so an unconditional skip also swallows
@@ -948,10 +956,14 @@ func isWebSocketUpgrade(r *http.Request) bool {
 // mistaken for a hijacked stream and skipped. Every condition here is NECESSARY
 // for Accept to succeed, so no request that really does become a stream can be
 // logged with the bogus 200-and-hours-long-duration line the skip exists to
-// prevent. The one Accept check deliberately not mirrored is the base64/16-byte
-// validity of the key VALUE: mirroring it would copy upstream decoding detail,
-// and a proxy either forwards or drops that header rather than corrupting its
-// value.
+// prevent. Two Accept checks are deliberately NOT mirrored, and both answer
+// short: the base64/16-byte validity of the key VALUE (mirroring it would copy
+// upstream decoding detail, and a proxy either forwards or drops that header
+// rather than corrupting its value), and authenticateOrigin's cross-origin 403
+// (pinned by TestWSRejectsCrossOrigin; modelling the engine's origin policy here
+// would be a second copy of it). Both keep their wsAttachLog record — so
+// neither is the unrecorded request CWE-778 is about — and lose only the
+// status/duration line.
 func willUpgrade(r *http.Request) bool {
 	return isWebSocketUpgrade(r) &&
 		r.Method == http.MethodGet &&

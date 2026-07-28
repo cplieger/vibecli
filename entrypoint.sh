@@ -165,8 +165,12 @@ kiro_cli_restore_one() {
   # foreign writes): `mv` would rename it over $dest, and `rm -f` could never
   # remove it, so the journal would never close and every later boot would re-fail
   # the repair. Discard it and report "no snapshot" rather than promoting it.
+  # The discard propagates its own failure: an artifact `rm -rf` cannot remove (an
+  # undeletable directory, a mount point) is still in the way of the NEXT boot's
+  # repair, so reporting this component restored would close the journal over a
+  # transaction that never completed. Same contract as the tombstone arm above.
   if [ ! -f "$backup" ]; then
-    rm -rf "$backup"
+    rm -rf "$backup" || return 1
     return 0
   fi
   # Same inode => this component was never promoted, so the backup IS the live file

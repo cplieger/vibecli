@@ -154,11 +154,15 @@ func TestParseTrustedProxies(t *testing.T) {
 		// never ENUMERATES the operator's own entries (any of which can be a
 		// compose-interpolated credential, CWE-532).
 		const sibling = "198.51.100.7"
-		t.Setenv("TRUSTED_PROXIES", "0.0.0.0/0,"+sibling)
+		// TWO default routes, one per family: the parser warns ONCE per boot
+		// (main.go breaks out of the loop), so this fixture is what makes that
+		// `break` load-bearing -- with one entry the count assertion below
+		// cannot tell one-per-boot from one-per-entry.
+		t.Setenv("TRUSTED_PROXIES", "0.0.0.0/0,::/0,"+sibling)
 		nets := parseTrustedProxies()
 
-		if len(nets) != 2 {
-			t.Fatalf("parseTrustedProxies len = %d, want 2 (the warning must not reject the set)", len(nets))
+		if len(nets) != 3 {
+			t.Fatalf("parseTrustedProxies len = %d, want 3 (the warning must not reject the set)", len(nets))
 		}
 		warns := 0
 		for _, r := range records.Records() {
@@ -172,6 +176,10 @@ func TestParseTrustedProxies(t *testing.T) {
 		if logContains(records, sibling) {
 			t.Error("log enumerates the configured TRUSTED_PROXIES entries; this var can hold a compose-interpolated credential, so the warning must name the var and the prefix class only")
 		}
+		// The needle above only catches the one value this test knows; the
+		// allowlist catches an entry echoed under ANY key and of ANY length --
+		// the same reach gap the malformed-entry subtest closes above.
+		assertOnlyAttrs(t, records, slog.LevelWarn, "default route", "hint")
 	})
 
 	t.Run("narrower entries emit no default-route warning", func(t *testing.T) {

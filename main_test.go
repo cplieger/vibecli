@@ -998,9 +998,13 @@ func TestParseCatalogRefresh_warnsByNameOnly(t *testing.T) {
 	}{
 		"token-shaped value falls back and warns by name": {token, toolbelt.DefaultCatalogRefresh, 1},
 		"negative duration falls back and warns by name":  {"-5m", toolbelt.DefaultCatalogRefresh, 1},
-		"unset is the silent default":                     {"", toolbelt.DefaultCatalogRefresh, 0},
-		"off disables the schedule silently":              {"off", 0, 0},
-		"zero disables the schedule silently":             {"0", 0, 0},
+		// A case-varied unit parses only after ToLower, so gating on the lowercased
+		// copy would forward it and let the library echo it: Go duration units are
+		// case-sensitive and scheduler.ParseInterval lowercases only its sentinels.
+		"a case-varied unit is rejected here, not by the library": {"24H", toolbelt.DefaultCatalogRefresh, 1},
+		"unset is the silent default":                             {"", toolbelt.DefaultCatalogRefresh, 0},
+		"off disables the schedule silently":                      {"off", 0, 0},
+		"zero disables the schedule silently":                     {"0", 0, 0},
 		// Passed through untouched, so the clamp and the default stay toolbelt's
 		// policy alone: "6h" is inside [MinCatalogRefresh, MaxCatalogRefresh] and
 		// comes back unchanged.

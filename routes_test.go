@@ -876,7 +876,7 @@ func readMarkerWithin(t *testing.T, path string, minBytes int, what string) []by
 			return b
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("child never %s (marker %q holds %d bytes, read error %v)", what, path, len(b), err)
+			t.Fatalf("child did not %s (marker %q holds %d bytes, read error %v)", what, path, len(b), err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

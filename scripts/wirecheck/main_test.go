@@ -77,8 +77,12 @@ func lineInvokesTheGate(line string) bool {
 		// refused from the gate's own segment ONWARD rather than over the whole
 		// logical line: a `;` in an EARLIER segment cannot touch the gate's exit
 		// status, and the live chain has several -- inside the quoted sed scripts
-		// that read the client constants out of the vendored artifact.
-		if strings.Contains(strings.Join(segments[i:], "&&"), ";") {
+		// that read the client constants out of the vendored artifact. A `|`
+		// discards it too (a pipeline's status is the LAST command's), and a
+		// trailing `&` backgrounds the gate so the step never waits for its
+		// verdict -- both are refused on the same gate-onward terms.
+		rest := strings.Join(segments[i:], "&&")
+		if strings.ContainsAny(rest, ";|") || strings.HasSuffix(strings.TrimSpace(rest), "&") {
 			return false
 		}
 		return true
@@ -135,6 +139,11 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"another command of the binary": {"    go build ./scripts/wirecheck " + flags, false},
 		"verdict swallowed by || true":  {"    go run ./scripts/wirecheck " + flags + " || true", false},
 		"verdict discarded by ; true":   {"    go run ./scripts/wirecheck " + flags + " ; true", false},
+		// A pipeline's exit status is the LAST command's, and a backgrounded gate
+		// is never waited for: both leave the invocation textually intact while
+		// the build stops acting on its verdict.
+		"verdict piped away": {"    go run ./scripts/wirecheck " + flags + " | tee /dev/null", false},
+		"gate backgrounded":  {"    go run ./scripts/wirecheck " + flags + " &", false},
 		"the live chained form": {
 			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && go run ./scripts/wirecheck ` + flags, true,
 		},

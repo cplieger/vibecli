@@ -346,6 +346,114 @@ function dispatchWindowError({ target, error }: { target?: unknown; error?: unkn
   window.dispatchEvent(event);
 }
 
+// index.html's REAL body, scripts removed, mounted into the live document. The
+// focusable-inventory test below has to enumerate the SERVED markup rather than
+// a hand-built subset of it: a link, a button or a tabindex ADDED to that file
+// is precisely what it exists to catch, and a fabricated fixture can never grow
+// one. Scripts are stripped because the watchdog is evaluated deliberately
+// through evaluateWatchdog() and /app.js must not load in a unit test. The
+// stylesheet <link> goes first for the same reason the stand-down-guard test
+// drops it: happy-dom fetches a parsed document's stylesheet hrefs.
+function mountServedBody(): void {
+  const html = readStaticAsset("index.html").replace(/<link\b[^>]*rel=["']?stylesheet[^>]*>/gi, "");
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  for (const script of doc.querySelectorAll("script")) {
+    script.remove();
+  }
+  document.body.innerHTML = doc.body.innerHTML;
+}
+
+// Everything the platform can put in the sequential focus order, enumerated by
+// CAPABILITY rather than as a list of the elements index.html happens to declare
+// today -- a list would keep passing for exactly the markup edit the inventory
+// test guards against.
+const FOCUSABLE_CANDIDATE_SELECTOR = [
+  "a[href]",
+  "button",
+  "input",
+  "select",
+  "textarea",
+  "[tabindex]",
+  "[contenteditable]",
+].join(",");
+
+// Candidates that are focusable by SCRIPT but not by Tab, so a `contenteditable`
+// or `tabindex` candidate is judged on its own value rather than on the fact
+// that it also happens to be a <button>.
+const TABBABLE_BY_DEFAULT = "a[href],button,input,select,textarea";
+
+// Whether Tab can actually land on a candidate. Computed explicitly here, and
+// that is not an oversight: happy-dom implements no sequential focus navigation
+// at all, and it models `inert` in exactly one place -- HTMLElementUtility.focus()
+// walks ancestors and refuses to focus into an inert tree -- which is a private
+// symbol-keyed path with no public "is this reachable" API and no bearing on a
+// static query. So the reachability rules live here, in the test's own helper.
+function isTabReachable(el: HTMLElement): boolean {
+  // Script-focusable only; never in the tab order.
+  if (el.getAttribute("tabindex") === "-1") {
+    return false;
+  }
+  // contenteditable="false" is plain content again: it only matched the
+  // [contenteditable] candidate selector above.
+  if (el.getAttribute("contenteditable") === "false" && !el.matches(TABBABLE_BY_DEFAULT)) {
+    return false;
+  }
+  // A disabled form control takes no focus. Read from the property, which is
+  // what the platform reads, and which only these four elements carry.
+  const disabled =
+    (el instanceof HTMLButtonElement ||
+      el instanceof HTMLInputElement ||
+      el instanceof HTMLSelectElement ||
+      el instanceof HTMLTextAreaElement) &&
+    el.disabled;
+  if (disabled) {
+    return false;
+  }
+  // visibility inherits, so the element's own computed value already accounts
+  // for a hidden ancestor -- and for a descendant that deliberately overrides
+  // one back to visible, which IS focusable.
+  const visibility = getComputedStyle(el).visibility;
+  if (visibility === "hidden" || visibility === "collapse") {
+    return false;
+  }
+  for (let node: HTMLElement | null = el; node !== null; node = node.parentElement) {
+    // An inert subtree is unreachable by keyboard, which is exactly the claim
+    // the watchdog's inert on #terminal makes good on.
+    if (node.hasAttribute("inert")) {
+      return false;
+    }
+    if (node.hasAttribute("hidden")) {
+      return false;
+    }
+    // <noscript> content is not rendered while scripting is enabled, and this
+    // dialog only exists on a page where it is.
+    if (node.localName === "noscript") {
+      return false;
+    }
+    // display:none removes the whole subtree from rendering (and from the tab
+    // order); a descendant cannot override it back.
+    if (getComputedStyle(node).display === "none") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function tabReachableElements(): HTMLElement[] {
+  return [...document.querySelectorAll<HTMLElement>(FOCUSABLE_CANDIDATE_SELECTOR)].filter(
+    isTabReachable,
+  );
+}
+
+// A stable, copy-independent name for a reachable element, so a failure of the
+// inventory test NAMES the element that broke the invariant instead of printing
+// a length mismatch.
+function describeReachable(el: HTMLElement): string {
+  const self = el.id === "" ? el.localName : `${el.localName}#${el.id}`;
+  const host = el.parentElement?.closest("[id]");
+  return `${self} in ${host === null || host === undefined ? "<body>" : `#${host.id}`}`;
+}
+
 describe("web-terminal-kiro bootstrap (app.ts)", () => {
   beforeEach(() => {
     // resetModules so each dynamic import re-runs app.ts top-level code. Mock
@@ -512,6 +620,76 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const reloadSpy = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
     overlay.querySelector("button")?.click();
     expect(reloadSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // GUARDS A DELIBERATE DECISION -- read this before "fixing" a failure here.
+  // index.html's watchdog does NOT trap Tab (expectFatalOverlayShape pins that,
+  // from both the button and <body>), and that is the wanted behaviour. It is
+  // only SAFE because of an invariant nothing else asserts: while the fatal
+  // dialog is shown, the dialog's Reload button is the only thing in the page
+  // Tab can land on, so Tab leaves for browser chrome rather than walking onto
+  // page content behind a dialog that claims aria-modal="true". Today that holds
+  // for two reasons that are easy to break by accident -- index.html declares no
+  // other focusable element, and the terminal's hidden text input cannot exist
+  // in this state (the watchdog stands down once createTerminal has built UI,
+  // and its fatal marker aborts boot before createTerminal runs). Add a link, a
+  // button or anything with a tabindex outside the dialog and the reasoning is
+  // silently gone. If this test fails: either restore the invariant (put the
+  // element inside the dialog, or make it unreachable -- inert, hidden,
+  // tabindex="-1") or revisit containment and add a real focus trap. Do not
+  // weaken the assertion.
+  it("fatal dialog leaves Reload as the ONLY tab-reachable element in the document (no-Tab-trap invariant)", () => {
+    // The SERVED body, not a hand-built subset: the markup edit this test exists
+    // to catch can only appear in the real file.
+    mountServedBody();
+    const overlay = document.getElementById("loading");
+    const root = document.getElementById("terminal");
+    evaluateWatchdog(readWatchdogSource());
+    const scriptEl = document.createElement("script");
+    document.body.appendChild(scriptEl);
+    scriptEl.dispatchEvent(new Event("error"));
+
+    // Precondition: the watchdog really did reach the fatal state against the
+    // served markup, and made its aria-modal claim good by inerting #terminal.
+    // Without this the inventory below would be asserting over the pristine
+    // pre-JS page, where no Reload button exists at all.
+    expect(overlay?.getAttribute("role")).toBe("alertdialog");
+    expect(root?.hasAttribute("inert")).toBe(true);
+
+    const reachable = tabReachableElements();
+    expect(
+      reachable.map(describeReachable),
+      "a tab-reachable element outside the fatal dialog breaks index.html's no-Tab-trap decision",
+    ).toEqual(["button in #loading"]);
+    expect(reachable[0]).toBe(overlay?.querySelector("button"));
+    // The one reachable element is the one that already holds focus, so Tab has
+    // nowhere else in the page to go.
+    expect(reachable[0]).toBe(document.activeElement);
+
+    // The enumerator must be able to SEE an element outside the dialog, or this
+    // test would pass for the wrong reason forever -- the local lesson from the
+    // KAS-prune guard tests: plant the bait the unguarded code would take.
+    const stray = document.createElement("a");
+    stray.href = "#stray";
+    document.body.appendChild(stray);
+    expect(tabReachableElements().map(describeReachable)).toEqual([
+      "button in #loading",
+      "a in <body>",
+    ]);
+    stray.remove();
+
+    // ...and the reachability filter must be doing real work rather than
+    // accepting every candidate: the same element inside the inerted #terminal,
+    // or carrying tabindex="-1", is not tab-reachable and must not be reported.
+    const insideInert = document.createElement("button");
+    root?.appendChild(insideInert);
+    const notTabbable = document.createElement("a");
+    notTabbable.href = "#not-tabbable";
+    notTabbable.setAttribute("tabindex", "-1");
+    document.body.appendChild(notTabbable);
+    const filtered = tabReachableElements();
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]).toBe(reachable[0]);
   });
 
   it("watchdog stands down when the overlay is already fading out (booted terminal)", () => {

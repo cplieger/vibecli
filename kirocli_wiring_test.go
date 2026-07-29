@@ -13,15 +13,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/pinstall"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
-	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 )
 
 // This file covers the SEAM between the install manager and the server: the
 // per-session argv, the per-session PATH, the session-create gate and the
-// loopback repair hook. internal/kirocli's own tests cover the manager; nothing
-// there can see whether main.go and routes.go actually consume it, and every
-// property below was silently breakable before these tests existed.
+// loopback repair hook. The pinstall library's own suite covers the manager;
+// nothing there can see whether main.go and routes.go actually consume it, and
+// every property below was silently breakable before these tests existed.
 
 // TestSessionPathEnv_versionDirectoryLeads pins the precedence rule the whole
 // sidecar-resolution story rests on: the active version's directory comes FIRST,
@@ -128,19 +128,65 @@ func TestSessionCommand_chatArgsSurviveVersionSwitch(t *testing.T) {
 	}
 }
 
-// TestSessionCreateGate_kiroReasonPerPhase pins the create gate's kiro-cli layer
-// and the reason it reports, per phase. Three separate regressions hide here:
-// the layer not being composed at all (creation proceeds and every tab dies
+// TestKiroReasonTextIsTheClientContract pins the four 503 reason literals and the
+// mapping that produces them. The install manager reports a TYPED reason
+// (pinstall.Reason) because the wording a consumer shows its own users is the
+// consumer's; these strings are THIS app's wording, and they are a published
+// contract in three directions: /api/health's reason field, the 503 body of
+// POST /api/sessions, and the repair hook's verdict — all read by an operator and
+// by a monitoring probe.
+//
+// The strings are spelled out here rather than compared against the constants,
+// which is the whole point: a test that reads `reasonInstalling` on both sides
+// passes after a rename and tells nobody that every operator-facing string changed.
+// It also pins that ReasonReady renders EMPTY, which every surface relies on to
+// omit the field, and that an unknown reason a future library version adds falls
+// back to the terminal wording rather than to "".
+func TestKiroReasonTextIsTheClientContract(t *testing.T) {
+	cases := []struct {
+		why  pinstall.Reason
+		want string
+	}{
+		{pinstall.ReasonReady, ""},
+		{pinstall.ReasonInstalling, "kiro-cli installing"},
+		{pinstall.ReasonRetrying, "kiro-cli install retrying"},
+		{pinstall.ReasonUnavailable, "kiro-cli unavailable"},
+		{pinstall.ReasonAssertion, "kiro-cli required settings not enforced"},
+		// Not a reason the library defines today. A state we cannot name still
+		// blocks sessions, so it must read as terminal rather than as ready.
+		{pinstall.Reason(200), "kiro-cli unavailable"},
+	}
+	for _, tc := range cases {
+		if got := kiroReasonText(tc.why); got != tc.want {
+			t.Errorf("kiroReasonText(%v) = %q, want %q -- these literals are what an operator and the monitoring probe read",
+				tc.why, got, tc.want)
+		}
+	}
+	// A withheld verdict must never render as ready: the health handler and the
+	// create gate both key on a non-empty reason to report the fault.
+	for _, why := range []pinstall.Reason{
+		pinstall.ReasonInstalling, pinstall.ReasonRetrying,
+		pinstall.ReasonUnavailable, pinstall.ReasonAssertion,
+	} {
+		if kiroReasonText(why) == "" {
+			t.Errorf("kiroReasonText(%v) is empty, so a 503 would carry no reason at all", why)
+		}
+	}
+}
+
+// TestSessionCreateGate_kiroReasonPerState pins the create gate's kiro-cli layer
+// and the reason it reports, per install state. Three separate regressions hide
+// here: the layer not being composed at all (creation proceeds and every tab dies
 // instantly with a false broken-install alert per tab), the layer replacing the
-// tools layer instead of composing with it, and the layer collapsing every phase
+// tools layer instead of composing with it, and the layer collapsing every state
 // to one reason (an operator cannot tell a first-boot download from an exhausted
 // retry budget, which call for opposite responses).
-func TestSessionCreateGate_kiroReasonPerPhase(t *testing.T) {
+func TestSessionCreateGate_kiroReasonPerState(t *testing.T) {
 	for _, reason := range []string{
-		kirocli.ReasonInstalling,
-		kirocli.ReasonRetrying,
-		kirocli.ReasonUnavailable,
-		kirocli.ReasonSettings,
+		reasonInstalling,
+		reasonRetrying,
+		reasonUnavailable,
+		reasonSettings,
 	} {
 		t.Run(reason, func(t *testing.T) {
 			deps := newTestDeps(true)
@@ -179,7 +225,7 @@ func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 	gate := composeGate(func(next http.Handler) http.Handler { return next },
 		func() (bool, string) { return toolsSyncing.Load(), "tools installing" })
 	gate = composeGate(gate, func() (bool, string) {
-		return kiroUnready.Load(), kirocli.ReasonInstalling
+		return kiroUnready.Load(), reasonInstalling
 	})
 	gated := gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		inner++
@@ -200,8 +246,8 @@ func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 	}{
 		// kiro-cli is checked first: it is the dependency a session cannot start
 		// without at all, and its reason is the more specific one.
-		{name: "both blocked", tools: true, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: kirocli.ReasonInstalling},
-		{name: "kiro only", tools: false, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: kirocli.ReasonInstalling},
+		{name: "both blocked", tools: true, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: reasonInstalling},
+		{name: "kiro only", tools: false, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: reasonInstalling},
 		{name: "tools only", tools: true, kiro: false, wantCode: http.StatusServiceUnavailable, wantReason: "tools installing"},
 		{name: "neither", tools: false, kiro: false, wantCode: http.StatusCreated},
 	}
@@ -286,7 +332,7 @@ func TestKiroRescan_reportsVerdictNotErrorText(t *testing.T) {
 	deps.kiroRescan = func(context.Context) (bool, error) {
 		return false, errors.New("/config/tools/kiro-cli-versions/2.14.2: permission denied")
 	}
-	deps.kiroReady = func() (bool, string) { return false, kirocli.ReasonUnavailable }
+	deps.kiroReady = func() (bool, string) { return false, reasonUnavailable }
 	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
@@ -299,8 +345,8 @@ func TestKiroRescan_reportsVerdictNotErrorText(t *testing.T) {
 		t.Fatalf("failed rescan: status = %d, want 503 (body %s)", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, kirocli.ReasonUnavailable) {
-		t.Errorf("failed rescan body %q does not carry the manager's reason %q", body, kirocli.ReasonUnavailable)
+	if !strings.Contains(body, reasonUnavailable) {
+		t.Errorf("failed rescan body %q does not carry the manager's reason %q", body, reasonUnavailable)
 	}
 	if strings.Contains(body, "permission denied") || strings.Contains(body, "/config/tools") {
 		t.Errorf("failed rescan body %q leaks the underlying error text and a filesystem path", body)
@@ -361,8 +407,8 @@ func TestStartKiroCLI_shapes(t *testing.T) {
 			t.Fatal("an unusable pin left readiness ungated; no version can ever be installed, so sessions must stay gated")
 		}
 		ok, reason := rt.ready()
-		if ok || reason != kirocli.ReasonUnavailable {
-			t.Errorf("unusable pin readiness = (%v, %q), want (false, %q)", ok, reason, kirocli.ReasonUnavailable)
+		if ok || reason != reasonUnavailable {
+			t.Errorf("unusable pin readiness = (%v, %q), want (false, %q)", ok, reason, reasonUnavailable)
 		}
 	})
 }

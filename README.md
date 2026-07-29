@@ -203,6 +203,7 @@ the container and the entrypoint installs them at each start.
 - [web-terminal-engine](https://github.com/cplieger/web-terminal-engine): the terminal engine (Go PTY/VT + TypeScript renderer) behind this app.
 - [web-terminal-ui](https://github.com/cplieger/web-terminal-ui): the touch-first browser UI.
 - [web-terminal-server](https://github.com/cplieger/web-terminal-server): a generic browser terminal for any command, built on the same engine.
+- [pinstall](https://github.com/cplieger/pinstall): the digest-pinned installer this app uses to download, verify and activate kiro-cli at runtime.
 
 ## Contributing
 

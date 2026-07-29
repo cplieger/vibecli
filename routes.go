@@ -20,7 +20,6 @@ import (
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/toolbelt/v2/httpapi"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
-	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -223,7 +222,7 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// took) at Warn or Error, so this reports the verdict rather than the
 		// error text: err can name a filesystem path, and this response is not
 		// the place to widen what a caller learns about the volume.
-		reason := kirocli.ReasonUnavailable
+		reason := reasonUnavailable
 		if deps.kiroReady != nil {
 			if _, r := deps.kiroReady(); r != "" {
 				reason = r

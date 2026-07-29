@@ -27,17 +27,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/cplieger/envx"
+	"github.com/cplieger/pinstall"
+	"github.com/cplieger/pinstall/kirocli"
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
-	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -495,6 +495,28 @@ func main() {
 	tools.close()
 }
 
+// The layout facts this app brings to the kiro-cli install: where the convenience
+// symlink goes, and what its own SHELL-era installer left on the volume.
+const (
+	// kiroLinkDir is the directory under the tools dir holding the
+	// non-authoritative `docker exec … kiro-cli` convenience symlink. It is
+	// co-owned by the toolbelt engine, which publishes bin/<tool> symlinks of its
+	// own — which is why the legacy sweep names its targets instead of scanning it.
+	kiroLinkDir = "bin"
+	// legacyStagePrefix prefixed the shell installer's staging trees directly under
+	// the tools dir. The managed staging trees live under the install root instead,
+	// so anything matching this is an orphan its EXIT trap missed on a SIGKILL. It
+	// ends in a dot so it cannot match the install root or the marker below.
+	legacyStagePrefix = ".kiro-cli-stage."
+	// legacyPurgeMarker records on the volume that the one-time migration sweep
+	// completed, so it runs ONCE rather than walking the co-owned bin directory on
+	// every boot. Dot-prefixed and directly under the tools dir, where the toolbelt
+	// engine never looks (it enumerates only bin/, opt/, npm/ and python/) and
+	// where neither the stage sweep nor the entrypoint's write-probe cleanup
+	// (".write-probe.*") can match it.
+	legacyPurgeMarker = ".kiro-cli-legacy-purged"
+)
+
 // baseKiro carries startKiroCLI's inputs: the three Renovate-pinned literals the
 // entrypoint exports, the tools tree they install into, the taint observation only
 // the entrypoint can make, and this deployment's extra chat flags.
@@ -537,7 +559,7 @@ type kiroRuntime struct {
 // up. In the image entrypoint.sh always exports the pins, so this shape is
 // unreachable there.
 func unmanagedKiroRuntime(chatArgs []string) kiroRuntime {
-	argv := sessionCommand("kiro-cli", chatArgs...)
+	argv := sessionCommand(kirocli.Name, chatArgs...)
 	return kiroRuntime{
 		cmd:  func() []string { return argv },
 		stop: func() {},
@@ -552,10 +574,54 @@ func unmanagedKiroRuntime(chatArgs []string) kiroRuntime {
 // repair path stay alive, per this app's failure posture.
 func unavailableKiroRuntime() kiroRuntime {
 	return kiroRuntime{
-		cmd:   func() []string { return sessionCommand("kiro-cli") },
-		ready: func() (bool, string) { return false, kirocli.ReasonUnavailable },
+		cmd:   func() []string { return sessionCommand(kirocli.Name) },
+		ready: func() (bool, string) { return false, reasonUnavailable },
 		stop:  func() {},
 	}
+}
+
+// The readiness reasons this app puts on the wire, one per operator situation.
+//
+// The install manager reports a TYPED reason (pinstall.Reason) that names only the
+// distinction — "installing", "unavailable" — because the wording a consumer shows
+// its own users is the consumer's. These four literals ARE that wording, and they
+// are a published contract: an operator reads them from `docker inspect` and a
+// monitoring probe, they are the 503 body of POST /api/sessions, and they are the
+// reason text /api/health serves. Renaming one silently changes what
+// every one of those consumers sees, so kiroReasonText is the single place they are
+// produced and TestKiroReasonTextIsTheClientContract pins the exact strings.
+const (
+	reasonInstalling = "kiro-cli installing"
+	reasonRetrying   = "kiro-cli install retrying"
+	// reasonUnavailable is also the fallback for a rescan with no verdict to read,
+	// and for a reason a future library version adds: a state we cannot name still
+	// blocks sessions, and the terminal wording says so.
+	reasonUnavailable = "kiro-cli unavailable"
+	// reasonSettings is pinstall.ReasonAssertion in this app's terms. The only
+	// REQUIRED assertion here is the profile's mandatory app.disableAutoupdates
+	// (every setting kiroSettings passes is best-effort), so a withheld verdict
+	// means exactly that the binary may replace itself and invalidate the verified
+	// digest.
+	reasonSettings = "kiro-cli required settings not enforced"
+)
+
+// kiroReasonText renders the install manager's typed reason as the reason
+// /api/health, the session-create gate and the repair hook serve. ReasonReady maps
+// to "", which every one of those surfaces omits.
+func kiroReasonText(why pinstall.Reason) string {
+	switch why {
+	case pinstall.ReasonReady:
+		return ""
+	case pinstall.ReasonInstalling:
+		return reasonInstalling
+	case pinstall.ReasonRetrying:
+		return reasonRetrying
+	case pinstall.ReasonUnavailable:
+		return reasonUnavailable
+	case pinstall.ReasonAssertion:
+		return reasonSettings
+	}
+	return reasonUnavailable
 }
 
 // startKiroCLI builds the kiro-cli install manager and starts the install in the
@@ -577,26 +643,7 @@ func startKiroCLI(cfg *baseKiro) kiroRuntime {
 			"hint", "expected outside the container (bare `go run`); in the image entrypoint.sh exports KIRO_CLI_VERSION, both digests and KIRO_CLI_TOOLS_DIR")
 		return unmanagedKiroRuntime(cfg.chatArgs)
 	}
-	mgr, err := kirocli.New(&kirocli.Config{
-		Version:     cfg.version,
-		SHA256:      cfg.sha256,
-		SHA256ARM64: cfg.sha256ARM64,
-		ToolsDir:    cfg.toolsDir,
-		Tainted:     cfg.tainted,
-		// This app's best-effort preferences. app.disableAutoupdates is NOT here:
-		// the manager adds it as Required itself, so no caller can configure the
-		// integrity gate away. The two notification settings are load-bearing for
-		// the per-tab status dots (routes.go's OSC 9 classifier only sees a
-		// notification kiro-cli was told to emit inline), and terminalTitle=false
-		// is what lets the tabs feature name each tab after the user's own input
-		// instead of the cwd.
-		Settings: []kirocli.Setting{
-			boolSetting("telemetry.enabled", false),
-			boolSetting("chat.enableNotifications", true),
-			{Key: "chat.notificationMethod", Value: "osc9"},
-			boolSetting("chat.terminalTitle", false),
-		},
-	})
+	mgr, err := pinstall.New(kiroInstallConfig(cfg))
 	if err != nil {
 		slog.Error("kiro-cli install manager could not be built from the exported pins; no version can be installed, so sessions stay gated",
 			"error", err,
@@ -614,20 +661,120 @@ func startKiroCLI(cfg *baseKiro) kiroRuntime {
 	// than a pointer into the composition root's config.
 	chatArgs := cfg.chatArgs
 	return kiroRuntime{
-		cmd: func() []string { return sessionCommand(mgr.CLIPath(), chatArgs...) },
+		cmd: func() []string { return sessionCommand(mgr.Path(), chatArgs...) },
 		env: func() []string { return sessionPathEnv(mgr.PathEntry()) },
-		// Ready, not Phase, is the authority: Phase only explains a "no".
-		ready:  mgr.Ready,
+		// The library reports a typed reason; this is the ONE place it becomes the
+		// wording an operator reads, so every surface below serves the same text.
+		ready: func() (bool, string) {
+			ok, why := mgr.Ready()
+			return ok, kiroReasonText(why)
+		},
 		rescan: mgr.Rescan,
 		stop:   cancel,
 	}
 }
 
-// boolSetting is one boolean kiro-cli setting. The settings CLI takes its value
-// as a string, so keeping the app's intent as a Go bool lets the compiler catch a
-// typo the CLI would silently accept as "not true".
-func boolSetting(key string, on bool) kirocli.Setting {
-	return kirocli.Setting{Key: key, Value: strconv.FormatBool(on)}
+// kiroInstallConfig is this app's whole deployment of the kiro-cli release: the
+// pins from the entrypoint, the tools tree, the taint observation and the local
+// policy. The release PROFILE — the archive URL, the arch tokens, the in-archive
+// installer, the probe argv, the licence notice and the mandatory auto-update
+// assertion — is kirocli.Release()'s, shared with every other consumer of the same
+// upstream.
+//
+// It is a function rather than an inline literal so the namespace test can build a
+// manager from the EXACT configuration production runs (see
+// kirocli_namespace_test.go): the collision it guards is a property of these
+// values, not of a copy of them.
+func kiroInstallConfig(cfg *baseKiro) *pinstall.Config {
+	return &pinstall.Config{
+		Release: kirocli.Release(),
+		Version: cfg.version,
+		// Both pins travel, whatever this container runs on; the library validates
+		// the digest for the resolved GOARCH and ignores the other.
+		Digests: map[string]string{
+			"amd64": cfg.sha256,
+			"arm64": cfg.sha256ARM64,
+		},
+		Root:    cfg.toolsDir,
+		LinkDir: kiroLinkDir,
+		// The chat sidecar is REQUIRED here because `kiro-cli chat` over a PTY IS
+		// the product: a version directory holding only the main dispatcher answers
+		// --version correctly and then kills every terminal at chat. The library
+		// always requires the release's primary artifact, so this names only the
+		// addition. No Optional set: kiro-cli-term is not installed at all here,
+		// and the archive's copy is discarded with the staging home. vibekit's
+		// required set has cardinality ONE for the mirror-image reason; do not copy
+		// either set into the other repo without a caller that needs it.
+		Require: []string{kirocli.Name + "-chat"},
+		Assert:  kiroSettings(),
+		Purge:   kiroLegacyPurge(),
+		// The entrypoint's tools-tree-was-writable observation, which only the
+		// entrypoint can make (secure_tools_dir). With it set, no pre-existing
+		// version directory may be activated at all: a forgeable sentinel is
+		// worthless evidence on a tree another host user could write, so only a
+		// version this process installed from a digest-verified archive counts.
+		// vibekit deliberately leaves this UNSET — it has no hardening pass that
+		// could make the observation.
+		Untrusted: cfg.tainted,
+	}
+}
+
+// kiroSettings is this app's kiro-cli settings set, re-asserted against the active
+// binary on every boot. Every one is best-effort: a failure warns and readiness is
+// unaffected.
+//
+// app.disableAutoupdates is deliberately NOT in this list: kirocli.Release()
+// declares it Mandatory, so the library forces it Required and merges it in
+// whatever a deployment passes — the integrity gate cannot be weakened, reworded or
+// dropped from here. The two notification settings are load-bearing for the per-tab
+// status dots (routes.go's OSC 9 classifier only sees a notification kiro-cli was
+// told to emit inline), and terminalTitle=false is what lets the tabs feature name
+// each tab after the user's own input instead of the cwd.
+func kiroSettings() []pinstall.Assertion {
+	return []pinstall.Assertion{
+		kirocli.Setting("telemetry.enabled", false),
+		kirocli.Setting("chat.enableNotifications", true),
+		// Raw because the value is not a boolean.
+		kirocli.SettingRaw("chat.notificationMethod", "osc9"),
+		kirocli.Setting("chat.terminalTitle", false),
+	}
+}
+
+// kiroLegacyPurge describes the layout THIS APP's shell installer left on the tools
+// volume, which is caller data: the residue is a fact about this app's history, not
+// about the kiro-cli release. Nothing in this list is read by anything any more, so
+// deleting it outright is the resolution of the inherited-open-journal state —
+// deletion, not a journal decoder, a rollback path or a legacy ready-fallback.
+//
+// The artifact list is larger than vibekit's on purpose: this app's shell installer
+// promoted in place, so it DID write an update journal, `.prev` hard-link backups
+// with their `.absent` tombstones, both install-completion markers and a readiness
+// marker. vibekit's promotion was single-commit-point and wrote none of them; do
+// not copy this list there.
+//
+// The dispatcher names come from the library profile rather than a local slice:
+// they are the set a shell-era kiro-cli installer promoted, which is release
+// knowledge. Naming three targets is also what makes the sweep safe in a directory
+// the toolbelt engine co-owns — a `kiro-cli*` prefix sweep deleted every match,
+// including another owner's live symlink.
+func kiroLegacyPurge() *pinstall.Purge {
+	return &pinstall.Purge{
+		Artifacts: []string{
+			".kiro-cli-update-in-progress",
+			".kiro-cli-installed",
+			".kiro-cli-installed.prev",
+			".kiro-cli-ready",
+			kiroLinkDir + "/.kiro-cli.prev",
+			kiroLinkDir + "/.kiro-cli.prev.absent",
+			kiroLinkDir + "/.kiro-cli-chat.prev",
+			kiroLinkDir + "/.kiro-cli-chat.prev.absent",
+			kiroLinkDir + "/.kiro-cli-term.prev",
+			kiroLinkDir + "/.kiro-cli-term.prev.absent",
+		},
+		Names:       kirocli.ShellEraDispatchers(),
+		StagePrefix: legacyStagePrefix,
+		Marker:      legacyPurgeMarker,
+	}
 }
 
 // sessionPathEnv returns the per-session environment overlay that puts the active

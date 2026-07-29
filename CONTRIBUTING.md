@@ -12,15 +12,23 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   root, `package main`). `main.go` embeds the web UI with `//go:embed static`
   and assembles the middleware stack in `buildHandler` on top of `webhttp`
   (access logging, panic recovery, security headers, cross-origin protection).
-- `internal/kirocli/`: the kiro-cli install manager, and the only installer.
-  `startKiroCLI` (main.go) builds it from the pins `entrypoint.sh` exports and
-  runs it in the background after the listener binds, the same bind-first shape
-  `startTools` uses. It owns the download and its SHA-256 verification, the
-  version-addressed layout under `/config/tools/kiro-cli-versions/<version>/`,
-  version selection, the kiro-cli settings the app depends on, pruning, and the
-  purge of the pre-2026-07 `/config/tools/bin` layout. Its verdict is what
-  `/api/health` and the session-create gate read, its active version directory
-  leads every session's `PATH`, and its `Rescan` backs the loopback
+- The kiro-cli install is the external
+  [`cplieger/pinstall`](https://github.com/cplieger/pinstall) library, and it is
+  the only installer. `startKiroCLI` (main.go) builds a `pinstall.Manager` from
+  `kiroInstallConfig` — this app's deployment of the shared
+  `pinstall/kirocli` release profile, fed by the pins `entrypoint.sh` exports —
+  and runs it in the background after the listener binds, the same bind-first
+  shape `startTools` uses. The library owns the download and its SHA-256
+  verification, the version-addressed layout under
+  `/config/tools/kiro-cli-versions/<version>/`, version selection, the per-boot
+  assertion of the settings the app depends on, pruning, and the one-shot purge
+  of the pre-2026-07 `/config/tools/bin` layout. What stays app-side is data and
+  wording: the required set (`kiro-cli` plus the `kiro-cli-chat` sidecar), the
+  four best-effort settings, the purge target list, the taint observation, and
+  `kiroReasonText`, which turns the library's typed `pinstall.Reason` into the
+  four 503 reason strings an operator reads. Its verdict is what `/api/health`
+  and the session-create gate read, its active version directory leads every
+  session's `PATH`, and its `Rescan` backs the loopback
   `POST /api/kiro-cli/rescan` repair hook.
 - `static-src/`: TypeScript + CSS sources, compiled into `static/`.
 - Tool provisioning is the external
@@ -115,6 +123,13 @@ $KIRO_CLI_TOOLS_DIR/kiro-cli-versions/<version>/
 
 ```sh
 export KIRO_CLI_TOOLS_DIR=/tmp/kweb-tools KIRO_CLI_VERSION=2.14.2
+# The RUNNING architecture's digest must be set and well-formed (64 lowercase
+# hex characters); the install manager validates it at construction, before it
+# knows whether anything will be downloaded. Nothing is fetched here, so the
+# value is never compared against an archive and a placeholder is enough. The
+# other architecture's digest may stay unset -- only the resolved GOARCH is
+# validated. On an aarch64 host set KIRO_CLI_SHA256_ARM64 instead.
+export KIRO_CLI_SHA256=0000000000000000000000000000000000000000000000000000000000000000
 V="$KIRO_CLI_TOOLS_DIR/kiro-cli-versions/$KIRO_CLI_VERSION"
 mkdir -p "$V"
 cp /path/to/kiro-cli /path/to/kiro-cli-chat "$V/"
@@ -122,13 +137,19 @@ printf '%s\n' "$KIRO_CLI_VERSION" >"$V/.complete"
 KWEB_WORK_DIR=/path/to/workdir go run .
 ```
 
-Both digest variables stay unset; nothing is fetched, so nothing is verified
-against them. `.complete` is what makes the directory a selection candidate, and
+Leaving both digest variables unset does NOT work, and fails in the least
+obvious way: the manager refuses to construct (`amd64 digest: want 64 hex
+characters, got 0`), so the server logs one error and then reports
+`kiro-cli unavailable` forever, with every session refused — even though the
+version directory on disk is complete and nothing was ever going to be
+downloaded. `.complete` is what makes the directory a selection candidate, and
 the two per-boot gates still run against whatever you put there: `kiro-cli
 --version` must print the directory's own name, and `app.disableAutoupdates=true`
 must be assertable through `kiro-cli settings` or readiness is withheld. A shell
 script answering both is enough for a wiring check;
-`kirocli_wiring_test.go` builds exactly that fake dispatcher set.
+`kirocli_wiring_test.go` builds exactly that fake dispatcher set (and pins both
+digest outcomes: a malformed pin reports unavailable, a well-formed one
+activates).
 
 `/api/health` reports readiness. Under a bare `go run` it reflects only that the
 HTTP listener is up: with no pins there is no install to gate on, and the tools
@@ -209,13 +230,19 @@ assert at least once (`expect.requireAssertions`) and `.only` is forbidden.
   carry a "Synced from cplieger/ci — DO NOT EDIT" header; the pipeline is
   centralised in `cplieger/ci`. Change behaviour there, not here.
 - **kiro-cli install model.** `entrypoint.sh` declares `KIRO_CLI_VERSION` +
-  both per-arch digests (Renovate-managed) and exports them; `internal/kirocli`
-  installs from them. Keep the pins as shell literals with their
+  both per-arch digests (Renovate-managed) and exports them; the `pinstall`
+  manager `kiroInstallConfig` builds installs from them. Keep the pins as shell
+  literals with their
   `# renovate:` anchors, where the custom datasource finds them. Don't switch to
   `latest/` URLs, bake the binary into the image, or re-enable in-binary
   auto-update; each breaks the pinned-sha / image-tag reproducibility story.
   Don't add a second installer to the entrypoint: one installer, in the server,
   is what makes the version-addressed layout and the readiness verdict agree.
+  Don't drop `kiro-cli-chat` from `Config.Require`: the library requires only the
+  primary artifact by itself, and `chat` over a PTY is this app's product, so a
+  directory without the sidecar would count as a complete install and then kill
+  every terminal at chat (vibekit's required set is deliberately smaller — don't
+  copy either app's set into the other).
   `/config/tools/bin/kiro-cli` is a convenience symlink for
   `docker exec … kiro-cli`; nothing in the product reads it, so don't gate
   anything on it.

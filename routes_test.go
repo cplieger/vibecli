@@ -22,7 +22,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
-	"github.com/cplieger/web-terminal-kiro/internal/kirocli"
 	"github.com/cplieger/webhttp"
 )
 
@@ -99,7 +98,7 @@ func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 	}
 
 	// No active version -> kiro-cli unavailable -> 503.
-	unready := func() (bool, string) { return false, kirocli.ReasonUnavailable }
+	unready := func() (bool, string) { return false, reasonUnavailable }
 	if code := status(newMux(unready)); code != http.StatusServiceUnavailable {
 		t.Errorf("no active version: status = %d, want %d", code, http.StatusServiceUnavailable)
 	}
@@ -709,20 +708,20 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 
 	// Not-ready (startup/shutdown): the ready gate short-circuits before the
 	// kiro-cli check, so 503 with the startup reason regardless of the verdict.
-	code, b := body(newMux(false, unready(kirocli.ReasonUnavailable)))
+	code, b := body(newMux(false, unready(reasonUnavailable)))
 	if code != http.StatusServiceUnavailable || !strings.Contains(b, "starting up or shutting down") {
 		t.Errorf("not-ready: (status %d, body %q), want 503 with reason %q", code, b, "starting up or shutting down")
 	}
 
-	// Ready, but the manager has no usable version. Each phase reports a
+	// Ready, but the manager has no usable version. Each state reports a
 	// DIFFERENT reason: a first-boot download in flight is not an alert, an
 	// exhausted retry budget is, and unenforced required settings point at a
 	// third remedy entirely.
 	for _, reason := range []string{
-		kirocli.ReasonInstalling,
-		kirocli.ReasonRetrying,
-		kirocli.ReasonUnavailable,
-		kirocli.ReasonSettings,
+		reasonInstalling,
+		reasonRetrying,
+		reasonUnavailable,
+		reasonSettings,
 	} {
 		code, b = body(newMux(true, unready(reason)))
 		if code != http.StatusServiceUnavailable || !strings.Contains(b, reason) {

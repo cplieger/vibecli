@@ -22,7 +22,8 @@
 # assert what happens when it should NOT.
 #
 # The kiro-cli INSTALL is no longer part of that surface: the Go server owns it
-# (internal/kirocli), so its failure branches are Go tests. What stays here is
+# (the cplieger/pinstall library), so its failure branches are that library's own
+# Go tests. What stays here is
 # what the entrypoint still does — directory hardening, the KAS runtime prune,
 # and the APT_PACKAGES validation.
 #

@@ -2,7 +2,8 @@
 # web-terminal-kiro entrypoint. Four jobs, and no more: declare the
 # Renovate-pinned kiro-cli version plus both per-arch archive digests, make
 # /config present, private and writable, export the pins, and exec the Go web
-# server. The server OWNS the kiro-cli install (internal/kirocli): it downloads
+# server. The server OWNS the kiro-cli install (the cplieger/pinstall library,
+# wired in main.go): it downloads
 # the pinned archive, verifies its SHA-256, installs it into a
 # version-addressed directory under /config/tools/kiro-cli-versions, and decides
 # readiness. It does that AFTER the listener binds, so a slow first-boot
@@ -329,7 +330,8 @@ warn_skipped_apt_token() {
 # packageRule in cplieger/.github groups all three literals into one Renovate PR so
 # neither arch's gate can land stale.
 # All three are EXPORTED below and consumed by the server's install manager
-# (internal/kirocli), which is the only installer. They stay shell literals here
+# (cplieger/pinstall, wired by main.go's kiroInstallConfig), which is the only
+# installer. They stay shell literals here
 # because that is where Renovate's custom datasource finds them.
 # COUPLING (re-verify on every bump): routes.go's status classifier matches
 # kiro-cli's EXACT OSC 9 notification strings "Response complete" (turn end ->

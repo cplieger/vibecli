@@ -827,7 +827,8 @@ type toolsRuntime struct {
 	// never spawns before the manifest's tools are on PATH.
 	syncing func() bool
 	// state is the /api/health informational detail:
-	// syncing | ok | degraded.
+	// syncing | ok | degraded. LIVE, not boot-only: after the boot
+	// verdict it tracks the tools engine's counted jobs (see toolsStatus).
 	state func() string
 }
 
@@ -845,10 +846,153 @@ const (
 	// toolsStateDegraded is the verdict for a tools subsystem that FAILED, as
 	// opposed to one deliberately absent (which omits the field entirely).
 	// Reported from an unusable config path, a failed engine start and a
-	// reconcile that could not be enqueued (startTools), and from a wait
-	// failure, a cancellation and a non-Done job (awaitBootConvergence).
+	// reconcile that could not be enqueued (startTools), from a wait
+	// failure, a cancellation and a non-Done job (awaitBootConvergence),
+	// and from a failed counted job (toolsStatus.observeJob).
 	toolsStateDegraded = "degraded"
 )
+
+// toolsStatus is the app-owned reducer behind /api/health's INFORMATIONAL
+// tools field. It is fed by the boot reconcile's verdict once and by the
+// toolbelt engine's Config.OnJobChanged callback for the rest of the
+// process's life, so the field reports LIVE tool state instead of latching
+// the boot outcome until the container is recreated: an operator whose boot
+// reconcile failed can repair the tools through the loopback tools API and
+// watch the field leave "degraded" (a signal that can only get worse trains
+// its reader to ignore it).
+//
+// STATE MACHINE — three states in one cell, written by two phases:
+//
+//	syncing   the initial value, and the only one never re-entered. It means
+//	          "the boot convergence pass has not produced a verdict yet",
+//	          which is exactly the window in which the session-create gate is
+//	          closed and POST /api/sessions answers 503 "tools installing". A
+//	          post-boot job running does NOT return the field here, because a
+//	          health consumer reads "syncing" as that gated window.
+//	ok        the tools tree last converged with intent. Entered from any
+//	          state by the boot verdict (clean reconcile, or an empty manifest
+//	          with nothing to converge) or by a COUNTED job reaching "done".
+//	degraded  the last counted attempt to converge FAILED, or the subsystem
+//	          never started. Entered from any state by the boot verdict or by
+//	          a COUNTED job reaching "failed".
+//
+// Transitions: syncing -> {ok, degraded} by the boot verdict only, then
+// ok <-> degraded freely for the rest of the run. degraded -> ok is the whole
+// point of the type — a successful repair heals the field, where the boot-only
+// latch it replaced could only ever get worse. Non-terminal transitions
+// (queued, running) and cancellations are ignored: the engine cancels the
+// running job from Close on every SIGTERM, so treating a cancel as a fault
+// would report shutdown as breakage.
+//
+// The two phases are ORDERED rather than racing, which is why `booted` exists.
+// The boot reconcile is itself a counted kind, and its terminal callback fires
+// (under toolbelt's queue lock) up to one Wait poll BEFORE startTools' finish
+// closure runs — so without the flag a converged boot would publish "ok" while
+// the session gate was still closed, contradicting what "syncing" promises a
+// health consumer above. The boot verdict is therefore authoritative until it
+// is recorded, and the live reducer starts only after.
+//
+// This type is deliberately IGNORANT of the session-create gate and of
+// kiro-cli readiness. It holds no reference to either, so a post-boot job
+// failure cannot re-close session creation (the gate lifts on boot failure by
+// design — degraded-not-dead — and that decision stays made) and cannot touch
+// the install manager's separate verdict.
+type toolsStatus struct {
+	// state is the current value. atomic rather than a mutex to match the
+	// syncing gate beside it, and because OnJobChanged fires under
+	// toolbelt's own queue lock and must not block: the health handler
+	// reads it on request goroutines.
+	state atomic.Value // string: syncing | ok | degraded
+	// booted reports whether the boot verdict has been recorded, i.e.
+	// whether the live half of the reducer is armed. Set last by recordBoot
+	// so a job transition can never overtake the verdict.
+	booted atomic.Bool
+}
+
+// newToolsStatus returns a reducer parked in the pre-verdict boot state.
+func newToolsStatus() *toolsStatus {
+	s := &toolsStatus{}
+	s.state.Store(toolsStateSyncing)
+	return s
+}
+
+// get reads the current value for /api/health.
+func (s *toolsStatus) get() string {
+	v, _ := s.state.Load().(string)
+	return v
+}
+
+// recordBoot stores the boot convergence pass's verdict and arms the live
+// half. Called once, from startTools' finish closure, which separately lifts
+// the session-create gate; the reducer half below never sees that gate. The
+// store order is load-bearing: state first, then booted, so no job transition
+// can land between them and be mistaken for the boot outcome.
+func (s *toolsStatus) recordBoot(v string) {
+	s.state.Store(v)
+	s.booted.Store(true)
+}
+
+// observeJob is the Config.OnJobChanged reducer: it folds one job state
+// transition into the field. Fires from toolbelt's job worker under the queue
+// lock, so it does exactly one atomic store and never blocks.
+func (s *toolsStatus) observeJob(j *toolbelt.Job) {
+	if j == nil || !s.booted.Load() || !toolsStatusCounts(j.Kind) {
+		return
+	}
+	switch j.State {
+	case toolbelt.JobDone:
+		s.state.Store(toolsStateOK)
+	case toolbelt.JobFailed:
+		s.state.Store(toolsStateDegraded)
+	}
+	// JobQueued/JobRunning are in-flight, and JobCancelled is not a fault
+	// (Engine.Close cancels the active job on every shutdown) — both leave
+	// the last settled value in place.
+}
+
+// toolsStatusCounts is the job-kind policy for the informational tools field,
+// enumerated rather than defaulted to "anything that failed" — the excluded
+// kinds are excluded for stated reasons, not by omission, and a job kind
+// toolbelt adds later counts only once someone decides it should.
+//
+// COUNTED — a failure means a tool the manifest says should be on PATH is not
+// there, which is the only thing this field claims:
+//
+//	install    provisioning one entry, and the REPAIR path. An operator fixing
+//	           a failed boot through the loopback tools API produces exactly
+//	           these, so this kind is what makes recovery observable at all.
+//	reconcile  converge disk to intent: the boot pass, and any later one.
+//
+// EXCLUDED, one reason each:
+//
+//	catalog-refresh  fetch/verify/swap of the PUBLISHED CATALOG, not of any
+//	                 installed tool. Failure is routine because keep-last-good
+//	                 keeps serving the cached (or baked) catalog, and
+//	                 startTools fires one at boot before the publisher is
+//	                 necessarily reachable — counting it would report a fully
+//	                 converged container as degraded on a network hiccup.
+//	update           the unpinned-freshness pass awaitBootConvergence enqueues
+//	                 after every boot. Its common failure is upstream version
+//	                 resolution (network, rate limit), which changes nothing on
+//	                 disk: the installed version stays on PATH. Counting it
+//	                 would flip an offline box to degraded on every boot. A
+//	                 bump that fails mid-install leaves a real gap, and the
+//	                 next reconcile reports it.
+//	uninstall        removal, not provisioning. A failed footprint removal
+//	                 leaves an EXTRA binary behind, which does not stop the
+//	                 tools tree from serving sessions.
+//	disable          the same removal, keeping the manifest entry. Also
+//	                 excluded on the SUCCESS side: letting a clean removal
+//	                 store "ok" would whitewash an earlier real install
+//	                 failure it proves nothing about.
+func toolsStatusCounts(kind string) bool {
+	switch kind {
+	case toolbelt.JobKindInstall, toolbelt.JobKindReconcile:
+		return true
+	default:
+		return false
+	}
+}
 
 // degradedRuntime is the engine-less runtime a startTools failure returns:
 // engine and syncing stay nil (no /api/tools mount, sessions ungated) while
@@ -869,7 +1013,10 @@ func (t *toolsRuntime) close() {
 // run; only session CREATION waits, via the syncing gate). The gate
 // lifts regardless of per-tool failures — degraded-not-dead, matching
 // the retired setup-tools.sh warn-and-continue posture — and the
-// health detail records the verdict. After convergence an async update
+// health detail records the verdict. That detail then keeps tracking the
+// engine's counted jobs for the rest of the run (toolsStatus), so a repair
+// through the loopback tools API heals it without a restart; the gate is a
+// separate cell the reducer cannot reach. After convergence an async update
 // pass refreshes unpinned tools, and a boot warning nudges when no
 // language server is enabled (kiro-cli scans PATH for LSPs at session
 // start).
@@ -902,14 +1049,19 @@ func startTools(cfg baseTools) toolsRuntime {
 		Require:  toolbelt.ParseRequireList(requiredToolsList),
 		Interval: cfg.refreshInterval,
 	}
+	// The informational-status reducer is built BEFORE the engine so it can be
+	// wired as the engine's job-transition callback: from here on the health
+	// field follows live job outcomes, not just the boot verdict.
+	status := newToolsStatus()
 	eng, err := toolbelt.New(&toolbelt.Config{
-		ConfigDir:   cfg.configDir,
-		ToolsDir:    filepath.Join(cfg.configDir, "tools"),
-		CatalogPath: cfg.catalogPath,
-		Refresh:     refresh,
-		Seed:        toolbelt.DefaultSeed(),
-		System:      []string{"git", "jq", "curl", "unzip", "xz", "ssh", "tar", "bash"},
-		Logger:      slog.Default(),
+		ConfigDir:    cfg.configDir,
+		ToolsDir:     filepath.Join(cfg.configDir, "tools"),
+		CatalogPath:  cfg.catalogPath,
+		Refresh:      refresh,
+		Seed:         toolbelt.DefaultSeed(),
+		System:       []string{"git", "jq", "curl", "unzip", "xz", "ssh", "tar", "bash"},
+		Logger:       slog.Default(),
+		OnJobChanged: status.observeJob,
 	})
 	if err != nil {
 		slog.Error("tools engine failed to start; continuing without it", "error", err)
@@ -922,10 +1074,15 @@ func startTools(cfg baseTools) toolsRuntime {
 	}
 
 	var syncing atomic.Bool
-	var verdict atomic.Value // string: syncing | ok | degraded
-	verdict.Store(toolsStateSyncing)
+	// finish is the ONLY function that touches both halves: it records the boot
+	// convergence verdict (arming the live reducer) and lifts the session-create
+	// gate. The gate is a separate cell from the health field on purpose — the
+	// live reducer (status.observeJob, wired above) closes over no gate state at
+	// all, so a post-boot job failure can update the informational field without
+	// ever re-closing session creation. Boot failure lifting the gate is
+	// deliberate (degraded-not-dead), and nothing may put it back.
 	finish := func(v string) {
-		verdict.Store(v)
+		status.recordBoot(v)
 		syncing.Store(false)
 	}
 
@@ -961,7 +1118,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	return toolsRuntime{
 		engine:  eng,
 		syncing: syncing.Load,
-		state:   func() string { s, _ := verdict.Load().(string); return s },
+		state:   status.get,
 	}
 }
 

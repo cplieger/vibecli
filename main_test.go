@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -867,6 +870,385 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	if got := records.CountLevel(slog.LevelWarn, "boot reconcile wait failed"); got != 1 {
 		t.Errorf("log = %q, want exactly one wait-failed Warn (got %d)", records.Messages(), got)
 	}
+}
+
+// jobEvent builds one OnJobChanged callback argument for the reducer table
+// below, in the shape toolbelt's jobQueue hands out (a *Job view).
+func jobEvent(kind, state string) *toolbelt.Job {
+	return &toolbelt.Job{Kind: kind, State: state}
+}
+
+// TestToolsStatus_reducerTransitions pins the whole documented state machine of
+// the /api/health tools field, one row per transition the reducer must or must
+// NOT make. Two properties carry the finding this reducer exists for:
+//
+//   - degraded -> ok is REACHABLE. The field used to latch the boot verdict, so
+//     an operator who repaired the tools through the loopback API kept reading
+//     "degraded" until the container was recreated; a signal that only ever
+//     gets worse trains its reader to ignore it.
+//   - catalog-refresh (and update, uninstall, disable) are EXCLUDED from the
+//     policy in both directions. Refresh failure is routine — keep-last-good
+//     keeps serving the cached catalog and startTools fires one at boot before
+//     the publisher is necessarily reachable — so counting it would degrade a
+//     fully converged container on a network hiccup.
+//
+// The pre-verdict rows pin the phase order: the boot reconcile is itself a
+// counted kind and its terminal callback fires up to one Wait poll BEFORE
+// startTools' finish closure records the verdict, so without the booted flag a
+// converged boot would publish "ok" while the session gate was still closed —
+// contradicting what "syncing" promises a health consumer.
+func TestToolsStatus_reducerTransitions(t *testing.T) {
+	t.Parallel()
+
+	// noBoot means the boot verdict has not been recorded yet: the reducer's
+	// live half must still be disarmed.
+	const noBoot = ""
+
+	for name, tc := range map[string]struct {
+		boot string          // boot verdict, or noBoot
+		jobs []*toolbelt.Job // OnJobChanged transitions, in order
+		want string
+	}{
+		"initial state is syncing": {boot: noBoot, want: toolsStateSyncing},
+		"pre-verdict success is ignored": {
+			boot: noBoot,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindReconcile, toolbelt.JobDone)},
+			want: toolsStateSyncing,
+		},
+		"pre-verdict failure is ignored": {
+			boot: noBoot,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobFailed)},
+			want: toolsStateSyncing,
+		},
+		"nil job is ignored": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{nil},
+			want: toolsStateOK,
+		},
+		"boot failure then a successful install heals": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone)},
+			want: toolsStateOK,
+		},
+		"boot failure then a successful reconcile heals": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindReconcile, toolbelt.JobDone)},
+			want: toolsStateOK,
+		},
+		"failed install degrades": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobFailed)},
+			want: toolsStateDegraded,
+		},
+		"failed reconcile degrades": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindReconcile, toolbelt.JobFailed)},
+			want: toolsStateDegraded,
+		},
+		"failed catalog refresh does not degrade": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindCatalogRefresh, toolbelt.JobFailed)},
+			want: toolsStateOK,
+		},
+		"successful catalog refresh does not heal": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindCatalogRefresh, toolbelt.JobDone)},
+			want: toolsStateDegraded,
+		},
+		"failed update does not degrade": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindUpdate, toolbelt.JobFailed)},
+			want: toolsStateOK,
+		},
+		"successful update does not heal": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindUpdate, toolbelt.JobDone)},
+			want: toolsStateDegraded,
+		},
+		"failed uninstall does not degrade": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindUninstall, toolbelt.JobFailed)},
+			want: toolsStateOK,
+		},
+		"successful uninstall does not whitewash": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindUninstall, toolbelt.JobDone)},
+			want: toolsStateDegraded,
+		},
+		"failed disable does not degrade": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindDisable, toolbelt.JobFailed)},
+			want: toolsStateOK,
+		},
+		"successful disable does not whitewash": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindDisable, toolbelt.JobDone)},
+			want: toolsStateDegraded,
+		},
+		"an unrecognized future job kind is ignored": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent("some-kind-toolbelt-adds-later", toolbelt.JobFailed)},
+			want: toolsStateOK,
+		},
+		"queued and running are in flight, not verdicts": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{
+				jobEvent(toolbelt.JobKindInstall, toolbelt.JobQueued),
+				jobEvent(toolbelt.JobKindInstall, toolbelt.JobRunning),
+			},
+			want: toolsStateOK,
+		},
+		"cancellation is not a fault": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobCancelled)},
+			want: toolsStateOK,
+		},
+		"cancellation does not heal either": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobCancelled)},
+			want: toolsStateDegraded,
+		},
+		"the last counted job wins": {
+			boot: toolsStateOK,
+			jobs: []*toolbelt.Job{
+				jobEvent(toolbelt.JobKindInstall, toolbelt.JobFailed),
+				jobEvent(toolbelt.JobKindCatalogRefresh, toolbelt.JobFailed),
+				jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone),
+			},
+			want: toolsStateOK,
+		},
+		"a repair followed by a regression degrades again": {
+			boot: toolsStateDegraded,
+			jobs: []*toolbelt.Job{
+				jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone),
+				jobEvent(toolbelt.JobKindReconcile, toolbelt.JobFailed),
+			},
+			want: toolsStateDegraded,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			s := newToolsStatus()
+			if got := s.get(); got != toolsStateSyncing {
+				t.Fatalf("initial state = %q, want %q", got, toolsStateSyncing)
+			}
+			if tc.boot != noBoot {
+				s.recordBoot(tc.boot)
+			}
+			for _, j := range tc.jobs {
+				s.observeJob(j)
+			}
+			if got := s.get(); got != tc.want {
+				t.Errorf("state = %q, want %q", got, tc.want)
+			}
+			// syncing is entered once and never re-entered: a health consumer
+			// reads it as the gated boot window, so a post-verdict job must
+			// never put the field back there.
+			if tc.boot != noBoot && s.get() == toolsStateSyncing {
+				t.Errorf("state fell back to %q after the boot verdict; that value means the session-create gate is closed", toolsStateSyncing)
+			}
+		})
+	}
+}
+
+// TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates is the end-to-end
+// half: the SAME transitions driven through the real toolbelt engine and the
+// real Config.OnJobChanged wiring startTools installs, so the callback path
+// itself is pinned rather than the reducer in isolation.
+//
+// The boot manifest fails on purpose (an unresolvable entry with no catalog),
+// which is the state the finding describes: repaired tools, working sessions,
+// and a health field stuck on "degraded" until the container is recreated. Then
+// a real install job heals it, a real catalog-refresh failure does not touch
+// it, and a real failed install degrades it again.
+//
+// After EVERY transition this asserts the two things that must not move:
+//
+//   - the session-create gate stays LIFTED. A boot failure lifts it
+//     deliberately (degraded-not-dead) and the reducer holds no reference to
+//     it, so no job outcome may re-close it. Asserted through composeGate with
+//     rt.syncing — the exact predicate registerRoutes installs — because that
+//     is the property most likely to regress if the two cells are ever merged
+//     back into one.
+//   - kiro-cli readiness is untouched. It is a separate verdict with its own
+//     rescan hook, so health keeps answering 200 {"status":"ok"} while only the
+//     informational tools field moves.
+func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash unavailable; the manual install below is the offline success path: %v", err)
+	}
+	dir := t.TempDir()
+	// faketool installs offline via a manual command (no catalog, no network);
+	// no-such-tool-xyz has no source and no catalog to hydrate from, so its
+	// install always fails. Both enabled, so the boot reconcile fails overall.
+	manifest := `{"version":2,"tools":{` +
+		`"no-such-tool-xyz":{},` +
+		`"faketool":{"source":"manual","version":"1.0.0","probe":"faketool",` +
+		`"install":"printf '#!/bin/sh\nexit 0\n' > \"$BIN/faketool\"; chmod 0755 \"$BIN/faketool\""}` +
+		`}}`
+	if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	if rt.engine == nil {
+		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
+	}
+	t.Cleanup(rt.close)
+
+	// The create gate, driven by the production predicate. A real POST would
+	// spawn a PTY whose logging goroutines leak into later capture tests, so
+	// the inner handler is a stub — the shape TestSessionCreateGate_ToolsSyncing
+	// established for the same reason.
+	inner := 0
+	gated := composeGate(
+		func(next http.Handler) http.Handler { return next },
+		func() (bool, string) { return rt.syncing(), "tools installing" },
+	)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		inner++
+		w.WriteHeader(http.StatusCreated)
+	}))
+
+	// kiro-cli readiness: a stub this test never flips, so any change in the
+	// health status field would have to come from the tools reducer.
+	var kiroReadyCalls atomic.Int64
+	deps := newTestDeps(true)
+	deps.toolsState = rt.state
+	deps.kiroReady = func() (bool, string) {
+		kiroReadyCalls.Add(1)
+		return true, ""
+	}
+	health := handleHealth(deps)
+
+	assertStage := func(stage, wantTools string) {
+		t.Helper()
+		if got := rt.state(); got != wantTools {
+			t.Fatalf("%s: tools state = %q, want %q", stage, got, wantTools)
+		}
+		if rt.syncing() {
+			t.Fatalf("%s: the session-create gate re-closed; the reducer must not be able to reach it", stage)
+		}
+		before := inner
+		rec := httptest.NewRecorder()
+		gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))
+		if rec.Code != http.StatusCreated || inner != before+1 {
+			t.Fatalf("%s: session create = %d (body %s), want 201 pass-through; the tools field must never gate creation",
+				stage, rec.Code, rec.Body.String())
+		}
+		hrec := httptest.NewRecorder()
+		health(hrec, httptest.NewRequest(http.MethodGet, "/api/health", http.NoBody))
+		if hrec.Code != http.StatusOK {
+			t.Fatalf("%s: health = %d (body %s), want 200; tool convergence never gates readiness",
+				stage, hrec.Code, hrec.Body.String())
+		}
+		body := hrec.Body.String()
+		if !strings.Contains(body, `"status":"ok"`) {
+			t.Fatalf("%s: health body = %s, want status ok (kiro-cli readiness is a separate verdict)", stage, body)
+		}
+		if !strings.Contains(body, `"tools":"`+wantTools+`"`) {
+			t.Fatalf("%s: health body = %s, want tools %q", stage, body, wantTools)
+		}
+	}
+
+	// Boot: the reconcile fails, the gate lifts anyway, the field degrades.
+	deadline := time.Now().Add(30 * time.Second)
+	for rt.syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("boot convergence gate never lifted after a failed reconcile; session creation would 503 forever")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assertStage("after a failed boot reconcile", toolsStateDegraded)
+
+	runJob := func(stage string, enqueue func() (*toolbelt.Job, error), wantState string) *toolbelt.Job {
+		t.Helper()
+		j, err := enqueue()
+		if err != nil {
+			t.Fatalf("%s: enqueue: %v", stage, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		final, err := rt.engine.Wait(ctx, j.ID)
+		if err != nil {
+			t.Fatalf("%s: wait: %v", stage, err)
+		}
+		if final.State != wantState {
+			t.Fatalf("%s: job state = %q (error %q), want %q", stage, final.State, final.Error, wantState)
+		}
+		return final
+	}
+
+	// THE FINDING: a repair performed through the loopback tools API — which
+	// enqueues exactly this install job — heals the field with no restart.
+	runJob("repair install", func() (*toolbelt.Job, error) { return rt.engine.Install("faketool") }, toolbelt.JobDone)
+	assertStage("after a successful repair install", toolsStateOK)
+
+	// A failed catalog refresh must NOT degrade: keep-last-good makes it
+	// routine, and the boot refresh runs before the publisher is reachable.
+	// The URL is empty here (no KWEB_TOOL_CATALOG_URL), so the fetch fails.
+	runJob("catalog refresh", rt.engine.RefreshCatalog, toolbelt.JobFailed)
+	assertStage("after a failed catalog refresh", toolsStateOK)
+
+	// A failed install DOES degrade: a tool the manifest says should be on
+	// PATH is not there, which is the only thing this field claims.
+	runJob("failing install", func() (*toolbelt.Job, error) { return rt.engine.Install("no-such-tool-xyz") }, toolbelt.JobFailed)
+	assertStage("after a failed install", toolsStateDegraded)
+
+	if kiroReadyCalls.Load() == 0 {
+		t.Error("kiroReady was never consulted; the health assertions above never proved readiness stayed separate")
+	}
+}
+
+// TestToolsStatus_callbackAndHealthReadAreRaceClean pins the concurrency
+// contract the reducer was written for: OnJobChanged fires from toolbelt's job
+// worker (under its queue lock) while /api/health reads the field on request
+// goroutines. Meaningful under -race, which CI runs; without it the assertions
+// still catch a torn or unexpected value.
+func TestToolsStatus_callbackAndHealthReadAreRaceClean(t *testing.T) {
+	t.Parallel()
+
+	s := newToolsStatus()
+	s.recordBoot(toolsStateDegraded)
+
+	deps := newTestDeps(true)
+	deps.toolsState = s.get
+	health := handleHealth(deps)
+
+	const rounds = 200
+	var wg sync.WaitGroup
+	// Writers: the callback path, alternating a failing and a succeeding
+	// counted job plus an excluded one.
+	for _, kind := range []string{toolbelt.JobKindInstall, toolbelt.JobKindReconcile, toolbelt.JobKindCatalogRefresh} {
+		wg.Go(func() {
+			for i := range rounds {
+				state := toolbelt.JobDone
+				if i%2 == 1 {
+					state = toolbelt.JobFailed
+				}
+				s.observeJob(jobEvent(kind, state))
+			}
+		})
+	}
+	// Readers: the health handler, plus the raw getter registerRoutes wires.
+	for range 3 {
+		wg.Go(func() {
+			for range rounds {
+				rec := httptest.NewRecorder()
+				health(rec, httptest.NewRequest(http.MethodGet, "/api/health", http.NoBody))
+				if rec.Code != http.StatusOK {
+					t.Errorf("health during concurrent job transitions = %d, want 200", rec.Code)
+					return
+				}
+				switch got := s.get(); got {
+				case toolsStateOK, toolsStateDegraded:
+				default:
+					t.Errorf("state read = %q, want ok or degraded (syncing is never re-entered after the boot verdict)", got)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
 }
 
 // TestParseBoolEnv_neverLogsRawValue pins the parser's VOCABULARY (so the local

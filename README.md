@@ -166,6 +166,19 @@ finished PATH. If provisioning fails, sessions are not blocked: creation is
 allowed anyway, the failure is logged, and `/api/health` reports
 `"tools": "degraded"`.
 
+That `tools` field is informational (it never affects the container's
+healthy/unhealthy verdict) and it is **live**, not just a boot result:
+`"syncing"` while the boot pass runs, then `"ok"` or `"degraded"` after each
+tool install or reconcile the server runs — including the ones you trigger
+through the loopback tools API. So repairing a failed install from inside the
+container (`POST localhost:9848/api/tools/...`) flips the field back to
+`"ok"` without restarting anything. Two things it deliberately does not
+report: a failed **catalog refresh** (the last good catalog keeps serving, so
+that failure changes nothing about your installed tools) and a failed
+**update**, **uninstall** or **disable** (your installed versions stay on
+`PATH`). kiro-cli's own readiness is a separate field — see the `status` and
+`reason` keys.
+
 **Add more tools by name.** Any catalog name works as a bare entry; the engine
 fills in the rest:
 

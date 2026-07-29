@@ -5,10 +5,17 @@
 # name-shaped, then a known-name gate (apt-cache pkgnames) refuses anything that
 # is not a real package -- and that second gate is what keeps a token away from
 # apt's regex fallback, where `apt-get install -s -- 'jq.'` plans 337 packages.
-# When the gate cannot run (a failed apt-get update, an unreadable index) the
-# install still proceeds on the grammar alone, minus DOTTED tokens: '.' is the only
-# apt metacharacter the grammar admits, so dropping just those removes the blowup
-# while every plain name still installs.
+#
+# The gate is attempted even when `apt-get update` FAILED, because the reachable
+# failure is a partial refresh whose surviving index still comes from real
+# repository metadata: it can only produce false negatives (a valid package it
+# does not list waits for a later boot), never a false positive. Only when that
+# oracle is unusable (non-zero exit, deadline kill, empty output) does the install
+# fall back to the grammar alone, minus every token containing '.' or '+' -- the
+# complete set of apt expansion characters the grammar admits ('.' is
+# any-character, '+' is one-or-more, so `jq++`, `libjq+1` and `libj+q1` all
+# regex-resolve to real packages). Plain names still install, which is the common
+# case and the reason skip-everything was rejected.
 #
 # Drives the real inline block with apt stubbed, recording exactly what argv
 # apt-get install would have received.
@@ -36,6 +43,13 @@ if [ -z "$start" ] || [ -z "$end" ]; then
   exit 1
 fi
 sed -n "${start},$((end + 2))p" "$ENTRYPOINT" >"$WORK/block.sh"
+# Fatal precondition, not decoration: an empty or truncated extraction installs
+# nothing and warns about nothing, which is indistinguishable from a correctly
+# refusing block -- every negative case below would go green against no code at all.
+if [ ! -s "$WORK/block.sh" ] || ! bash -n "$WORK/block.sh" 2>/dev/null; then
+  printf 'harness error: the extracted APT_PACKAGES block is empty or does not parse\n' >&2
+  exit 1
+fi
 extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 
 # RUN_CWD lets a case choose the directory the harness runs FROM. Empty means "here":
@@ -44,8 +58,15 @@ extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 RUN_CWD=""
 
 # run <update_rc> <pkgnames_mode> <APT_PACKAGES>
-#   pkgnames_mode: ok | empty | fail
-# -> INSTALLED (the argv apt-get install received), SKIPPED (warn count)
+#   pkgnames_mode: ok | partial | empty | fail
+#     ok      - a full index: every name the cases use is known
+#     partial - the surviving half of a partial refresh: a SUBSET of the real names,
+#               which is the only thing an incomplete index can be (false negatives,
+#               never false positives)
+#     empty   - the command succeeds but yields no names (unusable oracle)
+#     fail    - the command itself fails (unusable oracle)
+# -> INSTALLED (the argv apt-get install received), SKIPPED (warn count),
+#    INSTALL_CALLS (invocations), $WORK/warns (the stderr, for warn_for)
 run() {
   local urc=$1 mode=$2 pkgs=$3
   cat >"$WORK/harness.sh" <<HARNESS
@@ -82,10 +103,14 @@ apt-get() {
   return 0
 }
 apt-cache() {
+  # The stub answers the same whatever the update rc was, which is the point: a
+  # failed update does not by itself make the index unreadable, and the block must
+  # ASK rather than assume. _MODE is what decides usability here.
   case "\$_MODE" in
-    ok)    printf '%s\n' jq gcc python3 python3.13 docker.io g++ ;;
-    empty) : ;;
-    fail)  return 1 ;;
+    ok)      printf '%s\n' jq gcc python3 python3.13 docker.io g++ ;;
+    partial) printf '%s\n' jq gcc ;;
+    empty)   : ;;
+    fail)    return 1 ;;
   esac
 }
 timeout() { shift 3; "\$@"; }
@@ -108,29 +133,105 @@ $(cat "$WORK/block.sh")
 HARNESS
   : >"$WORK/installed"
   : >"$WORK/calls"
-  SKIPPED=$(cd "${RUN_CWD:-$PWD}" && bash "$WORK/harness.sh" 2>&1 >/dev/null | grep -c 'level=warn.*skipping' || true)
+  : >"$WORK/warns"
+  # stderr is kept in a file rather than counted through a pipe so a case can assert
+  # WHICH refusal fired, not just how many did: the oracle's "no such package" and
+  # the fallback's expansion-character refusal are different guards, and an
+  # outcome-only count cannot tell them apart.
+  (cd "${RUN_CWD:-$PWD}" && bash "$WORK/harness.sh" >/dev/null 2>"$WORK/warns")
+  SKIPPED=$(grep -c 'level=warn.*skipping' "$WORK/warns" || true)
   INSTALLED=$(tr '\n' ' ' <"$WORK/installed" | sed 's/ *$//')
   INSTALL_CALLS=$(grep -c 'install-call' "$WORK/calls" 2>/dev/null || true)
 }
 
-# --- the gate RUNS: unchanged behaviour, dots verified literally -------------
-run 0 ok 'jq python3.13 docker.io nosuchpkg.'
-[ "$INSTALLED" = "jq python3.13 docker.io" ] \
-  && ok "gate available: real dotted names install, the typo is rejected" \
-  || no "gate available" "installed='$INSTALLED', want 'jq python3.13 docker.io'"
+# warn_for <token> -> the warn line that named exactly this token (empty if none)
+warn_for() {
+  grep -F "token=\"$1\"" "$WORK/warns" 2>/dev/null | head -1
+}
 
-# --- THE REGRESSION: gate unavailable via a failed update --------------------
-run 100 ok 'jq gcc python3.13 nosuchpkg.'
-case "$INSTALLED" in
-  *nosuchpkg.*) no "update failed" "'nosuchpkg.' reached apt -- the 337-package regex blowup is live" ;;
-  *)
-    [ "$INSTALLED" = "jq gcc" ] \
-      && ok "update failed: plain names install, every dotted token dropped" \
-      || no "update failed" "installed='$INSTALLED', want 'jq gcc'"
-    ;;
+# --- the gate RUNS: unchanged behaviour, expansion characters verified literally --
+run 0 ok 'jq python3.13 docker.io g++ nosuchpkg.'
+[ "$INSTALLED" = "jq python3.13 docker.io g++" ] \
+  && ok "gate available: real '.'/'+' names install (docker.io, g++), the typo is rejected" \
+  || no "gate available" "installed='$INSTALLED', want 'jq python3.13 docker.io g++'"
+
+# --- THE OPTION-C PATH: update failed, the oracle still answers ---------------
+# The whole point of the design: a partial refresh leaves a usable index, so names
+# are still verified EXACTLY instead of being guessed at by character class. With
+# the oracle-retry removed (the gate wrapped in `if apt_update_rc -eq 0`) this case
+# reports installed='jq' -- docker.io and g++ carry expansion characters and the
+# fallback drops them.
+run 100 ok 'jq docker.io g++ nosuchpkg.'
+[ "$INSTALLED" = "jq docker.io g++" ] \
+  && ok "update failed but the oracle answers: names it proves install, including '.'/'+'" \
+  || no "degraded oracle recovery" "installed='$INSTALLED', want 'jq docker.io g++'"
+# And the refusal must come from the ORACLE, not the character filter: naming the
+# guard is what separates "the index answered and this name is not in it" from
+# "nothing could answer, so anything with a metacharacter goes". An outcome-only
+# assertion is green either way.
+case "$(warn_for 'nosuchpkg.')" in
+  *"no such package"*) ok "degraded refusal is the oracle's own (no such package), not the character filter" ;;
+  '') no "degraded refusal" "no warn named the token 'nosuchpkg.'" ;;
+  *) no "degraded refusal" "wrong guard refused it: $(warn_for 'nosuchpkg.')" ;;
 esac
 
-# --- gate unavailable via an unreadable index -------------------------------
+# --- a plain typo, no metacharacter at all, must still be refused ------------
+# This is what the oracle buys that no character rule can: 'nosuchpkg' is
+# grammar-valid, carries neither '.' nor '+', and is not a package. Before the
+# oracle retry a degraded boot installed it (apt then resolves nothing and the
+# install fails wholesale, taking the valid packages with it).
+run 100 ok 'jq nosuchpkg'
+[ "$INSTALLED" = "jq" ] && [ "$SKIPPED" -eq 1 ] \
+  && ok "degraded boot: a metacharacter-free typo is refused by the oracle, not installed" \
+  || no "degraded plain typo" "installed='$INSTALLED' skipped=$SKIPPED, want 'jq' / 1"
+
+# --- an INCOMPLETE index only ever loses a package, never admits one ---------
+# 'docker.io' is real but absent from the surviving half, so it is skipped as
+# unknown and installs on a boot whose index is complete. That false negative is
+# the entire cost of trusting a partial index.
+run 100 partial 'jq docker.io'
+case "$(warn_for docker.io)" in
+  *"no such package"*)
+    [ "$INSTALLED" = "jq" ] \
+      && ok "partial index: a name it does not list waits for the next boot (false negative only)" \
+      || no "partial index" "installed='$INSTALLED', want 'jq'"
+    ;;
+  *) no "partial index" "docker.io was not refused as unknown: installed='$INSTALLED' warn='$(warn_for docker.io)'" ;;
+esac
+
+# --- THE REGRESSION: no usable oracle, so '+' and '.' must both be dropped ---
+# `jq++`, `libjq+1` and `libj+q1` are all grammar-valid and all regex-resolve
+# through apt's unanchored fallback ('+' is one-or-more, so the metacharacter is
+# live ANYWHERE in the token, not only as a trailing suffix). With the filter still
+# dot-only, each of them reaches apt's argv and the blowup is live.
+for mode in fail empty; do
+  run 100 "$mode" 'jq jq++ libjq+1 libj+q1 python3.13'
+  case "$INSTALLED" in
+    *+* | *python3.13*) no "unusable oracle ($mode)" "an expansion-character token reached apt: '$INSTALLED'" ;;
+    *)
+      [ "$INSTALLED" = "jq" ] && [ "$SKIPPED" -eq 4 ] \
+        && ok "unusable oracle ($mode): jq++ / libjq+1 / libj+q1 and the dotted token are all dropped" \
+        || no "unusable oracle ($mode)" "installed='$INSTALLED' skipped=$SKIPPED, want 'jq' / 4"
+      ;;
+  esac
+done
+
+# Each dropped token must be named by the FALLBACK's refusal, and per token: a
+# single count cannot tell "all four were filtered" from "one was filtered and
+# three vanished somewhere else", and the operator needs the token and the reason.
+run 100 fail 'jq++ libjq+1 libj+q1 python3.13'
+_reasons_ok=1
+for tok in 'jq++' 'libjq+1' 'libj+q1' 'python3.13'; do
+  case "$(warn_for "$tok")" in
+    *"expansion character"*) ;;
+    *) _reasons_ok=0 ;;
+  esac
+done
+[ "$_reasons_ok" -eq 1 ] \
+  && ok "each dropped token is reported by name with the unverifiable-expansion-character reason" \
+  || no "fallback reporting" "a token was not named with the expansion-character reason: $(cat "$WORK/warns")"
+
+# --- gate unavailable with a SUCCESSFUL update (unreadable index) ------------
 for mode in empty fail; do
   run 0 "$mode" 'jq gcc python3.13 nosuchpkg.'
   [ "$INSTALLED" = "jq gcc" ] \
@@ -138,38 +239,46 @@ for mode in empty fail; do
     || no "index $mode" "installed='$INSTALLED', want 'jq gcc'"
 done
 
-# --- the common case must not regress: no dots, nothing to drop --------------
+# --- the common case must not regress: nothing to drop -----------------------
+# Formerly asserted with the gate presumed dead ('jq gcc g++' silently installed on
+# a failed update because '+' was not filtered). It now asserts the same silence for
+# the right reason -- the oracle proves g++ -- and its counterpart below carries the
+# g++ coverage for the case where nothing can prove it.
 run 100 ok 'jq gcc g++'
 [ "$INSTALLED" = "jq gcc g++" ] && [ "$SKIPPED" -eq 0 ] \
-  && ok "no dotted tokens: a degraded boot installs everything, silently" \
+  && ok "degraded boot with a usable oracle: g++ installs, silently" \
   || no "undotted degraded" "installed='$INSTALLED' skipped=$SKIPPED"
+run 100 fail 'jq gcc g++'
+[ "$INSTALLED" = "jq gcc" ] && [ "$SKIPPED" -eq 1 ] \
+  && ok "degraded boot with no oracle: g++ waits, the plain names still install" \
+  || no "undotted no-oracle" "installed='$INSTALLED' skipped=$SKIPPED, want 'jq gcc' / 1"
 
-# --- an all-dotted list must not invoke apt with an empty argv ---------------
+# --- an all-dropped list must not invoke apt with an empty argv ---------------
 # INSTALL_CALLS is the oracle, not the package list: an empty install records no
 # packages either way, so only the invocation count can see this guard.
-run 100 ok 'python3.13 docker.io'
+run 100 fail 'python3.13 g++'
 [ "$INSTALL_CALLS" -eq 0 ] && [ -z "$INSTALLED" ] && [ "$SKIPPED" -eq 2 ] \
   && ok "all tokens dropped: apt is not called with an empty package list" \
   || no "all dropped" "install_calls=$INSTALL_CALLS installed='$INSTALLED' skipped=$SKIPPED"
 
 # --- the grammar stage still owns its own rejections ------------------------
-# Run with the GATE UNAVAILABLE (failed update): with the gate up, these tokens
-# would be rejected by the known-name check too, and this case could go green with
-# the grammar deleted. Degraded mode is where only the grammar stands between a
-# hostile token and apt's argv, so that is where it is asserted. 'jq-' is the
-# canary: name-shaped enough to reach apt if the grammar's anchor broke, absent
-# from the known-name list, and not dotted (so the degraded dotted-token drop
-# cannot mask its rejection either).
-# `etc/passwd` carries no dot either, so the degraded dotted-token drop cannot mask
-# it: it is the traversal/slash canary the way `jq-` is the anchor canary, and it
-# isolates the grammar's slash rejection that `../etc/passwd` alone cannot.
+# Run with NO usable oracle (failed update AND a failing pkgnames): with the gate
+# up, these tokens would be rejected by the known-name check too, and this case
+# could go green with the grammar deleted. That is where only the grammar stands
+# between a hostile token and apt's argv, so that is where it is asserted. 'jq-' is
+# the canary: name-shaped enough to reach apt if the grammar's anchor broke, absent
+# from any known-name list, and carrying neither '.' nor '+' (so the fallback's
+# expansion-character drop cannot mask its rejection either).
+# `etc/passwd` carries no dot either, so the fallback cannot mask it: it is the
+# traversal/slash canary the way `jq-` is the anchor canary, and it isolates the
+# grammar's slash rejection that `../etc/passwd` alone cannot.
 # `../etc/passwd` stays for the dotted-traversal shape.
-run 100 ok 'jq ../etc/passwd etc/passwd jq- -0day'
+run 100 fail 'jq ../etc/passwd etc/passwd jq- -0day'
 case "$INSTALLED" in
   *jq-* | *passwd* | *opt:*) no "grammar" "a grammar-invalid token reached apt: '$INSTALLED'" ;;
   *)
     [ "$INSTALLED" = "jq" ] \
-      && ok "grammar rejections hold with the gate down (traversal, remove-suffix, option-like)" \
+      && ok "grammar rejections hold with no oracle at all (traversal, remove-suffix, option-like)" \
       || no "grammar" "installed='$INSTALLED', want 'jq'"
     ;;
 esac
@@ -184,8 +293,8 @@ esac
 # reports installed='jq gcc'.
 # The bait filename stays inside the stub's known-name list (`gcc`) so the assertion
 # fails at the INSTALL argv rather than being masked by the known-name gate, and
-# stays undotted so the degraded-path dotted-token drop cannot mask it either -- the
-# same canary discipline the grammar case documents for `jq-` and `etc/passwd`.
+# carries neither '.' nor '+' so the fallback cannot mask it either -- the same
+# canary discipline the grammar case documents for `jq-` and `etc/passwd`.
 mkdir -p "$WORK/globbait" && : >"$WORK/globbait/gcc"
 RUN_CWD="$WORK/globbait"
 run 0 ok 'jq *'

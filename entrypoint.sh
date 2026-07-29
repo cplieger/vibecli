@@ -628,9 +628,9 @@ if [ -n "${APT_PACKAGES:-}" ]; then
       # named distinctly for the same reason every sibling timeout here does: a
       # stalled mirror and an index apt rejected outright call for different
       # operator action, and the generic wording cannot tell them apart.
-      printf 'level=warn msg="apt-get update exceeded its 300s deadline and was terminated; APT_PACKAGES install may fail and the known-name check is skipped" rc=%d component=entrypoint\n' "$apt_update_rc" >&2
+      printf 'level=warn msg="apt-get update exceeded its 300s deadline and was terminated; APT_PACKAGES install may fail and the known-name check runs against whatever index survived" rc=%d component=entrypoint\n' "$apt_update_rc" >&2
     elif [ "$apt_update_rc" -ne 0 ]; then
-      printf 'level=warn msg="apt-get update failed; APT_PACKAGES install may fail and the known-name check is skipped" rc=%d component=entrypoint\n' "$apt_update_rc" >&2
+      printf 'level=warn msg="apt-get update failed; APT_PACKAGES install may fail and the known-name check runs against whatever index survived" rc=%d component=entrypoint\n' "$apt_update_rc" >&2
     fi
 
     # Known-name gate. The grammar above is only a PROXY for "is this a real
@@ -655,75 +655,89 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     # the warning says so: `apt-get install awk` fails on its own anyway, because a
     # multi-provider virtual has no installation candidate. Naming a concrete
     # provider is the fix in both cases, and the warning is clearer than apt's.
-    apt_gate_ran=0
-    if [ "$apt_update_rc" -eq 0 ]; then
-      apt_names=$(mktemp) || apt_names=''
-      # Bounded like every other external call in this foreground path: this runs
-      # before any listener exists, so an index apt cannot read through (corrupt or
-      # partially-written cache, very slow storage) would otherwise stall boot with
-      # no deadline and no diagnostic -- the container would sit in starting/
-      # unhealthy forever, and restart:unless-stopped never acts because nothing
-      # exited. A killed probe leaves apt_gate_ran=0, which the narrowing below
-      # already handles exactly as it handles an unreadable index.
-      apt_names_rc=0
-      if [ -n "$apt_names" ]; then
-        timeout --signal=TERM --kill-after=10s 60s apt-cache pkgnames >"$apt_names" 2>/dev/null || apt_names_rc=$?
-      else
-        apt_names_rc=1
-      fi
-      if [ "$apt_names_rc" -eq 124 ] || [ "$apt_names_rc" -eq 137 ]; then
-        # 124/137 = the 60s deadline (TERM, then the --kill-after SIGKILL fallback),
-        # named distinctly from the generic unreadable-index warning for the same
-        # reason the sibling timeouts are: a wedged cache and an index apt rejected
-        # outright call for different operator action.
-        printf 'level=warn msg="apt-cache pkgnames exceeded its 60s deadline and was terminated; installing APT_PACKAGES without the known-name check" rc=%d component=entrypoint\n' "$apt_names_rc" >&2
-      fi
-      if [ "$apt_names_rc" -eq 0 ] && [ -s "$apt_names" ]; then
-        apt_gate_ran=1
-        known_pkgs=()
-        for pkg in "${apt_pkgs[@]}"; do
-          if grep -qxF -- "$pkg" "$apt_names"; then
-            known_pkgs+=("$pkg")
-          else
-            warn_skipped_apt_token 'skipping unknown APT_PACKAGES token (no such package; a pure virtual package needs a concrete provider)' "$pkg"
-          fi
-        done
-        apt_pkgs=("${known_pkgs[@]}")
-      elif [ "$apt_names_rc" -ne 124 ] && [ "$apt_names_rc" -ne 137 ]; then
-        printf 'level=warn msg="apt package index unreadable; installing APT_PACKAGES without the known-name check" component=entrypoint\n' >&2
-      fi
-      [ -z "$apt_names" ] || rm -f "$apt_names"
-    fi
-
-    # Whenever the gate could NOT run -- a failed apt-get update above OR an
-    # unreadable index -- skipping it is still the right failure mode: rejecting
-    # every token would turn a transient problem into "none of your packages
-    # installed" plus a misleading per-token typo warning, and the grammar still
-    # holds. But the pre-gate behaviour is exactly what leaves the 337-package
-    # regex blowup described above reachable, so it degrades with ONE narrowing.
     #
-    # '.' is the only apt pattern metacharacter the grammar admits ('?' and '*' are
-    # outside its character class), so a dotted token is the only one that can be
-    # reinterpreted as a regex -- and it is precisely the token the gate exists to
-    # verify as literal. Dropping just those removes the blowup while every plain
-    # name still installs, which is the common case and the reason the
+    # The gate is ATTEMPTED even when apt-get update failed, and that ordering is
+    # the safety property, not an optimization. The reachable failure is a PARTIAL
+    # refresh (some mirrors fine, non-zero exit, index still usable), and every
+    # name such an index yields still comes from real repository metadata -- so an
+    # incomplete index can only produce false NEGATIVES (a valid package it does
+    # not list is skipped and installs on a later boot), never a false positive
+    # that admits a token to apt's regex path. The character fallback below is
+    # therefore the LAST resort, reached only when this oracle is unusable.
+    apt_gate_ran=0
+    apt_names=$(mktemp) || apt_names=''
+    # Bounded like every other external call in this foreground path: this runs
+    # before any listener exists, so an index apt cannot read through (corrupt or
+    # partially-written cache, very slow storage) would otherwise stall boot with
+    # no deadline and no diagnostic -- the container would sit in starting/
+    # unhealthy forever, and restart:unless-stopped never acts because nothing
+    # exited. A killed probe leaves apt_gate_ran=0, which the narrowing below
+    # already handles exactly as it handles an unreadable index.
+    apt_names_rc=0
+    if [ -n "$apt_names" ]; then
+      timeout --signal=TERM --kill-after=10s 60s apt-cache pkgnames >"$apt_names" 2>/dev/null || apt_names_rc=$?
+    else
+      apt_names_rc=1
+    fi
+    if [ "$apt_names_rc" -eq 124 ] || [ "$apt_names_rc" -eq 137 ]; then
+      # 124/137 = the 60s deadline (TERM, then the --kill-after SIGKILL fallback),
+      # named distinctly from the generic unreadable-index warning for the same
+      # reason the sibling timeouts are: a wedged cache and an index apt rejected
+      # outright call for different operator action.
+      printf 'level=warn msg="apt-cache pkgnames exceeded its 60s deadline and was terminated; falling back to the expansion-character filter for APT_PACKAGES" rc=%d component=entrypoint\n' "$apt_names_rc" >&2
+    fi
+    # Usable means exactly this: the command succeeded AND produced a non-empty
+    # name list. Anything else (non-zero exit, deadline kill, empty output, no
+    # temp file to capture into) is unusable and falls through to the filter.
+    if [ "$apt_names_rc" -eq 0 ] && [ -s "$apt_names" ]; then
+      apt_gate_ran=1
+      known_pkgs=()
+      for pkg in "${apt_pkgs[@]}"; do
+        if grep -qxF -- "$pkg" "$apt_names"; then
+          known_pkgs+=("$pkg")
+        else
+          warn_skipped_apt_token 'skipping unknown APT_PACKAGES token (no such package; a pure virtual package needs a concrete provider)' "$pkg"
+        fi
+      done
+      apt_pkgs=("${known_pkgs[@]}")
+    elif [ "$apt_names_rc" -ne 124 ] && [ "$apt_names_rc" -ne 137 ]; then
+      printf 'level=warn msg="apt package index unreadable; falling back to the expansion-character filter for APT_PACKAGES" component=entrypoint\n' >&2
+    fi
+    [ -z "$apt_names" ] || rm -f "$apt_names"
+
+    # Whenever the gate could NOT run -- an unusable oracle, whatever cost it (a
+    # failed apt-get update that also left no readable index, a corrupt cache, a
+    # killed probe) -- skipping it is still the right failure mode: rejecting every
+    # token would turn a transient problem into "none of your packages installed"
+    # plus a misleading per-token typo warning, and the grammar still holds. But
+    # the pre-gate behaviour is exactly what leaves the 337-package regex blowup
+    # described above reachable, so it degrades with ONE narrowing.
+    #
+    # The narrowing drops every token containing '.' or '+', which is the COMPLETE
+    # set of apt expansion characters the grammar admits ('?' and '*' are outside
+    # its character class, and a trailing '-' -- apt's remove form -- is already
+    # rejected by the grammar; an internal '-' has no special interpretation).
+    # Both are live: '.' is any-character and '+' is one-or-more, so `jq++`,
+    # `libjq+1` and `libj+q1` ALL regex-resolve to real packages (measured on apt
+    # 3.0.3, trixie's major) -- a '+' anywhere in the token is enough, this is not
+    # only a trailing-suffix concern. Dropping just these removes the blowup while
+    # every plain name still installs, which is the common case and the reason the
     # skip-everything option was rejected.
     #
-    # Handled here rather than inside either branch so the two ways of losing the
-    # gate cannot drift apart: the likelier one is a PARTIAL apt-get update failure
-    # (some mirrors fine, non-zero exit, index still usable), which is also the only
-    # state where the blowup is actually reachable -- with no index at all, apt
-    # resolves nothing and a regex matches nothing either.
+    # Handled here rather than inside the gate's branches so every way of losing
+    # the gate lands on the same rule and they cannot drift apart.
     #
-    # The cost is narrow and self-healing: a real dotted name (docker.io,
-    # python3.13) waits for a boot whose index is readable, which is a boot where
-    # the install was going to be unreliable anyway. Per "a broken state must be
-    # able to heal itself", the next boot's gate installs it.
+    # The cost is narrow and self-healing: a real name carrying one of these
+    # characters (docker.io, python3.13, g++) waits for a boot whose index answers,
+    # which is a boot where the install was going to be unreliable anyway. Per "a
+    # broken state must be able to heal itself", the next boot's gate installs it —
+    # and because the gate is now attempted even after a failed update, a partial
+    # index is usually enough to install it on THIS boot.
     if [ "$apt_gate_ran" -eq 0 ] && [ "${#apt_pkgs[@]}" -gt 0 ]; then
       ungated_pkgs=()
       for pkg in "${apt_pkgs[@]}"; do
-        if [[ "$pkg" == *.* ]]; then
-          warn_skipped_apt_token 'skipping dotted APT_PACKAGES token while the known-name check is unavailable (a dot is an apt regex metacharacter; retry once the package index is readable)' "$pkg"
+        if [[ "$pkg" == *.* || "$pkg" == *+* ]]; then
+          warn_skipped_apt_token 'skipping unverifiable APT_PACKAGES token containing an apt expansion character (. or +) while the known-name check is unavailable; retry once the package index is readable' "$pkg"
         else
           ungated_pkgs+=("$pkg")
         fi

@@ -14,8 +14,10 @@ import (
 // leaves the helper's default header on every asset and the whole suite stays
 // green (verified by deleting the option: fonts then answer "no-cache" and
 // only this test fails). The two branches are what the header must prove:
-// the ~9.4 MB Monaspace fonts are immutable for 30 days (otherwise every
-// visit re-downloads them) and everything else is no-cache +
+// the ~9.4 MB Monaspace fonts are cached for 30 days without `immutable`
+// (otherwise every visit re-downloads them, and with `immutable` a font whose
+// bytes change under the same filename could not be busted by a reload) and
+// everything else is no-cache +
 // must-revalidate (otherwise a deploy serves a stale bundle against a
 // changed server wire protocol).
 func TestStaticCachePolicyServedOnResponses(t *testing.T) {
@@ -29,7 +31,7 @@ func TestStaticCachePolicyServedOnResponses(t *testing.T) {
 	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	for _, tc := range []struct{ path, wantCache string }{
-		{path: "/vendor/fonts/mono.woff2", wantCache: "public, max-age=2592000, immutable"},
+		{path: "/vendor/fonts/mono.woff2", wantCache: "public, max-age=2592000"},
 		{path: "/", wantCache: "no-cache, must-revalidate"},
 	} {
 		t.Run(tc.path, func(t *testing.T) {

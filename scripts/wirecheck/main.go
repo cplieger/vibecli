@@ -23,9 +23,20 @@ import (
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
+// usageErrMsg is the exit-2 line: the flag values are unusable, so the
+// extraction is broken. Shared by run's own validation and flag's parse-error
+// path (a scrape matching TWICE, or a non-numeric capture, never reaches run:
+// flag.CommandLine is ExitOnError and exits 2 from inside flag.Parse), so both
+// exit-2 shapes tell the reader to fix the gate rather than move a pin.
+const usageErrMsg = "ERROR wire-floor-gate-usage: -client-rev and -client-min-server are required positive integers (the Dockerfile's extraction from the vendored engine artifact's src/wire-compatibility.ts is broken — fix the gate, do not bump a pin)"
+
 func main() {
 	clientRev := flag.Int("client-rev", 0, "client WIRE_PROTOCOL_VERSION from the vendored npm artifact")
 	clientMinServer := flag.Int("client-min-server", 0, "client MIN_SUPPORTED_SERVER_WIRE_VERSION from the vendored npm artifact")
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), usageErrMsg)
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	os.Exit(run(*clientRev, *clientMinServer, os.Stdout, os.Stderr))
 }
@@ -50,7 +61,7 @@ func main() {
 // compatibility verdict (exit 1, "bump a pin").
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	if clientRev <= 0 || clientMinServer <= 0 {
-		fmt.Fprintln(stderr, "ERROR wire-floor-gate-usage: -client-rev and -client-min-server are required positive integers (the Dockerfile's extraction from the vendored engine artifact's src/wire-compatibility.ts is broken — fix the gate, do not bump a pin)")
+		fmt.Fprintln(stderr, usageErrMsg)
 		return 2
 	}
 	if reason := terminal.WirePairIncompatibility(

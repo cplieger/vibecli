@@ -32,17 +32,11 @@ set -u
 . "$(dirname -- "$0")/lib.sh"
 new_workdir >/dev/null
 
-# The logic under test is INLINE boot code, not a function, so it is taken by line
-# range: from the APT_PACKAGES guard to the index reclaim, plus two lines to close
-# the enclosing if. Line numbers are resolved from the file rather than hardcoded.
-start=$(grep -n '^if \[ -n "${APT_PACKAGES:-}" \]; then$' "$ENTRYPOINT" | head -1 | cut -d: -f1)
-end=$(grep -n 'rm -rf /var/lib/apt/lists/\*' "$ENTRYPOINT" | head -1 | cut -d: -f1)
-if [ -z "$start" ] || [ -z "$end" ]; then
-  printf 'harness error: could not locate the APT_PACKAGES block (start=%s end=%s)\n' \
-    "$start" "$end" >&2
-  exit 1
-fi
-sed -n "${start},$((end + 2))p" "$ENTRYPOINT" >"$WORK/block.sh"
+# The logic under test is INLINE boot code, not a function, so it is taken by
+# range. lib.sh's block form, which names this block in its own doc comment.
+# Captured as an assignment, never as `. "$(extract_range ...)"`: the harness's
+# fatal has to reach THIS process, not just a command substitution's subshell.
+extract_range '^if \[ -n "${APT_PACKAGES:-}" \]; then$' '^fi$' "$WORK/block.sh" >/dev/null || exit 1
 # Fatal precondition, not decoration: an empty or truncated extraction installs
 # nothing and warns about nothing, which is indistinguishable from a correctly
 # refusing block -- every negative case below would go green against no code at all.

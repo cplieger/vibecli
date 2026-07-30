@@ -396,6 +396,7 @@ esac
 # `.local/bin -> /workspace/victim` link used to delete the link target's matching
 # files before any guard looked at that path. /config is included so a symlinked mount
 # root cannot redirect the whole tree; $HOME itself was proven above.
+printf 'level=info msg="preparing persistent directories" dir="%s" component=entrypoint\n' /config >&2
 make_config_dir /config
 make_config_dir "$TOOLS"
 make_config_dir "$TOOLS/bin"
@@ -413,6 +414,14 @@ make_config_dir "$TOOLS/bin"
 # hardened below: it holds engine binaries that $TOOLS/bin symlinks into and root
 # executes.
 make_config_dir "$TOOLS/opt"
+# The toolbelt engine's two package-manager roots. Created and validated here
+# for the same reason $TOOLS/opt is: their bin dirs hold npm -g / uv tool
+# launchers that $TOOLS/bin symlinks into and root executes
+# (toolbelt install.go npmDir/pythonDir).
+make_config_dir "$TOOLS/npm"
+make_config_dir "$TOOLS/npm/bin"
+make_config_dir "$TOOLS/python"
+make_config_dir "$TOOLS/python/bin"
 make_config_dir "$TOOLS/kiro-cli-versions"
 make_config_dir "$HOME/.local"
 make_config_dir "$HOME/.local/bin"
@@ -453,6 +462,41 @@ secure_tools_dir "$TOOLS"
 secure_tools_dir "$TOOLS/bin"
 secure_tools_dir "$TOOLS/opt"
 secure_tools_dir "$TOOLS/kiro-cli-versions"
+# Same argument as $TOOLS/opt: a group/other-writable directory here lets a
+# foreign host user REPLACE a launcher root runs, which tightening the file
+# alone cannot prevent. arm=0 -- neither tree ever holds kiro-cli, so a loose
+# mode here is no reason to distrust a version directory and re-download.
+secure_tools_dir "$TOOLS/npm" 0 1
+secure_tools_dir "$TOOLS/npm/bin" 0 1
+secure_tools_dir "$TOOLS/python" 0 1
+secure_tools_dir "$TOOLS/python/bin" 0 1
+# One level INSIDE the install root: the version directories and the dispatchers they hold.
+# The root's own mode says nothing about them, and the manager's remaining gates cannot tell
+# the difference -- a `.complete` sentinel is a plain file and a --version probe is satisfied
+# by a wrapper -- so a version directory a foreign host user can still rewrite would be
+# activated with the taint UNSET. Tighten what we can and ARM the taint, which is this app's
+# documented remedy (distrust plus reinstall from the digest-verified archive); warn, never
+# fatal, and never delete, per web-terminal-kiro.md "Failure posture". The globs skip
+# dot-prefixed staging trees for free (a leading dot is not matched by *), and a symlinked
+# entry arms the taint rather than being stat'd through, so no chmod here can reach a path
+# outside the install root.
+for version_entry in "$TOOLS/kiro-cli-versions"/* "$TOOLS/kiro-cli-versions"/*/*; do
+  [ -e "$version_entry" ] || continue
+  if [ -L "$version_entry" ]; then
+    tools_tree_was_writable=1
+    printf 'level=warn msg="an entry inside the kiro-cli install root is a symlink; treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" component=entrypoint\n' \
+      "$version_entry" >&2
+    continue
+  fi
+  version_entry_mode=$(stat -c '%a' "$version_entry" 2>/dev/null) || version_entry_mode=""
+  if [ -n "$version_entry_mode" ] && [ $((8#$version_entry_mode & 0022)) -eq 0 ]; then
+    continue
+  fi
+  tools_tree_was_writable=1
+  printf 'level=warn msg="an entry inside the kiro-cli install root is group/other-writable or its mode cannot be read; tightening it and treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" mode=%s component=entrypoint\n' \
+    "$version_entry" "${version_entry_mode:-unknown}" >&2
+  chmod go-w "$version_entry" 2>/dev/null || true
+done
 # The Dockerfile's ENV PATH puts ONE more /config-resident dir ahead of /usr/bin
 # for the server, its PTY sessions and the toolbelt engine: $TOOLS/go/bin, i.e.
 # GOPATH/bin. (The two runtimes/{go,node}/bin segments were dropped from ENV PATH
@@ -496,16 +540,37 @@ tightened_tool_bins=0
 for tool_bin in "$TOOLS/bin"/*; do
   # An unmatched glob, or a dangling symlink -- nothing that can be executed.
   [ -e "$tool_bin" ] || continue
-  # kiro-cli* here is the server's, not the engine's: the manager publishes a
-  # convenience symlink at $TOOLS/bin/kiro-cli pointing INTO the active version
-  # directory (nothing in the product reads it; it exists so
+  # Exactly `kiro-cli` is the server's: the manager publishes ONE convenience
+  # symlink at $TOOLS/bin/kiro-cli pointing INTO the active version directory
+  # (nothing in the product reads it; it exists so
   # `docker exec … kiro-cli --version` keeps working). Dereferencing it would report
-  # on a file the manager owns and re-publishes on every boot, so skip it.
-  case "${tool_bin##*/}" in kiro-cli*) continue ;; esac
+  # on a file the manager owns and re-publishes on every boot, so skip it. The
+  # skip is the exact name, NOT a kiro-cli* prefix: this directory is co-owned by
+  # the toolbelt engine (which is why main.go's legacy purge names its three
+  # dispatcher targets rather than prefix-sweeping here), and the purge is
+  # marker-gated to one boot -- so any other kiro-cli-* entry is either the
+  # engine's or unaccounted for, and both belong under the rule below.
+  case "${tool_bin##*/}" in kiro-cli) continue ;; esac
   tool_bin_mode=$(stat -Lc '%a' "$tool_bin" 2>/dev/null) || tool_bin_mode=""
   if [ -n "$tool_bin_mode" ] && [ $((8#$tool_bin_mode & 0022)) -eq 0 ]; then
     continue
   fi
+  # chmod FOLLOWS the symlink, so an entry pointing OUT of the tools tree would have root
+  # strip write bits from an unrelated path -- and the only entries that reach here are the
+  # ones already carrying a group/other write bit, i.e. device nodes (0666) and shared host
+  # directories (0777). A planted `x -> /dev/null` would degrade every process in the
+  # container; a link into /workspace would undo a permission the host operator set. Only
+  # targets inside $TOOLS are ours to tighten -- the same containment assertion
+  # prune_superseded_kas_runtimes makes before it deletes as root.
+  tool_bin_real=$(realpath -e "$tool_bin" 2>/dev/null) || tool_bin_real=""
+  case "$tool_bin_real" in
+    "$TOOLS"/*) ;;
+    *)
+      printf 'level=warn msg="skipping a group/other-writable tools bin entry whose target resolves outside the tools tree; tightening it would chmod a path this container does not own" path="%s" resolved="%s" mode=%s component=entrypoint\n' \
+        "$tool_bin" "${tool_bin_real:-unknown}" "${tool_bin_mode:-unknown}" >&2
+      continue
+      ;;
+  esac
   loose_mode=$tool_bin_mode
   chmod_rc=0
   chmod go-w "$tool_bin" || chmod_rc=$?
@@ -561,7 +626,7 @@ fi
 # and an unpinned binary on PATH. Warn, don't exit: every session leads its PATH with
 # the active version's directory, so nothing here can shadow the pinned CLI -- this is
 # hygiene, not an integrity gate.
-sweep_legacy_dispatchers "$HOME/.local/bin" || true
+sweep_legacy_dispatchers "$HOME/.local/bin"
 
 # Reclaim superseded kiro-cli agent runtimes. This stays in the entrypoint rather than
 # moving into the server with the installer, for three reasons: the kas store is a
@@ -578,7 +643,8 @@ sweep_legacy_dispatchers "$HOME/.local/bin" || true
 # the prune after the manager's selection -- would put it after the listener binds and
 # after the first session can start, so two trees could coexist on the routine bump
 # path. One tree at peak on every boot beats a rare re-unpack.
-prune_superseded_kas_runtimes "$KIRO_CLI_VERSION" || true
+printf 'level=info msg="pruning superseded kiro-cli agent runtimes" keep=%s component=entrypoint\n' "$KIRO_CLI_VERSION" >&2
+prune_superseded_kas_runtimes "$KIRO_CLI_VERSION"
 
 # OS packages (APT_PACKAGES env, e.g. "python3 gcc libc6-dev"). apt state
 # lives in the ephemeral container layer — never on /config — so it is
@@ -622,6 +688,7 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     # reason the kiro-cli download uses stall detection: a deadline sized for a
     # fast link is a bandwidth floor in disguise.
     apt_update_rc=0
+    printf 'level=info msg="refreshing apt indexes for APT_PACKAGES" component=entrypoint\n' >&2
     timeout --signal=TERM --kill-after=30s 300s apt-get update -qq || apt_update_rc=$?
     if [ "$apt_update_rc" -eq 124 ] || [ "$apt_update_rc" -eq 137 ]; then
       # 124/137 = the 300s deadline (TERM, then the --kill-after SIGKILL fallback),
@@ -700,6 +767,12 @@ if [ -n "${APT_PACKAGES:-}" ]; then
         fi
       done
       apt_pkgs=("${known_pkgs[@]}")
+    elif [ -z "$apt_names" ]; then
+      # The index may be perfectly readable: what failed is creating the file to
+      # capture the name list into. Named separately for the same reason the
+      # deadline warnings are -- an unwritable container temp dir and an index apt
+      # cannot read call for different operator action.
+      printf 'level=warn msg="could not create the temp file for the apt known-name check (is the container temp dir writable?); falling back to the expansion-character filter for APT_PACKAGES" component=entrypoint\n' >&2
     elif [ "$apt_names_rc" -ne 124 ] && [ "$apt_names_rc" -ne 137 ]; then
       printf 'level=warn msg="apt package index unreadable; falling back to the expansion-character filter for APT_PACKAGES" component=entrypoint\n' >&2
     fi
@@ -746,6 +819,22 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     fi
   fi
   if [ "${#apt_pkgs[@]}" -gt 0 ]; then
+    # A SIGKILL landing inside the install deadline (docker stop during the
+    # foreground window; this shell defers SIGTERM until the child returns) leaves
+    # dpkg interrupted, and apt state is container-layer state that SURVIVES
+    # docker start -- so every later boot would refuse the install with rc=100 and
+    # no package would ever be installed again for this container's life. Reconfigure
+    # once, bounded, warn-only: the state is either absent (a no-op) or the only
+    # thing standing between the operator and their packages.
+    if ! timeout --signal=TERM --kill-after=30s 300s dpkg --audit >/dev/null 2>&1 \
+      || [ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]; then
+      printf 'level=warn msg="dpkg is in an interrupted state (an earlier APT_PACKAGES install was killed mid-transaction); reconfiguring before installing" component=entrypoint\n' >&2
+      dpkg_fix_rc=0
+      timeout --signal=TERM --kill-after=30s 300s dpkg --configure -a || dpkg_fix_rc=$?
+      if [ "$dpkg_fix_rc" -ne 0 ]; then
+        printf 'level=warn msg="dpkg --configure -a failed; APT_PACKAGES will keep failing until the container is recreated" rc=%d component=entrypoint\n' "$dpkg_fix_rc" >&2
+      fi
+    fi
     printf 'level=info msg="installing OS packages" packages="%s" component=entrypoint\n' "${apt_pkgs[*]}" >&2
     # Called directly rather than through `bash -c`: with update split out there is
     # nothing left to chain, and one less shell between env content and apt is one
@@ -808,4 +897,5 @@ fi
 # install regardless of what else is on this PATH.
 PATH="$SESSION_PATH"
 export PATH
+printf 'level=info msg="entrypoint complete; starting the web server" component=entrypoint\n' >&2
 exec /app/web-terminal-kiro

@@ -1,5 +1,6 @@
-import { createTerminal } from "@cplieger/web-terminal-ui";
+import { createTerminal, type CreateTerminalOptions } from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
+import type { PublicThemeToken } from "@cplieger/web-terminal-ui/style-contract";
 
 // The one brand accent, as bare hsl() components: the accent token and the two
 // alpha-blended tab fills below all compose from this single literal, so a hue
@@ -21,7 +22,7 @@ if (loading?.hasAttribute("data-bootstrap-fatal")) {
   );
 }
 
-createTerminal("#terminal", {
+const options: CreateTerminalOptions = {
   // Every session is an agent expected to report OSC 9;4, so show its activity
   // dot from tab creation. Pass the function so preset failures remain inside
   // createTerminal's recovery boundary.
@@ -43,11 +44,26 @@ createTerminal("#terminal", {
     "--tab-active-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 32%)`,
     "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
     "--tab-active-fg": "#fff",
-    // Tab activity-dot vocabulary, replacing the library defaults: violet =
-    // thinking, green = done, yellow = action required. One family -- 78%
-    // lightness / 0.15 chroma, only the hue varying -- at the pastel accent's own
-    // level, so no state is separated by lightness; the wave/ring/shape cues
-    // carry that.
+    // Tab activity-dot vocabulary for the three states this app's server can
+    // actually report, replacing the library defaults: violet = thinking, green
+    // = done, yellow = action required. One family -- 78% lightness / 0.15
+    // chroma, only the hue varying -- at the pastel accent's own level, so none
+    // of THESE THREE is separated by lightness; the wave/ring/shape cues carry
+    // that (the WCAG 1.4.1 note below).
+    //
+    // The library publishes FIVE --status-* tokens; --status-warning and
+    // --status-failed (OSC 9;4 progress states 4 and 2) deliberately keep the
+    // library defaults, because the pinned Go engine reports only
+    // working/idle/input/done/exited (web-terminal-engine/v3 terminal/
+    // session_manager.go), so this app can never paint those two dots. Do NOT
+    // read the lightness sentence above as a general rule if that ever changes:
+    // PUBLIC_THEME_TOKENS requires the three ANIMATED states
+    // (working/warning/failed, which share one travelling wave and differ only
+    // in hue) to keep a LIGHTNESS spread, and this violet working dot (OKLab L
+    // 77.6%) already sits 8.5 L points from the library's default warning
+    // yellow (#facc15, L 86.1%) where the library's own blue working dot sat
+    // 14.2 apart. Retheme those two in-family before adopting an engine that
+    // emits them.
     //
     // Working is pinned as an sRGB HEX while its two siblings stay in oklch,
     // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
@@ -67,6 +83,18 @@ createTerminal("#terminal", {
     "--status-working": "#c6a0ff",
     "--status-done": "oklch(78% 0.15 150deg)",
     "--status-input": "oklch(78% 0.15 95deg)",
-  },
-  ...(loading ? { loading } : {}),
-});
+  } satisfies Partial<Record<PublicThemeToken, string>>,
+};
+
+// Assigned rather than spread: a spread-introduced key is not "fresh", so
+// TypeScript's excess-property check never sees it -- `loading` would survive a
+// rename or removal of the option in @cplieger/web-terminal-ui with no compile
+// error, and app.test.ts asserts this app's own key name against a mocked
+// createTerminal, so nothing else would catch it either. A property assignment on
+// a CreateTerminalOptions-typed local IS checked, and the `if` keeps the key
+// ABSENT rather than undefined (exactOptionalPropertyTypes).
+if (loading) {
+  options.loading = loading;
+}
+
+createTerminal("#terminal", options);

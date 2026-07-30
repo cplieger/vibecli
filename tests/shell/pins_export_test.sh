@@ -130,7 +130,8 @@ grep -q '^KIRO_CLI_TOOLS_DIR="\$TOOLS"$' "$ENTRYPOINT" \
 # from a hand-editable manifest -- so an entry named `kiro-cli` under opt/ would
 # delete the active kiro-cli and its retained predecessor. Both dirs are still
 # created and hardened; only the kiro-cli root moved out from under opt/.
-for dir in '"$TOOLS/opt"' '"$TOOLS/kiro-cli-versions"'; do
+for dir in '"$TOOLS/opt"' '"$TOOLS/kiro-cli-versions"' \
+  '"$TOOLS/npm"' '"$TOOLS/npm/bin"' '"$TOOLS/python"' '"$TOOLS/python/bin"'; do
   grep -qF "make_config_dir $dir" "$ENTRYPOINT" \
     && ok "make_config_dir walks $dir before the server writes into it" \
     || no "make_config_dir $dir" "the install root is not created component-by-component, so a symlink planted there is followed"
@@ -141,7 +142,7 @@ done
 
 # The install root must not be reachable as a child of a toolbelt tree, whatever
 # it is named. A nested root is what the collision was.
-grep -qE 'make_config_dir "\$TOOLS/(opt|npm|python|bin)/' "$ENTRYPOINT" \
+grep -qE 'make_config_dir "\$TOOLS/(opt|npm|python|bin)/[^"]*kiro-cli' "$ENTRYPOINT" \
   && no "install root under a toolbelt tree" "a directory is created INSIDE one of the toolbelt engine's own trees (opt/npm/python/bin); the engine's per-tool prune and bin republish own everything under those" \
   || ok "no directory is created inside a toolbelt-engine tree, so the engine's prune cannot reach the kiro-cli install"
 

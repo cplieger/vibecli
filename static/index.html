@@ -366,7 +366,14 @@
       // state decidable here: every same-document stylesheet has settled by
       // now, so a null .sheet means it FAILED, not "still loading". Re-dispatch
       // it through the one listener so there stays exactly one dialog builder.
-      for (const link of document.querySelectorAll('link[rel~="stylesheet"]')) {
+      // Exactly the rel the listener above accepts (e.target.rel === "stylesheet").
+      // The two halves of this guard MUST name the same thing: a [rel~=] token match
+      // selects rel="stylesheet preload" too, and the listener then discards it, so
+      // the re-dispatch would raise no dialog and report nothing. Tightened rather
+      // than broadening the listener, because relList.contains("stylesheet") also
+      // matches an unselected rel="alternate stylesheet", whose null .sheet is its
+      // normal state -- that direction raises the fatal dialog over a healthy page.
+      for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
         if (
           !link.sheet &&
           !link.disabled &&

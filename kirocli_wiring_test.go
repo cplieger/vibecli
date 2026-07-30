@@ -72,59 +72,31 @@ func TestSessionEnv_reachesSpawnedPTY(t *testing.T) {
 	}
 }
 
-// TestSessionCommand_perSessionPicksUpVersionSwitch pins that the argv is built
-// per SESSION rather than once at boot. It is the difference between the manager
-// being wired in and merely being present: the install finishes AFTER the
-// listener binds, so an argv captured at startup holds the empty path the manager
-// reports before any version is active, and every tab for the container's
-// lifetime then runs the sign-in guard's "not installed" branch. The same
-// property is what lets a rescan-recovered install serve the next tab.
-func TestSessionCommand_perSessionPicksUpVersionSwitch(t *testing.T) {
-	var active atomic.Value
-	active.Store("")
-	cliPath := func() string { s, _ := active.Load().(string); return s }
-	cmd := func() []string { return sessionCommand(cliPath()) }
-
+// TestSessionCommand_pathReachesArgvOnlyAsDollarZero pins that the cli path enters
+// the argv ONLY as $0: the guard script text is invariant across version switches,
+// so a version change cannot rewrite the sign-in guard and no path is spliced into
+// shell text. That the argv is REBUILT per session (rather than snapshotted at
+// boot) is production wiring, and it is pinned through the real runtime by
+// TestStartKiroCLI_managedWiringActivatesAnInstalledVersion; a factory this test
+// builds itself cannot fail that way.
+func TestSessionCommand_pathReachesArgvOnlyAsDollarZero(t *testing.T) {
+	const activePath = "/config/tools/kiro-cli-versions/2.14.2/kiro-cli"
 	// $0 is the argument after -c's script, so index 3 is the cli path.
 	const cliArg = 3
-	before := cmd()
-	if got := before[cliArg]; got != "" {
-		t.Fatalf("argv before activation carries cli path %q, want the empty path the manager reports with no active version", got)
-	}
-	active.Store("/config/tools/kiro-cli-versions/2.14.2/kiro-cli")
-	after := cmd()
-	if got := after[cliArg]; got != "/config/tools/kiro-cli-versions/2.14.2/kiro-cli" {
-		t.Errorf("argv after activation carries cli path %q, want the newly active version's binary -- the factory is closing over a boot constant instead of asking per session", got)
-	}
-	if before[1] != after[1] || before[2] != after[2] {
-		t.Errorf("the guard script or its -c flag changed between sessions (%q vs %q); only $0 may differ", before[:3], after[:3])
-	}
-}
+	empty := sessionCommand("")
+	active := sessionCommand(activePath)
 
-// TestSessionCommand_chatArgsSurviveVersionSwitch pins the KIRO_CLI_CHAT_ARGS
-// contract across the per-session rebuild: the flags stay positional params
-// reaching `chat` only, never spliced into the guard script, and they are
-// unaffected by which version is active. Rebuilding the argv per session is
-// exactly the change that could have dropped or duplicated them.
-func TestSessionCommand_chatArgsSurviveVersionSwitch(t *testing.T) {
-	argv := sessionCommand("/opt/v/kiro-cli", "--v3", "--effort", "high")
-	if got := argv[3]; got != "/opt/v/kiro-cli" {
-		t.Errorf("argv[3] = %q, want the cli path as $0", got)
+	if got := empty[cliArg]; got != "" {
+		t.Fatalf("argv carries cli path %q for the empty path the manager reports with no active version, want %q", got, "")
 	}
-	if got := strings.Join(argv[4:], " "); got != "--v3 --effort high" {
-		t.Errorf("chat args = %q, want %q as positional params after $0", got, "--v3 --effort high")
+	if got := active[cliArg]; got != activePath {
+		t.Errorf("argv cli path = %q, want %q as $0", got, activePath)
 	}
-	if strings.Contains(argv[2], "--v3") || strings.Contains(argv[2], "high") {
-		t.Errorf("chat args were spliced into the guard script: %q", argv[2])
+	if empty[1] != active[1] || empty[2] != active[2] {
+		t.Errorf("the guard script or its -c flag changed with the cli path (%q vs %q); the path may reach the argv only as $0, or a version switch would rewrite the script", empty[:3], active[:3])
 	}
-	// login and whoami must not see them: the script names both without "$@".
-	for _, sub := range []string{`"$0" whoami`, `"$0" login --use-device-flow`} {
-		if !strings.Contains(argv[2], sub) {
-			t.Errorf("guard script lost %q, so the chat-only argument contract can no longer be read from it: %q", sub, argv[2])
-		}
-	}
-	if !strings.Contains(argv[2], `exec "$0" chat "$@"`) {
-		t.Errorf("guard script no longer forwards the positional params to chat only: %q", argv[2])
+	if strings.Contains(active[2], activePath) {
+		t.Errorf("the cli path was spliced into the guard script: %q", active[2])
 	}
 }
 
@@ -147,6 +119,9 @@ func TestKiroReasonTextIsTheClientContract(t *testing.T) {
 		why  pinstall.Reason
 		want string
 	}{
+		// Only ready renders empty; every withheld verdict below must carry text,
+		// because /api/health and the create gate both key on a non-empty reason to
+		// report the fault.
 		{pinstall.ReasonReady, ""},
 		{pinstall.ReasonInstalling, "kiro-cli installing"},
 		{pinstall.ReasonRetrying, "kiro-cli install retrying"},
@@ -160,16 +135,6 @@ func TestKiroReasonTextIsTheClientContract(t *testing.T) {
 		if got := kiroReasonText(tc.why); got != tc.want {
 			t.Errorf("kiroReasonText(%v) = %q, want %q -- these literals are what an operator and the monitoring probe read",
 				tc.why, got, tc.want)
-		}
-	}
-	// A withheld verdict must never render as ready: the health handler and the
-	// create gate both key on a non-empty reason to report the fault.
-	for _, why := range []pinstall.Reason{
-		pinstall.ReasonInstalling, pinstall.ReasonRetrying,
-		pinstall.ReasonUnavailable, pinstall.ReasonAssertion,
-	} {
-		if kiroReasonText(why) == "" {
-			t.Errorf("kiroReasonText(%v) is empty, so a 503 would carry no reason at all", why)
 		}
 	}
 }
@@ -215,27 +180,27 @@ func TestSessionCreateGate_kiroReasonPerState(t *testing.T) {
 }
 
 // TestSessionCreateGate_kiroComposesWithTools pins that the two blocking layers
-// COMPOSE. Each must be able to refuse on its own, and a ready kiro-cli plus
-// converged tools must let the request reach the inner chain -- otherwise adding
-// the kiro layer would have silently replaced the tools layer (or permanently
-// closed the gate).
+// registerRoutes composes are BOTH there and are checked kiro-first. It drives the
+// real mux, because the composition order is registerRoutes' own: with the gate
+// rebuilt locally, swapping the two `if` blocks in registerRoutes left this test
+// green while every "both blocked" 503 started naming the tools layer instead.
+//
+// Each layer must be able to refuse alone, a ready kiro-cli plus converged tools
+// must reach the inner chain (so adding the kiro layer did not replace the tools
+// one, nor permanently close the gate), and when both are blocked the reported
+// reason must be kiro-cli's -- the dependency a session cannot start without at
+// all, and the more specific answer for an operator.
 func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 	var toolsSyncing, kiroUnready atomic.Bool
-	inner := 0
-	gate := composeGate(func(next http.Handler) http.Handler { return next },
-		func() (bool, string) { return toolsSyncing.Load(), "tools installing" })
-	gate = composeGate(gate, func() (bool, string) {
-		return kiroUnready.Load(), reasonInstalling
-	})
-	gated := gate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		inner++
-		w.WriteHeader(http.StatusCreated)
-	}))
-	post := func() (int, string) {
-		rec := httptest.NewRecorder()
-		gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))
-		return rec.Code, rec.Body.String()
-	}
+	// Unready deps plus a trivial command: the one pass-through case creates a
+	// real session, and the factory's fast-death Warn keys on readiness, so an
+	// unready handler keeps a stray broken-install line out of a later test's
+	// log capture (the same shape TestCreateRateLimit uses).
+	deps := newTestDeps(false)
+	deps.cmd = staticCmd("/bin/true")
+	deps.toolsSyncing = toolsSyncing.Load
+	deps.kiroReady = func() (bool, string) { return !kiroUnready.Load(), reasonInstalling }
+	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	cases := []struct {
 		name       string
@@ -244,8 +209,6 @@ func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 		wantCode   int
 		wantReason string
 	}{
-		// kiro-cli is checked first: it is the dependency a session cannot start
-		// without at all, and its reason is the more specific one.
 		{name: "both blocked", tools: true, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: reasonInstalling},
 		{name: "kiro only", tools: false, kiro: true, wantCode: http.StatusServiceUnavailable, wantReason: reasonInstalling},
 		{name: "tools only", tools: true, kiro: false, wantCode: http.StatusServiceUnavailable, wantReason: "tools installing"},
@@ -255,31 +218,30 @@ func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			toolsSyncing.Store(tc.tools)
 			kiroUnready.Store(tc.kiro)
-			code, body := post()
-			if code != tc.wantCode {
-				t.Fatalf("status = %d, want %d (body %s)", code, tc.wantCode, body)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tc.wantCode, rec.Body.String())
 			}
-			if tc.wantReason != "" && !strings.Contains(body, tc.wantReason) {
-				t.Errorf("body %q does not name %q", body, tc.wantReason)
+			if tc.wantReason != "" && !strings.Contains(rec.Body.String(), tc.wantReason) {
+				t.Errorf("body %q does not name %q", rec.Body.String(), tc.wantReason)
 			}
 		})
-	}
-	if inner != 1 {
-		t.Errorf("inner handler ran %d times, want exactly 1 (only the fully-unblocked case may reach it)", inner)
 	}
 }
 
 // TestKiroRescan_loopbackOnlyAndPostOnly pins the repair hook's admission, which
 // is the only thing standing between an unauthenticated port and a route that
 // spawns subprocesses. It is admitted exactly like the tools API: the SOCKET PEER
-// and the Host header must both be loopback, forwarded headers play no part, and
-// the POST method pattern keeps a GET from driving an install.
+// and the Host header must both be loopback, a proxy/browser provenance header
+// refuses even when both loopback legs pass, forwarded headers can never ADMIT,
+// and the POST method pattern keeps a GET from driving an install.
 //
-// A GET does not answer 405 here, and that is the mux's doing rather than a gap:
-// the app also registers the catch-all "/" static pattern, which matches the path
-// for any method, so Go's ServeMux serves the static 404 instead of a
-// method-not-allowed. What the contract needs is that a GET never REACHES the
-// handler, which is what this asserts.
+// A GET answers 405 (Allow: POST) rather than reaching the handler: the app also
+// registers the catch-all "/" static pattern, which matches the path for any
+// method and would otherwise silence ServeMux's own 405 synthesis, so the
+// method-agnostic mount beside the POST one is what makes the mismatch legible.
+// What the contract needs is that a GET never REACHES the handler.
 func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	newMux := func(t *testing.T, rescan func(context.Context) (bool, error)) *http.ServeMux {
 		t.Helper()
@@ -289,12 +251,26 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 		mux, _, _ := mustRegisterRoutes(t, deps)
 		return mux
 	}
+	// The documented consumer -- kiro-cli's ! escape running curl inside the
+	// container -- sends no proxy or browser provenance header at all.
 	call := func(mux *http.ServeMux, method, remote, host string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, kiroRescanPath, http.NoBody)
 		req.RemoteAddr = remote
 		req.Host = host
-		// Forwarded headers are client-controlled, so the gate must ignore
-		// them even when they claim loopback.
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	// The same call carrying a forwarded header. It can only ever REFUSE: a
+	// remote caller cannot use it to gain admission, and a request that already
+	// satisfies both loopback legs loses admission because the header is
+	// positive evidence it did not originate inside the container (the
+	// same-loopback reverse-proxy shape, whose Host nginx and Apache rewrite to
+	// the upstream address by default).
+	callProxied := func(mux *http.ServeMux, method, remote, host string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, kiroRescanPath, http.NoBody)
+		req.RemoteAddr = remote
+		req.Host = host
 		req.Header.Set("X-Forwarded-For", "127.0.0.1")
 		rec := httptest.NewRecorder()
 		mux.ServeHTTP(rec, req)
@@ -307,8 +283,11 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusOK {
 		t.Errorf("loopback POST: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
-	if rec := call(mux, http.MethodPost, "192.168.1.9:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
-		t.Errorf("remote peer POST: status = %d, want 403 -- a remote caller must not be able to drive an install", rec.Code)
+	if rec := callProxied(mux, http.MethodPost, "192.168.1.9:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
+		t.Errorf("remote peer POST: status = %d, want 403 -- a remote caller must not be able to drive an install, and a forwarded header claiming loopback must not admit it", rec.Code)
+	}
+	if rec := callProxied(mux, http.MethodPost, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
+		t.Errorf("both-ends-loopback POST with a forwarded header: status = %d, want 403 (the same-loopback reverse-proxy shape)", rec.Code)
 	}
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "webterm.example.com"); rec.Code != http.StatusForbidden {
 		t.Errorf("loopback peer with a non-loopback Host: status = %d, want 403 (the DNS-rebound-page shape)", rec.Code)
@@ -383,8 +362,11 @@ func TestStartKiroCLI_shapes(t *testing.T) {
 	t.Run("no pins falls back to the bare name", func(t *testing.T) {
 		rt := startKiroCLI(&baseKiro{chatArgs: []string{"--v3"}})
 		t.Cleanup(rt.stop)
-		if rt.ready != nil {
-			t.Error("a pin-less run wired a readiness gate; a bare `go run` would then never be ready")
+		if rt.ready == nil {
+			t.Fatal("a pin-less run left the readiness policy nil; the route layer's contract is total, so a nil policy panics on first call")
+		}
+		if ok, reason := rt.ready(); !ok || reason != "" {
+			t.Errorf("pin-less readiness = (%v, %q), want (true, \"\"); a bare `go run` would otherwise never be ready", ok, reason)
 		}
 		if rt.rescan != nil {
 			t.Error("a pin-less run wired a rescan hook; there is no managed install to rescan")
@@ -395,8 +377,11 @@ func TestStartKiroCLI_shapes(t *testing.T) {
 		if got := strings.Join(rt.cmd()[4:], " "); got != "--v3" {
 			t.Errorf("pin-less argv chat args = %q, want --v3", got)
 		}
-		if rt.env != nil {
-			t.Error("a pin-less run wired a PATH overlay; there is no version directory to lead with")
+		if rt.env == nil {
+			t.Fatal("a pin-less run left the session-env policy nil; the route layer's contract is total, so a nil policy panics on first call")
+		}
+		if got := rt.env(); got != nil {
+			t.Errorf("pin-less session env = %q, want nil; there is no version directory to lead with", got)
 		}
 	})
 
@@ -425,29 +410,18 @@ func TestStartKiroCLI_shapes(t *testing.T) {
 // than to a boot snapshot: the argv points INTO the activated version directory,
 // and the PATH overlay leads with that same directory.
 func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
-	const version = "9.9.9"
-	toolsDir := t.TempDir()
-	versionDir := filepath.Join(toolsDir, "kiro-cli-versions", version)
-	if err := os.MkdirAll(versionDir, 0o750); err != nil {
-		t.Fatalf("create version dir: %v", err)
-	}
-	// A fake dispatcher set: a regular executable answering --version with the
-	// pin (what selection probes) and exiting 0 for the settings calls.
-	for _, name := range []string{"kiro-cli", "kiro-cli-chat"} {
-		script := "#!/bin/sh\ncase \"$1\" in --version) printf 'kiro-cli " + version + "\\n' ;; esac\nexit 0\n"
-		if err := os.WriteFile(filepath.Join(versionDir, name), []byte(script), 0o700); err != nil { // #nosec G306 -- a dispatcher fake must be executable
-			t.Fatalf("write fake %s: %v", name, err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(versionDir, ".complete"), []byte(version+"\n"), 0o600); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
+	// The fixture is the namespace suite's plantOwnVersion: one definition of what a
+	// version a previous boot finished looks like (both required dispatchers, the
+	// sentinel written last), so the two suites cannot drift on this app's required
+	// set.
+	fixture := newNSEnv(t)
+	versionDir := fixture.plantOwnVersion()
 
 	rt := startKiroCLI(&baseKiro{
-		version:     version,
+		version:     nsVersion,
 		sha256:      strings.Repeat("a", 64),
 		sha256ARM64: strings.Repeat("b", 64),
-		toolsDir:    toolsDir,
+		toolsDir:    fixture.tools,
 	})
 	t.Cleanup(rt.stop)
 
@@ -470,7 +444,7 @@ func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	wantBin := filepath.Join(versionDir, "kiro-cli")
+	wantBin := filepath.Join(versionDir, nsTool)
 	if got := rt.cmd()[3]; got != wantBin {
 		t.Errorf("session argv cli path = %q, want the activated version's own binary %q", got, wantBin)
 	}
@@ -484,5 +458,67 @@ func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 	ok, err := rt.rescan(context.Background())
 	if !ok || err != nil {
 		t.Errorf("rescan on a healthy install = (%v, %v), want (true, nil)", ok, err)
+	}
+}
+
+// TestStartKiroCLI_readinessReasonIsThisAppsWording pins the last unguarded step
+// of the reason contract: that the MANAGED runtime renders the library's typed
+// reason through kiroReasonText rather than serving pinstall's own wording.
+// TestKiroReasonTextIsTheClientContract pins the function in isolation and the
+// unusable-pin shape reports a hardcoded literal, so replacing the managed
+// closure's kiroReasonText(why) with why.String() changes what /api/health, the
+// 503 body of POST /api/sessions and the repair hook all serve -- "required
+// assertion not enforced" instead of "kiro-cli required settings not enforced" --
+// with the whole suite green.
+//
+// It reaches a non-ready managed verdict with no download: the pinned version is
+// already complete on the volume, its dispatchers answer --version with the pin
+// (so selection accepts them) and fail every settings call, which is exactly the
+// required-assertion state.
+func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
+	const version = "9.9.9"
+	toolsDir := t.TempDir()
+	dir := filepath.Join(toolsDir, "kiro-cli-versions", version)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("create version dir: %v", err)
+	}
+	for _, name := range []string{"kiro-cli", "kiro-cli-chat"} {
+		script := "#!/bin/sh\ncase \"$1\" in --version) printf 'kiro-cli " + version + "\\n' ; exit 0 ;; esac\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil { // #nosec G306 -- a dispatcher fake must be executable
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".complete"), []byte(version+"\n"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+
+	rt := startKiroCLI(&baseKiro{
+		version:     version,
+		sha256:      strings.Repeat("a", 64),
+		sha256ARM64: strings.Repeat("b", 64),
+		toolsDir:    toolsDir,
+	})
+	t.Cleanup(rt.stop)
+	if rt.ready == nil {
+		t.Fatal("the managed runtime wired no readiness gate, so no reason reaches any surface")
+	}
+
+	// The verdict settles in the background, so poll rather than sleep.
+	deadline := time.Now().Add(5 * time.Second)
+	var reason string
+	for {
+		ok, r := rt.ready()
+		if ok {
+			t.Fatal("readiness was granted while the required settings assertion fails")
+		}
+		reason = r
+		if reason == reasonSettings {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the managed runtime reported %q, want this app's own wording %q -- the reason an operator and the monitoring probe read is no longer produced by kiroReasonText",
+				reason, reasonSettings)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

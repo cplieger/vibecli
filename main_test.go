@@ -190,10 +190,11 @@ esac
 
 // TestStartTools_configDirMissing pins the out-of-container shape: a missing
 // config dir disables the tools engine (bare `go run` / tests), returning the
-// zero toolsRuntime whose nil funcs make registerRoutes skip /api/tools and
-// the health tools field, with a Warn naming the fix. close() on the zero
-// value must be a safe no-op. This test mutates the process-global default
-// logger, so it runs serially (no t.Parallel).
+// engine-less runtime whose nil engine makes registerRoutes skip /api/tools
+// while its policies stay callable and report the off-shape defaults (not
+// syncing, empty state, which health's omitempty drops), with a Warn naming the
+// fix. close() on that runtime must be a safe no-op. This test mutates the
+// process-global default logger, so it runs serially (no t.Parallel).
 func TestStartTools_configDirMissing(t *testing.T) {
 	records := capture.Default(t)
 
@@ -203,12 +204,18 @@ func TestStartTools_configDirMissing(t *testing.T) {
 	})
 
 	if rt.engine != nil {
-		t.Fatal("engine is non-nil for a missing config dir; want the zero runtime (no tools surface outside the container)")
+		t.Fatal("engine is non-nil for a missing config dir; want no engine (no tools surface outside the container)")
 	}
-	if rt.syncing != nil || rt.state != nil {
-		t.Error("syncing/state funcs are non-nil; registerRoutes keys the /api/tools mount and the health tools field on nil")
+	if rt.syncing == nil || rt.state == nil {
+		t.Fatal("syncing/state funcs are nil; the route layer's policy contract is total, so a nil policy panics on first call")
 	}
-	rt.close() // zero-runtime close must not panic
+	if rt.syncing() {
+		t.Error("syncing reports true for a missing config dir; sessions must remain ungated")
+	}
+	if got := rt.state(); got != "" {
+		t.Errorf("state = %q, want %q (health's omitempty then drops the tools field)", got, "")
+	}
+	rt.close() // engine-less close must not panic
 	if got := records.CountLevel(slog.LevelWarn, "tools engine disabled"); got != 1 {
 		t.Errorf("log = %q, want exactly one config-dir-missing Warn (got %d)", records.Messages(), got)
 	}
@@ -219,10 +226,11 @@ func TestStartTools_configDirMissing(t *testing.T) {
 // regular FILE, and one whose stat FAILS for a reason other than absence (a
 // self-referential symlink is a deterministic ELOOP). Both are a broken mount
 // of a production subsystem, not the deliberate out-of-container disable, so
-// they follow degraded-not-dead: engine and syncing stay nil (sessions
-// ungated) but state() reports "degraded" so /api/health carries the
-// informational tools field instead of omitting it and presenting a failed
-// subsystem as intentionally off. Serial: mutates the global default logger.
+// they follow degraded-not-dead: the engine stays nil (no /api/tools mount) and
+// syncing reports false (sessions ungated) but state() reports "degraded" so
+// /api/health carries the informational tools field instead of omitting it and
+// presenting a failed subsystem as intentionally off. Serial: mutates the global
+// default logger.
 func TestStartTools_configDirUnusable(t *testing.T) {
 	loop := filepath.Join(t.TempDir(), "loop")
 	if err := os.Symlink(loop, loop); err != nil {
@@ -251,8 +259,11 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 			if rt.engine != nil {
 				t.Error("engine is non-nil for an unusable config path; want no engine")
 			}
-			if rt.syncing != nil {
-				t.Error("syncing is non-nil for an unusable config path; sessions must remain ungated")
+			if rt.syncing == nil {
+				t.Fatal("syncing is nil for an unusable config path; the route layer's policy contract is total, so a nil policy panics on first call")
+			}
+			if rt.syncing() {
+				t.Error("syncing reports true for an unusable config path; sessions must remain ungated")
 			}
 			if rt.state == nil {
 				t.Fatal("state is nil for an unusable config path; the health tools field would be omitted, hiding a broken mount")
@@ -272,11 +283,12 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 // tools.json is the retired v1 format fails toolbelt.New (strict v2 schema),
 // and startTools logs the Error and continues without an engine instead of
 // taking the server down. Unlike the missing-config-dir path (an intentionally
-// disabled subsystem: zero runtime, health omits the tools field entirely), a
-// FAILED production subsystem must stay visible: the returned runtime carries
-// state "degraded" so /api/health reports {"status":"ok","tools":"degraded"}
-// per the documented tools=syncing|ok|degraded contract, while engine and
-// syncing stay nil so sessions remain ungated. Serial: mutates the global
+// disabled subsystem: no engine, empty state, health omits the tools field
+// entirely), a FAILED production subsystem must stay visible: the returned
+// runtime carries state "degraded" so /api/health reports
+// {"status":"ok","tools":"degraded"} per the documented
+// tools=syncing|ok|degraded contract, while the engine stays nil and syncing
+// reports false so sessions remain ungated. Serial: mutates the global
 // default logger.
 func TestStartTools_engineStartFailure(t *testing.T) {
 	records := capture.Default(t)
@@ -292,8 +304,11 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 	if rt.engine != nil {
 		t.Fatal("engine is non-nil despite a failed toolbelt.New; want no engine (degraded-not-dead)")
 	}
-	if rt.syncing != nil {
-		t.Error("syncing is non-nil despite a failed toolbelt.New; sessions must remain ungated")
+	if rt.syncing == nil {
+		t.Fatal("syncing is nil despite a failed toolbelt.New; the route layer's policy contract is total, so a nil policy panics on first call")
+	}
+	if rt.syncing() {
+		t.Error("syncing reports true despite a failed toolbelt.New; sessions must remain ungated")
 	}
 	if rt.state == nil {
 		t.Fatal("state is nil despite a failed toolbelt.New; the health tools field would be omitted, hiding the failure from health consumers")
@@ -345,6 +360,55 @@ func TestStartTools_bootConvergenceLiftsGate(t *testing.T) {
 	if got := rt.state(); got != "ok" {
 		t.Errorf("state after convergence = %q, want %q (all seeded templates are disabled: nothing to install)", got, "ok")
 	}
+}
+
+// TestStartTools_toolsDirResolution pins the single-resolution-site contract for
+// the /config/tools tree: the toolbelt engine writes to the path the entrypoint
+// exported and hardened (baseTools.toolsDir, from KIRO_CLI_TOOLS_DIR) when it is
+// set, and falls back to <configDir>/tools only outside the container where no
+// pin is exported. Before this, startTools RE-DERIVED the tree from
+// KWEB_CONFIG_DIR while the kiro-cli install manager read the exported path, so a
+// non-default KWEB_CONFIG_DIR split the two co-owners of one tree with no signal
+// at all: every tool provisioned into a directory that is on no session's PATH
+// while /api/health still reported tools=ok. Observable because toolbelt.New
+// creates <ToolsDir>/bin (its single PATH dir) as it starts.
+func TestStartTools_toolsDirResolution(t *testing.T) {
+	t.Run("exported path wins over the derivation", func(t *testing.T) {
+		dir := t.TempDir()
+		exported := filepath.Join(t.TempDir(), "exported-tools")
+		rt := startTools(baseTools{
+			configDir:   dir,
+			toolsDir:    exported,
+			catalogPath: filepath.Join(dir, "absent-catalog.json"),
+		})
+		if rt.engine == nil {
+			t.Fatal("engine is nil for an existing config dir; want a running tools engine")
+		}
+		t.Cleanup(rt.close)
+
+		if _, err := os.Stat(filepath.Join(exported, "bin")); err != nil {
+			t.Errorf("stat %s/bin = %v; want the engine to provision into the EXPORTED tools tree (the one entrypoint.sh hardened and every session has on PATH)", exported, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "tools", "bin")); err == nil {
+			t.Errorf("the engine provisioned into the derived %s/tools instead of the exported tree; a non-default KWEB_CONFIG_DIR would put every tool off PATH", dir)
+		}
+	})
+
+	t.Run("derives from configDir when no pin is exported", func(t *testing.T) {
+		dir := t.TempDir()
+		rt := startTools(baseTools{
+			configDir:   dir,
+			catalogPath: filepath.Join(dir, "absent-catalog.json"),
+		})
+		if rt.engine == nil {
+			t.Fatal("engine is nil for an existing config dir; want a running tools engine")
+		}
+		t.Cleanup(rt.close)
+
+		if _, err := os.Stat(filepath.Join(dir, "tools", "bin")); err != nil {
+			t.Errorf("stat %s/tools/bin = %v; want the out-of-container fallback (bare `go run` exports no KIRO_CLI_TOOLS_DIR)", dir, err)
+		}
+	})
 }
 
 // TestHostAllowlist pins the KWEB_ALLOWED_HOSTS anti-DNS-rebinding gate
@@ -1643,7 +1707,11 @@ func TestAccessLogKeepsStreamPathRefusals(t *testing.T) {
 
 	for _, tc := range []struct {
 		name, url string
-		decorate  func(*http.Request)
+		// method is the request method; empty means GET. Only the cross-origin
+		// case needs an UNSAFE method, because that is the only shape
+		// CrossOriginProtection rejects.
+		method   string
+		decorate func(*http.Request)
 		// wantPath is the path the LINE must carry, which is not always the
 		// requested one: /api/sessions/events sits under the token-bearing
 		// subtree, so WithTemplatePathsUnder records the matched template or the
@@ -1662,10 +1730,27 @@ func TestAccessLogKeepsStreamPathRefusals(t *testing.T) {
 			decorate: func(*http.Request) {},
 			wantPath: terminal.SessionsSubtreePath + "(unmatched)",
 		},
+		{
+			// The sibling refusal shape on the same path, one gate further in:
+			// CrossOriginProtection sits INSIDE the stream skip, so a skip keyed
+			// on the path alone would delete this 403's only record. The GET
+			// conjunct in the predicate is what keeps it.
+			name:   "a cross-origin non-GET on the SSE stream keeps its 403 line",
+			url:    "http://webterm.example.com:9848" + terminal.SessionEventsPath,
+			method: http.MethodPost,
+			decorate: func(r *http.Request) {
+				r.Header.Set("Sec-Fetch-Site", "cross-site")
+			},
+			wantPath: terminal.SessionsSubtreePath + "(unmatched)",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := len(accessLinesFor(rec, ""))
-			req := httptest.NewRequest(http.MethodGet, tc.url, http.NoBody)
+			method := tc.method
+			if method == "" {
+				method = http.MethodGet
+			}
+			req := httptest.NewRequest(method, tc.url, http.NoBody)
 			tc.decorate(req)
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, req)
@@ -1867,5 +1952,106 @@ func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 					predicate, resp.StatusCode, upgraded)
 			}
 		})
+	}
+}
+
+// TestAwaitBootConvergence_cancellationIsNotAToolFailure pins the JobCancelled
+// arm, the one boot-convergence outcome no other test reaches: toolbelt cancels
+// the running job from Engine.Close, which is the path this app takes on every
+// SIGTERM and on the Serve-error teardown. Three properties, each a distinct
+// regression:
+//
+//   - the verdict is still recorded exactly once, so the syncing gate lifts and
+//     session creation never answers 503 "tools installing" forever;
+//   - the record stays Info. Reporting a shutdown cancellation at Warn as a
+//     degraded reconcile is the false broken-install alert on every deploy, and
+//     a first-boot restart is routine (the image budgets 20 minutes for it);
+//   - the post-convergence tail is SKIPPED. On the shutdown path Update() can
+//     only fail with "engine shutting down" and the LSP nudge has no reader, so
+//     both would be noise attributed to a broken tools tree.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
+	records := capture.Default(t)
+	dir := t.TempDir()
+	// A manual-source install that blocks, so the job is guaranteed to be
+	// unfinished when Close cancels it: the branch is reached deterministically
+	// instead of racing the reconcile to completion.
+	manifest := `{"version":2,"tools":{"sleepytool":{"source":"manual","version":"1.0.0",` +
+		`"probe":"sleepytool","install":"sleep 300"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	eng, err := toolbelt.New(&toolbelt.Config{
+		ConfigDir:   dir,
+		ToolsDir:    filepath.Join(dir, "tools"),
+		CatalogPath: filepath.Join(dir, "absent-catalog.json"),
+	})
+	if err != nil {
+		t.Fatalf("toolbelt.New: %v", err)
+	}
+	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	if rerr != nil || job == nil {
+		t.Fatalf("Reconcile = %v, %v; want an enqueued job for Close to cancel", job, rerr)
+	}
+	eng.Close() // the SIGTERM shape: Engine.Close cancels the active job
+
+	var verdicts []string
+	awaitBootConvergence(eng, job.ID, func(v string) { verdicts = append(verdicts, v) })
+
+	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
+		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift on a cancelled boot pass too",
+			verdicts, toolsStateDegraded)
+	}
+	if got := records.CountLevel(slog.LevelInfo, "boot convergence cancelled"); got != 1 {
+		t.Errorf("log = %q, want exactly one cancellation Info (got %d)", records.Messages(), got)
+	}
+	if got := records.CountLevel(slog.LevelWarn, "boot reconcile finished degraded"); got != 0 {
+		t.Errorf("log = %q; a shutdown cancellation must not be reported as a tool failure -- that Warn is the false broken-install alert on every deploy (got %d)",
+			records.Messages(), got)
+	}
+	for _, tail := range []string{"update pass not enqueued", "no language servers enabled"} {
+		if got := records.CountLevel(slog.LevelWarn, tail); got != 0 {
+			t.Errorf("log = %q; the post-convergence tail must be skipped on cancellation, but %q fired %d time(s)",
+				records.Messages(), tail, got)
+		}
+	}
+}
+
+// TestStartTools_logsTheGatedWindowOpening pins the one record that marks the
+// gated window OPENING. The terminal boot-convergence records (converged /
+// degraded / cancelled) are all asserted elsewhere, but they only say when the
+// gate lifted: without this Info line an operator staring at 503 "tools
+// installing" answers has nothing saying the gate is closed, since when, or
+// which toolbelt job to correlate with the engine's own job-timeout and
+// job-failed warnings. The job attribute is what makes that correlation
+// possible, so it is asserted as well as the message.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestStartTools_logsTheGatedWindowOpening(t *testing.T) {
+	const msg = "tools: boot convergence started"
+	records := capture.Default(t)
+	dir := t.TempDir()
+
+	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	if rt.engine == nil {
+		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
+	}
+	t.Cleanup(rt.close)
+
+	if got := records.CountLevel(slog.LevelInfo, msg); got != 1 {
+		t.Fatalf("log = %q, want exactly one %q Info (got %d); without it a 503 \"tools installing\" answer has no record of when the gate closed",
+			records.Messages(), msg, got)
+	}
+	if got, ok := records.AttrValue(msg, "job"); !ok || got == "" {
+		t.Errorf("gated-window record job = %q (present=%v), want the toolbelt job id the engine's own job warnings carry", got, ok)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for rt.syncing() {
+		if time.Now().After(deadline) {
+			t.Fatal("boot convergence gate never lifted")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

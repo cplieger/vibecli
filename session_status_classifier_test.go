@@ -209,6 +209,17 @@ func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.
 	if got := records.CountLevel(slog.LevelWarn, capped); got != 1 {
 		t.Errorf("budget-exhausted Warn count after a further distinct message = %d, want 1 (announced once)", got)
 	}
+	// The cap record's EXACT attr set. It is the one always-on record the
+	// package's confidentiality sweeps structurally cannot see:
+	// TestClassifyStatus_notificationTextLogging filters on
+	// unrecognizedNotifyMsg, and this wording deliberately shares no substring
+	// with it, so an attr carrying the notification text here would reach the
+	// shipped stream with nothing failing. The cap arm has the message in scope,
+	// which is what makes that a one-line edit rather than a hypothetical.
+	assertAttrSchema(t, records, slog.LevelWarn, capped, map[string]attrCheck{
+		"distinct_limit": wantInt(unrecognizedNotifyCap),
+		"hint":           wantString(unrecognizedNotifyHint),
+	})
 	// Every occurrence still reaches Debug, so the full set stays diagnosable.
 	if got := records.CountLevel(slog.LevelDebug, message); got != unrecognizedNotifyCap+2 {
 		t.Errorf("Debug count = %d, want %d (every occurrence traced)", got, unrecognizedNotifyCap+2)

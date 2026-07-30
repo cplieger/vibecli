@@ -82,8 +82,9 @@ func TestHealthEndpoint_reflectsReadiness(t *testing.T) {
 // server owns the install (main.go hands it the manager's Ready), /api/health
 // returns 503 while no version is active and 200 once one is — reflecting
 // web-terminal-kiro's core dependency from in-memory state, never launching
-// kiro-cli. A nil verdict skips the gate, so out-of-container runs (tests, a bare
-// `go run` with no pins) keep pure-listener readiness.
+// kiro-cli. Out-of-container runs (tests, a bare `go run` with no pins) get the
+// composition root's permissive (true, "") default instead of a nil policy, so
+// they keep pure-listener readiness.
 func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 	newMux := func(verdict func() (bool, string)) *http.ServeMux {
 		deps := newTestDeps(true)
@@ -103,14 +104,12 @@ func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 		t.Errorf("no active version: status = %d, want %d", code, http.StatusServiceUnavailable)
 	}
 
-	// A version active with its required settings asserted -> ready -> 200.
+	// A version active with its required settings asserted -> ready -> 200. This
+	// is also the unmanaged (no-pins) shape: main.go's unmanagedKiroRuntime
+	// supplies exactly this permissive (true, "") default, so the route layer has
+	// no nil case to disable a gate for.
 	if code := status(newMux(func() (bool, string) { return true, "" })); code != http.StatusOK {
 		t.Errorf("version active: status = %d, want %d", code, http.StatusOK)
-	}
-
-	// Nil verdict -> gate disabled -> 200.
-	if code := status(newMux(nil)); code != http.StatusOK {
-		t.Errorf("kiro-cli gate disabled: status = %d, want %d", code, http.StatusOK)
 	}
 }
 
@@ -122,7 +121,8 @@ const testIndexHTML = `<!doctype html><style>body{margin:0}</style><script type=
 
 // TestKiroCacheControl pins the two-branch cache POLICY handed to
 // webhttp.StaticHandler (the ETag/gzip mechanism now lives in webhttp and is
-// tested there): assets under vendor/fonts/ are immutable for 30 days while
+// tested there): assets under vendor/fonts/ are cached for 30 days but stay
+// revalidatable (no `immutable`) while
 // everything else is no-cache + must-revalidate so deploys take effect at
 // once. Paths arrive normalized (no leading slash; "index.html" for "/"), and
 // the fonts prefix's trailing slash is load-bearing -- "vendor/fonts-list.json"
@@ -133,8 +133,8 @@ func TestKiroCacheControl(t *testing.T) {
 		assetPath string
 		wantCache string
 	}{
-		{name: "font is immutable", assetPath: "vendor/fonts/iosevka.woff2", wantCache: "public, max-age=2592000, immutable"},
-		{name: "nested font is immutable", assetPath: "vendor/fonts/sub/x.woff2", wantCache: "public, max-age=2592000, immutable"},
+		{name: "font is long-lived but revalidatable", assetPath: "vendor/fonts/iosevka.woff2", wantCache: "public, max-age=2592000"},
+		{name: "nested font is long-lived but revalidatable", assetPath: "vendor/fonts/sub/x.woff2", wantCache: "public, max-age=2592000"},
 		{name: "html is no-cache", assetPath: "index.html", wantCache: "no-cache, must-revalidate"},
 		{name: "js bundle is no-cache", assetPath: "app.js", wantCache: "no-cache, must-revalidate"},
 		{name: "vendor non-font prefix is no-cache", assetPath: "vendor/fonts-list.json", wantCache: "no-cache, must-revalidate"},
@@ -483,21 +483,25 @@ func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 // "404 page not found" text and holds no session or tool state, so a cache
 // storing it can only ever replay a 404 for a path that has none.
 //
-// The rows are the three shapes an unmatched /api/ request takes: a path with no
-// mount at all, the bare prefix, and — the one worth pinning — a GET on
-// kiroRescanPath, which IS mounted but only for POST. That last one is a mux
-// miss rather than a 405 because the catch-all "/" pattern matches the request
-// fully, so ServeMux prefers it over reporting a method mismatch.
+// The rows are the three shapes an unmatched-or-method-mismatched /api/ request
+// takes: a path with no mount at all, the bare prefix, and — the one worth
+// pinning — a GET on kiroRescanPath, which IS mounted but only for POST and so
+// answers the explicit 405 the method-agnostic mount beside it produces (the
+// catch-all "/" pattern would otherwise silence ServeMux's own 405 synthesis and
+// serve a bare static 404). None of them may carry a Cache-Control directive.
 func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 	deps := newToolsDeps(t)
 	deps.kiroRescan = func(context.Context) (bool, error) { return true, nil }
 	mux, _, csp := mustRegisterRoutes(t, deps)
 	h := buildHandler(mux, nil, csp, nil)
 
-	for _, tc := range []struct{ name, method, path string }{
-		{"no such route", http.MethodGet, apiPrefix + "nope"},
-		{"bare api prefix", http.MethodGet, apiPrefix},
-		{"mounted for POST only, reached by GET", http.MethodGet, kiroRescanPath},
+	for _, tc := range []struct {
+		name, method, path string
+		wantStatus         int
+	}{
+		{"no such route", http.MethodGet, apiPrefix + "nope", http.StatusNotFound},
+		{"bare api prefix", http.MethodGet, apiPrefix, http.StatusNotFound},
+		{"mounted for POST only, reached by GET", http.MethodGet, kiroRescanPath, http.StatusMethodNotAllowed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, http.NoBody)
@@ -505,9 +509,9 @@ func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 			req.Host = "localhost:9848"
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
-			if rec.Code != http.StatusNotFound {
-				t.Fatalf("%s %s: status = %d, want %d (this test is about the static-mount 404 path)",
-					tc.method, tc.path, rec.Code, http.StatusNotFound)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("%s %s: status = %d, want %d (this test is about the no-directive property of a request no route body answers)",
+					tc.method, tc.path, rec.Code, tc.wantStatus)
 			}
 			if got := rec.Header().Get("Cache-Control"); got != "" {
 				t.Errorf("%s %s: Cache-Control = %q, want none — an unmatched /api/ 404 carrying a directive means something re-grew the /api/-wide wrapper; if that was deliberate, this test is the place to say so",
@@ -525,18 +529,7 @@ func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 // CSP buildCSPPolicy assembles. Hashes are computed from the embed, never
 // hardcoded, so the test tracks index.html automatically.
 func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
-	indexHTML, err := staticFS.ReadFile("static/index.html")
-	if err != nil {
-		t.Fatalf("read embedded static/index.html: %v", err)
-	}
-	sub, err := fs.Sub(staticFS, "static")
-	if err != nil {
-		t.Fatalf("fs.Sub: %v", err)
-	}
-	csp, err := buildCSPPolicy(sub)
-	if err != nil {
-		t.Fatalf("buildCSPPolicy: %v", err)
-	}
+	indexHTML, csp := embeddedCSP(t)
 
 	scriptRE := regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script\s*>`)
 	srcRE := regexp.MustCompile(`(?i)(^|[\s/])src\s*=`)
@@ -563,14 +556,7 @@ func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
 	// leaves both tokens as substrings of the policy and every assertion above
 	// stays green, while the browser parses one unknown source expression,
 	// blocks the inline importmap, and the page loads no ES modules at all.
-	var scriptDirective string
-	for directive := range strings.SplitSeq(csp, ";") {
-		directive = strings.TrimSpace(directive)
-		if strings.HasPrefix(directive, "script-src ") {
-			scriptDirective = directive
-			break
-		}
-	}
+	scriptDirective := cspDirective(csp, "script-src")
 	if want := "script-src 'self' " + strings.Join(oracle, " "); scriptDirective != want {
 		t.Errorf("CSP script directive = %q, want %q\nCSP: %s", scriptDirective, want, csp)
 	}
@@ -705,14 +691,14 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 func TestSessionTitleDerivesFromInput(t *testing.T) {
 	var ready webhttp.Ready
 	ready.Set(true)
-	deps := &routeDeps{
+	deps := withDefaultPolicies(&routeDeps{
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &ready,
 		workDir:  "",
 		// /bin/cat stands in for kiro-cli: the deriver reads the bytes the
 		// client SENDS, so what the program does with them is irrelevant.
 		cmd: staticCmd("/bin/cat"),
-	}
+	})
 	mux, mgr, csp, id := mustStartSession(t, deps)
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
@@ -939,6 +925,20 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 	return strings.TrimSpace(rec.Body.String()), rec.Header().Get("Cache-Control")
 }
 
+// withDefaultPolicies fills the four routeDeps POLICY functions with the
+// permissive off-shape defaults main.go's composition root supplies
+// (unmanagedKiroRuntime, degradedRuntime, startTools' absent-config-dir arm), so
+// a test literal only names the fields it cares about. registerRoutes' policy
+// contract is TOTAL — nil is reserved for the two mounting decisions (tools,
+// kiroRescan) — so every literal needs them.
+func withDefaultPolicies(d *routeDeps) *routeDeps {
+	d.toolsSyncing = func() bool { return false }
+	d.toolsState = func() string { return "" }
+	d.kiroReady = func() (bool, string) { return true, "" }
+	d.sessionEnv = func() []string { return nil }
+	return d
+}
+
 // newTestDeps returns the minimal routeDeps the route tests build
 // repeatedly: the index fixture that satisfies the fail-loud CSP build,
 // a ready flag, and a short-lived cat as the session command. Tests
@@ -946,12 +946,12 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 func newTestDeps(ready bool) *routeDeps {
 	var r webhttp.Ready
 	r.Set(ready)
-	return &routeDeps{
+	return withDefaultPolicies(&routeDeps{
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &r,
 		workDir:  "",
 		cmd:      staticCmd("/bin/cat"),
-	}
+	})
 }
 
 // staticCmd is the fixed-argv session command a test wants where production
@@ -962,8 +962,8 @@ func staticCmd(argv ...string) func() []string {
 
 // unreadyDepsWithTools is an UNREADY handler with a tools engine wired: the
 // combination that proves the informational tools field survives the 503 path,
-// which newTestDeps(false) alone cannot show (its toolsState is nil, and a nil
-// state is the deliberately-disabled case that omits the key).
+// which newTestDeps(false) alone cannot show (its toolsState reports "", the
+// deliberately-disabled case that omits the key).
 func unreadyDepsWithTools() *routeDeps {
 	d := newTestDeps(false)
 	d.toolsState = func() string { return "syncing" }
@@ -1048,13 +1048,13 @@ func newToolsDeps(t *testing.T) *routeDeps {
 	t.Cleanup(eng.Close)
 	var ready webhttp.Ready
 	ready.Set(true)
-	return &routeDeps{
+	return withDefaultPolicies(&routeDeps{
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &ready,
 		workDir:  "",
 		cmd:      staticCmd("/bin/cat"),
 		tools:    eng,
-	}
+	})
 }
 
 // TestToolsAPI_LoopbackOnly pins the tools API's only boundary on this
@@ -1168,6 +1168,14 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 		// install strings as root.
 		"localhost.evil.example", "localhost.evil.example:9848",
 		"evil.localhost", "evil.localhost:9848", "notlocalhost",
+		// The same widening, one arm over: admission of an IP LITERAL is
+		// net.ParseIP + IsLoopback, and every Host above decorates the NAME, so
+		// a loosening of the literal arm to a prefix or substring test
+		// (`strings.HasPrefix(canon, "127.")`, the equally plausible edit) is
+		// invisible to the whole package. These are attacker-REGISTERABLE names
+		// that a rebinding page resolves to 127.0.0.1 like any other.
+		"127.evil.example", "127.evil.example:9848",
+		"127.0.0.1.evil.example", "1.2.3.4",
 	} {
 		req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
 		req.RemoteAddr = "127.0.0.1:55555"
@@ -1305,12 +1313,12 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 func TestRegisterRoutes_failsLoudOnMalformedStatic(t *testing.T) {
 	mux := http.NewServeMux()
 	var ready webhttp.Ready
-	deps := &routeDeps{
+	deps := withDefaultPolicies(&routeDeps{
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}},
 		ready:    &ready,
 		workDir:  "",
 		cmd:      staticCmd("/bin/cat"),
-	}
+	})
 	if _, _, err := registerRoutes(mux, deps); err == nil {
 		t.Fatal("registerRoutes returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
 	}
@@ -1384,12 +1392,12 @@ func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	var ready webhttp.Ready
-	deps := &routeDeps{
+	deps := withDefaultPolicies(&routeDeps{
 		staticFS: failOpenFS{FS: base, failPath: "static/broken.js"},
 		ready:    &ready,
 		workDir:  "",
 		cmd:      staticCmd("/bin/cat"),
-	}
+	})
 	if _, _, err := registerRoutes(mux, deps); err == nil {
 		t.Fatal("registerRoutes returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
 	}

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import ts from "typescript";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -331,6 +331,15 @@ function dispatchWindowError({ target, error }: { target?: unknown; error?: unkn
   window.dispatchEvent(event);
 }
 
+// Parse the SERVED index.html into a detached Document under this suite's single
+// fixture-read policy: the external stylesheet <link> is stripped first, because
+// happy-dom fetches a parsed document's stylesheet hrefs and would turn an
+// assertion over static markup into a real HTTP request.
+function parseServedDocument(): Document {
+  const html = readStaticAsset("index.html").replace(/<link\b[^>]*rel=["']?stylesheet[^>]*>/gi, "");
+  return new DOMParser().parseFromString(html, "text/html");
+}
+
 // index.html's REAL body, scripts removed, mounted into the live document. The
 // focusable-inventory test below has to enumerate the SERVED markup rather than
 // a hand-built subset of it: a link, a button or a tabindex ADDED to that file
@@ -340,8 +349,7 @@ function dispatchWindowError({ target, error }: { target?: unknown; error?: unkn
 // stylesheet <link> goes first for the same reason the stand-down-guard test
 // drops it: happy-dom fetches a parsed document's stylesheet hrefs.
 function mountServedBody(): void {
-  const html = readStaticAsset("index.html").replace(/<link\b[^>]*rel=["']?stylesheet[^>]*>/gi, "");
-  const doc = new DOMParser().parseFromString(html, "text/html");
+  const doc = parseServedDocument();
   for (const script of doc.querySelectorAll("script")) {
     script.remove();
   }
@@ -982,6 +990,37 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expectPristineOverlayUntouched(overlay, root);
   });
 
+  it("converts HSL to hex across every hue sector", () => {
+    // hslToHex is the mechanical link between the accent's two spellings, and the
+    // brand-accent test below exercises exactly ONE of its six hue sectors (263deg).
+    // Its output is what a developer copies into <meta name="theme-color"> and
+    // manifest.json after a hue change, so a wrong sector row, a lost hue clamp or
+    // a broken rounding step ships the wrong colour to installed-PWA chrome with
+    // every test still green. These rows are the sRGB primaries and secondaries,
+    // whose hex is known independently of this implementation.
+    const cases: [string, string][] = [
+      ["hsl(0 100% 50%)", "#ff0000"],
+      ["hsl(60 100% 50%)", "#ffff00"],
+      ["hsl(120 100% 25%)", "#008000"],
+      ["hsl(180 100% 50%)", "#00ffff"],
+      ["hsl(240 100% 50%)", "#0000ff"],
+      ["hsl(300 100% 50%)", "#ff00ff"],
+      // The hue clamp: hp = 6 indexes past the sector table, so without
+      // Math.min(..., 5) this row throws instead of wrapping back to red.
+      ["hsl(360 100% 50%)", "#ff0000"],
+      // Achromatic: chroma 0, so every sector row must agree.
+      ["hsl(0 0% 100%)", "#ffffff"],
+      ["hsl(0 0% 0%)", "#000000"],
+    ];
+    for (const [hsl, hex] of cases) {
+      expect(hslToHex(hsl), `hslToHex(${hsl})`).toBe(hex);
+    }
+    // ...and an unparseable value must throw rather than return a colour: the
+    // parity assertion below is only as strong as this refusal (the theme's own
+    // oklch tokens are exactly the shape that must not silently convert).
+    expect(() => hslToHex("oklch(78% 0.15 150deg)")).toThrow("unparseable hsl");
+  });
+
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
     expect(hslToHex(ACCENT_HSL)).toBe(ACCENT_HEX);
     expect(THEME["--accent"]).toBe(ACCENT_HSL);
@@ -1007,6 +1046,59 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(html).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
     const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
     expect((manifest as { theme_color: string }).theme_color).toBe(ACCENT_HEX);
+    // ...and the token name itself is the library's, not ours: the assertions
+    // above only compare this app's four sites to each other, so a rename of
+    // --wt-loading-accent in page.css would leave the first screen of every load
+    // in the library's default blue with every one of them still green.
+    const pageCss = readFileSync(
+      resolve(fixtureRoot(), "node_modules/@cplieger/web-terminal-ui/css/page.css"),
+      "utf8",
+    );
+    expect(pageCss).toContain("var(--wt-loading-accent)");
+  });
+
+  it("serves every icon index.html and manifest.json reference, at the declared size", () => {
+    // Nothing else checks these. The icons are referenced by NAME from two static
+    // files no compiler reads, the watchdog deliberately ignores a failed icon link
+    // (icon 404s must never raise the fatal dialog), and routes_test.go serves
+    // fstest fixtures rather than the real tree -- so a renamed or regenerated
+    // asset ships as a 404 favicon and an uninstallable PWA (a manifest icon that
+    // does not fetch invalidates the install prompt) with nothing failing.
+    // Only COMMITTED assets are checked: /style.css and /app.js are gitignored
+    // build outputs, absent from a fresh checkout.
+    const html = readStaticAsset("index.html").replace(
+      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
+      "",
+    );
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const linked = [
+      ...doc.querySelectorAll('link[rel~="icon"], link[rel~="apple-touch-icon"]'),
+    ].map((link) => ({
+      src: link.getAttribute("href") ?? "",
+      sizes: link.getAttribute("sizes"),
+    }));
+    const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
+    const icons = (manifest as { icons: { src: string; sizes: string }[] }).icons;
+    // Neither list may be empty, or every assertion below is vacuous. Counts are
+    // deliberately not pinned: adding or dropping an icon is a legitimate edit.
+    expect(linked.length).toBeGreaterThan(0);
+    expect(icons.length).toBeGreaterThan(0);
+
+    for (const { src, sizes } of [...linked, ...icons]) {
+      const path = resolve(fixtureRoot(), `../static/${src.replace(/^\//, "")}`);
+      expect(
+        () => readFileSync(path),
+        `${src} is referenced but not present in static/`,
+      ).not.toThrow();
+      if (sizes === null || !src.endsWith(".png")) {
+        continue;
+      }
+      // The PNG IHDR width/height, so a regenerated asset cannot keep a stale
+      // declared size: an icon whose real pixels disagree with its `sizes` is
+      // rejected by some install prompts and rasterised wrong by others.
+      const header = readFileSync(path);
+      expect(`${header.readUInt32BE(16)}x${header.readUInt32BE(20)}`, `${src} pixels`).toBe(sizes);
+    }
   });
 
   it("keeps the served no-JS fallback wired to the class its critical CSS styles", () => {
@@ -1016,13 +1108,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // opaque background), so renaming it -- or dropping the <noscript> block --
     // leaves a JS-disabled visitor watching the infinite loading bar with no
     // explanation, while the surviving rule keeps the parity test green.
-    // The stylesheet link is stripped before parsing for the same reason as the
-    // pristine-overlay test: happy-dom would try to fetch its href.
-    const html = readStaticAsset("index.html").replace(
-      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
-      "",
-    );
-    const doc = new DOMParser().parseFromString(html, "text/html");
+    const doc = parseServedDocument();
     const fallback = doc.querySelector("noscript .noscript-fallback");
     expect(fallback?.tagName).toBe("P");
     expect(fallback?.textContent?.replace(/\s+/g, " ").trim()).toBe(
@@ -1038,15 +1124,9 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // never fires in production while every watchdog test above still passes
     // against its own fabricated overlay -- so pin the hand-built fixture to
     // the served file here.
-    // Drop the external stylesheet link before parsing: happy-dom fetches
-    // <link rel=stylesheet> hrefs off a parsed document, which would make this
-    // assertion attempt a real HTTP request. The guards below live entirely in
-    // the markup.
-    const html = readStaticAsset("index.html").replace(
-      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
-      "",
-    );
-    const doc = new DOMParser().parseFromString(html, "text/html");
+    // The guards below live entirely in the markup, read through the suite's
+    // shared served-document policy.
+    const doc = parseServedDocument();
     const overlay = doc.getElementById("loading");
     // The guards the watchdog keys on, read from the served file rather than
     // from appendPristineOverlay()'s hand-built copy.
@@ -1067,6 +1147,21 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const terminalRoot = doc.getElementById("terminal");
     expect(terminalRoot).not.toBeNull();
     expect(terminalRoot?.firstElementChild).toBeNull();
+  });
+
+  it("keys its fade stand-down on the class the kernel actually adds", () => {
+    // index.html's watchdog stands down while the overlay is fading out, and it
+    // recognizes that state by CLASS. LOADING_OVERLAY_CLASSES publishes the two
+    // classes this app WRITES (overlay/bar) but not the one the kernel ADDS, so the
+    // name is read from the library's own source here. If the kernel renames it, the
+    // stand-down silently stops firing and a stray uncaught error converts an
+    // already-lowered overlay into a dialog the kernel then removes.
+    const kernel = readFileSync(
+      resolve(fixtureRoot(), "node_modules/@cplieger/web-terminal-ui/src/kernel/kernel.ts"),
+      "utf8",
+    );
+    expect(kernel).toContain('classList.add("fade")');
+    expect(readWatchdogSource()).toContain('classList.contains("fade")');
   });
 
   it("declares an importmap entry for every bare specifier app.ts imports", () => {
@@ -1120,6 +1215,48 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
       expect(
         keys.some((key) => key === specifier || (key.endsWith("/") && specifier.startsWith(key))),
         `no importmap entry in static/index.html resolves ${specifier}`,
+      ).toBe(true);
+    }
+  });
+
+  it("declares an importmap entry for every bare specifier the vendored graph imports", () => {
+    // The test above covers app.ts's OWN two specifiers. The browser also resolves
+    // the specifiers the VENDORED packages import: the Dockerfile compiles
+    // web-terminal-ui's and web-terminal-engine's TypeScript into static/vendor/
+    // with bare specifiers preserved (only relative "./*.js" paths resolve inside
+    // the vendored dirs). @cplieger/web-terminal-engine is imported by the UI's
+    // kernel/viewport/tabs modules and NEVER by app.ts, so deleting that importmap
+    // entry puts every visitor on the watchdog's fatal dialog while the
+    // app.ts-only check above stays green.
+    const specifiers = new Set<string>();
+    for (const pkg of ["@cplieger/web-terminal-ui", "@cplieger/web-terminal-engine"]) {
+      const src = resolve(fixtureRoot(), `node_modules/${pkg}/src`);
+      for (const entry of readdirSync(src, { recursive: true, encoding: "utf8" })) {
+        if (!entry.endsWith(".ts")) {
+          continue;
+        }
+        for (const specifier of browserResolvedSpecifiers(
+          readFileSync(resolve(src, entry), "utf8"),
+        )) {
+          if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
+            specifiers.add(specifier);
+          }
+        }
+      }
+    }
+    // Guard the walk: the UI package imports the engine by bare specifier in
+    // several modules, so an engine-less set means the walk found nothing and the
+    // loop below would pass forever.
+    expect([...specifiers]).toContain("@cplieger/web-terminal-engine");
+
+    const html = readStaticAsset("index.html");
+    const map = /<script\b[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script\s*>/i.exec(html);
+    const parsed: unknown = JSON.parse(map?.[1] ?? "null");
+    const keys = Object.keys((parsed as { imports?: Record<string, string> })?.imports ?? {});
+    for (const specifier of specifiers) {
+      expect(
+        keys.some((key) => key === specifier || (key.endsWith("/") && specifier.startsWith(key))),
+        `no importmap entry in static/index.html resolves ${specifier}, which the vendored library graph imports`,
       ).toBe(true);
     }
   });

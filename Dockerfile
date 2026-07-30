@@ -295,8 +295,12 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # browser can fetch the compiled JS via the importmap. Internal imports (the
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
-RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -name '*.ts') && \
-    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -name '*.ts') && \
+# -type f, not a bare -name: a directory, symlink or FIFO named *.ts in a
+# mis-published or crafted vendored tarball would otherwise be handed to tsc, and
+# a FIFO blocks the build forever with no deadline -- the same class
+# scripts/css-bundle.sh refuses per MANIFEST entry for the CSS half of this build.
+RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -type f -name '*.ts') && \
+    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -type f -name '*.ts') && \
     { [ "${#ui_ts[@]}" -gt 0 ] \
       || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
     { [ "${#engine_ts[@]}" -gt 0 ] \
@@ -461,6 +465,16 @@ EXPOSE 9848
 # walks, stat/chmod, the agent-runtime prune, a small file write). That is a
 # ~4800s reduction against the pre-move sum, and it is why the container is now
 # observable during a first-boot download rather than connection-refused.
+#
+# The interrupted-dpkg recovery adds two more bounded steps to that sum
+# (dpkg --audit 300, +30 kill-after; dpkg --configure -a 300, +30 kill-after),
+# taking the worst case to 1690s — above this start-period. Those deadlines are
+# only REACHED on a boot following an APT_PACKAGES install that was killed
+# mid-transaction (a docker stop inside the install window), where apt state in
+# the container layer would otherwise refuse every later install for the
+# container's life. The audit probe is a no-op in the healthy case, so the 1030s
+# figure is the routine sum; the 1690s worst case is deliberately above the
+# budget for the same reason the download's is (see below).
 #
 # BACKGROUND allowance-sum for one install attempt, all AFTER the bind: the
 # archive fetch (bounded by a 60s no-progress stall guard and a 20s handshake

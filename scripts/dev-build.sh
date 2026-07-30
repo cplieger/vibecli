@@ -110,6 +110,23 @@ cp "$UI_DIR/package.json" "$UI_PKG/package.json"
     cp "$UI_DIR/src/$f" "$UI_PKG/src/$f"
   done
 
+# Wire-floor gate, mirroring the Dockerfile step after its vendor fetch: the Go
+# half comes from go.work (the LOCAL engine) and the client half from the overlay
+# above, so a dev build of an unpublished engine is exactly where the two floors
+# can disagree. Without this the pairing fails at first connect (close 4002) with
+# /api/health green and no build-time diagnostic. Built and then invoked, never
+# `go run`, which collapses the gate's exit 2 ("the extraction is broken, do NOT
+# bump a pin") into a plain 1.
+WIRE_TS="$ENGINE_PKG/src/wire-compatibility.ts"
+CLIENT_REV="$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS")"
+CLIENT_MIN_SERVER="$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS")"
+: "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in $WIRE_TS (engine src layout changed?)}"
+: "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in $WIRE_TS}"
+wirecheck_bin="$(mktemp)"
+go build -o "$wirecheck_bin" ./scripts/wirecheck
+"$wirecheck_bin" -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+rm -f "$wirecheck_bin"
+
 printf '[3/6] tsc: app -> static/app.js (resolves @cplieger/web-terminal-ui)\n'
 # Drop the previous emit first so the assertion after step [4/6] observes THIS
 # run's output: static/app.js is gitignored but persistent, so an outDir/rootDir
@@ -123,13 +140,13 @@ printf '[4/6] tsc: engine + UI libs -> static/vendor/\n'
 rm -rf static/vendor/cplieger-web-terminal-engine static/vendor/cplieger-web-terminal-ui
 # Compile the whole overlaid engine tree (flat today; recursive so a future nested
 # engine module is not silently dropped, matching the UI handling below).
-mapfile -t engine_ts < <(find "$ENGINE_PKG/src" -name '*.ts')
+mapfile -t engine_ts < <(find "$ENGINE_PKG/src" -type f -name '*.ts')
 "$TSC" --module ESNext --target ESNext --moduleResolution bundler \
   --outDir static/vendor/cplieger-web-terminal-engine \
   --rootDir "$ENGINE_PKG/src" --skipLibCheck --strict "${engine_ts[@]}"
 # Compile the whole nested UI src tree (index.ts + presets.ts + kernel/ +
 # features/); find collects every .ts (the overlay already excluded tests).
-mapfile -t ui_ts < <(find "$UI_PKG/src" -name '*.ts')
+mapfile -t ui_ts < <(find "$UI_PKG/src" -type f -name '*.ts')
 "$TSC" --module ESNext --target ESNext --moduleResolution bundler \
   --outDir static/vendor/cplieger-web-terminal-ui \
   --rootDir "$UI_PKG/src" --skipLibCheck --strict "${ui_ts[@]}"
@@ -169,8 +186,13 @@ FONT_CACHE_MARKER="$FONT_CACHE/.complete"
 # Dockerfile's tar member list. Hardcoding it here drifts SILENTLY (extracting the old
 # four faces still succeeds), so the dev binary would embed a different font set than the
 # image and only show it as tofu at runtime.
+# Match ANY .otf tar member rather than one family: pinning the family here is the
+# hardcoding this block exists to avoid, and it fails asymmetrically -- a wholesale
+# rename trips the guard below, but renaming SOME faces silently yields a shorter
+# list that passes it. Every .otf token in the Dockerfile is a member of this one
+# tar list, so no family prefix is needed to disambiguate.
 mapfile -t fonts < <(sed -n \
-  's/^[[:space:]]*\(MonaspiceNeNerdFontMono-[A-Za-z]*\.otf\).*/\1/p' Dockerfile)
+  's/^[[:space:]]*\([A-Za-z0-9][A-Za-z0-9.-]*\.otf\).*/\1/p' Dockerfile)
 [ "${#fonts[@]}" -gt 0 ] || {
   printf 'error: failed to parse the Monaspace face list from Dockerfile\n' >&2
   exit 1

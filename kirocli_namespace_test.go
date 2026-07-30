@@ -517,3 +517,52 @@ func TestLegacySweepRunsOncePerVolume(t *testing.T) {
 func nsShellQuote(s string) string {
 	return "'" + s + "'"
 }
+
+// TestKiroInstallConfig_requiresTheChatSidecar pins the half of this app's
+// install configuration its own product depends on: kiro-cli-chat is REQUIRED, so
+// a version directory holding only the main dispatcher is not a candidate at all.
+//
+// Nothing else can see it. The main dispatcher answers --version correctly, so the
+// selection probe accepts a chat-less directory, the sentinel is present, and every
+// assertion passes -- the volume looks healthy and every tab dies the moment `chat`
+// runs. Dropping "-chat" from kiroInstallConfig's Require leaves the whole suite
+// green (plantOwnVersion writes both dispatchers, so no existing test distinguishes
+// the two shapes).
+//
+// It uses Rescan rather than Ensure deliberately: Ensure would answer a rejected
+// directory by fetching the pinned archive over the network, while Rescan re-derives
+// the verdict from what the volume already holds, which is the property under test.
+func TestKiroInstallConfig_requiresTheChatSidecar(t *testing.T) {
+	env := newNSEnv(t)
+	dir := filepath.Join(env.tools, nsTool+"-versions", nsVersion)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", dir, err)
+	}
+	env.writeScript(filepath.Join(dir, nsTool), "case \"$1\" in --version) printf 'kiro-cli "+nsVersion+"\\n' ;; esac\n")
+	if err := os.WriteFile(filepath.Join(dir, ".complete"), []byte(nsVersion+"\n"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	mgr := env.manager()
+
+	if ok, _ := mgr.Rescan(context.Background()); ok {
+		t.Fatalf("a version directory holding only %s was activated: it answers --version correctly and then kills every terminal at chat", nsTool)
+	}
+	if ready, why := mgr.Ready(); ready || why != pinstall.ReasonUnavailable {
+		t.Errorf("Ready() = (%v, %v), want (false, %v)", ready, why, pinstall.ReasonUnavailable)
+	}
+	if got := mgr.Path(); got != "" {
+		t.Errorf("Path() = %q, want empty: no version may be active", got)
+	}
+
+	// The positive control, so the refusal above cannot be passing because the
+	// fixture is unusable for an unrelated reason: adding the sidecar to the SAME
+	// directory, changing nothing else, makes it activatable.
+	env.writeScript(filepath.Join(dir, nsTool+"-chat"), "exit 0\n")
+	ok, err := mgr.Rescan(context.Background())
+	if !ok || err != nil {
+		t.Fatalf("Rescan with the sidecar present = (%v, %v), want (true, nil)", ok, err)
+	}
+	if got, want := mgr.Path(), filepath.Join(dir, nsTool); got != want {
+		t.Errorf("Path() = %q, want %q", got, want)
+	}
+}

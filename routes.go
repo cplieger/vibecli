@@ -52,21 +52,27 @@ const (
 type routeDeps struct {
 	staticFS fs.FS
 	ready    *webhttp.Ready
+	// nil is reserved for the two MOUNTING decisions (tools, kiroRescan); every
+	// policy function below is always non-nil, defaulted by the composition
+	// root's off-shape constructors (main.go's unmanagedKiroRuntime,
+	// unavailableKiroRuntime, degradedRuntime and startTools' absent-config-dir
+	// arm), so no consumer here re-derives what an absent subsystem means.
+	//
 	// tools, when non-nil, mounts the toolbelt httpapi projection at
 	// /api/tools behind the loopback gate; toolsSyncing gates session
 	// creation on the boot convergence pass; toolsState feeds the
-	// /api/health informational tools field. All nil outside the
-	// container (see startTools).
+	// /api/health informational tools field ("" outside the container, which
+	// the omitempty tag drops).
 	tools        *toolbelt.Engine
 	toolsSyncing func() bool
 	toolsState   func() string
-	// kiroReady, when non-nil, is the kiro-cli install manager's readiness
-	// verdict plus the reason to report when it is false (installing, retrying,
-	// terminally unavailable, or required settings unenforced). It gates
-	// /api/health AND session creation. Nil means this server does not own the
-	// install, which happens only outside the container (a bare `go run` or a
-	// test with no pins), and then the gate is disabled and readiness stays
-	// pure-listener. Every container boot wires it.
+	// kiroReady is the kiro-cli install manager's readiness verdict plus the
+	// reason to report when it is false (installing, retrying, terminally
+	// unavailable, or required settings unenforced). It gates /api/health AND
+	// session creation. Outside the container (a bare `go run` or a test with no
+	// pins) this server does not own the install, and the root's off-shape
+	// constructor supplies the permissive (true, "") default so readiness stays
+	// pure-listener. Every container boot wires the real manager.
 	kiroReady func() (bool, string)
 	// kiroRescan, when non-nil, re-derives the active kiro-cli version from disk
 	// without downloading anything. It backs kiroRescanPath.
@@ -75,9 +81,9 @@ type routeDeps struct {
 	// version can change while the server runs, so the factory below must ask at
 	// session-create time rather than close over a boot constant.
 	cmd func() []string
-	// sessionEnv, when non-nil, returns the per-session environment overlay (the
-	// active version directory leading PATH). Nil, or a nil result, leaves the
-	// child with the server's own environment.
+	// sessionEnv returns the per-session environment overlay (the active version
+	// directory leading PATH). A nil result leaves the child with the server's
+	// own environment, which is what the root's off-shape constructors return.
 	sessionEnv func() []string
 	workDir    string
 	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
@@ -156,17 +162,13 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// stay reachable throughout: the container is observable during installs
 	// instead of connection-refused.
 	createGate := webhttp.SessionCreateRateLimit(terminal.SessionsPath)
-	if deps.toolsSyncing != nil {
-		createGate = composeGate(createGate, func() (bool, string) {
-			return deps.toolsSyncing(), "tools installing"
-		})
-	}
-	if deps.kiroReady != nil {
-		createGate = composeGate(createGate, func() (bool, string) {
-			ready, reason := deps.kiroReady()
-			return !ready, reason
-		})
-	}
+	createGate = composeGate(createGate, func() (bool, string) {
+		return deps.toolsSyncing(), "tools installing"
+	})
+	createGate = composeGate(createGate, func() (bool, string) {
+		ready, reason := deps.kiroReady()
+		return !ready, reason
+	})
 	mgr.MountAPI(mux, terminal.WithCreateGate(createGate))
 
 	// Tools REST surface: the toolbelt httpapi projection, loopback-only.
@@ -178,7 +180,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// Config-file edits + restart remain the primary toggle path; this
 	// API is the no-restart alternative.
 	if deps.tools != nil {
-		toolsAPI := loopbackOnly(httpapi.Handler(deps.tools, toolsPath))
+		toolsAPI := loopbackOnly("tools API", httpapi.Handler(deps.tools, toolsPath))
 		mux.Handle(toolsPath, toolsAPI)
 		mux.Handle(toolsPath+"/", toolsAPI)
 	}
@@ -191,7 +193,21 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// it until the container is recreated. This is the endpoint that makes such a
 	// repair observable without a recreate. It downloads nothing.
 	if deps.kiroRescan != nil {
-		mux.Handle("POST "+kiroRescanPath, loopbackOnly(handleKiroRescan(deps)))
+		mux.Handle("POST "+kiroRescanPath, loopbackOnly("kiro-cli rescan hook", handleKiroRescan(deps)))
+		// ServeMux synthesizes 405 only when NO pattern matches the request, and
+		// the "/" static mount matches every path — so without this mount a GET or
+		// PUT here is answered by the static handler's bare 404, which reads as "no
+		// such endpoint" on the one route that exists to repair a broken install
+		// (verified against a three-pattern mux: GET -> 404 static, with this mount
+		// -> 405 Allow: POST). This pattern is less specific than the POST one
+		// above, so POST still reaches the handler, and it sits behind the same
+		// loopback gate so a remote caller learns nothing new.
+		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook",
+			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Allow", http.MethodPost)
+				webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "",
+					"kiro-cli rescan is POST-only (curl -X POST localhost:9848"+kiroRescanPath+")")
+			})))
 	}
 
 	mux.HandleFunc(healthPath, handleHealth(deps))
@@ -217,7 +233,20 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// settings, so it is not free; it is also not cacheable under any
 		// circumstances.
 		w.Header().Set("Cache-Control", "no-store")
-		ok, err := deps.kiroRescan(r.Context())
+		// The rescan MUTATES readiness, so it must not inherit the request's
+		// cancellation: pinstall's Rescan probes each candidate with
+		// exec.CommandContext, and a canceled context makes every probe fail
+		// instantly, which the manager records as "no usable version" and
+		// publishes as unready (recordUnavailable clears the active version and
+		// assertionsOK). A caller that presses Ctrl-C, or passes --max-time,
+		// would therefore knock a healthy server unready and 503 every new
+		// session until the next successful rescan or a container recreate.
+		// WithoutCancel keeps the request-scoped values the logs correlate on
+		// (request id) while detaching the lifetime; no deadline is added on
+		// purpose, because pinstall bounds every subprocess itself (probeTimeout
+		// / assertionTimeout) and an expiring deadline would reintroduce exactly
+		// the canceled-probe verdict this removes.
+		ok, err := deps.kiroRescan(context.WithoutCancel(r.Context()))
 		if ok {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
 			return
@@ -227,10 +256,8 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// error text: err can name a filesystem path, and this response is not
 		// the place to widen what a caller learns about the volume.
 		reason := reasonUnavailable
-		if deps.kiroReady != nil {
-			if _, r := deps.kiroReady(); r != "" {
-				reason = r
-			}
+		if _, r := deps.kiroReady(); r != "" {
+			reason = r
 		}
 		slog.Warn("kiro-cli rescan found no usable version", "reason", reason, "error", err)
 		webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
@@ -290,7 +317,7 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// digest-verified install rather than out of a stale $TOOLS/bin copy
 			// left by a restored backup volume. A nil result (no version active,
 			// or no manager) leaves the server's own environment untouched.
-			terminal.WithEnv(sessionEnvFor(deps)),
+			terminal.WithEnv(deps.sessionEnv()),
 			// Name each tab after the first substantial thing the user asked
 			// for. This app is the engine's session-per-CONVERSATION consumer,
 			// which is the exact shape WithInputTitle is for: kiro-cli sets no
@@ -315,7 +342,8 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// exits while still serving are promoted to Warn; intentional
 			// shutdowns keep the engine's normal INFO exit record.
 			terminal.WithOnProcessExit(func(err error) {
-				if err != nil && deps.ready.Ready() && kiroReadyNow(deps) && time.Since(start) < 10*time.Second {
+				kiroReady, _ := deps.kiroReady()
+				if err != nil && deps.ready.Ready() && kiroReady && time.Since(start) < 10*time.Second {
 					sessionLogger.Warn(sessionFastDeathMsg,
 						"error", err,
 						"hint", "check /api/health and the kiro-cli install under /config/tools/kiro-cli-versions")
@@ -323,29 +351,6 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			}),
 		)
 	}
-}
-
-// sessionEnvFor returns the per-session environment overlay, or nil when this
-// server does not own the kiro-cli install.
-func sessionEnvFor(deps *routeDeps) []string {
-	if deps.sessionEnv == nil {
-		return nil
-	}
-	return deps.sessionEnv()
-}
-
-// kiroReadyNow reports whether kiro-cli is currently usable. An absent manager
-// means no install to gate on at all, which only happens outside the container (a
-// bare `go run` or a test with no pins) and reads as usable, the same
-// gate-disabled semantics /api/health applies. The fast-death Warn keys on it so a
-// session that dies because the install is not finished yet does not fire a
-// broken-install alert; that state has its own 503 and its own log line.
-func kiroReadyNow(deps *routeDeps) bool {
-	if deps.kiroReady == nil {
-		return true
-	}
-	ready, _ := deps.kiroReady()
-	return ready
 }
 
 // healthBody is /api/health's response envelope. A struct, not a map, for the
@@ -382,9 +387,7 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	// because both unready paths returned before it was attached.
 	healthResponse := func(status, reason string) healthBody {
 		body := healthBody{Status: status, Reason: reason}
-		if deps.toolsState != nil {
-			body.Tools = deps.toolsState()
-		}
+		body.Tools = deps.toolsState()
 		return body
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -419,11 +422,9 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// `restart: unless-stopped` nothing restarts on the resulting unhealthy
 		// state, so there is no restart loop; if ever run under Swarm/k8s, wire
 		// this to a readinessProbe, not a livenessProbe.
-		if deps.kiroReady != nil {
-			if ok, reason := deps.kiroReady(); !ok {
-				unready(reason)
-				return
-			}
+		if ok, reason := deps.kiroReady(); !ok {
+			unready(reason)
+			return
 		}
 		// The tools field is INFORMATIONAL: tool convergence never gates
 		// readiness (kiro-cli is the only core dependency), so monitoring
@@ -471,6 +472,13 @@ const recognizedNotifyMsg = "kiro-cli OSC 9 notification mapped to a tab status"
 // process output, so an unbounded set would let a chatty or hostile session grow
 // it without limit. Insertion stops at the cap; the map never exceeds it.
 const unrecognizedNotifyCap = 8
+
+// unrecognizedNotifyCapRearm is how long the budget-exhausted announcement stays
+// silent before it may fire again. The seen-set is keyed on CHILD output, so the
+// budget can be spent entirely on benign wordings; re-arming is what keeps a
+// kiro-cli rewording that begins AFTER exhaustion visible in the default log
+// stream, while still bounding volume to one line per window.
+const unrecognizedNotifyCapRearm = 6 * time.Hour
 
 // unrecognizedNotifyHint is the operator-facing next step both Warn arms carry:
 // what to re-verify after a kiro-cli bump, and the two levers that surface the
@@ -578,15 +586,20 @@ func (f notifyFingerprinter) metadata(msg string) []any {
 // budget.
 type notifyWarningState struct {
 	warned map[string]struct{}
-	mu     sync.Mutex
-	capped bool
+	// lastCapWarn is when the budget-exhausted announcement last fired; the zero
+	// value means never, so the first one always fires.
+	lastCapWarn time.Time
+	// mu guards warned and lastCapWarn.
+	mu sync.Mutex
 }
 
 // observe records msg against the warn budget and reports which record (if any)
 // the caller should emit: warnFirst for the first occurrence of a DISTINCT
-// message while budget remains, warnCapped exactly once for the first distinct
-// message the cap turns away (so a silent stop is distinguishable from "nothing
-// new appeared"). Both false means the message is Debug-only. The engine shares
+// message while budget remains, warnCapped at most once per
+// unrecognizedNotifyCapRearm window for a distinct message the cap turns away
+// (so a silent stop is distinguishable from "nothing new appeared", and a
+// wording drift that begins after exhaustion still reaches the default stream).
+// Both false means the message is Debug-only. The engine shares
 // one classifier across every session and calls it from per-session goroutines,
 // so the state is mutex guarded; the caller logs OUTSIDE the lock.
 func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
@@ -599,10 +612,15 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 		s.warned[msg] = struct{}{}
 		return true, false
 	}
-	if s.capped {
+	// The announcement re-arms rather than firing once per process: the seen-set is
+	// filled first-come by arbitrary child output, so announcing exhaustion a single
+	// time leaves a LATER kiro-cli rewording -- the drift this Warn exists to catch
+	// -- with no default-level record at all. The set still never grows past the
+	// cap, and log volume is still bounded (one line per window).
+	if !s.lastCapWarn.IsZero() && time.Since(s.lastCapWarn) < unrecognizedNotifyCapRearm {
 		return false, false
 	}
-	s.capped = true
+	s.lastCapWarn = time.Now()
 	return false, true
 }
 
@@ -726,14 +744,21 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 // kiroCacheControl is the per-asset Cache-Control policy handed to
 // webhttp.StaticHandler (which supplies the ETag/gzip mechanism; asset paths
 // arrive normalized, no leading slash):
-//   - fonts (vendor/fonts/**): immutable, 30 days. The Monaspace .otf
-//     files are large (~2.4 MB each, ~9.4 MB total) and their glyphs are
-//     fixed for a given vendored web-terminal-ui version, so immutable
-//     avoids re-downloading them on every visit. CAVEAT: the filenames
-//     are NOT content-addressed (no hash), and immutable suppresses even
-//     reload revalidation — a font whose bytes change under the SAME
-//     filename is served stale for up to 30 days. A font swap must change
-//     the path/filename (or hash it at vendor time) to bust the cache.
+//   - fonts (vendor/fonts/**): public, 30 days, NOT immutable. The Monaspace
+//     .otf files are large (~2.4 MB each, ~9.4 MB total) and their glyphs are
+//     fixed for a given vendored web-terminal-ui version, so a long max-age
+//     keeps an ordinary navigation from re-requesting them at all. `immutable`
+//     is deliberately absent: the filenames are NOT content-addressed and this
+//     app cannot make them so (the four @font-face URLs come from the vendored
+//     UI's page.css, and Dockerfile's NERDFONT_VERSION step extracts the same
+//     fixed names), so the bytes DO change under one filename on a nerd-fonts
+//     bump. Without `immutable` a reload revalidates against the helper's
+//     content-hash ETag — a ~200-byte 304 when nothing changed, the new face
+//     when it did — which is the operator's and the user's only lever after a
+//     bump. Remaining exposure: a returning browser that never reloads keeps
+//     the old face until max-age expires. Closing that fully means hashing the
+//     font filenames at vendor time and rewriting the library CSS URLs (a
+//     Dockerfile change), after which `immutable` can come back.
 //   - everything else (HTML/JS/CSS, ~1–30 KB modules): no-cache +
 //     must-revalidate so deployments take effect immediately. The helper's
 //     content-hash ETag lets unchanged files revalidate with a cheap 304;
@@ -742,7 +767,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 //     the server wire protocol.
 func kiroCacheControl(assetPath string) string {
 	if strings.HasPrefix(assetPath, "vendor/fonts/") {
-		return "public, max-age=2592000, immutable"
+		return "public, max-age=2592000"
 	}
 	return "no-cache, must-revalidate"
 }
@@ -884,18 +909,44 @@ func loopbackHost(host string) bool {
 	return canon == "localhost" || isLoopbackIP(canon)
 }
 
+// proxyProvenanceHeaders are the headers a request acquires by travelling
+// through a browser or a reverse proxy. The loopback gate's consumer is an
+// in-container CLI client, which sends none of them, so their presence is
+// positive evidence that this request did NOT originate inside the container
+// even when the socket peer and Host both canonicalize to loopback (a proxy
+// sharing the loopback interface with the server — host networking, a shared
+// network namespace — rewrites Host to its upstream address by default in
+// nginx and Apache, which passes loopbackHost).
+var proxyProvenanceHeaders = []string{
+	"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+	"X-Real-Ip", "Sec-Fetch-Site", "Origin",
+}
+
+// proxiedOrigin reports whether h carries any evidence the request was
+// forwarded by a proxy or issued by a browser.
+func proxiedOrigin(h http.Header) bool {
+	for _, name := range proxyProvenanceHeaders {
+		if h.Get(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // loopbackOnly admits only requests whose SOCKET PEER *and* Host header are
-// both loopback. Forwarded headers are deliberately ignored — they are
-// client-controlled, and this gate is the tools API's only boundary on
-// an otherwise-unauthenticated port. In-container consumers (kiro-cli's
-// ! escape hitting curl localhost:9848) pass; everything routed in from
-// outside — LAN browsers, the reverse proxy — is refused, as is a
-// DNS-rebound page whose loopback socket peer carries an attacker Host.
-func loopbackOnly(next http.Handler) http.Handler {
+// both loopback, and which carry no proxy/browser provenance header. Forwarded
+// headers are never TRUSTED — they can only refuse, never admit — and this gate
+// is the guarded surface's only boundary on an otherwise-unauthenticated port.
+// In-container consumers (kiro-cli's ! escape hitting curl localhost:9848) pass;
+// everything routed in from outside — LAN browsers, the reverse proxy — is
+// refused, as is a DNS-rebound page whose loopback socket peer carries an
+// attacker Host, and a same-loopback proxy that rewrites Host to its upstream
+// address (nginx's and Apache's defaults) and so satisfies both original legs.
+func loopbackOnly(surface string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !loopbackPeer(r.RemoteAddr) || !loopbackHost(r.Host) {
+		if !loopbackPeer(r.RemoteAddr) || !loopbackHost(r.Host) || proxiedOrigin(r.Header) {
 			webhttp.WriteError(w, r, http.StatusForbidden, "",
-				"tools API is loopback-only; call it from inside the container (curl localhost:9848)")
+				surface+" is loopback-only; call it from inside the container (curl localhost:9848)")
 			return
 		}
 		next.ServeHTTP(w, r)

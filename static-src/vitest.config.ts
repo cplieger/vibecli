@@ -66,7 +66,9 @@ export default defineConfig({
     testTimeout: 2000,
     hookTimeout: 5000,
 
-    // Flag tests slower than 100ms — these tests have no I/O.
+    // Flag tests slower than 100ms — the suite does only small synchronous
+    // fixture reads (static/index.html, manifest.json, app.ts) and no network
+    // or async I/O, so anything slower is a logic problem, not a wait.
     slowTestThreshold: 100,
 
     // Reproducible ordering. hooks: "stack" = afterEach/afterAll run in

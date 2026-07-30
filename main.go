@@ -151,6 +151,12 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 	return policy
 }
 
+// catalogRefreshKey is the env var parseCatalogRefresh interprets and names in its
+// by-name-only warning. main() reads the value under the same name from here, so the
+// key has one home. (Package scope beside the function rather than inside the
+// kiro-cli layout const block below, which is scoped to install-layout facts.)
+const catalogRefreshKey = "TOOL_CATALOG_REFRESH"
+
 // parseCatalogRefresh reads TOOL_CATALOG_REFRESH and delegates to toolbelt's
 // canonical parser — but only for values that parser ACCEPTS. toolbelt calls
 // scheduler.ParseInterval without scheduler.WithRedactedValue, so its fallback
@@ -164,7 +170,6 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 // (its clamp warning echoes only a duration that already parsed, which cannot be
 // a secret).
 func parseCatalogRefresh(raw string) time.Duration {
-	const key = "TOOL_CATALOG_REFRESH"
 	trimmed := strings.TrimSpace(raw)
 	switch strings.ToLower(trimmed) {
 	case "", "off", "disabled":
@@ -175,12 +180,12 @@ func parseCatalogRefresh(raw string) time.Duration {
 		// a lowercased copy would pass "24H" through to the library's
 		// value-echoing warnFallback.
 		if d, err := time.ParseDuration(trimmed); err != nil || d < 0 {
-			slog.Warn("unusable "+key+"; using the built-in catalog refresh cadence",
+			slog.Warn("unusable "+catalogRefreshKey+"; using the built-in catalog refresh cadence",
 				"hint", `use a Go duration (e.g. 24h, 90m) or "off" to disable the schedule`)
 			raw = ""
 		}
 	}
-	return toolbelt.ParseCatalogRefresh(raw, key)
+	return toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
 }
 
 // parseLogOSCText reads the KWEB_LOG_OSC_TEXT knob (default false) and emits the
@@ -330,7 +335,12 @@ func main() {
 	// exists (the container's /config bind mount); bare `go run` and
 	// tests outside the container run without a tools surface.
 	tools := startTools(baseTools{
-		configDir:   envx.String("KWEB_CONFIG_DIR", "/config"),
+		configDir: envx.String("KWEB_CONFIG_DIR", "/config"),
+		// The SAME env var startKiroCLI reads below, so the tools tree has one
+		// source of truth: entrypoint.sh exports the path it created and
+		// hardened, and both co-owners write to that one. Empty outside the
+		// container, where startTools falls back to <configDir>/tools.
+		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
 		catalogPath: envx.String("TOOL_CATALOG_PATH", "/app/tool-catalog.json"),
 		// Runtime catalog refresh: the baked catalog above is only the
 		// first-boot/offline fallback; the engine fetches the published
@@ -340,7 +350,7 @@ func main() {
 		// embedded required-tools list before it replaces the current
 		// one, and the last good catalog stands on any failure.
 		catalogURL:      envx.String("TOOL_CATALOG_URL", toolbelt.DefaultCatalogURL),
-		refreshInterval: parseCatalogRefresh(envx.String("TOOL_CATALOG_REFRESH", "")),
+		refreshInterval: parseCatalogRefresh(envx.String(catalogRefreshKey, "")),
 	})
 
 	// TRUSTED_PROXIES names the reverse proxies (CIDRs or bare IPs) whose
@@ -392,12 +402,22 @@ func main() {
 	// kiro-cli itself is installed and selected by the manager startKiroCLI builds:
 	// the per-session argv and PATH come from it, so a version switch is picked up by
 	// the next tab rather than being frozen at boot.
+	// The entrypoint's taint observation goes through the fleet's ONE boolean
+	// parser rather than a local == "1": envx.Bool/BoolStrict share a single
+	// vocabulary (true/1/yes/on, false/0/no/off, case-insensitive, trimmed), so
+	// the shell-to-Go boundary cannot drift on spelling or padding. BoolStrict,
+	// not Bool, for the same reason parseLogOSCText uses it: Bool's
+	// malformed-value Warn echoes the RAW value, and this key crosses a compose
+	// boundary. An unreadable value keeps today's outcome (false = trust the
+	// tree's own sentinels); the error is deliberately dropped rather than
+	// logged, so no future error text can carry a value fragment either.
+	tainted, _, _ := envx.BoolStrict("KIRO_CLI_TOOLS_TAINTED")
 	kiro := startKiroCLI(&baseKiro{
 		version:     envx.String("KIRO_CLI_VERSION", ""),
 		sha256:      envx.String("KIRO_CLI_SHA256", ""),
 		sha256ARM64: envx.String("KIRO_CLI_SHA256_ARM64", ""),
 		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
-		tainted:     envx.String("KIRO_CLI_TOOLS_TAINTED", "") == "1",
+		tainted:     tainted,
 		chatArgs:    chatArgs,
 	})
 
@@ -560,15 +580,19 @@ type kiroRuntime struct {
 
 // unmanagedKiroRuntime is the runtime for a process with no pins in its
 // environment: a bare `go run` outside the container. kiro-cli is resolved by
-// bare name through the developer's own PATH, there is no PATH overlay, and no
-// readiness gate (nil ready), so /api/health reflects only that the listener is
-// up. In the image entrypoint.sh always exports the pins, so this shape is
-// unreachable there.
+// bare name through the developer's own PATH, there is no PATH overlay, and
+// there is no install to gate on — so the readiness policy is total and
+// permissive and /api/health reflects only that the listener is up. In the image
+// entrypoint.sh always exports the pins, so this shape is unreachable there.
 func unmanagedKiroRuntime(chatArgs []string) kiroRuntime {
 	argv := sessionCommand(kirocli.Name, chatArgs...)
 	return kiroRuntime{
-		cmd:  func() []string { return argv },
-		stop: func() {},
+		cmd: func() []string { return argv },
+		env: func() []string { return nil },
+		// No install to gate on: the policy is total and permissive, so the
+		// route layer never re-derives what an absent manager means.
+		ready: func() (bool, string) { return true, "" },
+		stop:  func() {},
 	}
 }
 
@@ -581,6 +605,7 @@ func unmanagedKiroRuntime(chatArgs []string) kiroRuntime {
 func unavailableKiroRuntime() kiroRuntime {
 	return kiroRuntime{
 		cmd:   func() []string { return sessionCommand(kirocli.Name) },
+		env:   func() []string { return nil },
 		ready: func() (bool, string) { return false, reasonUnavailable },
 		stop:  func() {},
 	}
@@ -797,13 +822,26 @@ func sessionPathEnv(entry string) []string {
 	if entry == "" {
 		return nil
 	}
-	return []string{"PATH=" + entry + string(os.PathListSeparator) + os.Getenv("PATH")}
+	if inherited := os.Getenv("PATH"); inherited != "" {
+		return []string{"PATH=" + entry + string(os.PathListSeparator) + inherited}
+	}
+	// No inherited PATH: return the version directory ALONE. Appending an empty
+	// value would leave a trailing separator, and an empty PATH element resolves to
+	// the child's cwd (KWEB_WORK_DIR, the user's own checkouts), so the degenerate
+	// case would widen the search path instead of narrowing it.
+	return []string{"PATH=" + entry}
 }
 
 // baseTools carries startTools's inputs (env-resolved paths + the
 // catalog-refresh knobs).
 type baseTools struct {
-	configDir   string
+	configDir string
+	// toolsDir is the tools tree both co-owners write to: the entrypoint's
+	// exported, hardened KIRO_CLI_TOOLS_DIR when present, else derived from
+	// configDir for out-of-container runs (bare `go run`, tests). One
+	// resolution site, so the toolbelt engine and the kiro-cli install
+	// manager cannot disagree about where the tree is.
+	toolsDir    string
 	catalogPath string
 	// catalogURL is the published catalog the engine refreshes from.
 	catalogURL string
@@ -1001,17 +1039,47 @@ func toolsStatusCounts(kind string) bool {
 }
 
 // degradedRuntime is the engine-less runtime a startTools failure returns:
-// engine and syncing stay nil (no /api/tools mount, sessions ungated) while
-// state reports degraded so the failure is visible on /api/health instead of
-// looking like a deliberate disable.
+// engine stays nil (no /api/tools mount) and syncing reports false (sessions
+// ungated) while state reports degraded so the failure is visible on
+// /api/health instead of looking like a deliberate disable.
 func degradedRuntime() toolsRuntime {
-	return toolsRuntime{state: func() string { return toolsStateDegraded }}
+	return toolsRuntime{
+		syncing: func() bool { return false },
+		state:   func() string { return toolsStateDegraded },
+	}
 }
 
 func (t *toolsRuntime) close() {
 	if t.engine != nil {
 		t.engine.Close()
 	}
+}
+
+// warnIfToolsBinUnreachable warns when the engine's single PATH directory
+// (<toolsDir>/bin) is absent from this process's PATH, which is the state a
+// non-default KWEB_CONFIG_DIR creates: the knob moves the toolbelt tree, while
+// the session PATH (the image's ENV PATH), $HOME and the kiro-cli install root
+// (KIRO_CLI_TOOLS_DIR, which entrypoint.sh sets to /config/tools) all stay where
+// the image put them. Every tool the manifest installs then provisions
+// successfully — /api/health reports tools=ok and the language-server nudge
+// stays silent because an LSP entry IS enabled — while no session, and
+// therefore no kiro-cli PATH scan, can see any of it. Sessions inherit this
+// process's environment plus the kiro-cli version overlay, so this process's
+// PATH is the right thing to test.
+//
+// Warn, never fatal: a mismatch is the operator's to resolve (adjust PATH, or
+// move the mount), and this app's failure posture keeps a misconfigured dev box
+// reachable rather than aborting boot on persistent-volume layout.
+func warnIfToolsBinUnreachable(toolsDir string) {
+	binDir := filepath.Clean(filepath.Join(toolsDir, "bin"))
+	for entry := range strings.SplitSeq(os.Getenv("PATH"), string(os.PathListSeparator)) {
+		if entry != "" && filepath.Clean(entry) == binDir {
+			return
+		}
+	}
+	slog.Warn("the tools tree is not on PATH: every tool the manifest installs will be invisible to kiro-cli and to terminal sessions, even though /api/health will report tools=ok",
+		"tools_bin", binDir,
+		"hint", "KWEB_CONFIG_DIR only moves the tools tree; the session PATH, $HOME and the kiro-cli install root stay at the image defaults. Either leave KWEB_CONFIG_DIR at /config or add "+binDir+" to the container's PATH")
 }
 
 // startTools builds the toolbelt engine and launches the boot
@@ -1040,7 +1108,12 @@ func startTools(cfg baseTools) toolsRuntime {
 		slog.Warn("tools engine disabled: config dir missing",
 			"config_dir", cfg.configDir,
 			"hint", "bind-mount the persistent config volume (compose.yaml) or set KWEB_CONFIG_DIR")
-		return toolsRuntime{}
+		// No tools surface: engine stays nil (no /api/tools mount) while the
+		// policies stay callable; "" keeps health's omitempty tools field absent.
+		return toolsRuntime{
+			syncing: func() bool { return false },
+			state:   func() string { return "" },
+		}
 	case statErr != nil:
 		slog.Error("tools engine failed to inspect config dir; continuing without it",
 			"config_dir", cfg.configDir, "error", statErr)
@@ -1050,6 +1123,15 @@ func startTools(cfg baseTools) toolsRuntime {
 			"config_dir", cfg.configDir)
 		return degradedRuntime()
 	}
+	// The engine's tree, named once: it is both the engine's ToolsDir and the
+	// directory whose bin/ every session must find on PATH. Prefer the path the
+	// entrypoint hardened and exported; the derivation is the out-of-container
+	// fallback only.
+	toolsDir := cfg.toolsDir
+	if toolsDir == "" {
+		toolsDir = filepath.Join(cfg.configDir, "tools")
+	}
+	warnIfToolsBinUnreachable(toolsDir)
 	refresh := &toolbelt.CatalogRefresh{
 		URL:      cfg.catalogURL,
 		Require:  toolbelt.ParseRequireList(requiredToolsList),
@@ -1061,7 +1143,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	status := newToolsStatus()
 	eng, err := toolbelt.New(&toolbelt.Config{
 		ConfigDir:    cfg.configDir,
-		ToolsDir:     filepath.Join(cfg.configDir, "tools"),
+		ToolsDir:     toolsDir,
 		CatalogPath:  cfg.catalogPath,
 		Refresh:      refresh,
 		Seed:         toolbelt.DefaultSeed(),
@@ -1072,10 +1154,11 @@ func startTools(cfg baseTools) toolsRuntime {
 	if err != nil {
 		slog.Error("tools engine failed to start; continuing without it", "error", err)
 		// Unlike the missing-config-dir path (an intentionally disabled
-		// subsystem: zero runtime, no health detail), a FAILED production
-		// subsystem must stay visible: report state "degraded" so
+		// subsystem: no engine, empty state, no health detail), a FAILED
+		// production subsystem must stay visible: report state "degraded" so
 		// /api/health carries the documented informational tools field.
-		// engine and syncing stay nil so sessions remain ungated.
+		// The engine stays nil and syncing reports false, so sessions remain
+		// ungated.
 		return degradedRuntime()
 	}
 
@@ -1153,7 +1236,12 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 		// shutdown path Update() can only fail with "engine shutting down" and
 		// the LSP nudge has no reader, and after an operator cancel neither is
 		// wanted either.
+		// cause is the engine's own attribution (CancelShutdown from Engine.Close,
+		// CancelCaller from an explicit CancelJob, "unknown" for a path that names
+		// none): the two readings of this line call for different operator responses,
+		// so record which one it was instead of listing both in the hint.
 		slog.Info("tools: boot convergence cancelled; not a tool failure",
+			"cause", final.CancelCause.String(),
 			"hint", "expected during shutdown (the engine cancels the running job on Close) or after an explicit tools-API job cancel")
 		finish(toolsStateDegraded)
 		return
@@ -1362,8 +1450,26 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// the app's own gate rather than a re-implementation of a library's
 			// internals. Allows is nil- and inactive-safe (it returns true), so an
 			// unset KWEB_ALLOWED_HOSTS keeps today's behavior exactly.
+			// The GET conjunct is the same reasoning as the hostPolicy one, one
+			// layer further in. A skip predicate is evaluated BEFORE the chain
+			// runs, so it deletes the record whatever status the request ends
+			// with -- and CrossOriginProtection, which sits inside this skip,
+			// rejects an UNSAFE cross-origin request with a 403 that WriteError
+			// logs nowhere. Only a GET can become the stream this skip exists to
+			// suppress (SSE is a GET, and the safe methods are the ones the
+			// origin gate always admits), so restricting the skip to GET keeps
+			// every reachable refusal on this path logged: the cross-origin 403,
+			// the engine's 503 at the subscriber cap, its 500 for an
+			// unflushable writer. The trade is that a non-GET request that IS
+			// admitted (curl -X POST with no Origin -- the engine's
+			// EventsHandler does not check the method) now emits one
+			// close-time line with a session-length duration; a misleading line
+			// for an abnormal client is the lesser cost against deleting an
+			// attack's only record (CWE-778, and webhttp's own
+			// WithSkipUpgrades doc says so in as many words).
 			webhttp.WithSkipFunc(func(r *http.Request) bool {
-				return r.URL.Path == terminal.SessionEventsPath && hostPolicy.Allows(r)
+				return r.Method == http.MethodGet &&
+					r.URL.Path == terminal.SessionEventsPath && hostPolicy.Allows(r)
 			}),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes

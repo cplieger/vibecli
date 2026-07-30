@@ -138,7 +138,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # the RUN below asserts the two pins are equal, so the build gate and the
 # runtime gate can never become different verifiers — same fail-loud treatment
 # the engine/UI/tsc pin pairs get against static-src/package.json.
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.2.8
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.3.1
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
@@ -179,25 +179,6 @@ RUN mkdir -p static/vendor/fonts && \
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
 ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.3.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-# ---------------------------------------------------------------------------
-# PRE-RELEASE PIN — AWAITS PUBLICATION. @cplieger/web-terminal-ui 5.1.0 is
-# implemented but NOT YET ON npm: it adds the /style-contract subpath
-# (PUBLIC_THEME_TOKENS + LOADING_OVERLAY_CLASSES) that static-src/app.test.ts
-# now imports instead of scraping the package's css/MANIFEST out of
-# node_modules. Until it publishes, this build stage and `npm ci` both fail to
-# resolve the version — validate locally by overlaying the sibling
-# ../web-terminal-ui checkout into static-src/node_modules/@cplieger/
-# web-terminal-ui (gitignored), the npm-side equivalent of go.mod's `replace`
-# block. Unlike that block this does NOT keep the tree resolvable for everyone
-# else: `npm ci` and this stage's tarball fetch both fail until the version
-# exists. At merge time: publish the library, then run `npm install` in
-# static-src to regenerate package-lock.json (still resolving 5.0.0 — a lock
-# file cannot be hand-edited to an unpublished version's integrity hash).
-# static-src/package.json's pin and this ARG are already the versions to
-# resolve. Those two MUST stay exactly equal — the pin gate below is what
-# enforces it, and it exists because v1.1.3 shipped a broken image by bumping
-# one and missing the other.
-# ---------------------------------------------------------------------------
 ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.1.0
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local

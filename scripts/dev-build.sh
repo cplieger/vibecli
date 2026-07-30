@@ -123,9 +123,16 @@ CLIENT_MIN_SERVER="$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION =
 : "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in $WIRE_TS (engine src layout changed?)}"
 : "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in $WIRE_TS}"
 wirecheck_bin="$(mktemp)"
+# The gate's whole purpose is to EXIT non-zero (1 on a floor violation, 2 on a broken
+# extraction), and under set -euo pipefail either exit -- like a failing go build --
+# skips the rm below, leaking a multi-megabyte binary per failing run. Trap it, then
+# disarm: the later mona_tmp trap REPLACES this one, so leaving it armed would point
+# that trap's predecessor at a stale path.
+trap 'rm -f "$wirecheck_bin"' EXIT
 go build -o "$wirecheck_bin" ./scripts/wirecheck
 "$wirecheck_bin" -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
 rm -f "$wirecheck_bin"
+trap - EXIT
 
 printf '[3/6] tsc: app -> static/app.js (resolves @cplieger/web-terminal-ui)\n'
 # Drop the previous emit first so the assertion after step [4/6] observes THIS

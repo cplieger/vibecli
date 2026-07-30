@@ -67,7 +67,7 @@ func TestSessionEnv_reachesSpawnedPTY(t *testing.T) {
 		"report its PATH; the session command must write $PATH into the marker")))
 	first, _, _ := strings.Cut(got, string(os.PathListSeparator))
 	if first != versionDir {
-		t.Errorf("child PATH = %q, first entry %q, want the active kiro-cli version directory %q first -- terminal.WithEnv(sessionEnvFor(deps)) is missing from the session factory, or the engine no longer appends it last",
+		t.Errorf("child PATH = %q, first entry %q, want the active kiro-cli version directory %q first -- terminal.WithEnv(deps.sessionEnv()) is missing from the session factory, or the engine no longer appends it last",
 			got, first, versionDir)
 	}
 }
@@ -83,9 +83,18 @@ func TestSessionCommand_pathReachesArgvOnlyAsDollarZero(t *testing.T) {
 	const activePath = "/config/tools/kiro-cli-versions/2.14.2/kiro-cli"
 	// $0 is the argument after -c's script, so index 3 is the cli path.
 	const cliArg = 3
+	// ...and index 3 is the LAST element: exclusivity is a claim about the whole
+	// argv, so the length is asserted before anything is indexed. Without it an
+	// implementation that appends a second copy of the path after $0 passes every
+	// check below (and would hand kiro-cli a stray positional argument).
+	const wantArgc = cliArg + 1
 	empty := sessionCommand("")
 	active := sessionCommand(activePath)
 
+	if len(empty) != wantArgc || len(active) != wantArgc {
+		t.Fatalf("argv length = %d (empty) / %d (active), want %d for both -- the cli path may appear ONLY as $0, so any further positional argument is either a second copy of it or an unreviewed argument to the guard script; argv = %q / %q",
+			len(empty), len(active), wantArgc, empty, active)
+	}
 	if got := empty[cliArg]; got != "" {
 		t.Fatalf("argv carries cli path %q for the empty path the manager reports with no active version, want %q", got, "")
 	}
@@ -283,8 +292,15 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusOK {
 		t.Errorf("loopback POST: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
+	// No provenance header: the 403 can only come from the SOCKET-PEER leg, which
+	// is otherwise unpinned now that a forwarded header refuses on its own. Verified
+	// against a mutant with the peer conjunct dropped from loopbackOnly: without this
+	// row the whole package stays green.
+	if rec := call(mux, http.MethodPost, "192.168.1.9:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
+		t.Errorf("remote peer POST: status = %d, want 403 -- the socket-peer leg alone must refuse a remote caller driving an install", rec.Code)
+	}
 	if rec := callProxied(mux, http.MethodPost, "192.168.1.9:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
-		t.Errorf("remote peer POST: status = %d, want 403 -- a remote caller must not be able to drive an install, and a forwarded header claiming loopback must not admit it", rec.Code)
+		t.Errorf("remote peer POST: status = %d, want 403 -- a forwarded header claiming loopback must not admit it either", rec.Code)
 	}
 	if rec := callProxied(mux, http.MethodPost, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
 		t.Errorf("both-ends-loopback POST with a forwarded header: status = %d, want 403 (the same-loopback reverse-proxy shape)", rec.Code)
@@ -292,8 +308,14 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "webterm.example.com"); rec.Code != http.StatusForbidden {
 		t.Errorf("loopback peer with a non-loopback Host: status = %d, want 403 (the DNS-rebound-page shape)", rec.Code)
 	}
-	if rec := call(mux, http.MethodGet, "127.0.0.1:5555", "localhost:9848"); rec.Code == http.StatusOK {
-		t.Errorf("loopback GET: status = %d, want anything but 200 -- a rescan changes state, so a GET must not drive one", rec.Code)
+	// The exact response contract, not merely "not 200": the method-agnostic mount
+	// exists so a GET answers 405 with Allow: POST instead of the catch-all static
+	// handler's bare 404, and a not-200 assertion is green after that mount is
+	// reverted.
+	if rec := call(mux, http.MethodGet, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("loopback GET: status = %d, want 405 -- a rescan changes state, so a GET must not drive one, and the mount must say so rather than 404ing as static", rec.Code)
+	} else if got := rec.Header().Get("Allow"); got != http.MethodPost {
+		t.Errorf("loopback GET: Allow = %q, want %q -- the 405 must name the method that works", got, http.MethodPost)
 	}
 	if calls != 1 {
 		t.Errorf("rescan ran %d times, want exactly 1 (only the admitted loopback POST)", calls)
@@ -476,27 +498,24 @@ func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 // (so selection accepts them) and fail every settings call, which is exactly the
 // required-assertion state.
 func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
-	const version = "9.9.9"
-	toolsDir := t.TempDir()
-	dir := filepath.Join(toolsDir, "kiro-cli-versions", version)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		t.Fatalf("create version dir: %v", err)
-	}
-	for _, name := range []string{"kiro-cli", "kiro-cli-chat"} {
-		script := "#!/bin/sh\ncase \"$1\" in --version) printf 'kiro-cli " + version + "\\n' ; exit 0 ;; esac\nexit 1\n"
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o700); err != nil { // #nosec G306 -- a dispatcher fake must be executable
-			t.Fatalf("write fake %s: %v", name, err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(dir, ".complete"), []byte(version+"\n"), 0o600); err != nil {
-		t.Fatalf("write sentinel: %v", err)
+	// One definition of the complete-version layout and this app's required set
+	// (kirocli_namespace_test.go's plantOwnVersion), then the ONE deviation this
+	// test is about: dispatchers that answer --version with the pin and FAIL every
+	// settings call. Hand-building the fixture again is what l-f4 removed from this
+	// file, and it would reintroduce the divergence that made a required-set change
+	// fail a readiness poll without naming the missing dispatcher.
+	fixture := newNSEnv(t)
+	dir := fixture.plantOwnVersion()
+	for _, name := range []string{nsTool, nsTool + "-chat"} {
+		fixture.writeScript(filepath.Join(dir, name),
+			"case \"$1\" in --version) printf 'kiro-cli "+nsVersion+"\\n' ; exit 0 ;; esac\nexit 1\n")
 	}
 
 	rt := startKiroCLI(&baseKiro{
-		version:     version,
+		version:     nsVersion,
 		sha256:      strings.Repeat("a", 64),
 		sha256ARM64: strings.Repeat("b", 64),
-		toolsDir:    toolsDir,
+		toolsDir:    fixture.tools,
 	})
 	t.Cleanup(rt.stop)
 	if rt.ready == nil {

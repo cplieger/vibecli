@@ -216,9 +216,18 @@ func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.
 	// with it, so an attr carrying the notification text here would reach the
 	// shipped stream with nothing failing. The cap arm has the message in scope,
 	// which is what makes that a one-line edit rather than a hypothetical.
+	//
+	// The fingerprint pair is required, not optional: since the announcement
+	// RE-ARMS, it is the only default-level signal of a wording drift that begins
+	// after the budget filled, and without the fingerprint two firings are
+	// indistinguishable from the same rejected wording arriving twice. It is the
+	// same content-free, keyed attribute the per-distinct arm carries — so this
+	// assertion pins both the correlation key and its confidentiality shape.
 	assertAttrSchema(t, records, slog.LevelWarn, capped, map[string]attrCheck{
-		"distinct_limit": wantInt(unrecognizedNotifyCap),
-		"hint":           wantString(unrecognizedNotifyHint),
+		"message_fingerprint": isNotifyFingerprint,
+		"message_runes":       wantInt(len([]rune(fmt.Sprintf("wording variant %d", unrecognizedNotifyCap)))),
+		"distinct_limit":      wantInt(unrecognizedNotifyCap),
+		"hint":                wantString(unrecognizedNotifyHint),
 	})
 	// Every occurrence still reaches Debug, so the full set stays diagnosable.
 	if got := records.CountLevel(slog.LevelDebug, message); got != unrecognizedNotifyCap+2 {
@@ -505,5 +514,34 @@ func TestNotifyWarningState_concurrentObserveHonoursTheBudget(t *testing.T) {
 		if got := len(state.warned); got != unrecognizedNotifyCap {
 			t.Fatalf("seen-set size = %d, want %d; the set is keyed by child output, so exceeding the cap is an unbounded-memory path", got, unrecognizedNotifyCap)
 		}
+	}
+}
+
+// TestNotifyWarningState_capRearms pins the re-arm window on the budget-exhausted
+// announcement: suppressed inside unrecognizedNotifyCapRearm, fired again once the
+// window has elapsed. Reverting lastCapWarn to the old once-per-process bool keeps
+// every other test in this file green (the cap-count assertion holds under BOTH
+// semantics), so this is the only pin on the behavior the re-arm exists for -- a
+// kiro-cli rewording that begins AFTER exhaustion still reaching the default log
+// stream. observe() is directly constructible in-package with a backdatable
+// lastCapWarn, so no production seam is needed and no clock is faked.
+func TestNotifyWarningState_capRearms(t *testing.T) {
+	s := &notifyWarningState{warned: make(map[string]struct{})}
+	for i := range unrecognizedNotifyCap {
+		if first, capped := s.observe(fmt.Sprintf("wording %d", i)); !first || capped {
+			t.Fatalf("observe(wording %d) = (%t, %t), want (true, false) while budget remains", i, first, capped)
+		}
+	}
+	if first, capped := s.observe("overflow a"); first || !capped {
+		t.Fatalf("first turned-away message = (%t, %t), want (false, true): exhaustion is announced", first, capped)
+	}
+	if first, capped := s.observe("overflow b"); first || capped {
+		t.Fatalf("second turned-away message inside the window = (%t, %t), want (false, false): announcement suppressed", first, capped)
+	}
+	s.mu.Lock()
+	s.lastCapWarn = time.Now().Add(-unrecognizedNotifyCapRearm - time.Minute)
+	s.mu.Unlock()
+	if first, capped := s.observe("overflow c"); first || !capped {
+		t.Fatalf("turned-away message after the window = (%t, %t), want (false, true): the announcement re-arms", first, capped)
 	}
 }

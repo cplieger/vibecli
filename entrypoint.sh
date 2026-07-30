@@ -478,14 +478,29 @@ secure_tools_dir "$TOOLS/python/bin" 0 1
 # documented remedy (distrust plus reinstall from the digest-verified archive); warn, never
 # fatal, and never delete, per web-terminal-kiro.md "Failure posture". The globs skip
 # dot-prefixed staging trees for free (a leading dot is not matched by *), and a symlinked
-# entry arms the taint rather than being stat'd through, so no chmod here can reach a path
-# outside the install root.
+# entry arms the taint rather than being stat'd through -- but pathname expansion happens
+# before the body runs, so the */* glob still expands THROUGH a symlinked level-1 entry and
+# yields its children as their own words. The loop therefore REFUSES to traverse a symlink
+# rather than merely warning about one: no chmod here can reach a path outside the install
+# root, which is the same containment the $TOOLS/bin loop below asserts with realpath.
 for version_entry in "$TOOLS/kiro-cli-versions"/* "$TOOLS/kiro-cli-versions"/*/*; do
-  [ -e "$version_entry" ] || continue
+  # -L BEFORE -e: a DANGLING symlink here is exactly as anomalous as a live one and must
+  # arm the taint; [ -e ] dereferences, so testing it first skips a dangling link silently.
   if [ -L "$version_entry" ]; then
     tools_tree_was_writable=1
     printf 'level=warn msg="an entry inside the kiro-cli install root is a symlink; treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" component=entrypoint\n' \
       "$version_entry" >&2
+    continue
+  fi
+  [ -e "$version_entry" ] || continue
+  # Never act THROUGH a symlink: the */* glob traverses a symlinked level-1 entry, so a
+  # level-2 name can be a regular file OUTSIDE the install root ([ -L ] tests only the FINAL
+  # component) and the chmod below would strip write bits from a path this container does not
+  # own -- a device node, or a /workspace file whose mode the host operator set. The level-1
+  # pass has already armed the taint on that symlink, so skip its children rather than
+  # tightening them.
+  version_entry_parent=${version_entry%/*}
+  if [ "$version_entry_parent" != "$TOOLS/kiro-cli-versions" ] && [ -L "$version_entry_parent" ]; then
     continue
   fi
   version_entry_mode=$(stat -c '%a' "$version_entry" 2>/dev/null) || version_entry_mode=""
@@ -826,9 +841,23 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     # no package would ever be installed again for this container's life. Reconfigure
     # once, bounded, warn-only: the state is either absent (a no-op) or the only
     # thing standing between the operator and their packages.
-    if ! timeout --signal=TERM --kill-after=30s 300s dpkg --audit >/dev/null 2>&1 \
+    #
+    # The AUDIT OUTPUT is the primary evidence, not the exit status: `dpkg --audit`
+    # returns 0 while REPORTING unpacked-but-unconfigured packages (measured: 464
+    # bytes on stdout, rc=0), which is the ordinary interrupted state this recovery
+    # exists for -- gating on rc alone would never fire on it. A healthy tree prints
+    # nothing at all, so non-empty output cannot false-positive here. The updates
+    # journal stays a third trigger: it is evidence of a transaction killed even
+    # earlier, before any package reached the unpacked state.
+    dpkg_audit_rc=0
+    dpkg_audit_out=$(timeout --signal=TERM --kill-after=30s 300s dpkg --audit 2>/dev/null) || dpkg_audit_rc=$?
+    # Bounded for the log line: audit output is short in practice, and a truncated
+    # first line is enough to tell an operator WHICH interrupted state was seen.
+    dpkg_audit_summary=$(printf '%s' "${dpkg_audit_out:0:400}" | tr '\n' ' ')
+    if [ "$dpkg_audit_rc" -ne 0 ] || [ -n "$dpkg_audit_out" ] \
       || [ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]; then
-      printf 'level=warn msg="dpkg is in an interrupted state (an earlier APT_PACKAGES install was killed mid-transaction); reconfiguring before installing" component=entrypoint\n' >&2
+      printf 'level=warn msg="dpkg is in an interrupted state (an earlier APT_PACKAGES install was killed mid-transaction); reconfiguring before installing" audit_rc=%d audit="%s" component=entrypoint\n' \
+        "$dpkg_audit_rc" "$dpkg_audit_summary" >&2
       dpkg_fix_rc=0
       timeout --signal=TERM --kill-after=30s 300s dpkg --configure -a || dpkg_fix_rc=$?
       if [ "$dpkg_fix_rc" -ne 0 ]; then

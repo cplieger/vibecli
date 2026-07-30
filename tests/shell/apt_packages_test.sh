@@ -51,7 +51,7 @@ extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 # bait is a directory whose FILENAMES are what an unsuppressed '*' would expand to.
 RUN_CWD=""
 
-# run <update_rc> <pkgnames_mode> <APT_PACKAGES>
+# run <update_rc> <pkgnames_mode> <APT_PACKAGES> [audit_out] [audit_rc] [journal]
 #   pkgnames_mode: ok | partial | empty | fail
 #     ok      - a full index: every name the cases use is known
 #     partial - the surviving half of a partial refresh: a SUBSET of the real names,
@@ -60,14 +60,22 @@ RUN_CWD=""
 #     empty   - the command succeeds but yields no names (unusable oracle)
 #     fail    - the command itself fails (unusable oracle)
 # -> INSTALLED (the argv apt-get install received), SKIPPED (warn count),
-#    INSTALL_CALLS (invocations), $WORK/warns (the stderr, for warn_for)
+#    INSTALL_CALLS (invocations), DPKG_CONFIGURE_CALLS (interrupted-state recovery
+#    invocations), $WORK/warns (the stderr, for warn_for)
 run() {
-  local urc=$1 mode=$2 pkgs=$3
+  local urc=$1 mode=$2 pkgs=$3 audit_out=${4:-} audit_rc=${5:-0} journal=${6:-}
   cat >"$WORK/harness.sh" <<HARNESS
 set -u
 APT_PACKAGES='$pkgs'
 _URC=$urc
 _MODE=$mode
+# dpkg's interrupted-state evidence, per case. Default is a HEALTHY tree: no audit
+# output, rc 0, an empty updates journal -- so every pre-existing case asserts the
+# recovery does NOT fire, and the two cases that supply evidence assert it does.
+_DPKG_AUDIT_OUT='$audit_out'
+_DPKG_AUDIT_RC=$audit_rc
+_DPKG_JOURNAL='$journal'
+_DPKG_CONFIGURE_RC=0
 apt-get() {
   case "\$*" in
     *update*) return \$_URC ;;
@@ -108,6 +116,35 @@ apt-cache() {
   esac
 }
 timeout() { shift 3; "\$@"; }
+dpkg() {
+  # NOT the runner's real dpkg: the block's recovery path would otherwise read the
+  # host's package database and, on a runner with genuinely interrupted state, run
+  # \`dpkg --configure -a\` as root -- executing maintainer scripts from a suite whose
+  # only subject is argv. Audit evidence is per-case; configure is RECORDED, never run.
+  case "\$*" in
+    *--audit*)
+      [ -n "\$_DPKG_AUDIT_OUT" ] && printf '%s\n' "\$_DPKG_AUDIT_OUT"
+      return \$_DPKG_AUDIT_RC
+      ;;
+    *--configure*)
+      printf 'dpkg-configure\n' >>"$WORK/calls"
+      return \$_DPKG_CONFIGURE_RC
+      ;;
+  esac
+  return 0
+}
+ls() {
+  # Intercept EXACTLY the updates-journal probe, so the third recovery trigger is
+  # case-controlled instead of reading the runner's real /var/lib/dpkg/updates.
+  # Every other ls still runs -- the same containment the rm stub below uses.
+  case "\$*" in
+    *"/var/lib/dpkg/updates"*)
+      [ -n "\$_DPKG_JOURNAL" ] && printf '%s\n' "\$_DPKG_JOURNAL"
+      return 0
+      ;;
+  esac
+  command ls "\$@"
+}
 rm() {
   # The extracted block ends with the index reclaim (\`rm -rf /var/lib/apt/lists/*\`).
   # apt-get is stubbed here; rm is NOT, so that line is real: run as root -- the
@@ -136,6 +173,7 @@ HARNESS
   SKIPPED=$(grep -c 'level=warn.*skipping' "$WORK/warns" || true)
   INSTALLED=$(tr '\n' ' ' <"$WORK/installed" | sed 's/ *$//')
   INSTALL_CALLS=$(grep -c 'install-call' "$WORK/calls" 2>/dev/null || true)
+  DPKG_CONFIGURE_CALLS=$(grep -c 'dpkg-configure' "$WORK/calls" 2>/dev/null || true)
 }
 
 # warn_for <token> -> the warn line that named exactly this token (empty if none)
@@ -296,5 +334,37 @@ RUN_CWD=""
 [ "$INSTALLED" = "jq" ] && [ "$SKIPPED" -eq 1 ] \
   && ok "a stray '*' stays literal (set -f) and is warn-skipped" \
   || no "glob suppression" "installed='$INSTALLED' skipped=$SKIPPED -- set -f may be gone"
+
+# --- the interrupted-dpkg recovery: AUDIT OUTPUT is the evidence, not the rc -----
+# `dpkg --audit` returns 0 while REPORTING unpacked-but-unconfigured packages
+# (measured on a scratch admindir: 464 bytes of stdout, rc=0), and that is the
+# ordinary state a killed install leaves behind. A predicate reading only the exit
+# status never fires on it, so apt-get keeps failing with rc=100 for the rest of the
+# container's life -- the exact outcome the recovery was added to prevent. The
+# assertion is the CONFIGURE invocation, because the recovery is warn-only and
+# changes no argv: an install-list assertion is green with the recovery deleted.
+run 0 ok 'jq' 'The following packages have been unpacked but not yet configured.' 0 ''
+[ "$DPKG_CONFIGURE_CALLS" -eq 1 ] && [ "$INSTALLED" = "jq" ] \
+  && ok "interrupted dpkg reported with rc=0: recovery runs on the audit OUTPUT, and the install proceeds" \
+  || no "dpkg recovery on rc=0 output" "configure_calls=$DPKG_CONFIGURE_CALLS installed='$INSTALLED', want 1 / 'jq'"
+
+# A non-zero audit status and a non-empty updates journal are the other two triggers;
+# both predate this fix and are pinned here so a later narrowing cannot drop them.
+run 0 ok 'jq' '' 2 ''
+[ "$DPKG_CONFIGURE_CALLS" -eq 1 ] \
+  && ok "interrupted dpkg: a failing audit still triggers the recovery" \
+  || no "dpkg recovery on audit rc" "configure_calls=$DPKG_CONFIGURE_CALLS, want 1"
+run 0 ok 'jq' '' 0 'unrelated-journal-entry'
+[ "$DPKG_CONFIGURE_CALLS" -eq 1 ] \
+  && ok "interrupted dpkg: a non-empty updates journal still triggers the recovery" \
+  || no "dpkg recovery on journal" "configure_calls=$DPKG_CONFIGURE_CALLS, want 1"
+
+# The negative half, which is what keeps the predicate from becoming "always": a
+# healthy tree prints nothing, exits 0 and has an empty journal, so the recovery must
+# NOT run -- otherwise every boot would reconfigure every package before installing.
+run 0 ok 'jq'
+[ "$DPKG_CONFIGURE_CALLS" -eq 0 ] && [ "$INSTALLED" = "jq" ] \
+  && ok "healthy dpkg: no audit output, no journal, no reconfigure" \
+  || no "dpkg recovery false positive" "configure_calls=$DPKG_CONFIGURE_CALLS installed='$INSTALLED', want 0 / 'jq'"
 
 report

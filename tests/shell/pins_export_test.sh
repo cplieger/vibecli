@@ -142,9 +142,18 @@ done
 
 # The install root must not be reachable as a child of a toolbelt tree, whatever
 # it is named. A nested root is what the collision was.
-grep -qE 'make_config_dir "\$TOOLS/(opt|npm|python|bin)/[^"]*kiro-cli' "$ENTRYPOINT" \
-  && no "install root under a toolbelt tree" "a directory is created INSIDE one of the toolbelt engine's own trees (opt/npm/python/bin); the engine's per-tool prune and bin republish own everything under those" \
-  || ok "no directory is created inside a toolbelt-engine tree, so the engine's prune cannot reach the kiro-cli install"
+#
+# Name-INDEPENDENT by design: keying the pattern on `kiro-cli` would let a nested
+# root under any other name pass green, which is the opposite of what the rule above
+# says. The two exceptions are the toolbelt engine's OWN package-manager bin dirs,
+# which the hardening sweep now legitimately pre-creates because $TOOLS/bin symlinks
+# into them -- they are not a nested install root, so they are subtracted BY NAME
+# rather than the rule being widened to admit anything.
+grep -oE 'make_config_dir "\$TOOLS/(opt|npm|python|bin)/[^"]*"' "$ENTRYPOINT" \
+  | grep -vE '"\$TOOLS/(npm|python)/bin"$' \
+  | grep -q . \
+  && no "install root under a toolbelt tree" "a directory that is not one of the engine's own bin dirs is created INSIDE one of the toolbelt engine's own trees (opt/npm/python/bin); the engine's per-tool prune and bin republish own everything under those" \
+  || ok "no directory other than the engine's own npm/python bin dirs is created inside a toolbelt-engine tree, so the engine's prune cannot reach the kiro-cli install"
 
 # --- the taint flag carries the observation, not a constant ------------------
 # The flag is the only thing that stops a forged `.complete` sentinel on a

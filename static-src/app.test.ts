@@ -107,14 +107,29 @@ function readStaticAsset(name: string): string {
 // leaves its caller asserting over an empty list and passing forever, so the
 // parser that emits the code is the only extractor that cannot fall behind it.
 // `import type` is excluded because tsc erases it, so it never reaches module
-// resolution; side-effect imports and dynamic `import()` string literals are
-// included because the browser resolves both.
+// resolution; side-effect imports, dynamic `import()` string literals and
+// `export ... from "<specifier>"` re-exports are included because the browser
+// resolves all three.
 function browserResolvedSpecifiers(source: string): string[] {
   const parsed = ts.createSourceFile("app.ts", source, ts.ScriptTarget.ESNext, true);
   const specifiers: string[] = [];
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) {
       if (node.importClause?.isTypeOnly !== true && ts.isStringLiteralLike(node.moduleSpecifier)) {
+        specifiers.push(node.moduleSpecifier.text);
+      }
+    } else if (ts.isExportDeclaration(node)) {
+      // `export ... from "<specifier>"` is resolved by the browser exactly like an
+      // import. app.ts has none, but the vendored-graph test below points this
+      // extractor at barrel-heavy library src trees where the form is idiomatic,
+      // and a re-exported bare specifier missing from the importmap breaks the
+      // whole module graph. `export type ... from` is erased by tsc, so it is
+      // excluded the same way `import type` is.
+      if (
+        node.isTypeOnly !== true &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteralLike(node.moduleSpecifier)
+      ) {
         specifiers.push(node.moduleSpecifier.text);
       }
     } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
@@ -346,8 +361,8 @@ function parseServedDocument(): Document {
 // is precisely what it exists to catch, and a fabricated fixture can never grow
 // one. Scripts are stripped because the watchdog is evaluated deliberately
 // through evaluateWatchdog() and /app.js must not load in a unit test. The
-// stylesheet <link> goes first for the same reason the stand-down-guard test
-// drops it: happy-dom fetches a parsed document's stylesheet hrefs.
+// stylesheet <link> is already gone: the document comes from
+// parseServedDocument(), which owns that policy for the whole suite.
 function mountServedBody(): void {
   const doc = parseServedDocument();
   for (const script of doc.querySelectorAll("script")) {
@@ -1066,11 +1081,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // does not fetch invalidates the install prompt) with nothing failing.
     // Only COMMITTED assets are checked: /style.css and /app.js are gitignored
     // build outputs, absent from a fresh checkout.
-    const html = readStaticAsset("index.html").replace(
-      /<link\b[^>]*rel=["']?stylesheet[^>]*>/gi,
-      "",
-    );
-    const doc = new DOMParser().parseFromString(html, "text/html");
+    const doc = parseServedDocument();
     const linked = [
       ...doc.querySelectorAll('link[rel~="icon"], link[rel~="apple-touch-icon"]'),
     ].map((link) => ({

@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,19 +26,28 @@ import (
 
 // usageErrMsg is the exit-2 line: the flag values are unusable, so the
 // extraction is broken. Shared by run's own validation and flag's parse-error
-// path (a scrape matching TWICE, or a non-numeric capture, never reaches run:
-// flag.CommandLine is ExitOnError and exits 2 from inside flag.Parse), so both
-// exit-2 shapes tell the reader to fix the gate rather than move a pin.
+// path (a scrape matching TWICE, or a non-numeric capture, lands there), so both
+// exit-2 shapes tell the reader to fix the gate rather than move a pin. It is
+// deliberately NOT installed as flag.Usage: flag calls Usage for -h as well as
+// for a parse error, so doing that would tell a maintainer reading the flag
+// names that the gate is broken — on the one program whose job is to be trusted
+// about whether the gate or the pin is at fault.
 const usageErrMsg = "ERROR wire-floor-gate-usage: -client-rev and -client-min-server are required positive integers (the Dockerfile's extraction from the vendored engine artifact's src/wire-compatibility.ts is broken — fix the gate, do not bump a pin)"
 
 func main() {
 	clientRev := flag.Int("client-rev", 0, "client WIRE_PROTOCOL_VERSION from the vendored npm artifact")
 	clientMinServer := flag.Int("client-min-server", 0, "client MIN_SUPPORTED_SERVER_WIRE_VERSION from the vendored npm artifact")
-	flag.Usage = func() {
+	// ContinueOnError so a parse error can be told apart from -h, which
+	// flag.Usage cannot do: an ExitOnError FlagSet exits 0 for ErrHelp, so a
+	// Usage override prints the broken-gate ERROR on a successful help request.
+	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0) // same as ExitOnError's help exit
+		}
 		fmt.Fprintln(flag.CommandLine.Output(), usageErrMsg)
-		flag.PrintDefaults()
+		os.Exit(2)
 	}
-	flag.Parse()
 	os.Exit(run(*clientRev, *clientMinServer, os.Stdout, os.Stderr))
 }
 

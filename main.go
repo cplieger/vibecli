@@ -1079,7 +1079,7 @@ func warnIfToolsBinUnreachable(toolsDir string) {
 	}
 	slog.Warn("the tools tree is not on PATH: every tool the manifest installs will be invisible to kiro-cli and to terminal sessions, even though /api/health will report tools=ok",
 		"tools_bin", binDir,
-		"hint", "KWEB_CONFIG_DIR only moves the tools tree; the session PATH, $HOME and the kiro-cli install root stay at the image defaults. Either leave KWEB_CONFIG_DIR at /config or add "+binDir+" to the container's PATH")
+		"hint", "add "+binDir+" to this process's PATH. In the container this means the tools tree was moved off the image default (KWEB_CONFIG_DIR moves the tools tree; the session PATH, $HOME and the kiro-cli install root stay at the image defaults); outside it, a bare `go run` inherits the developer's PATH, so the derived tree is expected to be absent from it.")
 }
 
 // startTools builds the toolbelt engine and launches the boot

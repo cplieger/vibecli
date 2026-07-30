@@ -66,9 +66,15 @@ export default defineConfig({
     testTimeout: 2000,
     hookTimeout: 5000,
 
-    // Flag tests slower than 100ms — the suite does only small synchronous
-    // fixture reads (static/index.html, manifest.json, app.ts) and no network
-    // or async I/O, so anything slower is a logic problem, not a wait.
+    // Flag tests slower than 100ms — the suite's whole cost is synchronous
+    // fixture reads and parses: static/index.html, manifest.json, app.ts, two
+    // library sources read for parity (kernel/kernel.ts, css/page.css), and the
+    // vendored-graph importmap walk, which recursively reads and TS-parses both
+    // @cplieger/web-terminal-{ui,engine} src trees (measured 85–140ms, so it
+    // trips this threshold on a loaded machine). No network and no async I/O:
+    // anything slower than a fixture read is a logic problem, not a wait. The
+    // threshold is left where it is deliberately — the walk's real cost is worth
+    // staying visible rather than absorbed by a bigger number.
     slowTestThreshold: 100,
 
     // Reproducible ordering. hooks: "stack" = afterEach/afterAll run in

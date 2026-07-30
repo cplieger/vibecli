@@ -498,10 +498,11 @@ func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 	for _, tc := range []struct {
 		name, method, path string
 		wantStatus         int
+		wantAllow          string
 	}{
-		{"no such route", http.MethodGet, apiPrefix + "nope", http.StatusNotFound},
-		{"bare api prefix", http.MethodGet, apiPrefix, http.StatusNotFound},
-		{"mounted for POST only, reached by GET", http.MethodGet, kiroRescanPath, http.StatusMethodNotAllowed},
+		{"no such route", http.MethodGet, apiPrefix + "nope", http.StatusNotFound, ""},
+		{"bare api prefix", http.MethodGet, apiPrefix, http.StatusNotFound, ""},
+		{"mounted for POST only, reached by GET", http.MethodGet, kiroRescanPath, http.StatusMethodNotAllowed, http.MethodPost},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, http.NoBody)
@@ -516,6 +517,13 @@ func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 			if got := rec.Header().Get("Cache-Control"); got != "" {
 				t.Errorf("%s %s: Cache-Control = %q, want none — an unmatched /api/ 404 carrying a directive means something re-grew the /api/-wide wrapper; if that was deliberate, this test is the place to say so",
 					tc.method, tc.path, got)
+			}
+			// Allow is the ACTIONABLE half of a 405 (RFC 9110 requires it): dropping
+			// the header leaves the status correct and an in-container agent knowing
+			// only that its method was wrong, never which method to use — the exact
+			// diagnosis the method-agnostic mount was added to provide.
+			if got := rec.Header().Get("Allow"); got != tc.wantAllow {
+				t.Errorf("%s %s: Allow = %q, want %q", tc.method, tc.path, got, tc.wantAllow)
 			}
 		})
 	}
@@ -1186,6 +1194,33 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 			t.Errorf("loopback peer with Host %q: status = %d, want 403 (the gate requires a loopback Host as well as a loopback peer)", host, rec.Code)
 		}
 	}
+
+	// The provenance leg (proxiedOrigin): a request that passes BOTH loopback legs
+	// but carries proxy or browser evidence is refused. Without these rows, deleting
+	// `|| proxiedOrigin(r.Header)` from loopbackOnly -- or emptying
+	// proxyProvenanceHeaders -- keeps the entire suite green while a same-loopback
+	// proxy that rewrites Host to its upstream address readmits the API that runs
+	// `manual` install strings as root. Refuse-only by design: a header can never
+	// ADMIT, which is why the positive cases above carry none.
+	for _, hdr := range [][2]string{
+		{"Forwarded", "for=192.0.2.1"},
+		{"X-Forwarded-For", "192.0.2.1"},
+		{"X-Forwarded-Host", "kiro.lan"},
+		{"X-Forwarded-Proto", "https"},
+		{"X-Real-Ip", "192.0.2.1"},
+		{"Sec-Fetch-Site", "none"},
+		{"Origin", "http://localhost:9848"},
+	} {
+		req = httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
+		req.RemoteAddr = "127.0.0.1:55555"
+		req.Host = "localhost:9848"
+		req.Header.Set(hdr[0], hdr[1])
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("loopback peer+Host with %s header: status = %d, want 403 (provenance headers can only refuse, never admit)", hdr[0], rec.Code)
+		}
+	}
 }
 
 // TestToolsAPI_LoopbackOnly_malformedPeerFailsClosed pins the fail-closed
@@ -1570,5 +1605,97 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 		if rec := post(); rec.Code != http.StatusCreated {
 			t.Fatalf("create %d after the gate lifted = %d, want %d (body %s); the refused attempts must not have spent the burst", attempt, rec.Code, http.StatusCreated, rec.Body.String())
 		}
+	}
+}
+
+// TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall pins the
+// admission gate, which is not observable from a single request. pinstall
+// serializes rescans on an opMu whose acquisition ignores context, so before the
+// gate every concurrent POST parked a handler goroutine inside the library and —
+// because the operation context is deliberately detached from the request — still
+// ran its rescan after the caller was gone. A loopback agent retrying in a loop
+// (the documented consumer: kiro-cli's ! escape + curl) could queue an unbounded
+// number of them.
+//
+// The assertion is the rescan INVOCATION COUNT, not the response: the abandoned
+// caller has no reader left, so status codes prove nothing here, and a
+// count-blind test stays green with the gate deleted. Deterministic by
+// construction — the first request signals from inside the rescan and blocks
+// there, so the second request is provably queued rather than merely likely to be.
+func TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall(t *testing.T) {
+	var calls atomic.Int64
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	deps := newTestDeps(true)
+	deps.kiroRescan = func(context.Context) (bool, error) {
+		// Only the FIRST call holds the slot; a second call (which is the defect
+		// this pins) returns at once, so a broken gate fails the count assertion
+		// below instead of deadlocking the suite.
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return true, nil
+	}
+	h := handleKiroRescan(deps)
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
+		h(httptest.NewRecorder(), req)
+	}()
+	<-entered // the first rescan holds the only admission slot
+
+	// The second caller goes away while queued: exactly the abandoned-POST shape.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
+	h(httptest.NewRecorder(), req.WithContext(ctx))
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("kiroRescan calls after an abandoned queued request = %d, want 1 — an abandoned caller must not enter pinstall, or a retry loop queues unbounded serialized rescans", got)
+	}
+
+	close(release)
+	<-firstDone
+	if got := calls.Load(); got != 1 {
+		t.Errorf("kiroRescan calls after the in-flight rescan finished = %d, want 1", got)
+	}
+}
+
+// TestKiroRescan_AdmittedRescanSurvivesClientDisconnect is the other half of the
+// gate's contract, and the reason the cancellation check sits at ADMISSION only:
+// once a rescan is running, a caller that disconnects (Ctrl-C, --max-time) must
+// not abort it, because pinstall reads a canceled probe as "no usable version"
+// and publishes unready. The request context is canceled while the rescan is
+// executing; the rescan must still be allowed to complete.
+func TestKiroRescan_AdmittedRescanSurvivesClientDisconnect(t *testing.T) {
+	entered := make(chan struct{})
+	sawCancel := make(chan error, 1)
+	deps := newTestDeps(true)
+	deps.kiroRescan = func(ctx context.Context) (bool, error) {
+		close(entered)
+		// Whatever the caller does now, the operation context must stay live.
+		<-sawCancel
+		return ctx.Err() == nil, nil
+	}
+	h := handleKiroRescan(deps)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h(rec, req)
+	}()
+	<-entered
+	cancel() // the client disconnects mid-rescan
+	sawCancel <- nil
+	<-done
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d — an admitted rescan must run to completion on a detached context; a canceled probe would publish a false unready", rec.Code, http.StatusOK)
 	}
 }

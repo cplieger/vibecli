@@ -2055,3 +2055,52 @@ func TestStartTools_logsTheGatedWindowOpening(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestWarnIfToolsBinUnreachable pins the PATH-reachability nudge added for h-f1:
+// its CONDITION (both arms) and its level. Nothing else asserts it, so the check
+// could invert, go silent, or move to Error with the suite green -- and it fires on
+// every bare `go run`, which is a supported shape, so its wording has to name an
+// action that shape's reader can take.
+//
+// Serial: capture.Default mutates the process-global default logger, and t.Setenv
+// forbids t.Parallel.
+func TestWarnIfToolsBinUnreachable(t *testing.T) {
+	const warnMsg = "the tools tree is not on PATH: every tool the manifest installs will be invisible to kiro-cli and to terminal sessions, even though /api/health will report tools=ok"
+
+	t.Run("tools bin on PATH stays silent", func(t *testing.T) {
+		toolsDir := t.TempDir()
+		// A second, unrelated entry alongside it: the check must scan the whole
+		// list, not just the first entry.
+		t.Setenv("PATH", "/usr/bin"+string(os.PathListSeparator)+filepath.Join(toolsDir, "bin"))
+		records := capture.Default(t)
+		warnIfToolsBinUnreachable(toolsDir)
+		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
+			t.Errorf("log = %q; a tools bin that IS on PATH must not warn (got %d)", records.Messages(), got)
+		}
+	})
+
+	t.Run("tools bin absent from PATH warns once, and names the directory", func(t *testing.T) {
+		toolsDir := t.TempDir()
+		t.Setenv("PATH", "/usr/bin")
+		records := capture.Default(t)
+		warnIfToolsBinUnreachable(toolsDir)
+		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 1 {
+			t.Errorf("log = %q, want exactly one %q Warn (got %d)", records.Messages(), warnMsg, got)
+		}
+		// The directory is the actionable half: a hint telling the reader to add a
+		// path must say WHICH path, and the tools_bin attr is where it appears.
+		want := filepath.Join(toolsDir, "bin")
+		named := false
+		for _, r := range records.Records() {
+			r.Attrs(func(a slog.Attr) bool {
+				if strings.Contains(a.Value.String(), want) {
+					named = true
+				}
+				return true
+			})
+		}
+		if !named {
+			t.Errorf("log = %q carries no attr naming the unreachable bin dir %q; the nudge asks the reader to add a directory to PATH, so it must say which", records.Messages(), want)
+		}
+	})
+}

@@ -228,11 +228,32 @@ type kiroRescanBody struct {
 // 503 with the manager's own reason when none is: the same verdict /api/health will
 // serve from the next probe, so a caller gets its answer without polling.
 func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
+	// One admission slot for the whole endpoint. pinstall serializes rescans on its
+	// own opMu, whose acquisition is NOT context-aware, so without this gate every
+	// concurrent POST parks a handler goroutine inside the library until its turn
+	// comes — and because the operation context is detached below, an abandoned
+	// caller's rescan still runs later. A loopback agent retrying in a loop can
+	// therefore queue an unbounded number of handlers, each of which executes a
+	// serialized rescan long after its client is gone. Admission is what waits here
+	// instead, and waiting here IS cancellable.
+	admit := make(chan struct{}, 1)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A rescan probes the candidate binary and reasserts the required
 		// settings, so it is not free; it is also not cacheable under any
 		// circumstances.
 		w.Header().Set("Cache-Control", "no-store")
+		select {
+		case admit <- struct{}{}:
+			defer func() { <-admit }()
+		case <-r.Context().Done():
+			// Still QUEUED when the caller went away: nothing has entered pinstall
+			// on its behalf, so dropping it costs nothing and is the whole point of
+			// gating here. The in-flight rescan it was waiting behind continues,
+			// and its result is what the next probe of /api/health reports.
+			slog.Debug("kiro-cli rescan abandoned while queued behind an in-flight rescan",
+				"error", r.Context().Err())
+			return
+		}
 		// The rescan MUTATES readiness, so it must not inherit the request's
 		// cancellation: pinstall's Rescan probes each candidate with
 		// exec.CommandContext, and a canceled context makes every probe fail
@@ -245,7 +266,8 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// (request id) while detaching the lifetime; no deadline is added on
 		// purpose, because pinstall bounds every subprocess itself (probeTimeout
 		// / assertionTimeout) and an expiring deadline would reintroduce exactly
-		// the canceled-probe verdict this removes.
+		// the canceled-probe verdict this removes. Detachment applies only ONCE
+		// ADMITTED: a rescan that has started must finish on its own terms.
 		ok, err := deps.kiroRescan(context.WithoutCancel(r.Context()))
 		if ok {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
@@ -720,9 +742,17 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 				slog.Warn(unrecognizedNotifyMsg,
 					append(fingerprints.metadata(msg), "hint", unrecognizedNotifyHint)...)
 			case warnCapped:
+				// The fingerprint of the message that hit the full budget, so a
+				// re-armed announcement identifies WHICH wording drove it and pairs
+				// with the Debug record. Without it two firings six hours apart are
+				// indistinguishable from the same rejected wording arriving twice --
+				// and this line is the only default-level signal of a drift that
+				// begins AFTER the budget filled. Content-free and keyed, the same
+				// attribute the warnFirst arm carries.
 				slog.Warn(unrecognizedNotifyCapMsg,
-					"distinct_limit", unrecognizedNotifyCap,
-					"hint", unrecognizedNotifyHint)
+					append(fingerprints.metadata(msg),
+						"distinct_limit", unrecognizedNotifyCap,
+						"hint", unrecognizedNotifyHint)...)
 			}
 			// ONE Debug record either way; the KWEB_LOG_OSC_TEXT opt-in only ADDS
 			// the text. Whoever set BOTH it and the debug level accepted (and was

@@ -177,7 +177,7 @@ RUN mkdir -p static/vendor/fonts && \
 # ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
 # deemed in scope (at the cost of a manual sha bump on each engine/UI release).
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.2.0
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.3.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
 # ---------------------------------------------------------------------------
 # PRE-RELEASE PIN — AWAITS PUBLICATION. @cplieger/web-terminal-ui 5.1.0 is

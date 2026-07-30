@@ -6,6 +6,17 @@ import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 // The real constant from the real package -- NOT mocked below. The point is to
 // compare the served HTML against what the library actually ships.
 import { STARTUP_FAILURE_COPY } from "@cplieger/web-terminal-ui/startup-copy";
+// Likewise real, from the same package's /style-contract subpath: the public
+// theme-token list and the loading-overlay class names, published as DATA so the
+// two name-addressed surfaces of that library (the open `theme` Record, and
+// overlay classes hardcoded in static HTML) can be asserted instead of
+// remembered. Imported from the subpath, not the package root, because the root
+// is mocked below -- the same reason STARTUP_FAILURE_COPY comes from
+// /startup-copy.
+import {
+  LOADING_OVERLAY_CLASSES,
+  PUBLIC_THEME_TOKENS,
+} from "@cplieger/web-terminal-ui/style-contract";
 
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
@@ -116,32 +127,6 @@ function browserResolvedSpecifiers(source: string): string[] {
   };
   ts.forEachChild(parsed, visit);
   return specifiers;
-}
-
-// The UI package's shipped stylesheets, assembled from its own css/MANIFEST --
-// exactly the member list scripts/css-bundle.sh concatenates into the served
-// /style.css -- with CSS comments stripped so a name that survives only in prose
-// can never satisfy a parity assertion. Rooted at node_modules rather than
-// ../static, which is why this is not a readStaticAsset() call.
-function readUiCssBundle(): string {
-  const readCss = (name: string): string =>
-    readFileSync(
-      resolve(fixtureRoot(), `node_modules/@cplieger/web-terminal-ui/css/${name}`),
-      "utf8",
-    );
-  const members = readCss("MANIFEST")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line !== "" && !line.startsWith("#"));
-  expect(members.length).toBeGreaterThan(0);
-  return members
-    .map(readCss)
-    .join("\n")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
-}
-
-function declaredCustomProperties(bundle: string): string[] {
-  return [...bundle.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((match) => match[1] as string);
 }
 
 // The fatal-overlay alertdialog contract of the inline pre-module bootstrap
@@ -1139,61 +1124,88 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     }
   });
 
-  it("themes only custom properties the shipped UI package declares and reads", () => {
+  it("overrides only theme tokens the UI package publicly supports", () => {
     // The theme object is Readonly<Record<string, string>> on the library side:
     // the kernel copies every key onto .wt-root verbatim, so nothing -- not tsc,
     // not the assertions above, which only pin what app.ts PASSES -- notices a
     // token the library renamed or retired. The override silently becomes a dead
     // declaration, the terminal renders in the library's neutral blue defaults,
-    // and this file stays green. Same mechanism as STARTUP_FAILURE_COPY: the
-    // agreement is checked against the shipped package rather than remembered.
-    const bundle = readUiCssBundle();
-    const declared = declaredCustomProperties(bundle);
+    // and this file stays green.
+    //
+    // The check used to be a SCRAPE: read the library's css/MANIFEST out of
+    // node_modules, concatenate the bundle, strip comments, regex the `--token:`
+    // declarations, then confirm each override appeared as both a declaration and
+    // a var() read. Every one of those steps is gone. The library publishes
+    // PUBLIC_THEME_TOKENS now and guarantees on its own side that each listed
+    // token is both declared and read by the shipped CSS (its
+    // src/css-contract.test.ts generates the inventory from the stylesheets and
+    // fails otherwise), so re-deriving that here would duplicate the library's
+    // assertion against bytes this app has no business reading -- and would do it
+    // with a weaker parser. Same mechanism as STARTUP_FAILURE_COPY: import the
+    // contract, do not re-litigate it.
+    //
+    // What is left is the only half that is genuinely the CONSUMER's: every token
+    // this app overrides must be a token the library supports.
+    for (const token of Object.keys(THEME)) {
+      expect(
+        PUBLIC_THEME_TOKENS as readonly string[],
+        `theme token ${token} is not in the UI package's PUBLIC_THEME_TOKENS, so overriding it is unsupported: it may be an internal token the library renames without a release note, or it may not exist`,
+      ).toContain(token);
+    }
 
-    // Every key app.ts sets, plus every token its VALUES reach through var():
-    // --tab-active-border's color-mix reads --text, so a rename there breaks the
-    // whole declaration and the active tab loses its edge.
-    const named = new Set(Object.keys(THEME));
+    // The library's list is the assertion's whole strength, so a list that
+    // arrived empty (a bad publish, a mocked module, a subpath that resolved to
+    // something else) must fail here rather than make the loop above vacuous.
+    expect(PUBLIC_THEME_TOKENS.length).toBeGreaterThan(0);
+
+    // One override reaches THROUGH the public surface: --tab-active-border's
+    // color-mix reads var(--text), an INTERNAL token PUBLIC_THEME_TOKENS
+    // deliberately does not cover (the library's own doc comment says a value
+    // reaching an internal name is the consumer's to assert on separately). This
+    // app cannot assert it without the scrape that was just deleted, so the
+    // coupling is pinned as a LIST instead: adding a second internal reference is
+    // a deliberate edit to this line, not something that slips in unnoticed. If
+    // the library ever renames --text, the active tab silently loses its edge and
+    // nothing here catches it -- the durable fix is on the library side (publish
+    // the theme-referenceable internal tokens, or promote --text), not another
+    // node_modules reader in this repo.
+    const internalReferences = new Set<string>();
     for (const value of Object.values(THEME)) {
       for (const reference of value.matchAll(/var\(\s*(--[\w-]+)/g)) {
-        named.add(reference[1] as string);
+        const token = reference[1] as string;
+        if (!(PUBLIC_THEME_TOKENS as readonly string[]).includes(token)) {
+          internalReferences.add(token);
+        }
       }
     }
-    expect([...named]).toContain("--text");
-
-    for (const token of named) {
-      expect(declared, `theme token ${token} is not declared by the UI package`).toContain(token);
-      // Declared but unread is the same silent no-op: the kernel writes the
-      // override onto .wt-root and no rule consumes it.
-      expect(
-        new RegExp(`var\\(\\s*${token}\\s*[,)]`).test(bundle),
-        `theme token ${token} is declared but never read by the UI package`,
-      ).toBe(true);
-    }
+    expect([...internalReferences]).toEqual(["--text"]);
   });
 
-  it("opts into loading-overlay names the shipped UI package still styles", () => {
+  it("opts into the loading-overlay class names the UI package publishes", () => {
     // index.html's overlay is styled by the library now (its ~70 duplicated lines
-    // are gone), and it opts in by NAME: the .wt-loading class, the
-    // .wt-loading-bar child, the .wt-loading-text region the kernel writes the
-    // progressive status line into, and the one --wt-loading-accent token that
-    // carries the brand into the pre-JS screen. Those names are hardcoded in a
-    // static HTML file no compiler reads, so a library rename leaves the first
-    // screen of every load unstyled with every test above still green -- the
-    // "index.html's pristine overlay satisfies the watchdog's stand-down
-    // guards" test pins index.html's half of the same contract.
-    const bundle = readUiCssBundle();
-
-    for (const selector of [".wt-loading", ".wt-loading-bar", ".wt-loading-text"]) {
-      expect(
-        new RegExp(`(^|[\\s,])\\${selector}(?![\\w-])[^{}]*\\{`, "m").test(bundle),
-        `${selector} is not styled by the UI package`,
-      ).toBe(true);
-    }
-    expect(declaredCustomProperties(bundle)).toContain("--wt-loading-accent");
-    expect(
-      /var\(\s*--wt-loading-accent\s*[,)]/.test(bundle),
-      "--wt-loading-accent is declared but never read by the UI package",
-    ).toBe(true);
+    // are gone), and it opts in by NAME, hardcoded in a static HTML file no
+    // compiler reads -- so a library rename leaves the first screen of every load
+    // unstyled with every test above still green.
+    //
+    // Asserted against the library's exported LOADING_OVERLAY_CLASSES rather than
+    // against a regex over its stylesheets, for the same reason as the theme test
+    // above: whether page.css actually styles those selectors is the library's own
+    // assertion. Read in the opposite direction from that test, too -- here the
+    // SERVED markup is what must agree with the library, so this reads
+    // static/index.html rather than app.ts's theme object. The
+    // "index.html's pristine overlay satisfies the watchdog's stand-down guards"
+    // test pins the same element's ARIA half.
+    // mountServedBody() rather than a fresh DOMParser call: it applies the
+    // suite's shared policy for reading the served markup (stylesheet link and
+    // scripts stripped, because happy-dom fetches a parsed document's stylesheet
+    // hrefs and /app.js must not load in a unit test).
+    mountServedBody();
+    const overlay = document.getElementById("loading");
+    expect(overlay).not.toBeNull();
+    expect([...(overlay?.classList ?? [])]).toContain(LOADING_OVERLAY_CLASSES.overlay);
+    // The markup contract is one `overlay` element with one `bar` child; the
+    // .wt-loading-text status region is the KERNEL's own (it creates it inside the
+    // overlay at runtime), so it is deliberately not asserted as app markup.
+    expect(overlay?.querySelector(`.${LOADING_OVERLAY_CLASSES.bar}`)).not.toBeNull();
   });
 });

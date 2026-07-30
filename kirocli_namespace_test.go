@@ -24,12 +24,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/cplieger/pathinside"
 	"github.com/cplieger/pinstall"
 )
 
@@ -219,7 +221,7 @@ func (e *nsEnv) symlink(target, newname string) string {
 // against another owner's binary leaves a trace no outcome check would show.
 func (e *nsEnv) assertIntact(survivors []string) {
 	e.t.Helper()
-	optTree := filepath.Join(e.tools, "opt") + string(filepath.Separator)
+	optTree := filepath.Join(e.tools, "opt")
 	for _, p := range survivors {
 		fi, err := os.Lstat(p)
 		if err != nil {
@@ -232,7 +234,13 @@ func (e *nsEnv) assertIntact(survivors []string) {
 				e.t.Errorf("Readlink(%s): %v", p, err)
 				continue
 			}
-			if !strings.HasPrefix(target, optTree) {
+			// pathinside.Inside rather than a prefix test on the raw string: the
+			// link target is read off disk, so it need not be cleaned, and
+			// "<opt>/../elsewhere" carries the prefix while pointing outside the
+			// tree. Inside counts the opt dir ITSELF as inside, which no planted
+			// link is -- every survivor points at a file two levels down -- so
+			// the two rules agree on every value this test can produce.
+			if !pathinside.Inside(optTree, target) {
 				e.t.Errorf("%s now points at %q, outside the engine's own opt tree: its symlink was republished under it", p, target)
 			}
 			continue
@@ -298,6 +306,91 @@ func TestToolbeltKiroCLIFootprintSurvivesABoot(t *testing.T) {
 	}
 }
 
+// nsToolsRel names dir relative to the tools dir, refusing anything that is not
+// under that tree.
+//
+// The escape decision is pathinside.RelEscapes and NOT filepath.Rel's error,
+// because Rel does not error on escape: handed a target above its base it
+// returns "../evil" with a nil error, so reading a nil error as "under the tools
+// dir" accepted exactly the case the caller's assertion exists to catch. A Rel
+// error is a different failure (the two paths cannot be compared at all -- an
+// absolute path against a relative root, two Windows volumes) and is refused
+// too, because a path that cannot be named relative to the tools dir is not
+// under it.
+//
+// Depth is NOT this function's business: the caller splits the returned name and
+// asserts its own component count, which is a separate property (a root nested
+// deeper inside the tools dir is still contained by it).
+func nsToolsRel(root, dir string) (string, error) {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return "", fmt.Errorf("%q cannot be named relative to %q: %w", dir, root, err)
+	}
+	if pathinside.RelEscapes(rel) {
+		return rel, fmt.Errorf("%q is outside %q (relative name %q)", dir, root, rel)
+	}
+	return rel, nil
+}
+
+// TestNSToolsRelDetectsEscape pins the predicate the structural test below rides
+// on, because that test cannot fail for the case it exists to catch:
+// filepath.Rel does NOT error on escape -- handed a target above its base it
+// returns "../x" with a nil error -- and "../x" then splits into exactly two
+// components, so the depth assertion is satisfied too and "bin/opt/npm/python"
+// does not contain "..". An install root OUTSIDE the tools dir therefore passed
+// every assertion.
+//
+// The escaping case asserts both halves: the relative name is refused, AND it
+// really does split into two components, which is why the depth check cannot
+// stand in for the containment check.
+func TestNSToolsRelDetectsEscape(t *testing.T) {
+	root := t.TempDir()
+	cases := map[string]struct {
+		dir     string
+		wantRel string
+	}{
+		"the shape this app's configuration produces": {
+			dir:     filepath.Join(root, nsTool+"-versions", nsVersion),
+			wantRel: filepath.Join(nsTool+"-versions", nsVersion),
+		},
+		"a sibling of the tools dir, two components up-and-over": {
+			dir:     filepath.Join(filepath.Dir(root), "evil"),
+			wantRel: "",
+		},
+		"a path that cannot be compared with the tools dir at all": {
+			dir:     "relative/not/absolute",
+			wantRel: "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rel, err := nsToolsRel(root, tc.dir)
+			if tc.wantRel == "" {
+				if err == nil {
+					t.Fatalf("nsToolsRel(%q, %q) = %q, nil: a directory outside the tools dir was accepted as under it", root, tc.dir, rel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("nsToolsRel(%q, %q) = %v, want %q", root, tc.dir, err, tc.wantRel)
+			}
+			if rel != tc.wantRel {
+				t.Errorf("nsToolsRel(%q, %q) = %q, want %q", root, tc.dir, rel, tc.wantRel)
+			}
+		})
+	}
+	// The depth assertion the structural test makes on top of this predicate
+	// cannot substitute for it: the escaping name has the same component count
+	// as the legitimate one.
+	escaping, err := filepath.Rel(root, filepath.Join(filepath.Dir(root), "evil"))
+	if err != nil {
+		t.Fatalf("Rel: %v", err)
+	}
+	if parts := strings.Split(escaping, string(filepath.Separator)); len(parts) != 2 {
+		t.Fatalf("the escaping relative name %q has %d components; the case that fooled the depth check had 2", escaping, len(parts))
+	}
+}
+
 // TestInstallRootIsOutsideTheToolbeltNamespace pins the structural half, which no
 // single behavioral case can pin on its own: the install root this app's
 // configuration produces is ONE component directly under the tools dir, and it is
@@ -319,9 +412,9 @@ func TestInstallRootIsOutsideTheToolbeltNamespace(t *testing.T) {
 		t.Fatalf("PathEntry() = %q, want %q", mgr.PathEntry(), own)
 	}
 
-	rel, err := filepath.Rel(env.tools, mgr.PathEntry())
+	rel, err := nsToolsRel(env.tools, mgr.PathEntry())
 	if err != nil {
-		t.Fatalf("the active version directory is not under the tools dir at all: %v", err)
+		t.Fatalf("the active version directory is not under the tools dir: %v", err)
 	}
 	parts := strings.Split(rel, string(filepath.Separator))
 	if len(parts) != 2 {

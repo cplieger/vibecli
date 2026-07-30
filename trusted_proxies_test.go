@@ -460,19 +460,22 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 }
 
 // TestBuildHandlerSkipsAccessLogForStreams pins the access-log wiring in
-// buildHandler: the long-lived streams (a real /ws upgrade and the
-// /api/sessions/events SSE) must emit NO access-log line, while a request that
-// reaches /ws WITHOUT the RFC 6455 upgrade headers — the classic reverse-proxy
-// misconfiguration, which the engine refuses with a 426 it logs nowhere — is
-// short-lived and MUST be logged; a healthy /api/health probe is suppressed at
-// the default Info level while a failing probe still emits at Warn/Error.
+// buildHandler: the /api/sessions/events SSE stream must emit NO access-log line
+// (it is the one stream path still skipped by PATH, because SSE never switches
+// protocols and the response-based WithSkipUpgrades cannot cover it), while a
+// request to /ws that never becomes a stream — no upgrade headers (the classic
+// reverse-proxy misconfiguration, which the engine refuses with a 426 it logs
+// nowhere), or a non-GET carrying them — MUST be logged; a healthy /api/health
+// probe is suppressed at the default Info level while a failing probe still
+// emits at Warn/Error. The admitted-upgrade half of the contract cannot be shown
+// with a fake mux and lives in TestAccessLogSkipsOnlyCompletedUpgrades.
 // The token-bearing /api/sessions/ subtree must emit lines whose recorded path
 // is the token-free route template (a raw session id must never appear) for the
 // route shapes the server actually serves, and the "(unmatched)" marker for a
 // path under the subtree that routes nowhere, while normal requests still log
-// their real path. A regression dropping the stream skips would flood the access
-// log with one misleading line per reconnect; a regression widening them back to
-// the whole /ws path would re-hide the unlogged 426; a regression dropping
+// their real path. A regression dropping the SSE skip would flood the access
+// log with one misleading line per reconnect; a regression widening it to the
+// whole /ws path would re-hide the unlogged 426; a regression dropping
 // WithTemplatePathsUnder would leak live session tokens to log-read consumers;
 // all pass every other test. Serial: swaps the process-global default logger
 // (buildHandler binds WithLogger(slog.Default()) at construction).
@@ -540,24 +543,22 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 		h.ServeHTTP(httptest.NewRecorder(),
 			httptest.NewRequestWithContext(ctx, req.method, req.path, http.NoBody))
 	}
-	// A COMPLETE upgrade attempt is the stream shape, so it stays skipped. Every
-	// header websocket.Accept requires before it hijacks is present: a request
-	// missing any of them gets a short 4xx from Accept instead of becoming a
-	// stream, and willUpgrade keeps its access line (asserted below).
-	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key whose value
-	// willUpgrade never inspects (it counts the field, see its doc comment).
+	// A COMPLETE upgrade attempt cannot be exercised here any more, and that is
+	// the adoption showing through: the skip is webhttp.WithSkipUpgrades, decided
+	// from the RESPONSE, and this mux has no /ws route to upgrade with — a 404 is
+	// not a stream, so it is correctly logged. The admitted-upgrade case moved to
+	// TestAccessLogSkipsOnlyCompletedUpgrades, which drives a real handshake
+	// against the engine. What stays here is the REFUSAL half, which this fake
+	// mux can still show.
+	//
+	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key, so the
+	// refused request below is refused for its METHOD and nothing else.
 	const wsKey = "AAAAAAAAAAAAAAAAAAAAAA=="
-	upgrade := httptest.NewRequest(http.MethodGet, "/ws", http.NoBody)
-	upgrade.Header.Set("Upgrade", "websocket")
-	upgrade.Header.Set("Connection", "keep-alive, Upgrade")
-	upgrade.Header.Set("Sec-WebSocket-Version", "13")
-	upgrade.Header.Set("Sec-WebSocket-Key", wsKey)
-	h.ServeHTTP(httptest.NewRecorder(), upgrade)
 
-	// A request carrying the upgrade HEADERS that Accept still refuses short
-	// (here: not a GET, so Accept answers 405) is NOT a stream, so its access
-	// line must survive — the same silence the no-upgrade-headers 426 case
-	// exists to remove.
+	// A request carrying the upgrade HEADERS that never becomes a stream keeps
+	// its access line. Here it is refused for its method; over a real engine
+	// Accept answers 405, and either way the recorded response is not a protocol
+	// switch — the same silence the no-upgrade-headers case exists to remove.
 	badUpgrade := httptest.NewRequest(http.MethodPost, "/ws", http.NoBody)
 	badUpgrade.Header.Set("Upgrade", "websocket")
 	badUpgrade.Header.Set("Connection", "Upgrade")
@@ -567,9 +568,11 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 
 	log := buf.String()
 	if !strings.Contains(log, "method=POST path=/ws") {
-		t.Errorf("access log = %q, want a line for a non-GET /ws request carrying upgrade headers (Accept refuses it short; only a real hijacked stream may be skipped)", log)
+		t.Errorf("access log = %q, want a line for a non-GET /ws request carrying upgrade headers (it never switches protocols; only a completed upgrade may be skipped)", log)
 	}
-	for _, skipped := range []string{"method=GET path=/ws", "path=/api/sessions/events"} {
+	// SSE is the one stream path still skipped by a PATH test: it never switches
+	// protocols, so the response-based skip cannot cover it (see buildHandler).
+	for _, skipped := range []string{"path=/api/sessions/events"} {
 		if strings.Contains(log, skipped) {
 			t.Errorf("access log = %q, want no access line for skipped path %q (the skip wiring must keep stream lines out)", log, skipped)
 		}

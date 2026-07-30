@@ -1251,94 +1251,85 @@ func TestToolsStatus_callbackAndHealthReadAreRaceClean(t *testing.T) {
 	wg.Wait()
 }
 
-// TestParseBoolEnv_neverLogsRawValue pins the parser's VOCABULARY (so the local
-// parse stays compatible with envx.Bool's) and its fail-closed direction on a bad
-// value: a token-shaped value must yield the fallback with ok=false.
-//
-// It does NOT pin the confidentiality property, and must not be read as doing so:
-// parseBoolEnv emits no records at all, so the no-raw-value assertion below is
-// satisfied vacuously here. That property lives in the PRODUCTION knob read and is
-// pinned by TestParseLogOSCText_warnsByNameOnly. The assertion stays as a
-// regression guard for the one thing it can still catch — parseBoolEnv itself
-// gaining a log site that echoes the raw value, which is exactly what envx.Bool's
-// malformed path does (CWE-532: a durable, queryable copy in the log store) and why
-// this parser is local.
-// Serial: capture.Default mutates the process-global default logger.
-func TestParseBoolEnv_neverLogsRawValue(t *testing.T) {
-	const key = "KWEB_TEST_BOOL"
-	cases := map[string]struct {
-		raw       string
-		fallback  bool
-		wantValue bool
-		wantOK    bool
-	}{
-		"unset is not a parse failure": {raw: "", fallback: false, wantValue: false, wantOK: true},
-		"unset yields the fallback":    {raw: "", fallback: true, wantValue: true, wantOK: true},
-		"true":                         {raw: "true", wantValue: true, wantOK: true},
-		"1":                            {raw: "1", wantValue: true, wantOK: true},
-		"yes uppercase and padded":     {raw: "  YES  ", wantValue: true, wantOK: true},
-		"on":                           {raw: "on", wantValue: true, wantOK: true},
-		"false":                        {raw: "false", wantValue: false, wantOK: true},
-		"0":                            {raw: "0", wantValue: false, wantOK: true},
-		"no":                           {raw: "no", wantValue: false, wantOK: true},
-		"off":                          {raw: "off", wantValue: false, wantOK: true},
-		// The shape that motivates the local parser, on the half this table
-		// can actually pin: a token-shaped value must fail closed to the
-		// fallback. Whether the raw value stays out of the log is a property
-		// of the CALLER's warning, pinned by
-		// TestParseLogOSCText_warnsByNameOnly.
-		"secret-shaped value fails closed": {
-			raw: "s3cr3t-token-abc123", fallback: false, wantValue: false, wantOK: false,
-		},
-		"secret-shaped value keeps a true fallback": {
-			raw: "s3cr3t-token-abc123", fallback: true, wantValue: true, wantOK: false,
-		},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			records := capture.Default(t)
-			t.Setenv(key, tc.raw)
-
-			value, ok := parseBoolEnv(key, tc.fallback)
-
-			if value != tc.wantValue || ok != tc.wantOK {
-				t.Errorf("parseBoolEnv(%q, %v) = (%v, %v), want (%v, %v)",
-					tc.raw, tc.fallback, value, ok, tc.wantValue, tc.wantOK)
-			}
-			if tc.raw != "" && logContains(records, tc.raw) {
-				t.Errorf("log = %q carries the raw %s value; parseBoolEnv must stay log-free — echoing the raw value is exactly what envx.Bool's malformed path does (CWE-532) and why this parser is local; the operator-facing warning belongs to the caller, pinned by TestParseLogOSCText_warnsByNameOnly",
-					records.Messages(), key)
-			}
-		})
-	}
-}
-
 // TestParseLogOSCText_warnsByNameOnly pins the PRODUCTION knob read, which is
-// where the confidentiality property actually lives: parseBoolEnv emits no
-// records at all, so a test that captures slog around it alone satisfies the
-// "no raw value in the log" claim vacuously and would stay green if main went
-// back to envx.Bool. This drives parseLogOSCText — the function main calls —
-// and asserts the malformed path emits exactly ONE Warn carrying neither the
-// raw value in its message nor in any attribute, that the opt-in path warns
-// about widened content, and that the default path is silent.
+// where the confidentiality property lives — and it is the ONLY test of it,
+// deliberately: the read is envx.BoolStrict, which emits no records at all, so a
+// test that captured slog around the library call alone would satisfy the "no raw
+// value in the log" claim vacuously and would stay green if main went back to
+// envx.Bool. This drives parseLogOSCText, the function main calls, so the
+// assertions cover the real call path: envx.BoolStrict plus THIS function's
+// diagnostics, which are the only log sites the knob has.
+//
+// Four properties, each a distinct regression:
+//   - the accepted VOCABULARY is envx's (true/1/yes/on, false/0/no/off,
+//     case-insensitive, padding ignored). It is asserted here rather than against
+//     a local parser because there is no local parser any more: BoolStrict shares
+//     one parser with envx.Bool, and this table is what notices if the read is
+//     ever swapped for something with a different grammar (e.g. strconv.ParseBool,
+//     which accepts "t"/"f" — pinned below as malformed);
+//   - a malformed value fails CLOSED to false, so a typo cannot widen what
+//     content reaches the log store;
+//   - the malformed path emits exactly ONE Warn, naming the key and carrying no
+//     copy of the raw value in its message or in any attribute. The returned
+//     error is deliberately not logged either, so this holds however envx words
+//     it;
+//   - the ON path warns about the widened content, and the default path is
+//     silent.
+//
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	const token = "s3cr3t-token-abc123"
+	const onMsg = "KWEB_LOG_OSC_TEXT is on"
+	const badMsg = "unparseable KWEB_LOG_OSC_TEXT"
 	cases := map[string]struct {
 		raw       string
 		wantValue bool
 		wantWarns int
 		wantMsg   string
+		// rawMustStayOut asks for the confidentiality assertion. It is set only
+		// for values distinctive enough that finding one in the log PROVES a
+		// leak: "on", "0" and "t" occur as substrings of ordinary words in
+		// these two warnings, so asserting their absence would fail on wording
+		// alone and say nothing about the value.
+		rawMustStayOut bool
 	}{
+		// The whole accepted vocabulary, both spellings of every truth value,
+		// plus the case and padding tolerance.
+		"true":                 {raw: "true", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"1":                    {raw: "1", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"yes":                  {raw: "yes", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"on":                   {raw: "on", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"TRUE uppercase":       {raw: "TRUE", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"yes padded":           {raw: "  yes  ", wantValue: true, wantWarns: 1, wantMsg: onMsg},
+		"false":                {raw: "false", wantValue: false, wantWarns: 0},
+		"0":                    {raw: "0", wantValue: false, wantWarns: 0},
+		"no":                   {raw: "no", wantValue: false, wantWarns: 0},
+		"off":                  {raw: "off", wantValue: false, wantWarns: 0},
+		"OFF uppercase padded": {raw: " OFF ", wantValue: false, wantWarns: 0},
+
+		// Unset and blank are not parse failures: they are the silent default.
+		"unset is the silent default":       {raw: "", wantValue: false, wantWarns: 0},
+		"whitespace-only is the same thing": {raw: "   ", wantValue: false, wantWarns: 0},
+
+		// Malformed: fail closed, one Warn, no echo. The token case is the shape
+		// that motivates BoolStrict over Bool (a compose expansion mistake).
 		"token-shaped value fails closed and warns by name": {
-			raw: token, wantValue: false, wantWarns: 1,
-			wantMsg: "unparseable KWEB_LOG_OSC_TEXT",
+			raw: token, wantValue: false, wantWarns: 1, wantMsg: badMsg, rawMustStayOut: true,
 		},
-		"opt-in warns that notification text is logged": {
-			raw: "true", wantValue: true, wantWarns: 1,
-			wantMsg: "KWEB_LOG_OSC_TEXT is on",
+		"a typo of true is malformed, not false": {
+			raw: "ture", wantValue: false, wantWarns: 1, wantMsg: badMsg, rawMustStayOut: true,
 		},
-		"unset is the silent default": {raw: "", wantValue: false, wantWarns: 0},
+		"a word outside the vocabulary is malformed": {
+			raw: "enabled", wantValue: false, wantWarns: 1, wantMsg: badMsg, rawMustStayOut: true,
+		},
+		// strconv.ParseBool accepts "t"; envx's grammar does not. This is the
+		// case that fails if the read is swapped for the stdlib parser.
+		"t is not a spelling of true": {
+			raw: "t", wantValue: false, wantWarns: 1, wantMsg: badMsg,
+		},
+		"a number other than 0 or 1 is malformed": {
+			raw: "2", wantValue: false, wantWarns: 1, wantMsg: badMsg,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1354,8 +1345,8 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 			if tc.wantMsg != "" && records.CountLevel(slog.LevelWarn, tc.wantMsg) != 1 {
 				t.Errorf("log = %q, want a Warn containing %q", records.Messages(), tc.wantMsg)
 			}
-			if tc.raw == token && logContains(records, token) {
-				t.Errorf("log = %q carries the raw KWEB_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why envx.Bool is not used here)",
+			if tc.rawMustStayOut && logContains(records, tc.raw) {
+				t.Errorf("log = %q carries the raw KWEB_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why the read is envx.BoolStrict and not envx.Bool, whose malformed Warn carries the value)",
 					records.Messages())
 			}
 		})
@@ -1413,10 +1404,11 @@ func TestParseCatalogRefresh_warnsByNameOnly(t *testing.T) {
 // TestIsWebSocketUpgrade_requiresBothListTokens pins wsAttachLog's
 // "an attach was attempted" predicate: both header tokens are required, each
 // may arrive in a repeated field line or a comma list, matching is case- and
-// whitespace-insensitive, and a token SUBSTRING must not match. The access
-// log's skip test is the stricter willUpgrade below; a divergence here is
-// silent, dropping the attach record for a request that presented a session
-// capability token.
+// whitespace-insensitive, and a token SUBSTRING must not match. This is now the
+// app's ONLY upgrade-shaped predicate — the access log's skip is decided from
+// the response by webhttp.WithSkipUpgrades — and a divergence here is silent,
+// dropping the attach record for a request that presented a session capability
+// token.
 func TestIsWebSocketUpgrade_requiresBothListTokens(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -1446,59 +1438,273 @@ func TestIsWebSocketUpgrade_requiresBothListTokens(t *testing.T) {
 	}
 }
 
-// TestWillUpgrade_mirrorsAcceptPreconditions pins the access-log skip predicate
-// against every condition the engine's websocket.Accept checks BEFORE it hijacks
-// the connection. Each case drops exactly one of them from an otherwise complete
-// handshake, so the request is one Accept answers short (405/400/426) rather than
-// one that becomes a stream — and a short refusal must keep its access line, or a
-// proxy that mangles the handshake presents as a terminal that never connects
-// with no status recorded anywhere. Widening this back to isWebSocketUpgrade
-// passes every other test.
-func TestWillUpgrade_mirrorsAcceptPreconditions(t *testing.T) {
-	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key whose value
-	// willUpgrade never inspects (it counts the field, see its doc comment).
+// accessLinesFor returns the webhttp access-log records captured for path, in
+// order, as attribute maps. Pass "" to get every access line whatever its
+// recorded path — needed for requests under the /api/sessions/ subtree, whose
+// recorded path is the route template (or the "(unmatched)" marker) rather than
+// the raw one, because WithTemplatePathsUnder keeps session tokens out of the
+// log. The access line's message is webhttp's "http", so every other record the
+// server emits (the engine's session lines, wsAttachLog's attach record) is
+// filtered out. capture.Recorder is concurrency-safe, which is what makes it
+// usable while a real httptest server is serving.
+func accessLinesFor(rec *capture.Recorder, path string) []map[string]string {
+	var out []map[string]string
+	for _, r := range rec.Records() {
+		if r.Message != "http" {
+			continue
+		}
+		attrs := make(map[string]string, r.NumAttrs())
+		r.Attrs(func(a slog.Attr) bool {
+			attrs[a.Key] = a.Value.String()
+			return true
+		})
+		if path == "" || attrs["path"] == path {
+			out = append(out, attrs)
+		}
+	}
+	return out
+}
+
+// awaitAccessLines waits until at least want access records exist for path and
+// returns them. Polling rather than reading once: the line is written from a
+// DEFERRED call inside the middleware, so it can land after the client has
+// already read the response, and for a hijacked stream it lands only when the
+// handler returns. Counting is what makes each case's assertion exact — several
+// refusal shapes share status 400, so "a 400 line exists" would be satisfied by
+// an earlier case's line.
+func awaitAccessLines(t *testing.T, rec *capture.Recorder, path string, want int) []map[string]string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if lines := accessLinesFor(rec, path); len(lines) >= want {
+			return lines
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("access log has %d lines for %s, want %d; a refused upgrade must keep its line (records: %v)",
+				len(accessLinesFor(rec, path)), path, want, rec.Messages())
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAccessLogSkipsOnlyCompletedUpgrades is the payoff test for the access
+// log's move from a local willUpgrade predicate (a request-shaped PREDICTION of
+// what the engine's websocket.Accept would admit) to webhttp.WithSkipUpgrades (a
+// response-shaped OUTCOME: a recorded 101 or a bare hijack). It drives a REAL
+// handshake against the engine over a real server, because that is the only way
+// the outcome exists at all: no fake mux can be skipped by this option, and a
+// predicate test could only ever restate the app's own guess.
+//
+// One completed upgrade, then every refusal shape, then the count check that
+// ties them together: the number of /ws access lines must equal the number of
+// REFUSALS, so the completed upgrade contributed none and no refusal was
+// swallowed. Two of the refusals are the cases the deleted predicate got WRONG
+// and could not have got right without copying more of coder/websocket into this
+// app — a malformed Sec-WebSocket-Key VALUE (Accept base64-decodes it and
+// requires 16 bytes; the predicate only counted the field) and the cross-origin
+// 403 (the predicate deliberately did not model the engine's origin policy).
+// Both were suppressed as if they had upgraded, losing status, duration, request
+// id and client ip for exactly the requests an operator greps for when a browser
+// cannot attach.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
+	rec := capture.Default(t)
+	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
+	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
+	t.Cleanup(srv.Close)
+
+	// A COMPLETED handshake: the one shape whose access line would be a lie
+	// (status 101 recorded now, the line emitted hours later at socket close
+	// with a session-length duration).
+	resp, err := srv.Client().Do(newWSUpgradeRequest(t, srv.URL, id, srv.URL))
+	if err != nil {
+		t.Fatalf("/ws handshake: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		resp.Body.Close()
+		t.Fatalf("/ws handshake status = %d, want 101; without a real upgrade this test proves nothing about suppression", resp.StatusCode)
+	}
+	// Closing the hijacked connection is what makes the engine's handler return,
+	// which is when the deferred access log runs for this request.
+	resp.Body.Close()
+
+	// 16 zero bytes, base64: structurally valid, so it isolates the OTHER
+	// mangles from the key-validity refusal below.
 	const key = "AAAAAAAAAAAAAAAAAAAAAA=="
-	complete := func() *http.Request {
-		r := httptest.NewRequest(http.MethodGet, terminal.WSPath, http.NoBody)
-		r.Header.Set("Upgrade", "websocket")
-		r.Header.Set("Connection", "keep-alive, Upgrade")
-		r.Header.Set("Sec-WebSocket-Version", "13")
-		r.Header.Set("Sec-WebSocket-Key", key)
-		return r
-	}
-	cases := map[string]struct {
-		mangle func(*http.Request)
-		want   bool
+	refusals := []struct {
+		name       string
+		mangle     func(*http.Request)
+		wantStatus int
 	}{
-		"a complete handshake is the only skippable shape": {mangle: func(*http.Request) {}, want: true},
-		"a non-GET is answered 405, so it keeps its line": {
-			mangle: func(r *http.Request) { r.Method = http.MethodPost },
+		{
+			name:       "missing upgrade headers are answered 426 and logged",
+			mangle:     func(r *http.Request) { r.Header.Del("Upgrade"); r.Header.Del("Connection") },
+			wantStatus: http.StatusUpgradeRequired,
 		},
-		"HTTP/1.0 is answered 426, so it keeps its line": {
-			mangle: func(r *http.Request) { r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/1.0", 1, 0 },
+		{
+			name:       "a non-GET is answered 405 and logged",
+			mangle:     func(r *http.Request) { r.Method = http.MethodPost },
+			wantStatus: http.StatusMethodNotAllowed,
 		},
-		"a missing Sec-WebSocket-Key is answered 400": {
-			mangle: func(r *http.Request) { r.Header.Del("Sec-WebSocket-Key") },
+		{
+			name:       "a wrong Sec-WebSocket-Version is answered 400 and logged",
+			mangle:     func(r *http.Request) { r.Header.Set("Sec-WebSocket-Version", "8") },
+			wantStatus: http.StatusBadRequest,
 		},
-		"a DUPLICATED Sec-WebSocket-Key is answered 400": {
-			mangle: func(r *http.Request) { r.Header.Add("Sec-WebSocket-Key", key) },
+		{
+			name:       "a missing Sec-WebSocket-Key is answered 400 and logged",
+			mangle:     func(r *http.Request) { r.Header.Del("Sec-WebSocket-Key") },
+			wantStatus: http.StatusBadRequest,
 		},
-		"a wrong Sec-WebSocket-Version is answered 400": {
-			mangle: func(r *http.Request) { r.Header.Set("Sec-WebSocket-Version", "8") },
+		{
+			name:       "a DUPLICATED Sec-WebSocket-Key is answered 400 and logged",
+			mangle:     func(r *http.Request) { r.Header.Add("Sec-WebSocket-Key", key) },
+			wantStatus: http.StatusBadRequest,
 		},
-		"missing upgrade headers are answered 426": {
-			mangle: func(r *http.Request) { r.Header.Del("Upgrade") },
+		{
+			// The predicate counted this header; Accept decodes it. This 400 was
+			// silently suppressed before.
+			name:       "a malformed Sec-WebSocket-Key VALUE is answered 400 and logged",
+			mangle:     func(r *http.Request) { r.Header.Set("Sec-WebSocket-Key", "not-base64-16-bytes") },
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// The engine's own origin policy, which the predicate deliberately
+			// did not model — so this 403 was suppressed too.
+			name:       "a cross-origin upgrade is answered 403 and logged",
+			mangle:     func(r *http.Request) { r.Header.Set("Origin", "http://evil.example") },
+			wantStatus: http.StatusForbidden,
 		},
 	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			req := complete()
+	for i, tc := range refusals {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
 			tc.mangle(req)
-			if got := willUpgrade(req); got != tc.want {
-				t.Errorf("willUpgrade() = %v, want %v (only a request that really becomes a hijacked stream may be skipped)", got, tc.want)
+			refused, doErr := srv.Client().Do(req)
+			if doErr != nil {
+				t.Fatalf("/ws request: %v", doErr)
+			}
+			defer refused.Body.Close()
+			if refused.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d (the refusal shape this case pins is not the one the engine produced)", refused.StatusCode, tc.wantStatus)
+			}
+			line := awaitAccessLines(t, rec, terminal.WSPath, i+1)[i]
+			if got := line["status"]; got != strconv.Itoa(tc.wantStatus) {
+				t.Errorf("access line status = %s, want %d; a refusal must be logged with its REAL status (line: %v)", got, tc.wantStatus, line)
 			}
 		})
 	}
+
+	lines := accessLinesFor(rec, terminal.WSPath)
+	if len(lines) != len(refusals) {
+		t.Errorf("got %d /ws access lines for %d refusals plus one completed upgrade, want %d; an extra line means the admitted stream was logged (a bogus status with a session-length duration), a missing one means a refusal was swallowed (lines: %v)",
+			len(lines), len(refusals), len(refusals), lines)
+	}
+	for _, line := range lines {
+		if line["status"] == strconv.Itoa(http.StatusSwitchingProtocols) {
+			t.Errorf("access log carries a 101 line (%v); a completed upgrade must leave no record", line)
+		}
+	}
+}
+
+// TestAccessLogKeepsStreamPathRefusals pins the half of the stream skip that the
+// SSE path skip could quietly break. The skip rules are evaluated BEFORE the
+// chain runs, so a BARE path skip (webhttp.WithSkipPaths) on the SSE route would
+// also swallow the 403 hostPolicy.Middleware writes — WriteError logs nothing
+// itself and the engine handler never runs — leaving a wrong-Host or DNS-rebound
+// attempt on this unauthenticated PTY with no record anywhere (CWE-778). That is
+// why the SSE skip is a predicate carrying a hostPolicy.Allows conjunct, and
+// this test is the only thing standing between that conjunct and a simplifying
+// edit.
+//
+// The /ws leg needs no conjunct and is asserted for the same reason from the
+// other side: WithSkipUpgrades cannot suppress a 403, because a rejected request
+// never switched protocols.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestAccessLogKeepsStreamPathRefusals(t *testing.T) {
+	rec := capture.Default(t)
+	t.Setenv("KWEB_ALLOWED_HOSTS", "webterm.example.com")
+
+	mux := http.NewServeMux()
+	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
+	mux.HandleFunc("GET "+terminal.WSPath, ok)
+	mux.HandleFunc("GET "+terminal.SessionEventsPath, ok)
+	h := buildHandler(mux, nil, "default-src 'self'", parseAllowedHosts())
+
+	upgradeShaped := func(r *http.Request) {
+		r.Header.Set("Upgrade", "websocket")
+		r.Header.Set("Connection", "keep-alive, Upgrade")
+		r.Header.Set("Sec-WebSocket-Version", "13")
+		r.Header.Set("Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAA==")
+	}
+
+	for _, tc := range []struct {
+		name, url string
+		decorate  func(*http.Request)
+		// wantPath is the path the LINE must carry, which is not always the
+		// requested one: /api/sessions/events sits under the token-bearing
+		// subtree, so WithTemplatePathsUnder records the matched template or the
+		// "(unmatched)" marker for a request the mux never routed — a rejected
+		// Host is exactly that.
+		wantPath string
+	}{
+		{
+			name:     "a rebound Host on the ws upgrade keeps its 403 line",
+			url:      "http://attacker.evil:9848" + terminal.WSPath,
+			decorate: upgradeShaped, wantPath: terminal.WSPath,
+		},
+		{
+			name:     "a rebound Host on the SSE stream keeps its 403 line",
+			url:      "http://attacker.evil:9848" + terminal.SessionEventsPath,
+			decorate: func(*http.Request) {},
+			wantPath: terminal.SessionsSubtreePath + "(unmatched)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(accessLinesFor(rec, ""))
+			req := httptest.NewRequest(http.MethodGet, tc.url, http.NoBody)
+			tc.decorate(req)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (the host gate must reject this request, or the logging assertion below means nothing)", w.Code)
+			}
+			lines := accessLinesFor(rec, "")
+			if len(lines) != before+1 {
+				t.Fatalf("got %d access lines, want %d; a host-policy refusal on a stream path must stay logged (lines: %v)", len(lines), before+1, lines)
+			}
+			line := lines[len(lines)-1]
+			if got := line["status"]; got != strconv.Itoa(http.StatusForbidden) {
+				t.Errorf("access line status = %s, want 403 (line: %v)", got, line)
+			}
+			if got := line["path"]; got != tc.wantPath {
+				t.Errorf("access line path = %s, want %s (line: %v)", got, tc.wantPath, line)
+			}
+		})
+	}
+
+	// The other half of the conjunct: with an ALLOWED Host the SSE stream is
+	// skipped, which is the behavior the path skip exists to preserve. Without
+	// it the status stream would emit one misleading line per connection, with a
+	// session-length duration and a status decided at close.
+	t.Run("an allowed Host on the SSE stream emits no line", func(t *testing.T) {
+		before := len(accessLinesFor(rec, ""))
+		req := httptest.NewRequest(http.MethodGet,
+			"http://webterm.example.com:9848"+terminal.SessionEventsPath, http.NoBody)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (an allowed Host must reach the stream route)", w.Code)
+		}
+		if got := accessLinesFor(rec, ""); len(got) != before {
+			t.Errorf("got %d access lines, want %d; the status stream must stay skipped (SSE never switches protocols, so WithSkipUpgrades cannot cover it — it needs the path skip) (lines: %v)", len(got), before, got[before:])
+		}
+	})
 }
 
 // TestWSAttachLog pins the audit record for the ONE request that presents the
@@ -1591,15 +1797,16 @@ func TestWSAttachLog(t *testing.T) {
 }
 
 // TestIsWebSocketUpgrade_agreesWithTheEngineHandshake cross-checks the app's
-// header-matching predicate — the half willUpgrade and wsAttachLog both build on
-// — against the ONLY implementation that decides whether a /ws request really
+// header-matching predicate — wsAttachLog's "an attach was attempted" test —
+// against the ONLY implementation that decides whether a /ws request really
 // becomes a stream: the engine's coder/websocket handshake, driven over a real
 // server. TestIsWebSocketUpgrade_requiresBothListTokens
 // states what THIS app believes an upgrade is; nothing asserts the engine agrees,
-// and every disagreement is silent -- a request the engine refuses with 426 that
-// the predicate calls a stream leaves no access line anywhere (the CWE-778 silence
-// wsAttachLog and this skip exist to remove), and one the engine upgrades that the
-// predicate calls a plain request emits a bogus 200 with an hours-long duration.
+// and every disagreement is silent -- a request the engine refuses that this
+// predicate calls an attach records an attach that never happened, and one the
+// engine upgrades that the predicate calls a plain request leaves the ONE request
+// carrying a session capability token with no attach record at all (the CWE-778
+// silence wsAttachLog exists to remove).
 // The expectations here are DERIVED from the handshake rather than restated, so a
 // coder/websocket or engine bump that changes header matching fails this test
 // instead of quietly re-opening that silence.
@@ -1607,8 +1814,10 @@ func TestWSAttachLog(t *testing.T) {
 // Only the two upgrade headers vary; method, Sec-WebSocket-Version,
 // Sec-WebSocket-Key and Origin are held at the values a real handshake carries,
 // because those are the engine's OTHER refusal reasons and this predicate
-// deliberately does not model them — willUpgrade does, and
-// TestWillUpgrade_mirrorsAcceptPreconditions covers them.
+// deliberately does not model them. Nothing in this app models them any more:
+// the access log stopped predicting admission when it adopted
+// webhttp.WithSkipUpgrades, and TestAccessLogSkipsOnlyCompletedUpgrades covers
+// each of those refusals from the outcome side.
 func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
 

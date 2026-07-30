@@ -29,7 +29,11 @@ import (
 // once so a mount, a handler's declared base path, and the middleware policy
 // that keys on the same path cannot drift apart across files.
 const (
-	// apiPrefix scopes the JSON API surface apiNoStore marks uncacheable.
+	// apiPrefix is the JSON API surface's shared prefix. It names the app's own
+	// API mounts below; it is no longer a middleware scope — the /api/-wide
+	// no-store wrapper is gone now that each route owner (toolbelt's httpapi,
+	// handleHealth, handleKiroRescan) sets the header itself. See
+	// main.go's sessionNoStore for what remains and why.
 	apiPrefix = "/api/"
 	// healthPath is the readiness route; buildHandler's ProbeLogLevel policy
 	// must name the same path the mux registers, or a healthy probe stops
@@ -384,13 +388,16 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		return body
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {
-		// Set here, not left to the /api/-wide apiNoStore middleware, so the
-		// handler carries its own contract wherever it is mounted: a readiness
-		// verdict must never be cached (a 200 with no explicit freshness is
-		// heuristically cacheable under RFC 9111, and a cached "ok" keeps traffic
-		// arriving at an instance that has begun draining). Idempotent with the
-		// middleware, which sets the same value; the same header now comes from
-		// webhttp.ReadinessHandler for the apps that use it directly.
+		// Set here rather than by middleware, so the handler carries its own
+		// contract wherever it is mounted: a readiness verdict must never be
+		// cached (a 200 with no explicit freshness is heuristically cacheable
+		// under RFC 9111, and a cached "ok" keeps traffic arriving at an instance
+		// that has begun draining). This is now the only thing setting it — the
+		// app's /api/-wide no-store middleware is gone, narrowed to the engine's
+		// session surface (see main.go's sessionNoStore) once every other route
+		// owner covered itself, which is exactly the independence this line
+		// already had. The same header comes from webhttp.ReadinessHandler for
+		// the apps that use it directly.
 		w.Header().Set("Cache-Control", "no-store")
 		unready := func(reason string) {
 			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthResponse("unready", reason))

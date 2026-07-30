@@ -179,7 +179,26 @@ RUN mkdir -p static/vendor/fonts && \
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
 ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.2.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.0.0
+# ---------------------------------------------------------------------------
+# PRE-RELEASE PIN — AWAITS PUBLICATION. @cplieger/web-terminal-ui 5.1.0 is
+# implemented but NOT YET ON npm: it adds the /style-contract subpath
+# (PUBLIC_THEME_TOKENS + LOADING_OVERLAY_CLASSES) that static-src/app.test.ts
+# now imports instead of scraping the package's css/MANIFEST out of
+# node_modules. Until it publishes, this build stage and `npm ci` both fail to
+# resolve the version — validate locally by overlaying the sibling
+# ../web-terminal-ui checkout into static-src/node_modules/@cplieger/
+# web-terminal-ui (gitignored), the npm-side equivalent of go.mod's `replace`
+# block. Unlike that block this does NOT keep the tree resolvable for everyone
+# else: `npm ci` and this stage's tarball fetch both fail until the version
+# exists. At merge time: publish the library, then run `npm install` in
+# static-src to regenerate package-lock.json (still resolving 5.0.0 — a lock
+# file cannot be hand-edited to an unpublished version's integrity hash).
+# static-src/package.json's pin and this ARG are already the versions to
+# resolve. Those two MUST stay exactly equal — the pin gate below is what
+# enforces it, and it exists because v1.1.3 shipped a broken image by bumping
+# one and missing the other.
+# ---------------------------------------------------------------------------
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.1.0
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is
@@ -237,14 +256,49 @@ COPY . ./
 # Client constants come from the vendored artifact fetched above (published
 # source, frozen export shape); server constants come from the engine's
 # public Go API inside scripts/wirecheck (no source scraping on the Go half).
-# hadolint ignore=DL3062
+#
+# The gate is BUILT and then INVOKED, never `go run`: `go run` reports its OWN
+# exit status 1 for any non-zero program exit (it prints "exit status 2" to
+# stderr but does not propagate the 2), which collapses the gate's two failure
+# modes into one code. They mean opposite things — exit 2 is "the extraction
+# below is broken, fix the gate, do NOT bump a pin", exit 1 is "genuine wire
+# incompatibility, move a pin" — so the machine-readable half of that
+# distinction only survives when the compiled binary is the process the shell
+# observes. The binary is written into a tmpfs mount, so it is discarded when
+# the RUN ends and lands in neither this stage's layer nor a later one; it is a
+# build-time gate with no runtime role.
+#
+# FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): the two
+# `sed` scrapes below parse the vendored engine's TypeScript SOURCE for the
+# client wire constants. The engine now generates a language-neutral manifest
+# for exactly this consumer — `wire-compatibility.json` at the package root
+# (published via the npm `files` list and the `./wire-compatibility.json`
+# export subpath, so the vendored tarball carries it at
+# static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json).
+# Shape: {"schemaVersion":1,"generatedBy":...,"wireCompatibility":
+# {"protocolVersion","minimumServerProtocolVersion","incompatibleCloseCode"}};
+# read `schemaVersion` first and reject an unknown one. When the engine version
+# this Dockerfile pins carries that file, the parsing should move INTO
+# scripts/wirecheck (a `-manifest <path>` flag reading the JSON with
+# encoding/json), where it is unit-testable, rather than being reimplemented as
+# a shell JSON scrape: these `sed` lines and their `${VAR:?}` guards exist only
+# because shell had to do the parsing, and their failure mode (a silently empty
+# capture) is the reason the guards are loud.
+#
+# No `hadolint ignore=DL3062` here any more: that rule fires on an unpinned
+# `go run`/`go install <pkg>` (it wants `@<version>`), which is meaningless for
+# a local path — and with the `go run` gone, `go build ./scripts/wirecheck` does
+# not trip it at all (verified with hadolint 2.14.0). Do not re-add the ignore;
+# an unneeded one suppresses a real future warning on this step.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=tmpfs,target=/tmp/wirecheck-bin \
     WIRE_TS=static-src/node_modules/@cplieger/web-terminal-engine/src/wire-compatibility.ts && \
     CLIENT_REV=$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
     CLIENT_MIN_SERVER=$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
     : "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
     : "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
-    go run ./scripts/wirecheck -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+    go build -o /tmp/wirecheck-bin/wirecheck ./scripts/wirecheck && \
+    /tmp/wirecheck-bin/wirecheck -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
 
 # Compile client TypeScript and the engine + UI libs in a single layer.
 # Must run before the binary build because main.go's `//go:embed static`

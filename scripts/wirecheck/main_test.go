@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,44 +14,140 @@ import (
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
+// gatePackage is the gate's package path as the Dockerfile spells it, in the
+// `go build` step and nowhere else (see TestDockerfileBuildsTheGateInsteadOfGoRun).
+const gatePackage = "./scripts/wirecheck"
+
+// subprocessEnv re-enters the test binary AS the gate, so the process-level exit
+// codes can be observed without shelling out to `go build`. See
+// TestGateProcessPropagatesExitCodes.
+const subprocessEnv = "WIRECHECK_RUN_AS_GATE"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(subprocessEnv) == "1" {
+		main() // flag.Parse reads the -client-* flags the parent passed
+		return
+	}
+	os.Exit(m.Run())
+}
+
+// dockerfileUnderTest returns the Dockerfile text the parity tests scan.
+// WIRECHECK_DOCKERFILE overrides the path so these assertions can be red-checked
+// against a MUTATED /tmp copy -- the repo's established red-check discipline
+// (tests/shell's `ENTRYPOINT=/tmp/mut.sh`), and the only safe one here: editing
+// the real Dockerfile in place races a live code-review pipeline that may be
+// writing to it.
+func dockerfileUnderTest(t *testing.T) string {
+	t.Helper()
+	path := os.Getenv("WIRECHECK_DOCKERFILE")
+	if path == "" {
+		path = filepath.Join("..", "..", "Dockerfile")
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- test-only red-check seam
+	if err != nil {
+		t.Fatalf("read Dockerfile %s: %v", path, err)
+	}
+	return string(b)
+}
+
 // TestDockerfileInvokesTheGate pins the gate's only execution site. run()'s verdict
 // is worthless if nothing runs it: a stage restructure that drops OR COMMENTS OUT
 // the RUN leaves this package compiling and every test green while an incompatible
 // Go/TS pair ships and refuses every session at first connect (close 4002) behind a
 // green /api/health.
 func TestDockerfileInvokesTheGate(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("..", "..", "Dockerfile"))
-	if err != nil {
-		t.Fatalf("read Dockerfile: %v", err)
-	}
-	// One LIVE line must carry the invocation and both flags. A whole-file
-	// substring sweep would pass on a commented-out RUN (`#    go run
-	// ./scripts/wirecheck …`) — the other half of the silent case this test
+	// One LIVE line must build the gate and then invoke the BUILT binary with
+	// both flags. A whole-file substring sweep would pass on a commented-out RUN
+	// (`#    /tmp/…/wirecheck …`) — the other half of the silent case this test
 	// exists for, and the likelier one during a stage restructure, since it is
 	// the reversible edit a person makes while debugging a build — and the prose
-	// block above the RUN already mentions scripts/wirecheck. Requiring all three
-	// needles on ONE uncommented line also proves both flags are still attached
-	// to the gate invocation rather than surviving somewhere else in the file.
-	if !slices.ContainsFunc(dockerfileLogicalLines(string(b)), lineInvokesTheGate) {
-		t.Error("Dockerfile has no un-commented `go run ./scripts/wirecheck " +
-			"-client-rev ... -client-min-server ...` line; the wire-floor gate is " +
+	// block above the RUN already mentions scripts/wirecheck. Requiring the whole
+	// build-then-invoke shape on ONE uncommented logical line also proves both
+	// flags are still attached to the gate invocation rather than surviving
+	// somewhere else in the file.
+	if !slices.ContainsFunc(dockerfileLogicalLines(dockerfileUnderTest(t)), lineInvokesTheGate) {
+		t.Error("Dockerfile has no un-commented `go build -o <path> ./scripts/wirecheck " +
+			"&& <path> -client-rev ... -client-min-server ...` line; the wire-floor gate is " +
 			"not invoked (deleted OR commented out), so an incompatible Go/TS pair " +
 			"would build clean and refuse every session with close 4002 at runtime")
 	}
 }
 
+// TestDockerfileBuildsTheGateInsteadOfGoRun pins the exit-status half of the
+// gate's contract at its only execution site. `go run` reports its OWN status 1
+// for ANY non-zero program exit (it writes "exit status 2" to stderr but does not
+// propagate the 2), so under `go run` the gate's two failure modes -- exit 2 "the
+// Dockerfile's extraction is broken, fix the gate, do NOT bump a pin" and exit 1
+// "genuine wire incompatibility, move a pin" -- collapse into one code and only
+// the stderr text tells them apart. Reverting the step to `go run` is a one-word
+// edit that keeps every other assertion in this file green (the pair is still
+// gated, the build still fails on an incompatible pair), which is exactly why the
+// regression needs its own assertion rather than riding on the recognizer.
+func TestDockerfileBuildsTheGateInsteadOfGoRun(t *testing.T) {
+	lines := dockerfileLogicalLines(dockerfileUnderTest(t))
+	if i := slices.IndexFunc(lines, lineRunsTheGateUnbuilt); i >= 0 {
+		t.Errorf("Dockerfile runs the wire-floor gate via `go run %s`: %q\n"+
+			"`go run` collapses the gate's exit 2 (gate broken, fix the extraction) and exit 1 "+
+			"(genuine wire incompatibility, move a pin) into its own status 1, so the "+
+			"machine-readable distinction is lost. Build the gate and invoke the binary instead.",
+			gatePackage, lines[i])
+	}
+}
+
+// lineRunsTheGateUnbuilt reports whether one LOGICAL Dockerfile line executes the
+// gate through `go run` rather than as a built binary. Anchored at an `&&` segment
+// start for the same reason as lineInvokesTheGate: the prose above the RUN
+// mentions the package, and an `echo go run …` is not an execution.
+func lineRunsTheGateUnbuilt(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	for seg := range strings.SplitSeq(trimmed, "&&") {
+		if strings.HasPrefix(strings.TrimSpace(seg), "go run "+gatePackage) {
+			return true
+		}
+	}
+	return false
+}
+
+// gateBuildOutput finds the `go build -o <path> ./scripts/wirecheck` segment of a
+// split logical line and returns the output path plus that segment's index (index
+// -1 and an empty path when the line does not build the gate). The shape is
+// matched on FIELDS anchored at the segment start, not as a substring, so inert
+// shell data (`echo go build -o … ./scripts/wirecheck`) is not mistaken for a
+// build. Exactly the five-field form is accepted: extra flags on the step would
+// fail this test loudly and get the assertion consciously updated, which is the
+// right direction of error for a gate whose false pass ships an incompatible pair.
+func gateBuildOutput(segments []string) (string, int) {
+	for i, seg := range segments {
+		fields := strings.Fields(strings.TrimSpace(seg))
+		if len(fields) != 5 {
+			continue
+		}
+		if fields[0] != "go" || fields[1] != "build" || fields[2] != "-o" || fields[4] != gatePackage {
+			continue
+		}
+		return fields[3], i
+	}
+	return "", -1
+}
+
 // lineInvokesTheGate reports whether one LOGICAL Dockerfile line (see
-// dockerfileLogicalLines) RUNS the wire-floor gate with both flags attached. The
-// executable is anchored at the start of an `&&` SEGMENT rather than merely
-// contained in the line: a substring test counts inert shell data as an
-// invocation, so `echo go run ./scripts/wirecheck …` (the reversible edit a
-// person makes while debugging a build) would print the command, exit 0, and
-// leave this file's parity test green while the gate no longer runs. Segment
-// anchoring is what lets the live chain shape (`RUN … && go run …`) match
-// without weakening that: a shell construct WRAPPING the command still fails
-// the parity test until the assertion is consciously updated -- the intended
-// trade, since the alternative silently ships an incompatible Go/TS pair. A
-// logical line carrying `||` is rejected for the same reason in the other
+// dockerfileLogicalLines) BUILDS the wire-floor gate and then RUNS the built
+// binary with both flags attached. Both halves are required and in that order:
+// the built path is read out of the `go build -o` segment rather than hardcoded
+// here, so moving the binary (a tmpfs mount elsewhere) does not fail the test,
+// while dropping either half does. The executable is anchored at the start of an
+// `&&` SEGMENT rather than merely contained in the line: a substring test counts
+// inert shell data as an invocation, so `echo /tmp/…/wirecheck …` (the reversible
+// edit a person makes while debugging a build) would print the command, exit 0,
+// and leave this file's parity test green while the gate no longer runs. Segment
+// anchoring is what lets the live chain shape (`RUN … && go build … && /tmp/… `)
+// match without weakening that: a shell construct WRAPPING the command still
+// fails the parity test until the assertion is consciously updated -- the
+// intended trade, since the alternative silently ships an incompatible Go/TS
+// pair. A logical line carrying `||` is rejected for the same reason in the other
 // direction: it still runs the gate but discards the verdict, so the build
 // survives an incompatible pair. That refusal is judged over the WHOLE logical
 // line, so a `||` on any segment of the chain is refused too -- a false failure
@@ -59,42 +158,49 @@ func lineInvokesTheGate(line string) bool {
 		return false // a commented-out invocation is not an invocation
 	}
 	if strings.Contains(trimmed, "||") {
-		// A swallowed verdict is not a gate: `go run ... || true` runs the
+		// A swallowed verdict is not a gate: `<gate> ... || true` runs the
 		// check and then exits 0 on an incompatible pair.
 		return false
 	}
 	segments := strings.Split(trimmed, "&&")
-	for i, seg := range segments {
-		seg = strings.TrimSpace(seg)
-		if !strings.HasPrefix(seg, "go run ./scripts/wirecheck ") ||
+	bin, built := gateBuildOutput(segments)
+	if bin == "" {
+		return false // nothing built the gate on this line
+	}
+	for i := built + 1; i < len(segments); i++ {
+		seg := strings.TrimSpace(segments[i])
+		if !strings.HasPrefix(seg, bin+" ") ||
 			!strings.Contains(seg, "-client-rev") ||
 			!strings.Contains(seg, "-client-min-server") {
 			continue
 		}
-		// `;` discards the verdict the same way `||` does (`go run ... ; true`
+		// `;` discards the verdict the same way `||` does (`<gate> ... ; true`
 		// exits 0 on an incompatible pair, and the RUN is a `&&` chain so a
 		// trailing `;` command supplies the whole step's exit status), but it is
-		// refused from the gate's own segment ONWARD rather than over the whole
+		// refused from the BUILD segment onward rather than over the whole
 		// logical line: a `;` in an EARLIER segment cannot touch the gate's exit
 		// status, and the live chain has several -- inside the quoted sed scripts
-		// that read the client constants out of the vendored artifact. A `|`
-		// discards it too (a pipeline's status is the LAST command's), and a
-		// `&` backgrounds the gate so the step never waits for its verdict --
-		// both are refused on the same gate-onward terms. Backgrounding is
-		// judged as the presence of the `&` CONTROL OPERATOR, not as a trailing
-		// character: `go run … & wait` discards the verdict just as thoroughly
-		// (in POSIX `sh`, `false & wait` exits 0), so a shape test on the last
-		// character would accept it. Splitting on `&&` has already removed the
-		// legitimate chain separators from the gate's ONWARD text, and the live
-		// gate arguments contain no ampersand, so any `&` left anywhere in those
-		// segments is a background operator. The check is therefore over the
-		// gate-onward segments joined WITHOUT the `&&` separator, which refuses an
-		// `&` in ANY position of ANY later segment: `&` applies to the whole
-		// AND-list, so both `go run … && true &` and `go run … && true & echo done`
-		// background the gate without putting an ampersand in its own segment.
-		rest := strings.Join(segments[i:], "&&")
-		if strings.ContainsAny(rest, ";|") ||
-			strings.Contains(strings.Join(segments[i:], ""), "&") {
+		// that read the client constants out of the vendored artifact. Starting
+		// at the build segment (which sits after those seds) is strictly the
+		// stronger window: a discarded `go build` status would leave the next
+		// segment invoking a stale or absent binary. A `|` discards the verdict
+		// too (a pipeline's status is the LAST command's), and a `&` backgrounds
+		// the gate so the step never waits for it -- both are refused on the same
+		// build-onward terms. Backgrounding is judged as the presence of the `&`
+		// CONTROL OPERATOR, not as a trailing character: `<gate> … & wait`
+		// discards the verdict just as thoroughly (in POSIX `sh`, `false & wait`
+		// exits 0), so a shape test on the last character would accept it.
+		// Splitting on `&&` has already removed the legitimate chain separators
+		// from that text, and neither the build nor the gate arguments contain an
+		// ampersand, so any `&` left anywhere in those segments is a background
+		// operator. The check is therefore over the build-onward segments joined
+		// WITHOUT the `&&` separator, which refuses an `&` in ANY position of ANY
+		// later segment: `&` applies to the whole AND-list, so both
+		// `<gate> … && true &` and `<gate> … && true & echo done` background the
+		// gate without putting an ampersand in its own segment.
+		rest := segments[built:]
+		if strings.ContainsAny(strings.Join(rest, "&&"), ";|") ||
+			strings.Contains(strings.Join(rest, ""), "&") {
 			return false
 		}
 		return true
@@ -136,56 +242,107 @@ func dockerfileLogicalLines(dockerfile string) []string {
 // than "the gate's name appears somewhere". Each negative is a shape that leaves
 // the text intact while the build stops executing it.
 func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
-	const flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+	const (
+		flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+		bin   = "/tmp/wirecheck-bin/wirecheck"
+		build = "go build -o " + bin + " " + gatePackage
+	)
+	live := "    " + build + " && " + bin + " " + flags
 	cases := map[string]struct {
 		line string
 		want bool
 	}{
-		"the live Dockerfile form":      {"    go run ./scripts/wirecheck " + flags, true},
-		"echoed, so never executed":     {"    echo go run ./scripts/wirecheck " + flags, false},
-		"quoted into a no-op builtin":   {"    : 'go run ./scripts/wirecheck " + flags + "'", false},
-		"commented out":                 {"#    go run ./scripts/wirecheck " + flags, false},
-		"missing the client-rev flag":   {`    go run ./scripts/wirecheck -client-min-server "$CLIENT_MIN_SERVER"`, false},
-		"missing the min-server flag":   {`    go run ./scripts/wirecheck -client-rev "$CLIENT_REV"`, false},
-		"prose mentioning the gate":     {"# public Go API inside scripts/wirecheck (no source scraping)", false},
-		"another command of the binary": {"    go build ./scripts/wirecheck " + flags, false},
-		"verdict swallowed by || true":  {"    go run ./scripts/wirecheck " + flags + " || true", false},
-		"verdict discarded by ; true":   {"    go run ./scripts/wirecheck " + flags + " ; true", false},
+		"the live Dockerfile form":    {live, true},
+		"echoed, so never executed":   {"    " + build + " && echo " + bin + " " + flags, false},
+		"quoted into a no-op builtin": {"    " + build + " && : '" + bin + " " + flags + "'", false},
+		"commented out":               {"#    " + build + " && " + bin + " " + flags, false},
+		"missing the client-rev flag": {"    " + build + ` && ` + bin + ` -client-min-server "$CLIENT_MIN_SERVER"`, false},
+		"missing the min-server flag": {"    " + build + ` && ` + bin + ` -client-rev "$CLIENT_REV"`, false},
+		"prose mentioning the gate":   {"# public Go API inside scripts/wirecheck (no source scraping)", false},
+		// The gate must be BUILT and then RUN. `go run` still gates the pair but
+		// reports its own status 1 for the gate's exit 2, so the "fix the gate, do
+		// not bump a pin" signal is lost; TestDockerfileBuildsTheGateInsteadOfGoRun
+		// is the assertion that names that regression, and the recognizer must not
+		// accept it either.
+		"go run instead of build-then-invoke": {"    go run " + gatePackage + " " + flags, false},
+		// Built but never invoked: `go build` alone exits 0 for any wire pairing.
+		"built but not invoked": {"    " + build, false},
+		// Invoked but never built: the path is stale at best, absent at worst, so
+		// the step's verdict is not this repo's gate.
+		"invoked but not built":        {"    " + bin + " " + flags, false},
+		"a different package is built": {"    go build -o " + bin + " ./scripts/other && " + bin + " " + flags, false},
+		// The binary that runs must be the one just built; a stale path in the
+		// invocation would gate against whatever happens to sit there.
+		"a different binary is invoked": {"    " + build + " && /usr/local/bin/wirecheck " + flags, false},
+		"verdict swallowed by || true":  {live + " || true", false},
+		"verdict discarded by ; true":   {live + " ; true", false},
 		// A pipeline's exit status is the LAST command's, and a backgrounded gate
 		// is never waited for: both leave the invocation textually intact while
 		// the build stops acting on its verdict.
-		"verdict piped away": {"    go run ./scripts/wirecheck " + flags + " | tee /dev/null", false},
-		"gate backgrounded":  {"    go run ./scripts/wirecheck " + flags + " &", false},
+		"verdict piped away": {live + " | tee /dev/null", false},
+		"gate backgrounded":  {live + " &", false},
 		// `& wait` is the shape a trailing-character test accepts: the gate is
 		// backgrounded and the step then waits, but `wait` reports 0 here, so an
 		// incompatible pair builds clean with this file's parity test still green.
-		"gate backgrounded then masked by wait": {"    go run ./scripts/wirecheck " + flags + " & wait", false},
+		"gate backgrounded then masked by wait": {live + " & wait", false},
 		// `&` applies to the whole AND-list, so a `&` ending a LATER segment
 		// backgrounds the gate as well, without appearing in the gate's segment.
-		"a chain backgrounded by a trailing & on a later segment": {
-			"    go run ./scripts/wirecheck " + flags + " && true &", false,
-		},
+		"a chain backgrounded by a trailing & on a later segment": {live + " && true &", false},
 		// ...and an `&` INTERIOR to a later segment backgrounds the AND-list just
 		// the same: `A && B & C` parses as `(A && B) & C`, so the gate's verdict is
 		// never waited for even though the ampersand is neither in the gate's
 		// segment nor at the end of the line.
-		"a chain backgrounded by an interior & on a later segment": {
-			"    go run ./scripts/wirecheck " + flags + " && true & echo done", false,
+		"a chain backgrounded by an interior & on a later segment": {live + " && true & echo done", false},
+		// The build's own status must not be discarded either: a failed build
+		// followed by an invocation of an absent path is a different failure than
+		// the one this step exists to report.
+		"the build's status discarded by a trailing ;": {
+			"    " + build + " ; " + bin + " " + flags, false,
 		},
 		"the live chained form": {
-			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && go run ./scripts/wirecheck ` + flags, true,
+			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && CLIENT_REV=$(sed -n 's|^export const X = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && ` + build + " && " + bin + " " + flags, true,
 		},
 		"a chain whose verdict is swallowed": {
-			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && go run ./scripts/wirecheck ` + flags + ` || true`, false,
+			`RUN --mount=type=cache,target=/root/go/pkg/mod WIRE_TS=x && ` + build + " && " + bin + " " + flags + ` || true`, false,
 		},
 		"a chain whose verdict is discarded by a trailing ;": {
-			`RUN WIRE_TS=x && go run ./scripts/wirecheck ` + flags + ` ; true`, false,
+			`RUN WIRE_TS=x && ` + build + " && " + bin + " " + flags + ` ; true`, false,
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			if got := lineInvokesTheGate(tc.line); got != tc.want {
 				t.Errorf("lineInvokesTheGate(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLineRunsTheGateUnbuilt pins the `go run` detector, so
+// TestDockerfileBuildsTheGateInsteadOfGoRun means "the step executes the gate
+// through go run" rather than "the words appear somewhere".
+func TestLineRunsTheGateUnbuilt(t *testing.T) {
+	const flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+	cases := map[string]struct {
+		line string
+		want bool
+	}{
+		"go run with flags":            {"    go run " + gatePackage + " " + flags, true},
+		"go run at the end of a chain": {"RUN WIRE_TS=x && go run " + gatePackage + " " + flags, true},
+		"the live build-then-invoke form": {
+			"    go build -o /tmp/wirecheck-bin/wirecheck " + gatePackage +
+				" && /tmp/wirecheck-bin/wirecheck " + flags, false,
+		},
+		"commented out":                     {"#    go run " + gatePackage + " " + flags, false},
+		"prose mentioning it":               {"# never `go run ./scripts/wirecheck`: the exit code collapses", false},
+		"go run of an unrelated package":    {`    go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@v2.2.8" verify`, false},
+		"echoed rather than executed":       {"    echo go run " + gatePackage, false},
+		"go build of the gate is not a run": {"    go build -o /tmp/x " + gatePackage, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := lineRunsTheGateUnbuilt(tc.line); got != tc.want {
+				t.Errorf("lineRunsTheGateUnbuilt(%q) = %v, want %v", tc.line, got, tc.want)
 			}
 		})
 	}
@@ -256,14 +413,16 @@ func TestRun_failureNamesBothPins(t *testing.T) {
 	}
 }
 
-// TestRun_exitCodeContract pins the process exit codes and output streams that
-// are this program's own contract (0 compatible, 1 floor violated, 2 usage
-// error). The Dockerfile's gate observes only zero vs non-zero (see run's doc
-// comment), so these codes are the contract for direct invocation and for this
-// test. TestRun_delegatesToTheEngineRule alone cannot pin them: it checks only
-// the compatible-vs-not verdict, so a wiring regression in main/run (an
-// inverted reason check, a swapped exit code, output on the wrong stream)
-// would pass it and silently neuter or break the image build gate.
+// TestRun_exitCodeContract pins the exit codes and output streams that are this
+// program's own contract (0 compatible, 1 floor violated, 2 usage error). Since
+// the Dockerfile builds the gate and invokes the BINARY (see
+// TestDockerfileBuildsTheGateInsteadOfGoRun), these codes are what the build step
+// actually observes, not merely a direct-invocation nicety: 2 means the step's
+// own extraction is broken and no pin should move, 1 means the pair is genuinely
+// incompatible. TestRun_delegatesToTheEngineRule alone cannot pin them: it checks
+// only the compatible-vs-not verdict, so a wiring regression in main/run (an
+// inverted reason check, a swapped exit code, output on the wrong stream) would
+// pass it and silently neuter or misreport the image build gate.
 // Client-side values are derived from the engine's exported constants, never
 // hardcoded, so the cases track a future floor raise automatically.
 func TestRun_exitCodeContract(t *testing.T) {
@@ -330,6 +489,45 @@ func TestRun_exitCodeContract(t *testing.T) {
 	}
 }
 
+// TestGateProcessPropagatesExitCodes pins the last link that makes the
+// Dockerfile's build-then-invoke shape worth anything: the PROCESS must exit with
+// run()'s code. run() returning 2 is invisible to the build step if main()
+// collapses it (an `os.Exit(0)`, a `!= 0 -> 1` normalisation, a swallowed error),
+// which is the same loss the `go run` invocation caused and is not observable in
+// any in-process test. The gate is re-entered as a subprocess of this test binary
+// (TestMain honours WIRECHECK_RUN_AS_GATE) rather than shelling out to `go build`,
+// so the assertion costs a fork instead of a compile.
+func TestGateProcessPropagatesExitCodes(t *testing.T) {
+	cases := map[string]struct {
+		clientRev, clientMinServer int
+		wantCode                   int
+	}{
+		"compatible pairing":       {terminal.WireProtocolVersion, terminal.WireProtocolVersion, 0},
+		"genuine wire mismatch":    {terminal.WireProtocolVersion, terminal.WireProtocolVersion + 1, 1},
+		"unusable extracted input": {0, 0, 2},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// #nosec G204 -- os.Args[0] is this test binary; no external input.
+			cmd := exec.Command(os.Args[0],
+				fmt.Sprintf("-client-rev=%d", tc.clientRev),
+				fmt.Sprintf("-client-min-server=%d", tc.clientMinServer))
+			cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if err != nil && !errors.As(err, &exitErr) {
+				t.Fatalf("run gate subprocess: %v (output %q)", err, out)
+			}
+			if got := cmd.ProcessState.ExitCode(); got != tc.wantCode {
+				t.Errorf("gate process exit = %d, want %d (output %q); the Dockerfile's wire-floor "+
+					"gate reads this code -- 2 must stay distinguishable from 1, or a broken "+
+					"extraction reads as a genuine incompatibility and someone bumps a pin",
+					got, tc.wantCode, out)
+			}
+		})
+	}
+}
+
 // TestDockerfileLogicalLines_foldsAContinuedChain pins the joiner the parity scan
 // depends on. The gate is the last link of a multi-line `RUN … \` chain, so a
 // `|| true` appended on one FURTHER continuation line must be seen as part of the
@@ -339,7 +537,8 @@ func TestDockerfileLogicalLines_foldsAContinuedChain(t *testing.T) {
 	const flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
 	live := "RUN --mount=type=cache,target=/root/go/pkg/mod \\\n" +
 		"    CLIENT_REV=$(sed -n 's|a|b|p' \"$WIRE_TS\") && \\\n" +
-		"    go run ./scripts/wirecheck " + flags + "\n"
+		"    go build -o /tmp/wirecheck-bin/wirecheck " + gatePackage + " && \\\n" +
+		"    /tmp/wirecheck-bin/wirecheck " + flags + "\n"
 	swallowed := strings.TrimSuffix(live, "\n") + " \\\n    || true\n"
 
 	invoked := func(dockerfile string) bool {

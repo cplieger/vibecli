@@ -151,32 +151,12 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 	return policy
 }
 
-// parseBoolEnv reads a boolean env var, accepting the same vocabulary as
-// envx.Bool (true/1/yes/on, false/0/no/off, case-insensitive) and reporting
-// whether the value parsed. It exists so an unparseable value is warned about
-// by NAME only: envx.Bool logs the RAW value on its malformed path, and a
-// compose expansion mistake could put a credential there, so the raw string
-// never reaches the log (see parseTrustedProxies for the same reasoning).
-// An unset or blank value is not a parse failure — it yields the fallback.
-func parseBoolEnv(key string, fallback bool) (value, ok bool) {
-	switch strings.ToLower(strings.TrimSpace(envx.String(key, ""))) {
-	case "":
-		return fallback, true
-	case "true", "1", "yes", "on":
-		return true, true
-	case "false", "0", "no", "off":
-		return false, true
-	default:
-		return fallback, false
-	}
-}
-
 // parseCatalogRefresh reads TOOL_CATALOG_REFRESH and delegates to toolbelt's
 // canonical parser — but only for values that parser ACCEPTS. toolbelt calls
 // scheduler.ParseInterval without scheduler.WithRedactedValue, so its fallback
 // warning echoes the RAW value (scheduler warnFallback), and a compose expansion
 // mistake could put a credential on this key — the same reason KWEB_LOG_LEVEL is
-// read as a string and KWEB_LOG_OSC_TEXT goes through parseBoolEnv. A value the
+// read as a string and KWEB_LOG_OSC_TEXT goes through envx.BoolStrict. A value the
 // library would reject is warned about HERE by name only and replaced with "" so
 // the library applies its documented default silently. Accepted values are passed
 // through untouched, so the default, the "off"/"disabled"/"0" disable words and
@@ -216,22 +196,44 @@ func parseCatalogRefresh(raw string) time.Duration {
 // than logging silently: raising KWEB_LOG_LEVEL alone must not widen what
 // content reaches the log store.
 //
-// Parsed with parseBoolEnv rather than envx.Bool: envx warns with the RAW value
-// on an unparseable boolean, and a compose expansion mistake could put a secret
-// on this key -- the same reason KWEB_LOG_LEVEL is read as a string and parsed
-// here. Unparseable falls back to false (off), the fail-closed direction.
+// Read with envx.BoolStrict, NOT envx.Bool, and that choice is the
+// confidentiality property rather than a style preference: a compose expansion
+// mistake can put a secret on this key (`KWEB_LOG_OSC_TEXT: ${SOME_TOKEN}`), and
+// envx.Bool's malformed path emits a Warn carrying the RAW value — a durable,
+// queryable copy of that secret in the log store (CWE-532). BoolStrict shares
+// ONE parser with Bool, so the accepted vocabulary (true/1/yes/on,
+// false/0/no/off, case-insensitive, padding ignored) cannot drift from the
+// fleet's, but it logs nothing at all and hands the parse result back instead:
+// the error it returns names only the key and the accepted spellings, never the
+// value. Do NOT "simplify" this to envx.Bool — the two differ only in who owns
+// the diagnostic, and Bool's diagnostic is the leak. The same reasoning keeps
+// KWEB_LOG_LEVEL a string read and TOOL_CATALOG_REFRESH behind
+// parseCatalogRefresh.
 //
-// The read and its warnings live here, not inline in main, so a test can assert
-// the malformed path emits exactly one Warn and no copy of the raw value: the
-// property is the warning's, and parseBoolEnv itself logs nothing at all.
+// This function owns all the policy around that read, and every part of it is
+// load-bearing: an unreadable value falls back to false (off — the fail-closed
+// direction, so a typo cannot widen what content is logged), the failure emits
+// exactly ONE Warn naming the KEY only (the returned error is deliberately not
+// logged, so no future change to its text can reach a log record either), and
+// the ON state warns separately about the widened content. A test drives THIS
+// function — the one main calls — to assert the malformed path emits one Warn
+// with no copy of the raw value anywhere in it.
 func parseLogOSCText() bool {
-	logOSCText, ok := parseBoolEnv("KWEB_LOG_OSC_TEXT", false)
-	if !ok {
-		slog.Warn("unparseable KWEB_LOG_OSC_TEXT; keeping notification text out of the log (the default)",
+	const key = "KWEB_LOG_OSC_TEXT"
+	// The ok result is unused on purpose: the fallback is false and BoolStrict
+	// returns false when the key is unset, so "unset" and "set to false" need no
+	// distinguishing here.
+	logOSCText, _, err := envx.BoolStrict(key)
+	if err != nil {
+		// Fail closed, stated rather than inherited from BoolStrict's zero
+		// value. err itself is never logged: the warning must name the key and
+		// nothing else.
+		logOSCText = false
+		slog.Warn("unparseable "+key+"; keeping notification text out of the log (the default)",
 			"hint", "use true or false")
 	}
 	if logOSCText {
-		slog.Warn("KWEB_LOG_OSC_TEXT is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
+		slog.Warn(key+" is on: terminal notification text is logged at debug level and may contain secrets (a token, a device code, a tokenised URL) emitted by any program running in the terminal",
 			"hint", "leave it off outside an active diagnostic session; the default records a content-free fingerprint that still distinguishes kiro-cli wording drift")
 	}
 	return logOSCText
@@ -443,16 +445,20 @@ func main() {
 	// ordering rationale). webhttp.NewServer supplies the streaming-safe defaults
 	// (ReadHeaderTimeout 10s, IdleTimeout 120s, Read/WriteTimeout unset) that the
 	// hijacked /ws stream needs.
-	// WithErrorLog keeps net/http's OWN diagnostics (temporary accept failures,
-	// malformed requests) inside the slog stream this app documents as its only
-	// observability channel; a nil ErrorLog routes them through the legacy log
-	// package instead, with a different timestamp/level shape that Loki cannot
-	// query alongside the access log. Warn, not Error: net/http's principal
-	// accept-error path retries itself, so a transient listener hiccup should not
-	// page.
+	// WithSlogErrorLog keeps net/http's OWN diagnostics (temporary accept
+	// failures, malformed requests) inside the slog stream this app documents as
+	// its only observability channel; a nil ErrorLog routes them through the
+	// legacy log package instead, with a different timestamp/level shape that
+	// Loki cannot query alongside the access log. Warn, not Error: net/http's
+	// principal accept-error path retries itself, so a transient listener hiccup
+	// should not page — the level is the app's call, which is why the library
+	// takes it as an argument rather than defaulting it. It resolves
+	// slog.Default() as NewServer applies it, so the slogx.Setup above must
+	// already have run; it has. Replaces the hand-rolled slog.NewLogLogger
+	// recipe this app shared verbatim with its sibling servers.
 	srv := webhttp.NewServer(
 		buildHandler(mux, trustedProxies, cspPolicy, hostPolicy),
-		webhttp.WithErrorLog(slog.NewLogLogger(slog.Default().Handler(), slog.LevelWarn)),
+		webhttp.WithSlogErrorLog(slog.LevelWarn),
 	)
 	// BaseContext hands every request a context that the WithPreDrain hook below
 	// cancels on shutdown; see that hook's comment for why cancelling baseCtx
@@ -1197,28 +1203,54 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 		"hint", `enable gopls (Go), typescript-language-server (TypeScript), or pyright (Python): set "disabled": false in /config/tools.json and restart, or use the loopback tools API`)
 }
 
-// apiNoStore marks the JSON API surface uncacheable. GET /api/sessions returns
-// live session ids, and a session id is the /ws attach + resume capability
-// token — the same value routes.go's LogID truncates before logging and
-// WithTemplatePathsUnder keeps out of the access log. A 200 JSON body carrying no
-// freshness information is heuristically cacheable under RFC 9111, so with no
-// directive that response is stored by the browser's disk cache (a live token
-// persisted to disk, outliving the tab) and by a caching reverse proxy — the
+// sessionNoStore marks the ENGINE's session surface uncacheable on the responses
+// the engine itself does not cover. It is what remains of the app's former
+// /api/-wide apiNoStore middleware, narrowed to the one place a header would
+// otherwise be lost.
+//
+// Why any wrapper is still here. A session id is the /ws attach + resume
+// capability token — the same value routes.go's LogID truncates before logging
+// and WithTemplatePathsUnder keeps out of the access log — and a response with no
+// freshness information is heuristically cacheable under RFC 9111 §4.2.2 (200,
+// 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501), so with no directive it
+// is stored by the browser's disk cache and by a caching reverse proxy, the
 // README's recommended deployment shape.
 //
-// The engine covers its OWN session routes as of v3.2.1 (terminal's writeJSON sets
-// no-store on create/list, and the SSE stream sends "no-cache, no-store"), and
-// handleHealth sets no-store itself, so on those paths this middleware only
-// restates what the route owner already promises — setting the same header twice
-// is idempotent. The surface it still covers ALONE is /api/tools: toolbelt's
-// httpapi sets no Cache-Control at all. That is the reason to keep it, not the
-// sessions surface it was originally written for.
+// Why it is scoped HERE and nowhere else, measured rather than assumed against
+// engine v3.2.1 (the enumeration is TestAPICachePolicy_EveryAPIPathSetsNoStore,
+// which fails if any row's owner stops setting the header):
 //
-// Gated on the /api/ prefix so the static surface keeps kiroCacheControl's
+//   - /api/tools + subtree — toolbelt's httpapi sets no-store on every response
+//     of its own as of v2.3.0, upstream of its mux, so its 404s and 405s are
+//     covered too. This is what let the /api/-wide wrapper go.
+//   - /api/health, POST /api/kiro-cli/rescan — each handler sets it itself.
+//   - /api/sessions, POST /api/sessions, /api/sessions/events — the engine sets
+//     it: terminal's writeJSON on create/list, "no-cache, no-store" on the SSE
+//     stream.
+//   - EVERYTHING ELSE under /api/sessions — NOT covered by the engine. writeJSON
+//     is reached only by create and list, so the REST handler's 204s (close,
+//     set/clear title), its http.Error 400/404s, and its inner mux's own 404/405
+//     (e.g. GET on a session path that only serves DELETE) all carry no
+//     Cache-Control at all. That is this wrapper's entire remaining job.
+//
+// Most of that uncovered set is unreachable by a cache anyway — RFC 9111 §3
+// forbids storing a response to a method a cache does not understand as
+// cacheable, which excludes every DELETE/PUT/PATCH — so the genuinely cacheable
+// remainder is the GET/HEAD 404s and 405s in the subtree, whose bodies are
+// net/http's constant error text and carry no session data. The header is kept
+// anyway rather than reasoned away: this costs one map write on a surface that
+// issues capability tokens, and the argument that a 405 is harmless has to be
+// re-derived correctly by every future reader.
+//
+// This is the ENGINE's gap to close, not the app's. When the engine adopts the
+// same upstream-of-mux default toolbelt just did, delete this wrapper and its
+// chain entry — the enumeration test then holds with no app middleware at all.
+// Scoped by the engine's own exported path constant (a prefix, so it covers the
+// exact path and the subtree) so the static surface keeps kiroCacheControl's
 // ETag/immutable policy untouched.
-func apiNoStore(next http.Handler) http.Handler {
+func sessionNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, apiPrefix) {
+		if strings.HasPrefix(r.URL.Path, terminal.SessionsPath) {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
@@ -1228,7 +1260,7 @@ func apiNoStore(next http.Handler) http.Handler {
 // buildHandler wraps the route mux in web-terminal-kiro's middleware stack via
 // webhttp.Chain. Chain(h, A, B, C, D) == A(B(C(D(h)))), so the first entry is
 // the outermost wrapper; a request flows Logging -> Recoverer -> wsAttachLog ->
-// SecurityHeaders -> apiNoStore -> host allowlist -> CrossOriginProtection ->
+// SecurityHeaders -> sessionNoStore -> host allowlist -> CrossOriginProtection ->
 // mux, and the response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
@@ -1262,10 +1294,12 @@ func apiNoStore(next http.Handler) http.Handler {
 //     'none' — web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
-//   - apiNoStore — Cache-Control: no-store on the /api/ surface (see
-//     apiNoStore for the capability-token rationale). Scoped to the /api/
-//     prefix so the static surface keeps kiroCacheControl's policy, and placed
-//     outside the host/origin gates so even a rejected request is uncacheable.
+//   - sessionNoStore — Cache-Control: no-store on the responses the ENGINE's
+//     session surface leaves without one (see sessionNoStore for the measured
+//     enumeration and the capability-token rationale). Scoped to the engine's
+//     session path so the static surface keeps kiroCacheControl's policy, and
+//     placed outside the host/origin gates so even a rejected request is
+//     uncacheable.
 //   - hostPolicy.Middleware — the KWEB_ALLOWED_HOSTS exact-host check
 //     (webhttp.HostPolicy; see parseAllowedHosts for the DNS-rebinding
 //     rationale). Placed before CrossOriginProtection because rebinding makes
@@ -1281,28 +1315,55 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 	return webhttp.Chain(mux,
 		webhttp.Logging(
 			webhttp.WithLogger(slog.Default()),
-			// SSE stays blanket-skipped: a plain GET is indistinguishable from the
-			// stream itself, so there is no non-stream shape to keep. /ws HAS one —
-			// a request becomes a stream only when the handshake is COMPLETE — so the
-			// skip test is the stricter willUpgrade, and every shape Accept answers
-			// short keeps its access line: the 426 for missing upgrade headers (the
-			// classic reverse-proxy misconfiguration: no `proxy_set_header Upgrade`)
-			// and the 405/400 for a non-GET, a wrong Sec-WebSocket-Version or a
-			// missing/duplicated Sec-WebSocket-Key.
-			// Skip only a request that will actually REACH the stream handler.
-			// The skip is decided before the chain runs (Logging returns early
-			// without a StatusRecorder), so an unconditional skip also swallows
-			// the 403 hostPolicy.Middleware writes below -- WriteError logs
-			// nothing itself and the engine handler never runs -- leaving a
-			// wrong-Host or DNS-rebound attempt on this unauthenticated PTY with
-			// no record anywhere, the same silence this predicate exists to
-			// remove for the non-upgrade 426. Allows is nil- and inactive-safe
-			// (it returns true), so an unset KWEB_ALLOWED_HOSTS keeps today's
-			// behavior exactly.
+			// The /ws access-log skip is webhttp's WithSkipUpgrades, and the
+			// decision it makes is an OUTCOME rather than a prediction: it
+			// suppresses the record only for a response that actually switched
+			// protocols (a recorded 101, or a hijack with nothing recorded), which
+			// is the state that makes the line a lie — the exchange ENDED at the
+			// handshake, so the line emitted hours later at socket close carries a
+			// session-length duration and a status net/http never sent. This
+			// replaced a local willUpgrade predicate that re-implemented every
+			// pre-hijack precondition of the engine's websocket.Accept (GET,
+			// HTTP/1.1, Sec-WebSocket-Version: 13, exactly one Sec-WebSocket-Key)
+			// in order to GUESS the same answer before the handler ran. That
+			// coupled this app to another library's internals with nothing keeping
+			// the copy in step, and it was already wrong in two places it could not
+			// see: Accept base64-decodes the key and requires 16 bytes, so a
+			// malformed-key 400 was suppressed as if it had upgraded, as was the
+			// cross-origin 403 the predicate deliberately did not model. Both are
+			// now logged with their real status, because the outcome test cannot
+			// mistake a refusal for a stream: the 426 for missing upgrade headers
+			// (the classic reverse-proxy misconfiguration, no `proxy_set_header
+			// Upgrade`), the 405 for a non-GET, the 400 for a bad version or key,
+			// the 403 for a rejected Host — every one of them keeps its line by
+			// construction rather than by a predicate remembering to.
+			webhttp.WithSkipUpgrades(),
+			// SSE needs its own path-shaped skip, and the asymmetry with /ws is not
+			// obvious enough to leave unstated: WithSkipUpgrades cannot cover the
+			// status stream, because SSE never switches protocols. It is a plain
+			// 200 that simply does not return until the client disconnects, so
+			// switchedProtocol() is false for it and its record would START being
+			// emitted — one misleading line per stream, with a session-length
+			// duration, exactly what the /ws skip exists to prevent. /ws HAS a
+			// non-stream shape worth logging (a handshake Accept answers short);
+			// SSE has none, because a plain GET to this path is indistinguishable
+			// from the stream itself. So the stream half is decided by the
+			// response for /ws and by the path for SSE.
+			//
+			// A predicate rather than WithSkipPaths, for the hostPolicy.Allows
+			// conjunct alone: skip rules are evaluated BEFORE the chain runs
+			// (Logging returns early with no StatusRecorder), so a bare path skip
+			// would also swallow the 403 hostPolicy.Middleware writes below --
+			// WriteError logs nothing itself and the engine handler never runs --
+			// leaving a wrong-Host or DNS-rebound attempt on this unauthenticated
+			// PTY with no record anywhere (CWE-778). Asking the SAME policy object
+			// that will decide the request is not the prediction problem
+			// WithSkipUpgrades solved: webhttp exports Allows for this, and it is
+			// the app's own gate rather than a re-implementation of a library's
+			// internals. Allows is nil- and inactive-safe (it returns true), so an
+			// unset KWEB_ALLOWED_HOSTS keeps today's behavior exactly.
 			webhttp.WithSkipFunc(func(r *http.Request) bool {
-				stream := r.URL.Path == terminal.SessionEventsPath ||
-					(r.URL.Path == terminal.WSPath && willUpgrade(r))
-				return stream && hostPolicy.Allows(r)
+				return r.URL.Path == terminal.SessionEventsPath && hostPolicy.Allows(r)
 			}),
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
@@ -1365,7 +1426,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			webhttp.WithReferrerPolicy("same-origin"),
 			webhttp.WithPermissionsPolicy("camera=(), microphone=(), geolocation=()"),
 		),
-		apiNoStore,
+		sessionNoStore,
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 	)
@@ -1407,52 +1468,32 @@ func wsAttachLog(trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
 
 // isWebSocketUpgrade reports whether r carries the RFC 6455 upgrade signal
 // (Upgrade: websocket plus the Upgrade connection option). It is wsAttachLog's
-// "this request is trying to attach" test: the session capability token is in
-// the query string, so every attempt that LOOKS like an attach gets its record
-// even when the handshake is malformed in some other way. The access log's skip
-// test is the stricter willUpgrade — a request that reaches /ws without a
-// COMPLETE handshake is answered short (426 without these headers, 405/400 with
-// them but not a valid GET/13/keyed handshake) and must keep its access line,
-// or a proxy that mangles the handshake presents as a page that loads normally,
-// a UI stuck reconnecting, and no status anywhere in the log.
+// "this request is trying to attach" test — an ATTEMPT predicate, which is why
+// it survived the access-log skip's move to webhttp.WithSkipUpgrades: the two
+// answer different questions. The access log now asks whether a request ENDED as
+// a stream, after the fact, and nothing in this app predicts that any more (the
+// willUpgrade mirror of websocket.Accept's preconditions is deleted). This asks
+// whether a request is trying to attach, BEFORE the handshake runs, because the
+// session capability token is in the query string and every attempt that looks
+// like an attach must leave its audit record even when the handshake is
+// malformed in some other way — including the shapes Accept refuses short (426
+// without these headers, 405/400 with them but not a valid GET/13/keyed
+// handshake), which now ALSO keep their access line. An attempt predicate cannot
+// be replaced by an outcome: by the time the outcome is known, the request that
+// presented the token may have been refused and there would be nothing to
+// record.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return headerHasToken(r, "Upgrade", "websocket") &&
 		headerHasToken(r, "Connection", "upgrade")
-}
-
-// willUpgrade reports whether r satisfies EVERY pre-hijack condition the
-// engine's websocket.Accept checks before it hijacks the connection: the RFC
-// 6455 header signal (isWebSocketUpgrade), plus GET, HTTP/1.1 or later,
-// Sec-WebSocket-Version: 13, and exactly one Sec-WebSocket-Key field. It is
-// the access log's skip test, and it is deliberately STRICTER than
-// isWebSocketUpgrade: a request carrying the upgrade headers but failing any of
-// these gets a SHORT error response from Accept (405 for a non-GET, 400 for a
-// missing/duplicated key or a wrong version, 426 for HTTP/1.0) exactly like the
-// no-upgrade-headers 426 — so it must keep its access line rather than be
-// mistaken for a hijacked stream and skipped. Every condition here is NECESSARY
-// for Accept to succeed, so no request that really does become a stream can be
-// logged with the bogus 200-and-hours-long-duration line the skip exists to
-// prevent. Two Accept checks are deliberately NOT mirrored, and both answer
-// short: the base64/16-byte validity of the key VALUE (mirroring it would copy
-// upstream decoding detail, and a proxy either forwards or drops that header
-// rather than corrupting its value), and authenticateOrigin's cross-origin 403
-// (pinned by TestWSRejectsCrossOrigin; modelling the engine's origin policy here
-// would be a second copy of it). Both keep their wsAttachLog record — so
-// neither is the unrecorded request CWE-778 is about — and lose only the
-// status/duration line.
-func willUpgrade(r *http.Request) bool {
-	return isWebSocketUpgrade(r) &&
-		r.Method == http.MethodGet &&
-		r.ProtoAtLeast(1, 1) &&
-		r.Header.Get("Sec-WebSocket-Version") == "13" &&
-		len(r.Header.Values("Sec-WebSocket-Key")) == 1
 }
 
 // headerHasToken reports whether any field value of the named header carries
 // token as a comma-separated element, case-insensitively. Both headers are
 // comma-lists that may also arrive as repeated field lines (RFC 7230 3.2.2),
 // and the engine's websocket.Accept matches them exactly this way — so this
-// predicate must too, or the access-log skip and the actual upgrade disagree.
+// predicate must too, or wsAttachLog's attach record and the actual upgrade
+// disagree about which requests were trying to attach (pinned against the real
+// handshake by TestIsWebSocketUpgrade_agreesWithTheEngineHandshake).
 func headerHasToken(r *http.Request, name, token string) bool {
 	for _, v := range r.Header.Values(name) {
 		for opt := range strings.SplitSeq(v, ",") {

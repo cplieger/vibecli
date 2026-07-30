@@ -15,6 +15,34 @@ import (
 
 // resumeAck frame offsets (the engine's encodeResumeAck layout):
 // [0] msg type, [1:9] ack, [9:17] epoch, [17:25] committed, [25:33] oldestIndex.
+//
+// FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): DELETE
+// these four constants and readResumeAckBounds' frame parsing. They hard-code the
+// engine's PRIVATE encodeResumeAck layout — msg type 2, offsets 17 and 25, min
+// length 33 — only because no accessor existed when this test was written; a
+// layout change inside the engine turns this test into a silent
+// never-sees-a-resumeAck timeout rather than a compile error. The engine now
+// exports the bounds directly:
+//
+//	func (h *terminal.Handler) ScrollbackBounds() (committed, oldest uint64)
+//
+// read-only, both values under ONE mutex acquisition (so the pair is a state the
+// session actually had), half-open range [oldest, committed), both 0 on a fresh
+// session. When the pinned engine version carries it, rewrite this test to hold
+// the session's Handler and call ScrollbackBounds() instead of dialing /ws and
+// decoding a frame — which also drops the websocket dial, the read-limit bump and
+// the resume-control JSON from this file.
+//
+// WHOEVER REWRITES IT MUST KEEP IT ABLE TO FAIL. An earlier version of this test
+// was VACUOUS: it emitted 2500 lines and asserted oldest == 0, so ANY capacity
+// above ~2500 passed and a raised capacity was invisible. The current shape is
+// deliberate and must survive the rewrite: emit PAST the configured capacity
+// (5250 > 5000) so eviction is observable, wait until enough lines are committed,
+// and assert committed-oldest == 5000 EXACTLY — an equality that fails both when
+// terminal.WithScrollbackCapacity(5000) is deleted (the engine default retains
+// 1000) and when the number is changed in either direction. Red-check the rewrite
+// by editing the capacity in registerRoutes' session factory and confirming it
+// fails.
 const resumeAckMsgType byte = 2
 
 const (

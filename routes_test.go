@@ -344,67 +344,176 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 	}
 }
 
-// TestAPINoStore pins that the token-bearing JSON surface is uncacheable while
-// static assets keep their own policy. GET /api/sessions returns live session
-// ids, which are the /ws attach/resume capability tokens the logging layer
-// deliberately keeps out of logs; without no-store the browser persists one to
-// its on-disk cache and an intermediary proxy may serve the list from cache.
-func TestAPINoStore(t *testing.T) {
-	mux, _, csp := mustRegisterRoutes(t, newTestDeps(true))
+// TestAPICachePolicy_EveryAPIPathSetsNoStore is the enumeration of this app's
+// entire /api/ surface and the record of WHO sets each response's cache policy.
+// It replaced a pair of narrower tests when the app's /api/-wide apiNoStore
+// middleware was deleted: the reason that deletion is safe is not an argument,
+// it is this table, and a row goes red the moment an owner stops covering its
+// own responses.
+//
+// Why the surface needs covering at all: a session id is the /ws attach + resume
+// capability token that LogID truncates before logging and
+// WithTemplatePathsUnder keeps out of the access log, and a response carrying no
+// freshness information is heuristically cacheable under RFC 9111 §4.2.2, so
+// without a directive the browser persists one to its on-disk cache (outliving
+// the tab) and an intermediary proxy may serve a list from cache. The tools
+// inventory has a milder version of the same problem: an operator reads it to
+// decide whether an install finished, and a cached copy answers with stale state.
+//
+// Everything runs through buildHandler — the REAL chain, in production order —
+// rather than against a handler directly, because three of the four owners set
+// the header somewhere the handler-level call cannot see: toolbelt's httpapi
+// wraps its own mux, the engine's REST handler has an inner mux of its own, and
+// the app's remaining sessionNoStore is chain middleware. Calling a handler
+// directly would assert the wrong thing and stay green through a chain edit.
+func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
+	deps := newToolsDeps(t)
+	deps.kiroRescan = func(context.Context) (bool, error) { return true, nil }
+	mux, mgr, csp := mustRegisterRoutes(t, deps)
+	quietTeardown(t, deps)
 	h := buildHandler(mux, nil, csp, nil)
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, terminal.SessionsPath, http.NoBody))
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control on %s = %q, want %q (session ids are capability tokens)", terminal.SessionsPath, got, "no-store")
+	// One live session so the REST handler's success paths (204 close, 405 on a
+	// method the session path does not serve) are reached with a real id rather
+	// than falling through to the unknown-session 404.
+	liveID, err := mgr.Create()
+	if err != nil {
+		t.Fatalf("mgr.Create: %v", err)
 	}
 
-	srec := httptest.NewRecorder()
-	h.ServeHTTP(srec, httptest.NewRequest(http.MethodGet, "/index.html", http.NoBody))
-	if got := srec.Header().Get("Cache-Control"); got != "no-cache, must-revalidate" {
-		t.Errorf("Cache-Control on a static asset = %q, want kiroCacheControl's policy (the API gate must not leak onto static)", got)
-	}
+	const noStore = "no-store"
+	for _, tc := range []struct {
+		name      string
+		method    string
+		path      string
+		body      string
+		wantCache string
+		// owner names the code that sets the header, so a red row says whose
+		// contract broke instead of only that a header went missing.
+		owner string
+	}{
+		// The engine's own coverage: terminal's writeJSON (create + list) and
+		// the SSE stream. These hold with NO app middleware at all.
+		{"sessions list", http.MethodGet, terminal.SessionsPath, "", noStore, "engine writeJSON"},
+		{"sessions create", http.MethodPost, terminal.SessionsPath, "", noStore, "engine writeJSON"},
+		{"sessions events (SSE)", http.MethodGet, terminal.SessionEventsPath, "", "no-cache, no-store", "engine events handler"},
 
-	// A non-API path nothing downstream decorates, so the /api/ scoping is
-	// actually observable: GET /ws without an Upgrade header is answered 426 by
-	// the engine's WebSocket handler, which sets no Cache-Control. Neither
-	// check above can see the guard -- /index.html is a KNOWN asset whose
-	// Cache-Control webhttp.StaticHandler overwrites on its way out, and an
-	// unknown path 404s through net/http's serveError, which since Go 1.23
-	// DELETES Cache-Control (with ETag/Last-Modified) on the error path, so it
-	// carries none whether or not apiNoStore is /api/-scoped.
-	nrec := httptest.NewRecorder()
-	h.ServeHTTP(nrec, httptest.NewRequest(http.MethodGet, terminal.WSPath, http.NoBody))
-	if got := nrec.Header().Get("Cache-Control"); got != "" {
-		t.Errorf("Cache-Control on the non-API path %s = %q, want none (the no-store gate is /api/-scoped)", terminal.WSPath, got)
+		// The engine's session surface BEYOND writeJSON. writeJSON is reached
+		// only by create and list, so every row below carries no Cache-Control
+		// from the engine and is covered by the app's sessionNoStore. Delete
+		// that middleware and exactly these rows go red — which is the test
+		// that keeps it from being deleted as dead weight, and the test that
+		// tells the next reader it can go once the engine covers its own mux.
+		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
+		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "app sessionNoStore"},
+		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "app sessionNoStore"},
+		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "app sessionNoStore"},
+		{"set pinned title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/pinned-title", `{"title":"x"}`, noStore, "app sessionNoStore"},
+		{"clear pinned title, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef/pinned-title", "", noStore, "app sessionNoStore"},
+		// The engine's INNER mux generates these itself, which is why no
+		// per-handler fix inside the engine would reach them: a 405 for a
+		// method the session path does not serve, and a 404 for the bare
+		// subtree path (no {id} segment to match).
+		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
+		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "app sessionNoStore"},
+
+		// The app's own handlers, each setting the header at the top of the
+		// function rather than relying on middleware.
+		{"health", http.MethodGet, healthPath, "", noStore, "handleHealth"},
+		{"kiro-cli rescan", http.MethodPost, kiroRescanPath, "", noStore, "handleKiroRescan"},
+
+		// toolbelt's httpapi, as of v2.3.0: no-store on every response of its
+		// own, set upstream of its mux, so its 404s and 405s are covered too.
+		// This is the coverage that let the app's /api/-wide wrapper go — it
+		// was the last path with no owner.
+		{"tools inventory", http.MethodGet, toolsPath, "", noStore, "toolbelt httpapi"},
+		{"tools search", http.MethodGet, toolsPath + "/search", "", noStore, "toolbelt httpapi"},
+		{"tools add, undecodable body (400)", http.MethodPost, toolsPath, "not json", noStore, "toolbelt httpapi"},
+		{"tools subtree root (404)", http.MethodGet, toolsPath + "/", "", noStore, "toolbelt httpapi"},
+		{"tools unrouted path (405)", http.MethodGet, toolsPath + "/nope", "", noStore, "toolbelt httpapi"},
+
+		// Non-API paths, proving the session scope does not leak. A static
+		// asset must keep kiroCacheControl's revalidation policy, and /ws — a
+		// path nothing downstream decorates (GET without an Upgrade header is
+		// the engine's 426) — must carry nothing at all. Without this second
+		// row the scoping is unobservable: /index.html is a KNOWN asset whose
+		// Cache-Control webhttp.StaticHandler overwrites on its way out.
+		{"static asset", http.MethodGet, "/index.html", "", "no-cache, must-revalidate", "kiroCacheControl"},
+		{"websocket upgrade path", http.MethodGet, terminal.WSPath, "", "", "nobody (deliberately)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			// Loopback peer AND loopback Host: the tools and rescan admission
+			// gate (see TestToolsAPI_LoopbackOnly) refuses anything else, and a
+			// 403 would not exercise the response this policy applies to.
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Host = "localhost:9848"
+			// The SSE stream never completes on its own. Bounding the request
+			// context ends it; the header map is already populated by then,
+			// which is the whole point of setting it before WriteHeader.
+			ctx, cancel := context.WithTimeout(req.Context(), 200*time.Millisecond)
+			defer cancel()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req.WithContext(ctx))
+
+			if got := rec.Header().Get("Cache-Control"); got != tc.wantCache {
+				t.Errorf("%s %s -> %d: Cache-Control = %q, want %q (set by %s)",
+					tc.method, tc.path, rec.Code, got, tc.wantCache, tc.owner)
+			}
+			// A row that silently stopped reaching its handler would assert
+			// nothing: a 403 from the loopback gate, or a fallthrough to the
+			// static 404, both produce a response whose header a passing row
+			// would happily read.
+			if rec.Code == http.StatusForbidden {
+				t.Errorf("%s %s: status 403 — the loopback gate refused the request, so this row proves nothing", tc.method, tc.path)
+			}
+		})
 	}
 }
 
-// TestAPINoStore_marksToolsInventoryUncacheable pins the surface apiNoStore
-// covers ALONE, which TestAPINoStore above cannot see: the engine sets no-store
-// on its own /api/sessions responses, so that test stays green with the
-// apiNoStore chain entry deleted. toolbelt's httpapi handler sets no
-// Cache-Control at all, so without the app's middleware a successful tools
-// inventory response is cacheable and a browser or intermediary can keep
-// serving stale tool state (an inventory an operator reads to decide whether an
-// install finished). Verified red against a build with only the apiNoStore chain
-// entry removed.
-func TestAPINoStore_marksToolsInventoryUncacheable(t *testing.T) {
+// TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective records the ONE thing
+// the /api/-wide wrapper used to do that nothing does now, as a decision rather
+// than an oversight: an /api/ path no route matches gets no Cache-Control.
+//
+// It is deliberately harmless, and measurably not even a change. Such a path
+// falls through to the catch-all static mount, and net/http's serveError DELETES
+// Cache-Control (with ETag and Last-Modified) on its error path, so a 404 body
+// carried no directive even WITH the old middleware in the chain — the header
+// the wrapper set was stripped again downstream. The body is net/http's constant
+// "404 page not found" text and holds no session or tool state, so a cache
+// storing it can only ever replay a 404 for a path that has none.
+//
+// The rows are the three shapes an unmatched /api/ request takes: a path with no
+// mount at all, the bare prefix, and — the one worth pinning — a GET on
+// kiroRescanPath, which IS mounted but only for POST. That last one is a mux
+// miss rather than a 405 because the catch-all "/" pattern matches the request
+// fully, so ServeMux prefers it over reporting a method mismatch.
+func TestAPICachePolicy_UnmatchedAPIPathCarriesNoDirective(t *testing.T) {
 	deps := newToolsDeps(t)
+	deps.kiroRescan = func(context.Context) (bool, error) { return true, nil }
 	mux, _, csp := mustRegisterRoutes(t, deps)
-	// Loopback peer AND loopback Host: the tools API's admission gate (see
-	// TestToolsAPI_LoopbackOnly) refuses anything else, and a 403 would not
-	// exercise the successful response this header policy applies to.
-	req := httptest.NewRequest(http.MethodGet, toolsPath, http.NoBody)
-	req.RemoteAddr = "127.0.0.1:54321"
-	req.Host = "localhost:9848"
-	rec := httptest.NewRecorder()
-	buildHandler(mux, nil, csp, nil).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET %s: status = %d, want %d (body %s)", toolsPath, rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
-		t.Errorf("Cache-Control on %s = %q, want %q; toolbelt's handler does not set this header, so apiNoStore must", toolsPath, got, "no-store")
+	h := buildHandler(mux, nil, csp, nil)
+
+	for _, tc := range []struct{ name, method, path string }{
+		{"no such route", http.MethodGet, apiPrefix + "nope"},
+		{"bare api prefix", http.MethodGet, apiPrefix},
+		{"mounted for POST only, reached by GET", http.MethodGet, kiroRescanPath},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, http.NoBody)
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.Host = "localhost:9848"
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s %s: status = %d, want %d (this test is about the static-mount 404 path)",
+					tc.method, tc.path, rec.Code, http.StatusNotFound)
+			}
+			if got := rec.Header().Get("Cache-Control"); got != "" {
+				t.Errorf("%s %s: Cache-Control = %q, want none — an unmatched /api/ 404 carrying a directive means something re-grew the /api/-wide wrapper; if that was deliberate, this test is the place to say so",
+					tc.method, tc.path, got)
+			}
+		})
 	}
 }
 
@@ -748,10 +857,12 @@ func TestHealthEndpoint_reasonDistinguishesUnreadyCause(t *testing.T) {
 // freshness is heuristically cacheable under RFC 9111, and a cached "ok"
 // outliving the readiness it reported keeps traffic arriving at an instance that
 // has begun draining -- the exact failure the gate exists to prevent. The handler
-// sets it itself rather than relying on the /api/-wide apiNoStore middleware, so
-// the contract holds wherever the route is mounted and a future narrowing of that
-// middleware's scope cannot silently drop it. That is also why this asserts
-// against the bare mux: it is the HANDLER's property being pinned.
+// sets it itself rather than relying on middleware, which is what let the app's
+// /api/-wide no-store wrapper be narrowed to the engine's session surface without
+// touching this route; the contract holds wherever the route is mounted. That is
+// also why this asserts against the bare mux: it is the HANDLER's property being
+// pinned. TestAPICachePolicy_EveryAPIPathSetsNoStore asserts the same header
+// through the real chain, where the whole /api/ surface is enumerated together.
 // STATUS + READY BODY: the byte-exact bodies above are also what pins the ready
 // document, so no separate ready-body test is needed -- an exact match fails for
 // a renamed status field, an empty tools value, or ANY extra key (the tools

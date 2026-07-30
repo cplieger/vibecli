@@ -35,13 +35,14 @@ func main() {
 // 1 floor violated (fail the build), 2 usage error (missing/non-positive flag
 // values).
 //
-// The Dockerfile's gate observes only zero vs non-zero: it invokes this via
-// `go run`, which reports its OWN exit status 1 for ANY non-zero program exit
-// (it prints "exit status 2" to stderr but does not propagate the 2). So the
-// three-way code is the contract for direct invocation and
-// TestRun_exitCodeContract; in a build log the two failures are told apart by
-// their stderr line, not by the code — never add an `[ $? -eq 2 ]` branch to
-// the build step.
+// All three codes reach the Dockerfile's wire-floor gate, which BUILDS this
+// program and invokes the binary for exactly that reason: `go run` reports its
+// OWN exit status 1 for ANY non-zero program exit (it prints "exit status 2" to
+// stderr but does not propagate the 2), which collapsed 2 and 1 into one code
+// and left only the stderr line to tell "the gate's extraction is broken, do NOT
+// bump a pin" from "genuine wire incompatibility". Do not put the step back on
+// `go run`; TestDockerfileBuildsTheGateInsteadOfGoRun fails if anyone does, and
+// TestGateProcessPropagatesExitCodes pins main's propagation of these codes.
 //
 // The flags are validated here rather than left to the engine's comparator so
 // a missing extraction is reported as the usage error it is (exit 2, the

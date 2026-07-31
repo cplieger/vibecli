@@ -244,6 +244,69 @@ func parseLogOSCText() bool {
 	return logOSCText
 }
 
+// parseToolsTainted decodes KIRO_CLI_TOOLS_TAINTED, the entrypoint's
+// tools-tree-was-writable observation, into the flag that makes the kiro-cli
+// install manager distrust every version directory already on the volume
+// (pinstall's Untrusted) and activate only one it installed from the
+// digest-verified archive this boot. Only the entrypoint can make the
+// observation — it is the half that chmods and re-stats (secure_tools_dir) — so
+// this is a handoff with exactly one producer, not an operator knob.
+//
+// The accepted vocabulary is exactly "1" and "0", and that narrowness is the
+// property rather than strictness for its own sake. The variable is an
+// AFFIRMATIVE OBSERVATION ("the entrypoint looked, and the tree was writable"),
+// and the entrypoint only ever writes 0 or 1, so a value that is NEITHER means no
+// such observation was made — the same epistemic state as unset, and unset already
+// reads as clean. Arming the taint on garbage would be inventing evidence rather
+// than acting on it, and the cost is not merely a download: the recovery it forces
+// replaces the pinned version directory and then prunes everything beyond the
+// active version plus one predecessor, and that retained pair is what stands in
+// for a rollback path in this app (pinstall's retainedVersions; "Exactly one
+// predecessor is retained").
+//
+// So: "1" arms, "0" does not, unset does not, anything else does not AND warns.
+//
+// Deliberately NOT envx.Bool/BoolStrict, and do not "unify" it with them: that
+// shared vocabulary also accepts true/yes/on in any capitalisation with
+// surrounding whitespace, which widens the set of values that can arm a trust
+// boundary. The accepted spellings of a security-relevant flag are never widened
+// as cleanup; the narrow vocabulary IS the property. The shell-to-Go boundary is
+// protected from the other side instead: tests/shell/pins_export_test.sh asserts
+// every assignment to the producer's taint variable is the literal 0 or 1, which
+// is what makes this side safe to keep narrow rather than merely strict.
+//
+// The warning names the KEY and nothing else — not the value, not its length, not
+// a fragment — for the reason parseTrustedProxies, parseAllowedHosts,
+// parseLogOSCText and parseCatalogRefresh all log by name or count only: a compose
+// interpolation mistake can put a credential on ANY variable
+// (`KIRO_CLI_TOOLS_TAINTED: ${SOME_TOKEN}`), and echoing it would leave a durable,
+// queryable copy in the log store (CWE-532). The hint is a FIXED string for the
+// same reason: it must not grow an input-derived tail.
+//
+// os.LookupEnv rather than envx.String, because unset and set-but-empty must not
+// behave alike here: unset is the ordinary out-of-container run (a bare `go run`,
+// the tests) and has to stay silent, while an empty value came from the one
+// producer that was supposed to write 0 or 1 and is exactly the malformed case
+// worth reporting. That set-vs-unset distinction is envx's documented escape hatch
+// from its empty-equals-unset rule.
+func parseToolsTainted() bool {
+	const key = "KIRO_CLI_TOOLS_TAINTED"
+	raw, set := os.LookupEnv(key)
+	switch {
+	case !set, raw == "0":
+		// The only silent path, and the two spellings of the same fact: nothing
+		// reported the tree as writable, so a pre-existing version directory is
+		// still trusted on the strength of its own sentinel.
+		return false
+	case raw == "1":
+		return true
+	default:
+		slog.Warn("unusable "+key+"; treating the kiro-cli tools tree as untainted, the same outcome as unset",
+			"hint", "only entrypoint.sh sets this, and only to 1 (it found the tools tree group/other-writable) or 0 (it did not); any other value is not an observation, so it cannot arm the distrust-and-reinstall path")
+		return false
+	}
+}
+
 // sessionCommand builds the per-session PTY command: `kiro-cli chat` behind a
 // sign-in guard. When no identity is present (`whoami` exits non-zero, verified
 // against the pinned build: 0 logged in, 1 not), the guard first runs
@@ -402,16 +465,11 @@ func main() {
 	// kiro-cli itself is installed and selected by the manager startKiroCLI builds:
 	// the per-session argv and PATH come from it, so a version switch is picked up by
 	// the next tab rather than being frozen at boot.
-	// The entrypoint's taint observation goes through the fleet's ONE boolean
-	// parser rather than a local == "1": envx.Bool/BoolStrict share a single
-	// vocabulary (true/1/yes/on, false/0/no/off, case-insensitive, trimmed), so
-	// the shell-to-Go boundary cannot drift on spelling or padding. BoolStrict,
-	// not Bool, for the same reason parseLogOSCText uses it: Bool's
-	// malformed-value Warn echoes the RAW value, and this key crosses a compose
-	// boundary. An unreadable value keeps today's outcome (false = trust the
-	// tree's own sentinels); the error is deliberately dropped rather than
-	// logged, so no future error text can carry a value fragment either.
-	tainted, _, _ := envx.BoolStrict("KIRO_CLI_TOOLS_TAINTED")
+	// KIRO_CLI_TOOLS_TAINTED is the entrypoint's tools-tree-was-writable
+	// observation; the two-value vocabulary that may arm it, the
+	// treat-anything-else-as-unset outcome and the by-name-only warning are all
+	// parseToolsTainted's.
+	tainted := parseToolsTainted()
 	kiro := startKiroCLI(&baseKiro{
 		version:     envx.String("KIRO_CLI_VERSION", ""),
 		sha256:      envx.String("KIRO_CLI_SHA256", ""),

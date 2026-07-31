@@ -192,4 +192,52 @@ grep -q '^KIRO_CLI_TOOLS_TAINTED="\$tools_tree_was_writable"$' "$ENTRYPOINT" \
   && ok "the exported taint flag is secure_tools_dir's own observation" \
   || no "taint flag value" "KIRO_CLI_TOOLS_TAINTED is not \$tools_tree_was_writable, so a foreign-writable tree is reported as clean"
 
+# --- ...and the producer only ever emits 0 or 1 -------------------------------
+# The assertion above pins WHERE the exported value comes from; this one pins what
+# that value can BE, which is the other half of a contract main.go now depends on.
+# parseToolsTainted decodes exactly "1" and "0" and treats every other spelling as
+# NO observation (i.e. identically to unset, plus a warning), deliberately refusing
+# envx.Bool's wider true/yes/on-any-case-trimmed vocabulary, because a wider reader
+# widens what can arm a trust boundary. A narrow reader is only SAFE while the
+# writer cannot emit a third spelling: `tools_tree_was_writable=true` here would be
+# read as no observation at all, so a foreign-writable tree would be reported clean
+# -- silently, and that is the exact failure this flag exists to prevent.
+#
+# Read as TEXT rather than by running secure_tools_dir, for the reason
+# tools_dir_hardening_test.sh parses its call sites: the property is the SET of
+# values the script can assign, and no single execution can exhibit a set.
+#
+# The pattern admits a `local`/`declare`/`export`/`readonly` prefix on purpose --
+# an assignment hidden behind one of those would otherwise evade the check and pass
+# green, which is the one way this assertion could lie.
+taint_writes=$(grep -nE '^[[:space:]]*(local|declare|export|readonly)?[[:space:]]*tools_tree_was_writable=' "$ENTRYPOINT")
+if [ -z "$taint_writes" ]; then
+  no "taint flag producer" "nothing assigns tools_tree_was_writable, so the exported flag is empty on every boot and main.go's decoder reads an empty value as no observation: a foreign-writable tree would be reported as clean"
+else
+  foreign_taint_writes=$(printf '%s\n' "$taint_writes" | grep -vE '=[01][[:space:]]*(#.*)?$')
+  [ -z "$foreign_taint_writes" ] \
+    && ok "every assignment to tools_tree_was_writable is the literal 0 or 1" \
+    || no "taint flag vocabulary" "an assignment is not the literal 0 or 1 [$(printf '%s' "$foreign_taint_writes" | tr '\n' ';')]; main.go's parseToolsTainted accepts only those two spellings and reads anything else as NO observation, so such a value reports a foreign-writable tree as clean"
+
+  # Both literals must actually occur, or the vocabulary assertion above passes
+  # vacuously: a producer whose 0 was deleted exports an empty flag, and one whose
+  # 1 was deleted can never arm the taint at all -- the invisible every-boot-looks-
+  # clean failure the "not a constant" assertion above guards from the other end.
+  printf '%s\n' "$taint_writes" | grep -qE '=0[[:space:]]*(#.*)?$' \
+    && ok "the taint flag is initialised to the literal 0 (the clean default)" \
+    || no "taint flag default" "no assignment sets tools_tree_was_writable to 0, so the exported flag has no defined clean value"
+
+  printf '%s\n' "$taint_writes" | grep -qE '=1[[:space:]]*(#.*)?$' \
+    && ok "at least one site arms the taint flag with the literal 1" \
+    || no "taint flag arming" "no assignment sets tools_tree_was_writable to 1, so no observation can ever arm the quarantine and every boot looks clean"
+fi
+
+# One assignment, so the exact-shape assertion above cannot be undone further down
+# the file: a later KIRO_CLI_TOOLS_TAINTED=<anything> would win at exec time while
+# that grep still matched the earlier line and reported green.
+taint_export_writes=$(grep -cE '^[[:space:]]*(local|declare|export|readonly)?[[:space:]]*KIRO_CLI_TOOLS_TAINTED=' "$ENTRYPOINT")
+[ "$taint_export_writes" -eq 1 ] \
+  && ok "KIRO_CLI_TOOLS_TAINTED is assigned exactly once" \
+  || no "taint flag assignment count" "KIRO_CLI_TOOLS_TAINTED is assigned $taint_export_writes times; the last one wins at exec, so the observation this script proved can be overwritten by a value nothing checked"
+
 report

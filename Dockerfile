@@ -138,7 +138,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # the RUN below asserts the two pins are equal, so the build gate and the
 # runtime gate can never become different verifiers — same fail-loud treatment
 # the engine/UI/tsc pin pairs get against static-src/package.json.
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.0
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.1
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
@@ -285,6 +285,17 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # Must run before the binary build because main.go's `//go:embed static`
 # captures static/ at `go build` time.
 #
+# Re-arm the bash SHELL before the bash-only RUNs below. It is already declared
+# at the top of this stage and nothing changed it, but hadolint (>=2.15.0) resets
+# its shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
+# directive -- the Renovate-pinned ARGs above do exactly that -- and then
+# shellchecks the rest of the stage as sh, calling this file's bash arrays
+# (SC3054) and process substitution (SC3001) undefined. Re-declaring keeps those
+# two checks live and real, where suppressing the codes on the instruction would
+# switch them off for good. Docker-side this is a no-op: same shell, no layer.
+# Drop it when upstream honours the first declaration again.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Step 1: tsc --project compiles app TS — tsconfig.json's outDir is
 # "../static", so tsc writes static/app.js directly into the embed tree.
 # The lib import (`@cplieger/web-terminal-ui`) is preserved in the emit as a

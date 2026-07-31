@@ -35,14 +35,21 @@ const options: CreateTerminalOptions = {
   // tab HOVER state, desktop or mobile -- the library keeps its own neutral lift
   // there deliberately (a translucent accent wash over a filled chip reads as
   // "more transparent", not "lighter"), so a hovered inactive tab stays grey
-  // however this token is set. --tab-active-border re-declares the library's own
-  // derivation of it, deliberately, so the edge stays low-saturation even if that
-  // derivation changes.
+  // however this token is set. The active tab's EDGE is themed without an
+  // override of its own: the library derives --tab-active-border from
+  // --tab-active-bg (mixed 25% toward its own text colour) and custom properties
+  // resolve at USE time, so the brand fill set above is what that derivation
+  // consumes. That fill is deliberately app-owned and deliberately NOT the
+  // sibling web-terminal-server's edge, which takes the library's accent-derived
+  // blue default -- so the derived edge carries THIS app's purple, not a shared
+  // one. Do not re-add a --tab-active-border override restating the library's
+  // formula: it read var(--text), an internal library token, for a
+  // byte-identical result, and app.test.ts now fails any theme value reading a
+  // token outside PUBLIC_THEME_TOKENS.
   theme: {
     "--accent": `hsl(${ACCENT_HSL_COMPONENTS})`,
     "--tab-hover-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 16%)`,
     "--tab-active-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 32%)`,
-    "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
     "--tab-active-fg": "#fff",
     // Tab activity-dot vocabulary for the three states this app's server can
     // actually report, replacing the library defaults: violet = thinking, green

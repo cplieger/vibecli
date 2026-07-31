@@ -31,11 +31,12 @@ vi.mock("@cplieger/web-terminal-ui/presets", () => ({
 }));
 
 // web-terminal-kiro's purple theme, passed through createTerminal (matches app.ts).
+// No --tab-active-border: the library derives the active tab's edge from this
+// app's own --tab-active-bg, so overriding it would restate a library formula.
 const THEME = {
   "--accent": "hsl(263.1683 100% 80%)",
   "--tab-hover-bg": "hsl(263.1683 100% 80% / 16%)",
   "--tab-active-bg": "hsl(263.1683 100% 80% / 32%)",
-  "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
   "--tab-active-fg": "#fff",
   "--status-working": "#c6a0ff",
   "--status-done": "oklch(78% 0.15 150deg)",
@@ -1306,27 +1307,33 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // something else) must fail here rather than make the loop above vacuous.
     expect(PUBLIC_THEME_TOKENS.length).toBeGreaterThan(0);
 
-    // One override reaches THROUGH the public surface: --tab-active-border's
-    // color-mix reads var(--text), an INTERNAL token PUBLIC_THEME_TOKENS
-    // deliberately does not cover (the library's own doc comment says a value
-    // reaching an internal name is the consumer's to assert on separately). This
-    // app cannot assert it without the scrape that was just deleted, so the
-    // coupling is pinned as a LIST instead: adding a second internal reference is
-    // a deliberate edit to this line, not something that slips in unnoticed. If
-    // the library ever renames --text, the active tab silently loses its edge and
-    // nothing here catches it -- the durable fix is on the library side (publish
-    // the theme-referenceable internal tokens, or promote --text), not another
-    // node_modules reader in this repo.
-    const internalReferences = new Set<string>();
+    // A value's var() reads are as much a dependency as its key, and the key
+    // loop above cannot see them. One override used to reach THROUGH the public
+    // surface here: --tab-active-border restated the library's own edge
+    // derivation and read var(--text) with it, an INTERNAL token
+    // PUBLIC_THEME_TOKENS deliberately does not cover (the library's doc comment
+    // says a value reaching an internal name is the consumer's to assert on
+    // separately). That override is gone -- the kernel derives the edge from this
+    // app's own --tab-active-bg, byte-identically -- so the expectation is not a
+    // LIST of tolerated internal names any more: NO theme value may read a token
+    // outside the published contract. Strictly stronger than pinning the set to
+    // ["--text"], and it is what stops this coupling class returning: a library
+    // rename can no longer silently drop a themed surface, because nothing here
+    // names an unpublished token. Spell a value as a literal, or compose it from
+    // public tokens only.
+    const nonPublicReferences = new Set<string>();
     for (const value of Object.values(THEME)) {
       for (const reference of value.matchAll(/var\(\s*(--[\w-]+)/g)) {
         const token = reference[1] as string;
         if (!(PUBLIC_THEME_TOKENS as readonly string[]).includes(token)) {
-          internalReferences.add(token);
+          nonPublicReferences.add(token);
         }
       }
     }
-    expect([...internalReferences]).toEqual(["--text"]);
+    expect(
+      [...nonPublicReferences],
+      "a theme value reads a custom property outside the UI package's PUBLIC_THEME_TOKENS: the library may rename or retire an internal token with no release note, silently dropping whatever this value themes, and neither tsc nor the key check above can see inside a CSS string",
+    ).toEqual([]);
   });
 
   it("opts into the loading-overlay class names the UI package publishes", () => {

@@ -129,6 +129,17 @@ restarts), disabled entries wait as templates, removed installs are cleaned up.
 There is no management UI; you edit the manifest and restart, or drive the
 loopback API from inside a session.
 
+**Upgrading a volume from an image that kept the manifest in `/config`?** The
+manifest and its state moved into `/config/tools/`, beside the tools they describe,
+and the files at the old paths (`/config/tools.json`, `/config/tools-state.json`,
+`/config/tool-catalog.cached.json`) are ignored rather than migrated. A fresh
+manifest is seeded at the new path, so re-apply your enabled tools there, plus any
+tool you had added by name, which the seeded file does not carry at all. Tools from
+the old install keep working on `PATH`, but the engine no longer tracks them: to
+hand one back to it, declare it in the new manifest and delete its entry from
+`/config/tools/bin` so the engine reinstalls and records it. The container logs a
+warning at every start while the old files are still there; deleting them stops it.
+
 **Enable a bundled template.** First boot seeds language-server templates plus
 the GitHub CLI, all disabled. Flip the ones you want and restart:
 

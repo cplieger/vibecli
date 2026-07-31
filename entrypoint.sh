@@ -116,11 +116,26 @@ secure_tools_dir() {
   # web-terminal-kiro.md), so a broken state must be able to heal itself or at worst
   # be fixable from INSIDE the container. Aborting boot fails that test -- there is no
   # way in to repair it, and nothing recreates these trees.
-  #   owned=1  /config, $TOOLS, $TOOLS/bin, $TOOLS/opt, $TOOLS/kiro-cli-versions --
-  #            created by this entrypoint, so a symlink or a plain file there is
-  #            unambiguously anomalous and a reinstall repairs the contents. Fatal.
-  #   owned=0  the legacy PATH segments -- never created, never repaired, and holding
-  #            no integrity-gated binary. Warn and skip, matching
+  #   owned=1  the NINE directories this entrypoint creates itself, i.e. exactly the
+  #            make_config_dir list outside $HOME: /config, $TOOLS, $TOOLS/bin,
+  #            $TOOLS/opt, $TOOLS/npm, $TOOLS/npm/bin, $TOOLS/python,
+  #            $TOOLS/python/bin and $TOOLS/kiro-cli-versions. Two properties make
+  #            them ours, and both are needed. (a) The entrypoint CREATES them, so a
+  #            symlink or a plain file there is unambiguously anomalous rather than
+  #            the operator's shape. (b) A reinstall REPAIRS their contents -- the
+  #            toolbelt engine reinstalls a tool it finds missing and the kiro-cli
+  #            manager reinstalls from the pinned archive -- so refusing to boot
+  #            costs a download, not the operator's data. The npm and python roots
+  #            are in the set for the reason $TOOLS/bin is: $TOOLS/bin leads PATH
+  #            and its entries are symlinks INTO opt/, npm/bin/ and python/bin/
+  #            (toolbelt install.go's npmDir/pythonDir + linkPMBins), so root
+  #            executes what those trees hold, and a group/other-writable root there
+  #            lets a foreign host user replace a launcher -- which tightening the
+  #            leaf file alone cannot prevent. Fatal.
+  #   owned=0  $TOOLS/go and $TOOLS/go/bin, i.e. GOPATH/bin and its parent: on PATH
+  #            (Dockerfile ENV PATH) but never created and never repaired here, and
+  #            holding no integrity-gated binary -- a `go install` lands whatever the
+  #            operator asked for. Warn and skip, matching
   #            prune_superseded_kas_runtimes' explicit "disk hygiene must not brick
   #            boot" precedent for a tree this script does not own.
   # The mode enforcement below is unaffected: a writable tree is still tightened on
@@ -303,98 +318,54 @@ prune_superseded_kas_runtimes() {
   return 0
 }
 
-# --- one-time relocation of the tool subsystem's metadata -----------------------
+# --- legacy tool-metadata notice ------------------------------------------------
 # toolbelt keeps three metadata files -- tools.json (HAND-AUTHORED intent:
 # enabling a tool is a file edit plus a restart), tools-state.json (engine-owned
-# machine state) and tool-catalog.cached.json -- and they used to sit in /config
-# while every artifact they describe sits in $TOOLS. The server now points the
-# engine's config dir at $TOOLS, so all four converge; on a volume created by an
-# earlier image the three files are still in the old place, where the engine no
-# longer reads them and would seed a FRESH all-disabled manifest beside the tree
-# instead. That is the operator's own intent silently reset, not a clean break, so
-# move the files once.
+# machine state) and tool-catalog.cached.json. They used to sit directly under
+# /config; the server now points the engine's config dir at $TOOLS, where the
+# artifacts they describe already live. That relocation is a CLEAN BREAK, not a
+# migration: on a volume created by an earlier image the three files stay where
+# they are, nothing reads them, and the engine seeds a fresh manifest beside the
+# tree instead.
 #
-# Guards, in the shape the sweeps above use, plus the marker the server's own
-# one-shot purge uses ($TOOLS/.kiro-cli-legacy-purged, main.go's legacyPurgeMarker):
+# This notice exists because that break is otherwise SILENT, which is the only
+# claim it makes. From the engine's point of view such a volume IS a fresh one:
+# it seeds five disabled templates (toolbelt's DefaultSeed) and logs nothing
+# unusual. So the operator's enabled tools come back as disabled templates, and
+# any tool they added by name is absent from the manifest entirely -- while its
+# binary still resolves on PATH, because $TOOLS/bin and the opt/npm/python trees
+# were never touched. The engine cannot report any of that: its reconcile derives
+# every work set from the manifest and the state file, and an artifact with no
+# state row is neither a disabled "extra" nor an "orphan" (that pass iterates the
+# state), so a converged boot prints "everything converged" over a tree it no
+# longer records as its own -- and a later uninstall of such a name removes
+# opt/<name> while leaving bin/<name> behind as a dangling symlink in the dir
+# that leads PATH, since the bin names to unlink are read from that same state.
 #
-#   1. Only a REGULAR file is moved. A symlink at the source is refused rather
-#      than moved: `mv` would relocate the link itself, landing a redirect inside
-#      the tree the server writes tools.json through -- the same reason
-#      prune_superseded_kas_runtimes refuses to act through one.
-#   2. A destination that already exists is NEVER overwritten. Both copies present
-#      means a partial migration or the operator's own doing; either way the file
-#      the engine reads today wins and the stale one is left for them to delete.
-#   3. Nothing here is fatal, per web-terminal-kiro.md "Failure posture": a
-#      container that cannot tidy its own volume must still boot.
-#   4. Completion is recorded, so a migrated volume stops being scanned. A failed
-#      `mv` WITHHOLDS the marker, so the next boot retries rather than recording a
-#      job it did not finish -- while a refusal by shape (1 and 2 above) does not,
-#      matching the purge's own distinction between "I could not" and "that is not
-#      mine to touch".
+# So: say it, and do nothing else. This is a NOTICE, and each of its properties
+# is deliberate:
 #
-# The marker is dot-prefixed and directly under $TOOLS, where the toolbelt engine
-# never looks (it enumerates bin/, opt/, npm/ and python/) and where neither the
-# write-probe sweep (.write-probe.*) nor the server's staging sweep
-# (.kiro-cli-stage.*) can match it.
-move_legacy_tool_metadata() {
-  local from=$1 to=$2 marker name src dst stamp moved=0 failed=0
-  marker="$to/.tools-metadata-moved"
-  # Only a regular file counts as the marker: on anything else this would rather
-  # run again (every step is idempotent) than skip on evidence it did not write.
-  [ -f "$marker" ] && return 0
-  # Never act THROUGH a symlink at either end. The destination has already been
-  # proven by the make_config_dir/secure_tools_dir walk on the boot path, but this
-  # function is also the unit under test, so it states what it requires.
-  if [ -L "$from" ] || [ ! -d "$from" ] || [ -L "$to" ] || [ ! -d "$to" ]; then
-    printf 'level=warn msg="skipping the one-time tool-metadata move: one of the directories is missing or is a symlink, and moving through a link could place the manifest outside the /config mount" from="%s" to="%s" component=entrypoint\n' \
-      "$from" "$to" >&2
-    return 0
-  fi
+#   1. It MOVES, DELETES and CREATES nothing -- not even a marker. A marker is a
+#      write, and a write is precisely what must not happen here. It therefore
+#      repeats every boot; the operator deleting the old files is what silences
+#      it, which is also the action the message asks for.
+#   2. It cannot fail boot, per web-terminal-kiro.md "Failure posture": the body
+#      is two existence tests per name and one printf.
+#   3. A symlink at either end needs no guard, unlike the sweeps above. Nothing
+#      here is followed into, chmod'ed, moved or removed, so there is no
+#      operation a planted link could redirect. The test accepts a DANGLING link
+#      as well ([ -e ] dereferences, [ -L ] does not): a leftover the operator
+#      has to clear is a leftover whether its target still exists or not.
+warn_legacy_tool_metadata() {
+  local from=$1 to=$2 name found=""
   for name in tools.json tools-state.json tool-catalog.cached.json; do
-    src="$from/$name"
-    dst="$to/$name"
-    # -L BEFORE -f: [ -f ] dereferences, so a symlink to a regular file would pass
-    # it and be moved as a link.
-    if [ -L "$src" ]; then
-      printf 'level=warn msg="refusing to move a symlinked tool metadata file into the tools tree; the engine would then write the manifest through a link that can point anywhere" path="%s" component=entrypoint\n' \
-        "$src" >&2
-      continue
-    fi
-    [ -f "$src" ] || continue
-    if [ -e "$dst" ]; then
-      printf 'level=warn msg="a tool metadata file exists in BOTH the old and the new location; keeping the one the engine reads and leaving the old copy alone (it is unused now and can be deleted)" old="%s" new="%s" component=entrypoint\n' \
-        "$src" "$dst" >&2
-      continue
-    fi
-    if mv "$src" "$dst"; then
-      moved=$((moved + 1))
-      printf 'level=info msg="moved tool metadata beside the tools tree it describes" old="%s" new="%s" component=entrypoint\n' \
-        "$src" "$dst" >&2
-    else
-      failed=1
-      printf 'level=warn msg="failed to move a tool metadata file beside the tools tree; the engine will seed a fresh manifest instead of adopting this one" old="%s" new="%s" component=entrypoint\n' \
-        "$src" "$dst" >&2
+    if [ -e "$from/$name" ] || [ -L "$from/$name" ]; then
+      found="${found:+$found }$name"
     fi
   done
-  if [ "$failed" -ne 0 ]; then
-    printf 'level=warn msg="not recording the tool-metadata move as complete: a file could not be moved, so the next boot retries it" dir="%s" component=entrypoint\n' \
-      "$from" >&2
-    return 0
-  fi
-  if [ "$moved" -ne 0 ]; then
-    printf 'level=info msg="tool metadata now sits beside the artifacts it describes" dir="%s" count=%d component=entrypoint\n' \
-      "$to" "$moved" >&2
-  fi
-  # A marker this boot could not write only costs a rescan next boot, which is a
-  # no-op on a migrated volume -- so warn like every other hygiene step here. The
-  # timestamp is resolved BEFORE the redirect, so the warning is true when it
-  # fires: only a redirect that could not create the file reaches it, and an
-  # unreadable clock degrades the content rather than the record.
-  stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || stamp="unknown"
-  if ! printf '%s\n' "$stamp" >"$marker"; then
-    printf 'level=warn msg="failed to record the tool-metadata move; the next boot rescans, which is a no-op once the files have moved" path="%s" component=entrypoint\n' \
-      "$marker" >&2
-  fi
+  [ -n "$found" ] || return 0
+  printf 'level=warn msg="tool metadata found at its OLD location and IGNORED: it now lives beside the tools tree it describes, so the engine seeded a fresh manifest -- previously enabled tools are back to disabled templates, and tools added by name are not in it at all. Their binaries still resolve on PATH, but the engine no longer records, updates or uninstalls them. Re-apply your selections in the new manifest, then delete the old files to silence this" files="%s" old="%s" new="%s" component=entrypoint\n' \
+    "$found" "$from" "$to/tools.json" >&2
   return 0
 }
 
@@ -732,12 +703,12 @@ if ! rm -rf "$TOOLS"/.write-probe.*; then
   printf 'level=warn msg="failed to remove orphaned boot-time temp artifacts; they keep occupying the /config volume" dir="%s" component=entrypoint\n' "$TOOLS" >&2
 fi
 
-# Bring the tool subsystem's metadata beside the tree it describes, once per volume
-# (see move_legacy_tool_metadata). Placed here, after the walk proved $TOOLS is a real
-# private directory and after the write probe proved the mount is writable, so a move
-# into it cannot be redirected and a failure is a real failure rather than a read-only
-# mount reported three times.
-move_legacy_tool_metadata /config "$TOOLS"
+# Point out tool metadata still sitting at its pre-$TOOLS location, which nothing
+# reads any more (see warn_legacy_tool_metadata). Placed here, after the walk proved
+# $TOOLS is a real private directory, so the new path the message names is the one
+# the server will actually hand the engine. Reads three directory entries and
+# prints; it moves, deletes and creates nothing.
+warn_legacy_tool_metadata /config "$TOOLS"
 
 # Hygiene for the one residue class the manager's own purge does not reach: binaries an
 # EARLIER image version staged into $HOME/.local/bin (that install ran with the real

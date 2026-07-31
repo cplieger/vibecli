@@ -3,20 +3,42 @@
 # entrypoint does not own.
 #
 # The third argument encodes the app's failure posture (see the steering doc's
-# "Failure posture" section). owned=1 is for the three directories the entrypoint
-# creates and a reinstall repairs — /config, $TOOLS, $TOOLS/bin — where aborting is
-# right because the state is ours and self-healing. owned=0 is for the legacy PATH
-# segments it never creates, never repairs, and which hold no integrity-gated
-# binary: this is a dev box whose operator reshapes /config on purpose, and `fatal`
-# sleeps 10s and exits, so a boot that aborts on operator-owned state leaves no way
-# in to fix it.
+# "Failure posture" section). owned=1 is for the NINE directories the entrypoint
+# creates itself — /config, $TOOLS, $TOOLS/bin, $TOOLS/opt, $TOOLS/npm,
+# $TOOLS/npm/bin, $TOOLS/python, $TOOLS/python/bin and $TOOLS/kiro-cli-versions,
+# which is exactly the make_config_dir list outside $HOME. Two properties put a
+# directory in that set and both are needed: the entrypoint CREATES it, so a
+# symlink or a plain file there is unambiguously anomalous rather than the
+# operator's shape, and a reinstall REPAIRS its contents (the toolbelt engine
+# reinstalls a tool it finds missing, the kiro-cli manager reinstalls from the
+# pinned archive), so refusing to boot costs a download rather than data.
+#
+# The npm and python roots are in that set for the same reason $TOOLS/bin is:
+# $TOOLS/bin leads PATH and its entries are symlinks INTO opt/, npm/bin/ and
+# python/bin/, so root executes what those trees hold — and no leaf-file chmod
+# stops a foreign host user who can write the ROOT from replacing a launcher.
+#
+# owned=0 is for $TOOLS/go and $TOOLS/go/bin, i.e. GOPATH/bin and its parent: on
+# PATH but never created and never repaired here, and holding no integrity-gated
+# binary (a `go install` lands whatever the operator asked for). This is a dev box
+# whose operator reshapes /config on purpose, and `fatal` sleeps 10s and exits, so
+# a boot that aborts on operator-owned state leaves no way in to fix it.
+#
+# Two halves below, and the second is not optional. The BEHAVIOURAL half drives the
+# extracted function against temp dirs, one owned value at a time. The CALL-SITE
+# half reads the shipped boot path and pins WHICH directory gets which value —
+# nothing about the function's own behaviour can see that, so without it, flipping
+# a fail-closed root to warn-only is a silent one-token edit.
+#
 # Lint directives for this whole file, each against a stated guarantee rather than
 # an assumption:
 #   SC2015 - the assertion form `[ cond ] && ok "..." || no "..."` cannot mis-fire,
 #     because lib.sh's ok/no return 0 unconditionally by design (see their comment).
+#   SC2016 - the call-site expectations below must stay single-quoted: they compare
+#     the LITERAL text of the shipped script ($TOOLS as written, unexpanded).
 #   SC2329 - the stat/chmod stubs below are invoked INDIRECTLY, by the extracted
 #     function they shadow, which shellcheck cannot see.
-# shellcheck disable=SC2015,SC2329
+# shellcheck disable=SC2015,SC2016,SC2329
 set -u
 
 # shellcheck source-path=SCRIPTDIR
@@ -131,6 +153,23 @@ attempt "$R/seg" 0
 [ "$tools_tree_was_writable" -eq 0 ] && ok "unowned writable: quarantine NOT armed" \
   || no "unowned quarantine" "armed a kiro-cli quarantine for a tree that holds none"
 
+# --- owned + arm=0: the package-manager roots' live shape -----------------------
+# All four npm/python roots are called `secure_tools_dir <dir> 0 1`, a COMBINATION
+# neither block above states: fail-closed like an owned tree, but no kiro-cli
+# quarantine, because a launcher tree never holds the pinned CLI. So a
+# group/other-writable one must be tightened, must NOT arm the taint (that would
+# re-download kiro-cli over an unrelated tree's mode), and must NOT abort — the
+# mode is fixable, and only an UNFIXABLE state earns a fatal.
+R=$(mk) && mkdir -p "$R/npm" && chmod 0777 "$R/npm"
+attempt "$R/npm" 1
+MODE=$(stat -c '%a' "$R/npm" 2>/dev/null)
+if [ "$FATALED" -eq 0 ] && [ $((8#$MODE & 0022)) -eq 0 ] && [ "$tools_tree_was_writable" -eq 0 ] \
+  && warned 'permits group/other writes; tightening it (no kiro-cli quarantine'; then
+  ok "owned + arm=0 writable (the npm/python shape): tightened to $MODE, no quarantine, no abort"
+else
+  no "owned arm=0 writable" "fataled=$FATALED mode=$MODE armed=$tools_tree_was_writable log: $(cat "$WARNLOG")"
+fi
+
 # --- the owned fail-CLOSED postconditions: mode that cannot be PROVED clean -------
 # These three are the point of the whole gate: the tree holds the first-on-PATH
 # kiro-cli, so an unprovable or unfixable mode must stop the boot. Each failure is
@@ -169,5 +208,66 @@ attempt "$R/owned" 1
 unset -f stat
 [ "$FATALED" -eq 1 ] && ok "owned unverifiable tightening: fails closed on the second stat" \
   || no "owned unverifiable tightening" "trusted a tighten it could not re-read"
+
+# --- the CALL SITES: which directories are fail-closed --------------------------
+# Everything above tests the function GIVEN an owned value. This half tests the
+# mapping, which is where the real risk lives: the policy is one token per call
+# site, so demoting a fail-closed root to warn-only is a two-character edit that
+# no behavioural assertion can notice.
+#
+# Field 4 of a call is the `owned` argument; ABSENT means the function's own
+# default (`owned=${3:-1}`), which is how the five original roots are written, so
+# the parse has to supply that default rather than reading a missing field as 0.
+call_pairs() {
+  grep -E '^[[:space:]]*secure_tools_dir ' "$ENTRYPOINT" \
+    | sed 's/^[[:space:]]*//' \
+    | awk '{ owned = ($4 == "" ? 1 : $4); gsub(/"/, "", $2); print $2, owned }'
+}
+
+# A precondition, not an assertion: with no call sites parsed, every set
+# comparison below would compare two empty sets and report green.
+CALLS=$(call_pairs)
+if [ -z "$CALLS" ]; then
+  printf 'harness error: no secure_tools_dir call sites parsed out of %s\n' "$ENTRYPOINT" >&2
+  exit 1
+fi
+
+# The whole fail-closed set, as a set: this fails both when a root is demoted and
+# when a NEW one is added, because either way the three places that describe this
+# policy (the function's doc comment, the steering doc, this file) have drifted
+# from the code. Both sides go through the same `LC_ALL=C sort`, so the assertion
+# is about membership and never about the collation order of `$` versus `/`.
+OWNED_EXPECTED=$(printf '%s\n' \
+  /config '$TOOLS' '$TOOLS/bin' '$TOOLS/opt' \
+  '$TOOLS/npm' '$TOOLS/npm/bin' '$TOOLS/python' '$TOOLS/python/bin' \
+  '$TOOLS/kiro-cli-versions' | LC_ALL=C sort)
+OWNED_ACTUAL=$(printf '%s\n' "$CALLS" | awk '$2 == 1 { print $1 }' | LC_ALL=C sort)
+if [ "$OWNED_ACTUAL" = "$OWNED_EXPECTED" ]; then
+  ok "the fail-closed (owned=1) set is exactly the nine directories the entrypoint creates"
+else
+  no "owned=1 set drifted" "expected [$(printf '%s' "$OWNED_EXPECTED" | tr '\n' ' ')] but the boot path has [$(printf '%s' "$OWNED_ACTUAL" | tr '\n' ' ')] -- if intended, update secure_tools_dir's doc comment and web-terminal-kiro.md 'Failure posture' in the same change"
+fi
+
+# Named individually as well as in the set above, because these four are the ones
+# whose membership is not self-evident, and a per-root failure says WHY.
+for pm in '$TOOLS/npm' '$TOOLS/npm/bin' '$TOOLS/python' '$TOOLS/python/bin'; do
+  printf '%s\n' "$CALLS" | grep -qxF -- "$pm 1" \
+    && ok "$pm is fail-closed (owned=1)" \
+    || no "$pm owned argument" "not called with owned=1; \$TOOLS/bin symlinks into this tree and root executes what it finds there, so warn-only lets a foreign host user who can write this root replace a launcher"
+done
+
+# And the warn-only side, pinned in both directions: exactly one call site passes
+# owned=0, it is the loop variable, and the loop feeding it iterates exactly
+# GOPATH/bin and its parent. Without the second half, "only $path_dir is
+# warn-only" would stay green while the loop was widened to sweep a fail-closed
+# root into it.
+OWNED0=$(printf '%s\n' "$CALLS" | awk '$2 == 0 { print $1 }' | LC_ALL=C sort)
+[ "$OWNED0" = '$path_dir' ] \
+  && ok "exactly one warn-only call site, and it is the legacy-PATH-segment loop" \
+  || no "owned=0 set drifted" "warn-only call sites are [$(printf '%s' "$OWNED0" | tr '\n' ' ')], expected only the \$path_dir loop"
+
+grep -qF 'for path_dir in "$TOOLS/go" "$TOOLS/go/bin"; do' "$ENTRYPOINT" \
+  && ok "the warn-only loop iterates exactly \$TOOLS/go and \$TOOLS/go/bin" \
+  || no "warn-only loop contents" "the loop feeding the owned=0 call no longer iterates exactly GOPATH/bin and its parent"
 
 report

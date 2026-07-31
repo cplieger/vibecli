@@ -227,7 +227,12 @@ function expectPristineOverlayUntouched(overlay: HTMLElement, root: HTMLElement)
 // discovery cannot drift per test.
 function readWatchdogSource(): string {
   const html = readStaticAsset("index.html");
-  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)].filter(
+  // The end-tag half is `<\/script\b[^>]*>`, not `<\/script\s*>`: an HTML parser
+  // ends a script element at `</script foo>` and `</script\t\n bar>` too, so a
+  // pattern that only tolerates whitespace before `>` reads past a real end tag
+  // and swallows the rest of the document into match[2]. The `\b` keeps
+  // `</scriptfoo>` out, which is not an end tag for this element.
+  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\b[^>]*>/gi)].filter(
     (match) => !/src\s*=/i.test(match[1] ?? "") && !/importmap/i.test(match[1] ?? ""),
   );
   expect(scripts).toHaveLength(1);

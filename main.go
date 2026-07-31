@@ -482,18 +482,32 @@ func main() {
 	mux := http.NewServeMux()
 	var ready webhttp.Ready
 
+	// Tab names come from kiro-cli's own session record. The state root is
+	// container-local on purpose: a mapping is only meaningful for a LIVE tab, and
+	// this app persists no session state (terminal state is the in-memory VT
+	// buffer), so nothing here should outlive the container. A failure to create
+	// the directory is a warn, not fatal — the hook then writes nothing, no tab
+	// gets a client title, and the engine's automatic ladder still names them.
+	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
+	if err := titles.ensureStateDir(); err != nil {
+		slog.Warn("session title state dir could not be created; tabs will fall back to the automatic name ladder",
+			"dir", titles.titleStateDir(), "error", err,
+			"hint", "kiro-cli session titles need this directory writable by the server and by the hook it seeds")
+	}
+
 	mgr, cspPolicy, err := registerRoutes(mux, &routeDeps{
-		staticFS:     staticFS,
-		cmd:          kiro.cmd,
-		sessionEnv:   kiro.env,
-		workDir:      workDir,
-		ready:        &ready,
-		kiroReady:    kiro.ready,
-		kiroRescan:   kiro.rescan,
-		logOSCText:   logOSCText,
-		tools:        tools.engine,
-		toolsSyncing: tools.syncing,
-		toolsState:   tools.state,
+		staticFS:        staticFS,
+		cmd:             kiro.cmd,
+		sessionEnv:      kiro.env,
+		sessionTitleEnv: titles.sessionEnv,
+		workDir:         workDir,
+		ready:           &ready,
+		kiroReady:       kiro.ready,
+		kiroRescan:      kiro.rescan,
+		logOSCText:      logOSCText,
+		tools:           tools.engine,
+		toolsSyncing:    tools.syncing,
+		toolsState:      tools.state,
 	})
 	if err != nil {
 		slog.Error("route registration failed; the embedded static tree is unusable",
@@ -542,6 +556,11 @@ func main() {
 	// cancels on shutdown; see that hook's comment for why cancelling baseCtx
 	// (not srv.Shutdown) is what unblocks the always-open SSE stream.
 	srv.BaseContext = func(net.Listener) context.Context { return baseCtx }
+
+	// Poll kiro-cli session titles onto the engine's client title rung for as long
+	// as the server serves. Bound to baseCtx, which the pre-drain hook cancels, so
+	// this stops with the rest of the request-scoped work.
+	go titles.Run(baseCtx, mgr)
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)

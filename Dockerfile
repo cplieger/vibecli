@@ -285,6 +285,17 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
 # Must run before the binary build because main.go's `//go:embed static`
 # captures static/ at `go build` time.
 #
+# Re-arm the bash SHELL before the bash-only RUNs below. It is already declared
+# at the top of this stage and nothing changed it, but hadolint (>=2.15.0) resets
+# its shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
+# directive -- the Renovate-pinned ARGs above do exactly that -- and then
+# shellchecks the rest of the stage as sh, calling this file's bash arrays
+# (SC3054) and process substitution (SC3001) undefined. Re-declaring keeps those
+# two checks live and real, where suppressing the codes on the instruction would
+# switch them off for good. Docker-side this is a no-op: same shell, no layer.
+# Drop it when upstream honours the first declaration again.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
 # Step 1: tsc --project compiles app TS — tsconfig.json's outDir is
 # "../static", so tsc writes static/app.js directly into the embed tree.
 # The lib import (`@cplieger/web-terminal-ui`) is preserved in the emit as a

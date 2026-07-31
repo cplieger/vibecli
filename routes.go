@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -902,43 +901,6 @@ func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, st
 	}
 }
 
-// isLoopbackIP reports whether s parses as an IP literal in the loopback range.
-// The shared tail of the tools gate's two legs, so the fail-closed answer for an
-// unparseable value (nil ip) is defined once for both.
-func isLoopbackIP(s string) bool {
-	ip := net.ParseIP(s)
-	return ip != nil && ip.IsLoopback()
-}
-
-// loopbackPeer reports whether an http.Request.RemoteAddr belongs to a
-// loopback socket peer. Forwarded headers play no part — RemoteAddr is set
-// by the server from the accepted connection. Malformed values fail closed.
-// (The KWEB_ALLOWED_HOSTS gate's loopback carve-out lives in
-// webhttp.HostPolicy; this local helper serves only the loopbackOnly tools
-// gate below.)
-func loopbackPeer(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		return false
-	}
-	return isLoopbackIP(host)
-}
-
-// loopbackHost reports whether a request's Host header names the local host:
-// "localhost" or a loopback IP literal, canonicalized by webhttp.CanonicalHost
-// (so 127.0.0.1:9848, [::1]:9848 and localhost all match, and a malformed Host
-// canonicalizes to "" and fails closed). Paired with loopbackPeer this is the
-// both-ends test webhttp.WithLoopbackExempt applies to the KWEB_ALLOWED_HOSTS
-// carve-out: a DNS-rebound page carries the ATTACKER's name in Host even when
-// its socket peer is loopback, so the peer check alone does not close CWE-346
-// wherever the browser and the server share a loopback interface (host
-// networking, a bare `go run`, or any same-host proxy that forwards the public
-// Host).
-func loopbackHost(host string) bool {
-	canon := webhttp.CanonicalHost(host)
-	return canon == "localhost" || isLoopbackIP(canon)
-}
-
 // proxyProvenanceHeaders are the headers a request acquires by travelling
 // through a browser or a reverse proxy. The loopback gate's consumer is an
 // in-container CLI client, which sends none of them, so their presence is
@@ -946,7 +908,7 @@ func loopbackHost(host string) bool {
 // even when the socket peer and Host both canonicalize to loopback (a proxy
 // sharing the loopback interface with the server — host networking, a shared
 // network namespace — rewrites Host to its upstream address by default in
-// nginx and Apache, which passes loopbackHost).
+// nginx and Apache, which satisfies webhttp.LoopbackRequest's Host leg).
 var proxyProvenanceHeaders = []string{
 	"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
 	"X-Real-Ip", "Sec-Fetch-Site", "Origin",
@@ -964,17 +926,21 @@ func proxiedOrigin(h http.Header) bool {
 }
 
 // loopbackOnly admits only requests whose SOCKET PEER *and* Host header are
-// both loopback, and which carry no proxy/browser provenance header. Forwarded
-// headers are never TRUSTED — they can only refuse, never admit — and this gate
-// is the guarded surface's only boundary on an otherwise-unauthenticated port.
+// both loopback, and which carry no proxy/browser provenance header. The
+// two-legged loopback test is webhttp.LoopbackRequest — the shared conjunction
+// the library exports, which reads only RemoteAddr and Host and fails closed on
+// either being unparseable; the provenance refusal stays THIS app's policy,
+// composed on top as an additional deny. Forwarded headers are never TRUSTED —
+// they can only refuse, never admit — and this gate is the guarded surface's
+// only boundary on an otherwise-unauthenticated port.
 // In-container consumers (kiro-cli's ! escape hitting curl localhost:9848) pass;
 // everything routed in from outside — LAN browsers, the reverse proxy — is
 // refused, as is a DNS-rebound page whose loopback socket peer carries an
 // attacker Host, and a same-loopback proxy that rewrites Host to its upstream
-// address (nginx's and Apache's defaults) and so satisfies both original legs.
+// address (nginx's and Apache's defaults) and so satisfies both loopback legs.
 func loopbackOnly(surface string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !loopbackPeer(r.RemoteAddr) || !loopbackHost(r.Host) || proxiedOrigin(r.Header) {
+		if !webhttp.LoopbackRequest(r) || proxiedOrigin(r.Header) {
 			webhttp.WriteError(w, r, http.StatusForbidden, "",
 				surface+" is loopback-only; call it from inside the container (curl localhost:9848)")
 			return

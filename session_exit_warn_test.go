@@ -26,9 +26,21 @@ import (
 // Synchronization: the manager's session status derives from Handler.Exited(),
 // whose procExitCh closes only AFTER the engine's process monitor has invoked
 // the OnProcessExit callback (terminal.go: the callback runs in the monitor
-// body, the channel close in its defer). Polling GET /api/sessions for
-// "exited" is therefore a deterministic happens-after barrier for the Warn
-// decision on BOTH branches — no bare sleep guessing.
+// body, the channel close in its defer). Polling GET /api/sessions for a
+// TERMINAL status is therefore a deterministic happens-after barrier for the
+// Warn decision on BOTH branches — no bare sleep guessing.
+//
+// The barrier accepts EITHER terminal status, because which one the engine
+// reports is not this test's subject. Engine v3.3.0 split session exit in two
+// (refinedStatus reads Handler.exitOutcome): StatusCrashed for a non-zero
+// status or an unrequested terminating signal, StatusExited narrowed to an
+// ordinary end — status 0, or any exit the server itself caused. /bin/false
+// exits 1 unprompted, so it lands on crashed, while a teardown-initiated Close
+// of the same session lands on exited. Both mean the monitor ran, which is the
+// only thing the barrier needs; classifying the exit is the engine's own test's
+// job, not a consumer's. Matching only "exited" is what stalled the v3.2.1 ->
+// v3.3.2 bump: all three rows burned their full deadline on a session already
+// sitting at crashed.
 //
 // Serial: capture.Default mutates the process-global default logger, and the
 // factory binds its session logger from slog.Default() at Create time (no
@@ -49,11 +61,14 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		for {
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, terminal.SessionsPath, http.NoBody))
-			if strings.Contains(rec.Body.String(), `"status":"`+terminal.StatusExited+`"`) {
+			body := rec.Body.String()
+			if strings.Contains(body, `"status":"`+terminal.StatusExited+`"`) ||
+				strings.Contains(body, `"status":"`+terminal.StatusCrashed+`"`) {
 				return records
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("session never reported exited; body %s", rec.Body.String())
+				t.Fatalf("session never reported a terminal status (%s or %s); body %s",
+					terminal.StatusExited, terminal.StatusCrashed, body)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

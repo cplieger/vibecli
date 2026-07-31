@@ -36,13 +36,13 @@ set -u
 # yields an empty match, which the guard below turns into a silent no-op (the
 # tab keeps the server's automatic name) rather than a wrong mapping.
 payload=$(cat)
-kiro_session=$(printf '%s' "$payload" |
-	sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-	head -n 1)
+kiro_session=$(printf '%s' "$payload" \
+  | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  | head -n 1)
 
 case "$kiro_session" in
-sess_*) ;;
-*) exit 0 ;;
+  sess_*) ;;
+  *) exit 0 ;;
 esac
 
 # The tab id becomes a filename, so refuse anything that is not the server's own
@@ -50,7 +50,7 @@ esac
 # validates this again on read; both sides check because neither owns this file
 # exclusively.
 case "$KWEB_SESSION_ID" in
-*[!A-Za-z0-9_-]* | '') exit 0 ;;
+  *[!A-Za-z0-9_-]* | '') exit 0 ;;
 esac
 
 mkdir -p "$KWEB_TITLE_STATE_DIR" 2>/dev/null || exit 0

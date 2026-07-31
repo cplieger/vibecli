@@ -4,6 +4,11 @@
 FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS builder
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# Official Go tarballs currently set GOTOOLCHAIN=auto in $GOROOT/go.env; keep it
+# explicit here so the builder's policy does not depend on that packaged default. A
+# downloaded toolchain is checksum-database verified, so the tarball sha gate keeps
+# its meaning when go.mod requires a newer toolchain.
+ENV GOTOOLCHAIN=auto
 
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -40,7 +45,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # the `typescript` package's per-platform `tsc`
 # (@typescript/typescript-linux-<arch>, published in lockstep with the
 # metapackage). Runtime LSPs are not baked — the toolbelt engine installs
-# them on demand from the /config/tools.json manifest.
+# them on demand from the /config/tools/tools.json manifest.
 # renovate: datasource=npm depName=typescript
 ARG TS_VERSION=7.0.2
 # sha256 of the platform-specific tsc tarball, per arch. npm publishes SHA-512
@@ -48,6 +53,17 @@ ARG TS_VERSION=7.0.2
 # move these — the manual-sha-bump rule in cplieger/.github (scoped to this
 # repo) labels the PR with the recompute commands. Update both alongside
 # TS_VERSION (the linux-x64 and linux-arm64 packages publish in lockstep).
+# Upstream toolchain vuln tracking: the pinned 7.0.2 tsc binaries were built
+# with Go 1.26.4 + golang.org/x/text v0.38.0, which govulncheck -mode=binary
+# flags for GO-2026-5970 / GO-2026-5856 / GO-2026-4970. The compiler lives
+# only in this discarded builder stage, so the residual risk is build/CI
+# denial of service on crafted compiler input — nothing vulnerable ships in
+# the runtime image. No rebuilt upstream package exists yet (7.0.2 is npm's
+# latest). On the next TS native-compiler release: bump TS_VERSION and both
+# shas together, then verify `go version -m` on both downloaded tsc binaries
+# shows Go >= 1.26.5 and x/text >= v0.39.0, and re-run
+# `govulncheck -mode=binary` as the gate. Never drop these sha256 checks or
+# substitute an unpinned latest package while waiting.
 ARG TS_SHA256_X64=7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
 ARG TS_SHA256_ARM64=c83d931ac9dd7549cde6e71246aa9d6a9812843023df3e277fe3b5dcf41dd0ea
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -90,18 +106,48 @@ COPY required-tools.txt ./
 # registries' MIT license texts travel INSIDE the JSON) is DATA on a
 # daily upstream cadence — the runtime engine refreshes it at boot and
 # on a schedule (TOOL_CATALOG_REFRESH), so this baked copy only serves
-# a container that has never reached the publisher. Fetched unpinned
-# (latest release; TLS + first-party): the verify pass below re-gates
-# whatever arrives, asserting every required-tools.txt name resolves to
+# a container that has never reached the publisher. Fetched from an
+# IMMUTABLE release asset and gated on TOOL_CATALOG_SHA256 before use:
+# `latest/download` was mutable, and TLS authenticates GitHub, not the
+# artifact, so a swapped release asset (compromised publisher account)
+# could replace the catalog between otherwise identical builds. That
+# matters because catalog entries carry install recipes (including the
+# `manual` shell-command source) executed by the root-running tool
+# engine. `toolcatalog verify` below is a SEMANTIC coverage gate, not an
+# authenticity one: it asserts every required-tools.txt name resolves to
 # usable install knowledge for linux amd64+arm64 — a published catalog
 # that drops a seed or migration tool FAILS THE BUILD here, and the
-# runtime refresh re-runs the same check before every swap.
-ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/latest/download/tool-catalog.json
+# runtime refresh re-runs the same check before every swap. The two
+# checks cover different threats; both run, authenticity first.
+# TOOL_CATALOG_VERSION + TOOL_CATALOG_SHA256 move together in one
+# Renovate PR (the `# tool-catalog <version>` trailer is the digest's
+# version anchor — same trailer model as the kiro-cli/golang per-arch sha
+# pins; the grouping + digest recompute rule lives in cplieger/.github's
+# default.json, never in this repo's inherited renovate.json). The
+# publisher's cadence is daily; the pin means the baked fallback is a
+# REVIEWED catalog, while the runtime refresh keeps a running container
+# current.
+# renovate: datasource=github-releases depName=cplieger/tool-catalog
+ARG TOOL_CATALOG_VERSION=v2026.07.24.1907
+ARG TOOL_CATALOG_SHA256=651d11d218a313a029d7a7ad15eedccdaa1c2c7a48aad39661c33d0684b864cb # tool-catalog v2026.07.24.1907
+ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/${TOOL_CATALOG_VERSION}/tool-catalog.json
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.3.1
+# This is the SAME module go.mod requires (the runtime engine that re-verifies
+# required-tools.txt before every catalog swap), pinned a second time here to
+# select the build-time `toolcatalog verify` binary. The toolbelt-pin-gate in
+# the RUN below asserts the two pins are equal, so the build gate and the
+# runtime gate can never become different verifiers — same fail-loud treatment
+# the engine/UI/tsc pin pairs get against static-src/package.json.
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.0
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
+    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
+    if [ "$TOOLBELT_GOMOD" != "$TOOLBELT_TOOLCATALOG_VERSION" ]; then \
+      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v2 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
+    fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
+    printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
     go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
@@ -131,9 +177,9 @@ RUN mkdir -p static/vendor/fonts && \
 # ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
 # deemed in scope (at the cost of a manual sha bump on each engine/UI release).
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.2.0
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.3.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.8.1
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.1.0
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is
@@ -145,9 +191,13 @@ ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=4.8.1
 # release (a Go-only release moves the tag without publishing npm, so lockstep
 # is not satisfiable); wire compatibility across the two halves is the
 # engine's own contract (wire_binary protocol version + the conformance
-# suite), not a version-string equality. Renovate moves the ARG+package.json
-# pins in one grouped PR on the routine path; this gate catches the human
-# bypass.
+# suite), not a version-string equality — asserted mechanically by the
+# wire-floor gate after the vendor fetch below. Renovate moves the
+# ARG+package.json pins in one grouped PR on the routine path; this gate
+# catches the human bypass. The tsc compiler pair (ARG TS_VERSION vs
+# static-src/package.json's @typescript/native pin) is asserted for the same
+# dev/prod-parity reason: the served bundle must be compiled by the same tsc
+# version local dev typechecked against.
 COPY static-src/package.json static-src/package.json
 RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p' static-src/package.json) && \
     UI_NPM=$(sed -n 's|.*"@cplieger/web-terminal-ui": "\([^"]*\)".*|\1|p' static-src/package.json) && \
@@ -158,6 +208,11 @@ RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p
     fi && \
     if [ "$UI_NPM" != "$CPLIEGER_WEB_TERMINAL_UI_VERSION" ]; then \
       echo "ERROR ui-pin-mismatch: static-src/package.json pins @cplieger/web-terminal-ui ${UI_NPM} but Dockerfile ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=${CPLIEGER_WEB_TERMINAL_UI_VERSION}" >&2; exit 1; \
+    fi && \
+    TSC_NPM=$(sed -n 's|.*"@typescript/native": "npm:typescript@\([^"]*\)".*|\1|p' static-src/package.json) && \
+    : "${TSC_NPM:?pin-gate: no @typescript/native pin found in static-src/package.json}" && \
+    if [ "$TSC_NPM" != "$TS_VERSION" ]; then \
+      echo "ERROR tsc-pin-mismatch: static-src/package.json pins @typescript/native npm:typescript@${TSC_NPM} but Dockerfile ARG TS_VERSION=${TS_VERSION}" >&2; exit 1; \
     fi && \
     mkdir -p static-src/node_modules/@cplieger/web-terminal-engine static-src/node_modules/@cplieger/web-terminal-ui && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/engine.tgz "https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-${CPLIEGER_WEB_TERMINAL_ENGINE_VERSION}.tgz" && \
@@ -173,6 +228,59 @@ RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p
 # dev copies.
 COPY . ./
 
+# Wire-floor gate (cross-language compatibility): go.mod's engine module and
+# the ARG-pinned npm client version independently (see the pin gate above),
+# so their pairing is governed by the engine's exported wire-compatibility
+# floors, not version strings. Assert both directional floors at build time —
+# a declared-incompatible pairing would refuse every session at first connect
+# (close code 4002) while /api/health stays green, so fail HERE instead.
+# Client constants come from the vendored artifact fetched above (published
+# source, frozen export shape); server constants come from the engine's
+# public Go API inside scripts/wirecheck (no source scraping on the Go half).
+#
+# The gate is BUILT and then INVOKED, never `go run`: `go run` reports its OWN
+# exit status 1 for any non-zero program exit (it prints "exit status 2" to
+# stderr but does not propagate the 2), which collapses the gate's two failure
+# modes into one code. They mean opposite things — exit 2 is "the extraction
+# below is broken, fix the gate, do NOT bump a pin", exit 1 is "genuine wire
+# incompatibility, move a pin" — so the machine-readable half of that
+# distinction only survives when the compiled binary is the process the shell
+# observes. The binary is written into a tmpfs mount, so it is discarded when
+# the RUN ends and lands in neither this stage's layer nor a later one; it is a
+# build-time gate with no runtime role.
+#
+# FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): the two
+# `sed` scrapes below parse the vendored engine's TypeScript SOURCE for the
+# client wire constants. The engine now generates a language-neutral manifest
+# for exactly this consumer — `wire-compatibility.json` at the package root
+# (published via the npm `files` list and the `./wire-compatibility.json`
+# export subpath, so the vendored tarball carries it at
+# static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json).
+# Shape: {"schemaVersion":1,"generatedBy":...,"wireCompatibility":
+# {"protocolVersion","minimumServerProtocolVersion","incompatibleCloseCode"}};
+# read `schemaVersion` first and reject an unknown one. When the engine version
+# this Dockerfile pins carries that file, the parsing should move INTO
+# scripts/wirecheck (a `-manifest <path>` flag reading the JSON with
+# encoding/json), where it is unit-testable, rather than being reimplemented as
+# a shell JSON scrape: these `sed` lines and their `${VAR:?}` guards exist only
+# because shell had to do the parsing, and their failure mode (a silently empty
+# capture) is the reason the guards are loud.
+#
+# No `hadolint ignore=DL3062` here any more: that rule fires on an unpinned
+# `go run`/`go install <pkg>` (it wants `@<version>`), which is meaningless for
+# a local path — and with the `go run` gone, `go build ./scripts/wirecheck` does
+# not trip it at all (verified with hadolint 2.14.0). Do not re-add the ignore;
+# an unneeded one suppresses a real future warning on this step.
+RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=tmpfs,target=/tmp/wirecheck-bin \
+    WIRE_TS=static-src/node_modules/@cplieger/web-terminal-engine/src/wire-compatibility.ts && \
+    CLIENT_REV=$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
+    CLIENT_MIN_SERVER=$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
+    : "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
+    : "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
+    go build -o /tmp/wirecheck-bin/wirecheck ./scripts/wirecheck && \
+    /tmp/wirecheck-bin/wirecheck -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+
 # Compile client TypeScript and the engine + UI libs in a single layer.
 # Must run before the binary build because main.go's `//go:embed static`
 # captures static/ at `go build` time.
@@ -187,7 +295,16 @@ COPY . ./
 # browser can fetch the compiled JS via the importmap. Internal imports (the
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
-RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -name '*.ts') && \
+# -type f, not a bare -name: a directory, symlink or FIFO named *.ts in a
+# mis-published or crafted vendored tarball would otherwise be handed to tsc, and
+# a FIFO blocks the build forever with no deadline -- the same class
+# scripts/css-bundle.sh refuses per MANIFEST entry for the CSS half of this build.
+RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -type f -name '*.ts') && \
+    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -type f -name '*.ts') && \
+    { [ "${#ui_ts[@]}" -gt 0 ] \
+      || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
+    { [ "${#engine_ts[@]}" -gt 0 ] \
+      || { echo "ERROR engine-src-empty: no *.ts under the vendored @cplieger/web-terminal-engine src tree (tarball layout changed?)" >&2; exit 1; }; } && \
     /tmp/package/lib/tsc --project static-src/tsconfig.json && \
     /tmp/package/lib/tsc \
         --module ESNext \
@@ -197,7 +314,7 @@ RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/
         --rootDir static-src/node_modules/@cplieger/web-terminal-engine/src \
         --skipLibCheck \
         --strict \
-        static-src/node_modules/@cplieger/web-terminal-engine/src/*.ts && \
+        "${engine_ts[@]}" && \
     /tmp/package/lib/tsc \
         --module ESNext \
         --target ESNext \
@@ -206,7 +323,13 @@ RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/
         --rootDir static-src/node_modules/@cplieger/web-terminal-ui/src \
         --skipLibCheck \
         --strict \
-        "${ui_ts[@]}"
+        "${ui_ts[@]}" && \
+    for emitted in static/app.js \
+        static/vendor/cplieger-web-terminal-engine/index.js \
+        static/vendor/cplieger-web-terminal-ui/index.js \
+        static/vendor/cplieger-web-terminal-ui/presets.js; do \
+      [ -s "$emitted" ] || { echo "ERROR tsc-emit-missing: $emitted is absent or empty after the tsc steps; static/index.html's script and importmap targets would 404 at runtime (outDir/rootDir or vendored src layout drift?)" >&2; exit 1; }; \
+    done
 
 # Concatenate the UI package's per-feature CSS splits into the served bundle
 # (canonical recipe: scripts/css-bundle.sh, shared with scripts/dev-build.sh).
@@ -231,7 +354,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #     script; Debian's /bin/sh is dash)
 #   - ca-certificates + curl + unzip: kiro-cli installer + HTTPS trust
 #   - git: source control from inside the terminal (gh is NOT baked; it
-#     is opt-in via /config/tools.json)
+#     is opt-in via /config/tools/tools.json)
 #   - openssh-client: git over ssh (and gh over ssh once gh is enabled)
 #   - jq + less: standard kiro-cli diagnostic dependencies
 #   - libasound2: kiro-cli dlopens libasound.so.2 at runtime. It is NOT
@@ -267,27 +390,40 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 # Language servers and developer tools (gh, linters, runtimes) are NOT
 # baked into the image: the server's toolbelt engine installs them from
-# the /config/tools.json manifest (schema v2) against the image-baked
+# the /config/tools/tools.json manifest (schema v2) against the image-baked
 # catalog. First boot seeds disabled templates (gopls,
-# typescript-language-server, pyright, gh) — enable one by flipping
-# "disabled": false and restarting, or through the loopback tools API.
+# typescript-language-server, pyright, rust-analyzer, gh) — enable one by
+# flipping "disabled": false and restarting, or through the loopback tools API.
 # This keeps the image
 # ~32 MB slimmer and free of the daily LSP-bump rebuild churn.
 
 # kiro-cli installs under $HOME/.local. Home is under /config so the
 # install survives container restarts.
 ENV HOME=/config/home
-# PATH leads with the engine-managed bin dir. The legacy segments
-# (tools/go/bin, runtimes/{go,node}/bin) are retained for volumes whose
-# binaries predate the toolbelt engine; prune them once a startup audit
-# shows no binary resolves only through them (evidence-gated, not
-# release-count-gated). GOROOT/GOBIN are gone: the engine installs Go
-# under versioned opt/go/<ver>/ trees with a bin/go symlink and the
-# toolchain derives GOROOT itself; go-installed tools land in the bin
-# dir via the engine's own GOBIN env at install time.
-ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/tools/runtimes/go/bin:/config/tools/runtimes/node/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# PATH leads with the engine-managed bin dir. The two `runtimes/{go,node}/bin`
+# segments are GONE: the audit they were gated on ran on the borgcube volume
+# (2026-07) and found they held only go/gofmt and node/npm/npx, every one already
+# resolving through tools/bin to the engine's opt/<tool>/<ver>/ trees, so both
+# trees were deleted (265 MB) after symlinking the one exception, corepack, into
+# tools/bin. Keeping them on PATH after that bought nothing and cost real exposure:
+# they sit ahead of /usr/bin, are never created or repaired by this entrypoint, and
+# a binary planted while such a tree was group/other-writable stays executable by
+# root even after the mode is tightened (chmod stops new writes, it does not
+# re-verify existing files). Removing the segments removes that path instead of
+# policing it. Restoring a pre-toolbelt backup volume is the one case that
+# regresses; the remedy is the same one the audit used, symlink the exception into
+# tools/bin.
+# tools/go/bin STAYS: it is GOPATH/bin (see ENV GOPATH below), the landing site for
+# any `go install` run without the engine's GOBIN, and 18 binaries live there on the
+# real volume. Its residual exposure is accepted rather than hardened -- deleting a
+# user's own go-installed tools is the productivity harm the dev-box failure posture
+# forbids (web-terminal-kiro.md), and anyone able to plant there already holds
+# /config/home/.ssh and the auth tokens.
+# GOROOT/GOBIN are gone: the engine installs Go under versioned opt/go/<ver>/ trees
+# with a bin/go symlink and the toolchain derives GOROOT itself; go-installed tools
+# land in the bin dir via the engine's own GOBIN env at install time.
+ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-ENV KIRO_CLI_PATH=/config/tools/bin/kiro-cli
 ENV KWEB_WORK_DIR=/workspace
 ENV KWEB_ADDR=:9848
 
@@ -305,16 +441,78 @@ COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
 WORKDIR /workspace
 EXPOSE 9848
 
-# start-period covers the entrypoint's worst-case FOREGROUND path before the
-# server binds: kiro-cli download (curl --max-time 300) + install.sh (120) +
-# version/settings probes (~60) + optional APT_PACKAGES (600) ≈ 1080s, so 20m
-# with headroom. The same derived budget drives tests/image-smoke.conf's
-# SMOKE_TIMEOUT and scripts/dev-deploy.sh's DEPLOY_TIMEOUT (both 1260) — move
-# all three together whenever a foreground timeout changes. Tool installs
-# converge in the background AFTER bind (only session creation waits on
-# them), so /api/health is reachable throughout that window — it reports the
-# install state in the informational "tools" field without going
-# unhealthy. Under `restart: unless-stopped`, health failures are reported
+# start-period is the SELECTED startup tolerance for reaching a HEALTHY
+# /api/health, which means a completed kiro-cli install; it satisfies the
+# smoke-harness sizing rule (tests/image-smoke.conf SMOKE_TIMEOUT 1260 = 1200 +
+# two 30s probe intervals). KEPT AT 20m across the move of the installer into the
+# server: the work the budget has to cover is the same ~528MB download plus
+# install, and only its PLACE changed.
+#
+# What the ordering changed is the shape of a probe DURING that work, and it moved
+# in the operator's favour. The entrypoint no longer installs anything: it hardens
+# /config, optionally installs APT_PACKAGES, prunes superseded kiro-cli agent
+# runtimes, writes the theme and execs the server, so the listener binds within
+# seconds on a boot with no APT_PACKAGES. The install then runs in the background,
+# and a probe against it answers 503 with a reason (kiro-cli installing / install
+# retrying / unavailable) instead of being refused outright for want of a listener.
+# Health still only reports 200 once a version is active, so neither this budget
+# nor the smoke timeout got looser.
+#
+# FOREGROUND allowance-sum before the listener binds, explicit timeouts only:
+# APT_PACKAGES (apt-get update 300, +30 kill-after; apt-cache pkgnames 60, +10
+# kill-after; apt-get install 600, +30 kill-after) = 1030s with APT_PACKAGES, and
+# effectively zero without — every remaining step is untimed local work (directory
+# walks, stat/chmod, the agent-runtime prune, a small file write). That is a
+# ~4800s reduction against the pre-move sum, and it is why the container is now
+# observable during a first-boot download rather than connection-refused.
+#
+# The interrupted-dpkg recovery adds two more bounded steps to that sum
+# (dpkg --audit 300, +30 kill-after; dpkg --configure -a 300, +30 kill-after),
+# taking the worst case to 1690s — above this start-period. Those deadlines are
+# only REACHED on a boot following an APT_PACKAGES install that was killed
+# mid-transaction (a docker stop inside the install window), where apt state in
+# the container layer would otherwise refuse every later install for the
+# container's life. The audit probe is a no-op in the healthy case, so the 1030s
+# figure is the routine sum; the 1690s worst case is deliberately above the
+# budget for the same reason the download's is (see below).
+#
+# BACKGROUND allowance-sum for one install attempt, all AFTER the bind: the
+# archive fetch (bounded by a 60s no-progress stall guard and a 20s handshake
+# deadline rather than a wall-clock cap, so a slow-but-progressing link is not cut
+# off), local unzip and streaming SHA-256 (untimed, ~528MB), install.sh (120s),
+# one --version probe on the staged binary plus one per selection candidate (10s
+# each), and the settings calls (10s each: one required before publication, then
+# five against the active binary). The manager then retries a failed attempt up to
+# 4 times with 30s/60s/120s backoff, so a persistently failing install keeps the
+# server up for the container's lifetime and reports the reason on /api/health.
+#
+# THE BUDGET IS DELIBERATELY BELOW THE WORST CASE (decided 2026-07, unchanged by
+# the move). The two budgets protect different things and only one has teeth:
+#   - At RUNTIME `unhealthy` is cosmetic. The restart policy acts on process exit,
+#     not health status, so a very slow first boot shows unhealthy, keeps
+#     downloading, and converges once a version is active. /api/health is
+#     reachable throughout and names the phase, so the state is diagnosable while
+#     it lasts. Tool installs converge in the BACKGROUND alongside it (only
+#     session creation waits on them) and report through the informational "tools"
+#     field.
+#   - In CI the download runs on a GitHub-hosted runner over a fast link and takes
+#     minutes. A smoke boot that exceeds this start-period means something is
+#     genuinely wrong, so tests/image-smoke.sh failing there is CORRECT SIGNAL, not
+#     a false negative on a healthy image.
+# Raising both budgets to cover the retry envelope was considered and
+# rejected: it would make a genuinely hung CI job burn ~3 hours of Actions time
+# before failing, which is a real recurring cost against a theoretical worst case
+# (CI cost matters on the free plan; validation is meant to stay minutes, not
+# hours). Bounding or dropping the retries was also rejected: the stall guard
+# already aborts a link that stops making progress, so the retries exist for the
+# case worth keeping, a connection DROPPED mid-528MB.
+# What this accepts, stated plainly: a download slow enough to outlast the
+# start-period fails the smoke job, and an operator on a genuinely slow link sees
+# an unhealthy interval on first boot before it converges. Both are the intended
+# outcomes, not a gap awaiting a decision.
+# Keep this comment and tests/image-smoke.conf's header in lockstep whenever a
+# timeout on either side of the exec changes.
+# Under `restart: unless-stopped`, health failures are reported
 # but do not restart the container (restart policies react to process exit,
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.

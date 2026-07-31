@@ -1,116 +1,107 @@
-// web-terminal-kiro client entry point.
-//
-// All terminal behavior lives in the shared packages: the
-// @cplieger/web-terminal-engine engine (render / scroll / connection / keyboard)
-// and the @cplieger/web-terminal-ui reference UI (the modular kernel plus opt-in
-// features). web-terminal-kiro is the thinnest possible consumer: createTerminal builds the
-// whole terminal UI inside the #terminal root element with the agent-shell
-// feature set (presetAgentTabbed: tabs + activity monitor + touch toolbar +
-// context menu + clipboard + scroll-to-bottom + predictive echo + connection
-// banner + animations). web-terminal-kiro is an agent shell, so it wants the activity
-// monitor (per-tab working/done/needs-input dots); a generic terminal would use
-// the plain presetTabbed, which is label-only. Each browser tab drives its own
-// independent kiro-cli chat session
-// over the shared server; kiro-cli's TUI is rendered verbatim through the raw PTY
-// stream.
-//
-// The session WebSocket ("/ws") and font (Monaspace) use createTerminal's
-// defaults and are left implicit. The options passed are `features` (the agent
-// preset), `theme` (web-terminal-kiro's purple tokens), and -- only when present --
-// `loading`, the overlay element createTerminal fades out once the first frame
-// renders.
-
-import { createTerminal } from "@cplieger/web-terminal-ui";
+import { createTerminal, type CreateTerminalOptions } from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
+import type { PublicThemeToken } from "@cplieger/web-terminal-ui/style-contract";
 
-// Reveal the #loading overlay as an assertive alert with a fatal message.
-// remove("fade") undoes any fade-out createTerminal began; on the missing-root
-// path createTerminal never ran, so the remove is a harmless no-op.
-function showFatal(overlay: HTMLElement, message: string): void {
-  overlay.classList.remove("fade");
-  // index.html names the overlay "Loading" (aria-label); drop it so the
-  // alert's accessible name doesn't contradict the fatal message it now shows.
-  overlay.removeAttribute("aria-label");
-  overlay.setAttribute("role", "alert");
-  overlay.setAttribute("aria-live", "assertive");
-  overlay.textContent = message;
-  // manifest.json declares display: standalone, so an installed PWA has no browser
-  // chrome; "reload the page" needs an in-page affordance (Vercel: no dead ends).
-  const reload = document.createElement("button");
-  reload.type = "button";
-  reload.textContent = "Reload";
-  reload.addEventListener("click", () => {
-    window.location.reload();
-  });
-  overlay.append(" ", reload);
-}
+// The one brand accent, as bare hsl() components: the accent token and the two
+// alpha-blended tab fills below all compose from this single literal, so a hue
+// change cannot land on some of them only. Four sites cannot read this module and
+// must change with it -- static/index.html's <meta name="theme-color"> and its
+// #loading critical CSS (--wt-loading-accent, plus the .noscript-fallback
+// colour), and static/manifest.json's theme_color, where this colour is spelled
+// #c099ff -- or the installed-PWA chrome and the pre-JS overlay drift from the app
+// accent. app.test.ts's brand-accent parity test fails if they do.
+const ACCENT_HSL_COMPONENTS = "263.1683 100% 80%";
 
+// A stylesheet failure does not stop app.js from evaluating. If the inline
+// watchdog already converted #loading into a recovery dialog, do not let the
+// UI kernel remove that dialog when its first frame renders.
 const loading = document.getElementById("loading");
-const root = document.getElementById("terminal");
-if (!root) {
-  // Surface the failure on the page, not just the console: createTerminal (which
-  // fades the #loading overlay out on first frame) is never reached on this path,
-  // so without this the user is left on a stuck loading screen with no explanation.
-  if (loading) {
-    showFatal(
-      loading,
-      "Web Terminal for Kiro failed to start. Reload the page; if this persists the app was built incorrectly.",
-    );
-  }
-  throw new Error("web-terminal-kiro: missing #terminal root element");
+if (loading?.hasAttribute("data-bootstrap-fatal")) {
+  throw new Error(
+    "web-terminal-kiro: bootstrap watchdog already reported a fatal resource failure",
+  );
 }
-try {
-  createTerminal(root, {
-    features: presetAgentTabbed(),
-    // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships the
-    // neutral defaults). Recolors hovered/active tabs, the accent icons (the
-    // mobile "+", the toggled keyboard button), and the tab activity dots
-    // (--status-*, below). Since web-terminal-ui v4 all tokens
-    // live on .wt-root -- the element the theme is applied to -- so the library's
-    // --tab-active-border derivation (the fill lightened + slightly desaturated)
-    // already follows an overridden fill; the explicit re-declaration below is a
-    // deliberate pin of that same formula, kept so the edge stays low-saturation
-    // even if the library's derivation formula changes.
-    theme: {
-      "--accent": "hsl(263.1683 100% 80%)",
-      "--tab-hover-bg": "hsl(263.1683 100% 80% / 16%)",
-      "--tab-active-bg": "hsl(263.1683 100% 80% / 32%)",
-      "--tab-active-border": "color-mix(in oklch, var(--tab-active-bg), var(--text) 25%)",
-      "--tab-active-fg": "#fff",
-      // Tab activity-dot vocabulary (replaces the library defaults; ui >= the
-      // release that tokenized the dots -- older bundles ignore these and keep
-      // the defaults): violet = thinking, green = done, yellow = action
-      // required. One declared family -- 78% lightness / 0.15 chroma, only the
-      // hue carries the state -- sitting at the pastel accent's own level
-      // (#c099ff is ~oklch(76% 0.13 296deg)).
-      //
-      // Working is PINNED AS AN sRGB HEX while its two siblings stay in oklch,
-      // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
-      // is outside sRGB (linear blue 1.086) AND outside Display P3 (1.024), so
-      // it can never render as declared on any display we ship to: every screen
-      // shows a gamut-mapped approximation, and WHICH approximation is the
-      // browser's choice rather than ours. #c6a0ff is that approximation made
-      // explicit: it is exactly what Chromium paints for the formula on an sRGB
-      // display, deltaEOK 0.0099 from what a P3 display shows for it (a JND is
-      // ~0.02, so the pin is imperceptible on wide-gamut screens and a no-op on
-      // sRGB ones). The mathematically nearest sRGB colour is #c79eff, better by
-      // deltaEOK 0.0004, which is nothing. Green (150deg) and yellow (95deg) ARE
-      // in gamut at 0.15 chroma and render as declared (#67d283 / #d6b529), so
-      // they keep the formula.
-      //
-      // Hue alone never carries state (pulse/ring/shape per WCAG 1.4.1):
-      // working and input share one ringed silhouette -- live pulses, blocked
-      // is frozen -- and done stays the bare disc. Both rings derive from
-      // their own token inside the library CSS.
-      "--status-working": "#c6a0ff",
-      "--status-done": "oklch(78% 0.15 150deg)",
-      "--status-input": "oklch(78% 0.15 95deg)",
-    },
-    ...(loading ? { loading } : {}),
-  });
-} catch (e) {
-  if (loading) {
-    showFatal(loading, "Failed to start the terminal. Reload the page to retry.");
-  }
-  throw e;
+
+const options: CreateTerminalOptions = {
+  // Every session is an agent expected to report OSC 9;4, so show its activity
+  // dot from tab creation. Pass the function so preset failures remain inside
+  // createTerminal's recovery boundary.
+  features: presetAgentTabbed,
+  // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships
+  // the neutral defaults). Reaches the ACTIVE tab (fill/edge/label, desktop strip
+  // + mobile switcher row), the accent icons (the mobile "+", the toggled keyboard
+  // button), the hover/press fill of the mobile switch and "+" buttons, and the
+  // activity dots (--status-*, below). What --tab-hover-bg does NOT reach: either
+  // tab HOVER state, desktop or mobile -- the library keeps its own neutral lift
+  // there deliberately (a translucent accent wash over a filled chip reads as
+  // "more transparent", not "lighter"), so a hovered inactive tab stays grey
+  // however this token is set. The active tab's EDGE is themed without an
+  // override of its own: the library derives --tab-active-border from
+  // --tab-active-bg (mixed 25% toward its own text colour) and custom properties
+  // resolve at USE time, so the brand fill set above is what that derivation
+  // consumes. That fill is deliberately app-owned and deliberately NOT the
+  // sibling web-terminal-server's edge, which takes the library's accent-derived
+  // blue default -- so the derived edge carries THIS app's purple, not a shared
+  // one. Do not re-add a --tab-active-border override restating the library's
+  // formula: it read var(--text), an internal library token, for a
+  // byte-identical result, and app.test.ts now fails any theme value reading a
+  // token outside PUBLIC_THEME_TOKENS.
+  theme: {
+    "--accent": `hsl(${ACCENT_HSL_COMPONENTS})`,
+    "--tab-hover-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 16%)`,
+    "--tab-active-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 32%)`,
+    "--tab-active-fg": "#fff",
+    // Tab activity-dot vocabulary for the three states this app's server can
+    // actually report, replacing the library defaults: violet = thinking, green
+    // = done, yellow = action required. One family -- 78% lightness / 0.15
+    // chroma, only the hue varying -- at the pastel accent's own level, so none
+    // of THESE THREE is separated by lightness; the wave/ring/shape cues carry
+    // that (the WCAG 1.4.1 note below).
+    //
+    // The library publishes FIVE --status-* tokens; --status-warning and
+    // --status-failed (OSC 9;4 progress states 4 and 2) deliberately keep the
+    // library defaults, because the pinned Go engine reports only
+    // working/idle/input/done/exited (web-terminal-engine/v3 terminal/
+    // session_manager.go), so this app can never paint those two dots. Do NOT
+    // read the lightness sentence above as a general rule if that ever changes:
+    // PUBLIC_THEME_TOKENS requires the three ANIMATED states
+    // (working/warning/failed, which share one travelling wave and differ only
+    // in hue) to keep a LIGHTNESS spread, and this violet working dot (OKLab L
+    // 77.6%) already sits 8.5 L points from the library's default warning
+    // yellow (#facc15, L 86.1%) where the library's own blue working dot sat
+    // 14.2 apart. Retheme those two in-family before adopting an engine that
+    // emits them.
+    //
+    // Working is pinned as an sRGB HEX while its two siblings stay in oklch,
+    // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
+    // is outside sRGB AND outside Display P3, so no display we ship to can render
+    // it as declared: every one shows a gamut-mapped approximation of the
+    // browser's choosing. #c6a0ff is that approximation made explicit (what
+    // Chromium paints on sRGB, deltaEOK 0.0099 from the P3 rendering, well inside
+    // a ~0.02 JND). Green (150deg) and yellow (95deg) are in gamut and keep the
+    // formula.
+    //
+    // Hue alone never carries state (WCAG 1.4.1): working is a disc emitting a
+    // soft-edged ripple WAVE that travels outward and dissolves, input a disc
+    // inside a static hard-edged RING (differing by edge quality as well as
+    // motion), done the bare ringless disc. Under prefers-reduced-motion the
+    // library punches working's disc into a donut, so all three stay distinct by
+    // shape with no motion at all.
+    "--status-working": "#c6a0ff",
+    "--status-done": "oklch(78% 0.15 150deg)",
+    "--status-input": "oklch(78% 0.15 95deg)",
+  } satisfies Partial<Record<PublicThemeToken, string>>,
+};
+
+// Assigned rather than spread: a spread-introduced key is not "fresh", so
+// TypeScript's excess-property check never sees it -- `loading` would survive a
+// rename or removal of the option in @cplieger/web-terminal-ui with no compile
+// error, and app.test.ts asserts this app's own key name against a mocked
+// createTerminal, so nothing else would catch it either. A property assignment on
+// a CreateTerminalOptions-typed local IS checked, and the `if` keeps the key
+// ABSENT rather than undefined (exactOptionalPropertyTypes).
+if (loading) {
+  options.loading = loading;
 }
+
+createTerminal("#terminal", options);

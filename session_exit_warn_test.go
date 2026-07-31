@@ -6,11 +6,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 // TestSessionFastDeathWarn pins the operator-facing fast-death signal wired in
@@ -35,23 +34,13 @@ import (
 // factory binds its session logger from slog.Default() at Create time (no
 // t.Parallel).
 func TestSessionFastDeathWarn(t *testing.T) {
-	runFastDeathSession := func(t *testing.T, ready bool) *capture.Recorder {
+	runFastDeathSession := func(t *testing.T, ready bool, kiroReady func() (bool, string)) *capture.Recorder {
 		t.Helper()
 		records := capture.Default(t) // before registerRoutes: the factory derives its logger from slog.Default()
-		mux := http.NewServeMux()
-		var r webhttp.Ready
-		r.Set(ready)
-		deps := &routeDeps{
-			staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-			ready:    &r,
-			workDir:  "",
-			cmd:      []string{"/bin/false"}, // exits 1 instantly: the broken-install signature (non-nil Wait error, well under 10s)
-		}
-		mgr, _, err := registerRoutes(mux, deps)
-		if err != nil {
-			t.Fatalf("registerRoutes: %v", err)
-		}
-		t.Cleanup(mgr.Shutdown)
+		deps := newTestDeps(ready)
+		deps.kiroReady = kiroReady         // the composition root's permissive default is the no-install shape
+		deps.cmd = staticCmd("/bin/false") // exits 1 instantly: the broken-install signature (non-nil Wait error, well under 10s)
+		mux, mgr, _ := mustRegisterRoutes(t, deps)
 		if _, err := mgr.Create(); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
@@ -59,8 +48,8 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		deadline := time.Now().Add(10 * time.Second)
 		for {
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/sessions", http.NoBody))
-			if strings.Contains(rec.Body.String(), `"exited"`) {
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, terminal.SessionsPath, http.NoBody))
+			if strings.Contains(rec.Body.String(), `"status":"`+terminal.StatusExited+`"`) {
 				return records
 			}
 			if time.Now().After(deadline) {
@@ -70,19 +59,40 @@ func TestSessionFastDeathWarn(t *testing.T) {
 		}
 	}
 
-	const warnMsg = "exited almost immediately"
+	const warnMsg = sessionFastDeathMsg
+
+	// The permissive readiness policy main.go's unmanagedKiroRuntime supplies:
+	// no install to gate on, so the hook's kiro-cli conjunct is satisfied.
+	noInstall := func() (bool, string) { return true, "" }
 
 	t.Run("spontaneous fast death while serving warns once", func(t *testing.T) {
-		records := runFastDeathSession(t, true)
-		if got := countLevel(records, slog.LevelWarn, warnMsg); got != 1 {
+		records := runFastDeathSession(t, true, noInstall)
+		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 1 {
 			t.Errorf("log = %q, want exactly one fast-death Warn (got %d); a broken kiro-cli install must be operator-visible outside the PTY", records.Messages(), got)
 		}
 	})
 
 	t.Run("app-initiated shutdown stays quiet", func(t *testing.T) {
-		records := runFastDeathSession(t, false)
-		if got := countLevel(records, slog.LevelWarn, warnMsg); got != 0 {
+		records := runFastDeathSession(t, false, noInstall)
+		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
 			t.Errorf("log = %q, want no fast-death Warn when readiness is cleared (got %d); a deploy teardown must not raise false broken-install alerts", records.Messages(), got)
+		}
+	})
+
+	// The kiro-cli half of the hook's guard, which the two rows above cannot
+	// see: both use the permissive no-install policy, so the readiness read
+	// returns true and the conjunct is never exercised. The install manager's
+	// verdict changes while the server runs in both directions (a first-boot
+	// download completing, a rescan, an exhausted retry budget), so a session can
+	// die fast at a moment kiro-cli is NOT usable -- and that state already has
+	// its own 503 and its own log line, so promoting it to a broken-install Warn
+	// is a false alert on exactly the boot where the log is busiest. Deleting the
+	// `&& kiroReady` conjunct from the factory's WithOnProcessExit hook, or
+	// inverting it, leaves every other test in the package green.
+	t.Run("fast death while kiro-cli is unready stays quiet", func(t *testing.T) {
+		records := runFastDeathSession(t, true, func() (bool, string) { return false, reasonInstalling })
+		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
+			t.Errorf("log = %q, want no fast-death Warn while the kiro-cli install is unready (got %d); that state reports itself through /api/health's reason, and a broken-install alert per tab during a first-boot download is the false signal the guard exists to suppress", records.Messages(), got)
 		}
 	})
 }

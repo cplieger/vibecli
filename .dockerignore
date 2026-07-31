@@ -1,8 +1,12 @@
 # Dev-only build artifacts; production uses vendored TS via tsc at Docker build time.
 static/*.js
 static/*.js.map
-static/wire/
 static/*.test.js
+# The CSS bundle is generated inside the builder by scripts/css-bundle.sh; keep
+# a local dev copy (and any mktemp sibling left by a SIGKILLed run) out of the
+# build context so nothing unpinned reaches `COPY . ./` and go:embed.
+static/style.css
+static/style.css.*
 
 
 # Local-dev Go workspace (resolves the unpublished engine via a replace);
@@ -17,3 +21,21 @@ static-src/node_modules/
 static/vendor/
 # Local dev binary from scripts/dev-build.sh; never part of the image build.
 web-terminal-kiro-dev-bin
+# Git metadata and the local `go build` output (both gitignored): keep them
+# out of the build context so `COPY . ./` neither ingests a stale local
+# binary nor cache-busts the builder layers on every commit.
+.git
+/web-terminal-kiro
+# Kiro skill scratch trees (gitignored; can be huge on a dev checkout)
+**/.code-review/
+**/.judgement/
+**/.refactor/
+**/.steering-maintenance/
+# Frontend test/mutation scratch (all gitignored, same reason as the trees
+# above): Stryker copies the whole static-src tree per mutant, so
+# .stryker-tmp/ alone reaches tens of MB on a checkout that ran the mutation
+# suite, and any vitest/coverage/report write would cache-bust `COPY . ./`.
+**/.stryker-tmp/
+**/.vitest-cache/
+static-src/coverage/
+static-src/reports/

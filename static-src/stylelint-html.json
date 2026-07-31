@@ -1,0 +1,16 @@
+{
+  "comment": "App-owned HTML lint config. It lives HERE, not in the repo-root .stylelintrc.json, because that file is a SYNCED copy of cplieger/ci's configs/stylelint.json -- the nightly sync would revert an override placed there while the repo-owned lint:stylelint script survived, so the script would fail with a CssSyntaxError (postcss-html gone). It is a developer-run check, not a CI gate: ci's ts-ci web-lint step stylelints only **/*.css and html-validate handles the HTML, so nothing in CI covers the CSS embedded in static/index.html. Deliberately NOT named .stylelintrc* so cosmiconfig never auto-discovers it for CI's plain CSS run; only lint:stylelint passes it explicitly.",
+  "extends": "../.stylelintrc.json",
+  "overrides": [
+    {
+      "comment": "The app's only hand-written CSS is the critical block embedded in static/index.html: the self-sufficient #loading fatal surface. It is id-scoped on purpose (#loading is this app's own element, and the library selects the overlay by class precisely so it never reaches for our id), so selector-max-id and its specificity companion cannot apply here. hue-degree-notation is off for the same kind of reason: the accent literal hsl(263.1683 100% 80%) is one of FOUR independent spellings of one color (app.ts's createTerminal theme, this block, <meta name=\"theme-color\">, manifest.json), pinned byte-for-byte by app.test.ts's brand-accent parity test, so this file cannot adopt the deg suffix unilaterally. Every other rule still does apply, and the ones that bite here are value-keyword-case/color-named on a hand-edited literal and no-unknown-custom-properties on a typo'd var() READ. It cannot catch a typo in the --wt-loading-accent DECLARATION this block sets for the library to read: referenceFiles resolves that token from the library's own css/page.css, so a misspelled declaration is merely an unused one while the overlay silently reverts to the library default -- app.test.ts's brand-accent parity test is what pins that spelling.",
+      "files": ["**/*.html"],
+      "customSyntax": "postcss-html",
+      "rules": {
+        "selector-max-id": null,
+        "selector-max-specificity": null,
+        "hue-degree-notation": null
+      }
+    }
+  ]
+}

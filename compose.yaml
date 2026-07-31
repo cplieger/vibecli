@@ -6,8 +6,8 @@ services:
     restart: unless-stopped
 
     ports:
-      # No built-in auth: this is a root shell. See README "It is a remote shell";
-      # bind "127.0.0.1:9848:9848" when fronting it with a reverse proxy.
+      # Root shell with no built-in auth; loopback alone does not stop DNS rebinding.
+      # See README "It is a remote shell" for proxy, bind, and KWEB_ALLOWED_HOSTS setup.
       - "9848:9848"
 
     volumes:

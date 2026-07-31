@@ -27,20 +27,21 @@ export default defineConfig({
     // Vitest's defaults (node_modules at any depth, .git); spreading
     // configDefaults.exclude avoids narrowing the built-in
     // "**/node_modules/**" to a top-level-only glob.
-    // "**/.code-review/**" keeps stray *.test.ts scratch (e.g. files written under
-    // .code-review/tmp by tooling) from being collected and failing the run.
+    // "**/.stryker-tmp/**" keeps a leftover Stryker sandbox (an interrupted
+    // mutation run does not clean it up) from double-collecting the suite's
+    // test files with stale or mutated copies.
     // (Compiled output under ../static needs no entry: include/exclude resolve
     // against this directory, so files outside it are never collected.)
-    exclude: [...configDefaults.exclude, "**/.code-review/**"],
+    exclude: [...configDefaults.exclude, "**/.stryker-tmp/**"],
 
     // Forbid .only tests unconditionally — not just in CI.
     allowOnly: false,
 
     // app.test.ts covers web-terminal-kiro's thin bootstrap (the createTerminal() wiring); the terminal
     // logic itself is tested in @cplieger/web-terminal-ui and @cplieger/web-terminal-engine.
-    // passWithNoTests stays as a safety net so moving the bootstrap test into the
-    // packages later won't hard-fail the suite here.
-    passWithNoTests: true,
+    // Deleting, misnaming, or excluding that suite must fail rather than
+    // report green with zero tests.
+    passWithNoTests: false,
 
     // Require explicit imports of describe/it/expect from "vitest".
     globals: false,
@@ -65,7 +66,15 @@ export default defineConfig({
     testTimeout: 2000,
     hookTimeout: 5000,
 
-    // Flag tests slower than 100ms — these tests have no I/O.
+    // Flag tests slower than 100ms — the suite's whole cost is synchronous
+    // fixture reads and parses: static/index.html, manifest.json, app.ts, two
+    // library sources read for parity (kernel/kernel.ts, css/page.css), and the
+    // vendored-graph importmap walk, which recursively reads and TS-parses both
+    // @cplieger/web-terminal-{ui,engine} src trees (measured 85–140ms, so it
+    // trips this threshold on a loaded machine). No network and no async I/O:
+    // anything slower than a fixture read is a logic problem, not a wait. The
+    // threshold is left where it is deliberately — the walk's real cost is worth
+    // staying visible rather than absorbed by a bigger number.
     slowTestThreshold: 100,
 
     // Reproducible ordering. hooks: "stack" = afterEach/afterAll run in

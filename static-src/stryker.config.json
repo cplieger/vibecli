@@ -9,9 +9,6 @@
     "prioritizePerformanceOverAccuracy": false
   },
   "mutate": ["app.ts"],
-  "mutator": {
-    "excludedMutations": ["StringLiteral"]
-  },
   "ignorePatterns": ["node_modules", "reports", "coverage", "dist"],
   "ignoreStatic": true,
   "reporters": ["html", "progress", "clear-text"],

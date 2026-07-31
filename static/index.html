@@ -4,6 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
     <meta name="color-scheme" content="dark">
+    <!-- #c099ff is the app accent (hsl(263.1683 100% 80%)); the accent is pinned
+         across app.ts's theme, this file (the #loading critical CSS and the
+         noscript fallback) and manifest.json theme_color by app.test.ts's
+         brand-accent parity test, so installed-PWA chrome never flashes. -->
+    <meta name="theme-color" content="#c099ff">
     <title>Web Terminal for Kiro</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
@@ -13,37 +18,81 @@
     <link rel="stylesheet" href="/style.css">
     <!-- [html-validate-disable-next no-style-tag -- critical CSS for instant loading indicator] -->
     <style>
+      /* The loading overlay's APPEARANCE is not here any more: web-terminal-ui's
+         css/page.css owns .wt-loading / .wt-loading-bar / .wt-loading-text, and it
+         arrives with /style.css above. That link is render-blocking, so nothing
+         paints before it either way and an inline copy bought no earlier paint --
+         it only bought three divergent copies of one loading screen (this app's,
+         web-terminal-server's, and the library scaffold's).
+         What survives inline is ONLY the failure surface below: the case where
+         /style.css is the thing that failed, which the bootstrap watchdog reports
+         by converting this overlay into an alertdialog. Those rules are therefore
+         written to be SELF-SUFFICIENT (their own position/inset/background), since
+         by definition no library CSS is available when they are needed. */
       #loading {
+        /* web-terminal-kiro's brand purple, as the library's overlay token. Same
+           literal as the createTerminal theme --accent (the overlay cannot read
+           the JS theme) and pinned by app.test.ts's brand-accent parity test. */
+        --wt-loading-accent: hsl(263.1683 100% 80%);
+      }
+
+      #loading[role="alertdialog"] {
+        /* Self-sufficient by necessity: the state this dialog reports includes
+           "/style.css failed to load", so it cannot inherit the box from
+           page.css's .wt-loading rule. Everything the panel needs to be a
+           legible full-screen surface is declared here. */
         position: fixed;
         inset: 0;
         z-index: 200;
         display: flex;
-        align-items: center;
-        justify-content: center;
-        /* web-terminal-kiro accent (matches the createTerminal theme --accent); the pre-JS
-           overlay can't read the JS theme, so the brand purple is set here too. */
-        --accent: hsl(263.1683 100% 80%);
         background: #000;
-        color: var(--accent);
-        /* easing matches the UI bundle's --ease-exit; tokens are scoped to .wt-root
-           and unreachable here, so the value is inlined like the --accent literal. */
-        transition: opacity 0.3s cubic-bezier(0.4, 0, 1, 1);
-      }
-      #loading.fade {
-        opacity: 0;
-        /* the kernel removes the node on transitionend (1.5s fallback); until
-           then the invisible full-viewport overlay must not swallow the first
-           tap-to-focus on the freshly rendered terminal */
-        pointer-events: none;
-      }
-      #loading[role="alert"] {
+        color: var(--wt-loading-accent);
         flex-direction: column;
+        align-items: center;
+        /* Keep the ONLY recovery affordance reachable. This is a fixed
+           inset:0 box with centred content, so at small viewport heights (a
+           short landscape window, a large user font size) the message and the
+           Reload button overflow BOTH ends of an unscrollable box. `safe
+           center` degrades the centring to start-alignment exactly when the
+           content overflows and overflow-y makes the remainder reachable. It is
+           declared TWICE because `safe center` is one value: a UA that does not
+           know the `safe` keyword drops the whole declaration, and with no
+           earlier `justify-content` in this rule that leaves the initial
+           `normal` (top-aligned), not centring -- page.css's .wt-loading
+           supplies `center` only when /style.css LOADED, which is the one case
+           these self-sufficient rules must not depend on. The insets honour
+           this page's viewport-fit=cover (the UI bundle does the same for its
+           own chrome via --safe-top/--safe-bottom), so the button never sits
+           under a notch or the home-indicator gesture strip. */
+        justify-content: center;
+        justify-content: safe center;
         gap: 1rem;
-        padding: 1rem;
+        padding: max(1rem, env(safe-area-inset-top))
+          max(1rem, env(safe-area-inset-right))
+          max(1rem, env(safe-area-inset-bottom))
+          max(1rem, env(safe-area-inset-left));
+        overflow-y: auto;
+        overscroll-behavior: contain;
         font-family: system-ui, -apple-system, sans-serif;
         text-align: center;
       }
-      #loading[role="alert"] button {
+      /* The fatal dialog's visible title, which is also its accessible name via
+         aria-labelledby (built by the watchdog below). It lives in this critical
+         block rather than style.css for the
+         same reason the rest of #loading does: this overlay must be styled
+         before /style.css has loaded, and a stylesheet failure is one of the
+         states it exists to report. The library's own .wt-fatal-title rules
+         cannot be reused because every .wt-fatal* rule is scoped
+         :where(.wt-root), and .wt-root does not exist when the terminal failed
+         to build. h2 defaults are reset so the heading reads as dialog copy
+         rather than document structure. */
+      #loading[role="alertdialog"] h2 {
+        margin: 0;
+        font-size: 1.125rem;
+        font-weight: 600;
+        line-height: 1.3;
+      }
+      #loading[role="alertdialog"] button {
         min-inline-size: 2.75rem;
         min-block-size: 2.75rem;
         padding-inline: 1rem;
@@ -56,61 +105,102 @@
         cursor: pointer;
         touch-action: manipulation;
       }
-      #loading[role="alert"] button:focus-visible {
+      /* Plain :focus, deliberately broader than the family's :focus-visible-only
+         convention (web-terminal-ui 10-primitives.css). The watchdog below moves
+         focus to Reload with focus({ focusVisible: true }), which Samsung Internet,
+         Chrome < 145 and Safari < 18.4 ignore; script focus after a pointer load
+         does not match :focus-visible there, so on those engines the dialog's only
+         recovery control would be focused with no visible indicator from the moment
+         it appears (WCAG 2.4.7) -- and a user who never presses a key never gets
+         one. Safe to broaden HERE because this dialog has exactly one control and
+         is a dead end: the extra ring can only ever appear on a click of Reload
+         itself. */
+      #loading[role="alertdialog"] button:focus {
         outline: 2px solid currentcolor;
         outline-offset: 3px;
       }
-      #loading .bar {
-        position: relative;
-        inline-size: min(220px, 62vw);
-        block-size: 5px;
-        overflow: hidden;
-        border-radius: 999px;
-        background: color-mix(in oklch, currentColor 16%, transparent);
+      /* Hover gated on ANY-hover, never (hover: hover): `hover` reports only the
+         PRIMARY input, so iPadOS answers `hover: none` with a Magic Keyboard
+         trackpad attached and would drop this rule on a device that can hover.
+         `any-hover` still answers `none` on a bare touchscreen, so it keeps the
+         sticky-:hover-after-tap protection the gate exists for (web.md; the
+         library's own css/*.css still gates on `hover` and is its repo's fix).
+         Press feedback on touch comes from :active either way. */
+      @media (any-hover: hover) {
+        #loading[role="alertdialog"] button:hover {
+          background: color-mix(in oklch, currentcolor 28%, transparent);
+        }
       }
-      #loading .bar::before {
-        content: "";
+      #loading[role="alertdialog"] button:active {
+        background: color-mix(in oklch, currentcolor 36%, transparent);
+      }
+      #loading[role="alertdialog"] p {
+        margin: 0;
+        /* Cap the measure and set the leading the way the library's own fatal
+           panel does (10-primitives.css .wt-fatal-card inline-size:
+           min(100%, 28rem), .wt-fatal-message line-height: 1.5) and the way
+           this same overlay's non-fatal status line does (page.css
+           .wt-loading-text max-inline-size: 34rem). The cause sentence is the
+           only diagnostic on this screen -- around 130 characters -- and an
+           uncapped centred paragraph in a full-viewport flex column sets it as
+           one edge-to-edge line on any desktop window. The flex column already
+           centres the block, so the cap alone places it. */
+        max-inline-size: 34rem;
+        line-height: 1.5;
+      }
+      /* The document <h1>'s permanent off-screen hide (a body-level sibling no
+         builder clears). Same technique web-terminal-ui's kernel announcer uses
+         (src/kernel/a11y.ts hideVisually).
+         The overlay's own status line used to share this rule: this app carried a
+         clip-hidden <p class="loading-status">Starting the terminal...</p> so the
+         role="status" region had text for assistive tech (WCAG 4.1.3). That is the
+         library's job now -- the kernel writes a PROGRESSIVE line into the overlay
+         (silent for the first seconds, then rotating, superseded by the server's
+         own reason), and it owns both the visible and the announced half. One
+         status owner instead of a static sentence this app had to keep in step. */
+      .visually-hidden {
         position: absolute;
-        inset-block: 0;
-        inline-size: 42%;
-        border-radius: inherit;
-        background: linear-gradient(
-          90deg,
-          transparent,
-          currentColor 28%,
-          color-mix(in oklch, currentColor, #fff 45%) 50%,
-          currentColor 72%,
-          transparent
-        );
-        filter: drop-shadow(
-          0 0 4px color-mix(in oklch, currentColor 55%, transparent)
-        );
-        animation: wt-loading-slide 1.5s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+        inline-size: 1px;
+        block-size: 1px;
+        margin: -1px;
+        padding: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
       }
-      @keyframes wt-loading-slide {
-        0% {
-          transform: translateX(-110%);
-        }
-        100% {
-          transform: translateX(250%);
-        }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        #loading .bar::before {
-          animation-duration: 3s;
-        }
-      }
+
       .noscript-fallback {
         position: fixed;
         inset: 0;
         z-index: 300;
         display: flex;
+        /* `safe` degrades the CROSS-axis centring (this row-direction box centres
+           vertically with align-items, not justify-content) to start-alignment
+           exactly when the message is taller than the viewport -- 400% zoom, a
+           short landscape window, a large user font size -- and overflow-y makes
+           the remainder reachable in an otherwise unscrollable fixed inset:0 box.
+           Same hardening #loading[role="alertdialog"] above carries, including
+           its two-declaration form: `safe center` is one value, so a UA that
+           does not know the `safe` keyword drops the whole declaration and
+           falls back to the initial `normal` (top/start-aligned), not centring
+           -- and no library CSS covers this rule, so the plain `center` pair
+           has to be here. The insets honour this page's viewport-fit=cover so
+           the sentence never sits under a notch or the home-indicator strip. */
         align-items: center;
+        align-items: safe center;
         justify-content: center;
+        justify-content: safe center;
         margin: 0;
-        padding: 1rem;
+        padding: max(1rem, env(safe-area-inset-top))
+          max(1rem, env(safe-area-inset-right))
+          max(1rem, env(safe-area-inset-bottom))
+          max(1rem, env(safe-area-inset-left));
+        overflow-y: auto;
+        overscroll-behavior: contain;
         background: #000;
-        /* brand accent (matches #loading --accent and the createTerminal theme) */
+        /* brand accent (matches #loading's --wt-loading-accent and the
+           createTerminal theme) */
         color: hsl(263.1683 100% 80%);
         font-family:
           system-ui,
@@ -121,11 +211,24 @@
     </style>
   </head>
   <body>
+    <!-- The served shell is an empty JS-built app: without these two lines the
+     document has no heading and no landmark at all (createTerminal builds
+     role="log" + the hidden input, and the library's only heading is the <h2>
+     inside its fatal panel). The h1 is heading-navigation's single anchor and
+     the parent level for that h2; #terminal is a <main> so AT can jump to the
+     terminal region. Keep the h1 OUTSIDE #terminal: createTerminal appends
+     into the root and its fatal path clears it. -->
+    <h1 class="visually-hidden">Web Terminal for Kiro</h1>
     <!-- createTerminal() (in /app.js) builds the entire terminal UI inside this
      root element; the loading overlay is a sibling so it is never cleared. -->
-    <div id="terminal"></div>
-    <div id="loading" role="status" aria-label="Loading">
-      <div class="bar" aria-hidden="true"></div>
+    <main id="terminal"></main>
+    <!-- Styled by web-terminal-ui's css/page.css through the wt-loading* CLASSES
+         (recoloured by the --wt-loading-accent token set above), NOT by this id.
+         role="status" is load-bearing: the kernel writes a progressive status line
+         in here once startup drags on, and that region is what a screen reader
+         reads. No static status text of our own -- the library owns it now. -->
+    <div id="loading" class="wt-loading" role="status" aria-label="Loading">
+      <div class="wt-loading-bar" aria-hidden="true"></div>
     </div>
     <noscript>
       <p class="noscript-fallback">
@@ -139,6 +242,144 @@
           "@cplieger/web-terminal-engine": "/vendor/cplieger-web-terminal-engine/index.js",
           "@cplieger/web-terminal-ui": "/vendor/cplieger-web-terminal-ui/index.js",
           "@cplieger/web-terminal-ui/presets": "/vendor/cplieger-web-terminal-ui/presets.js"
+        }
+      }
+    </script>
+    <script>
+      // Bootstrap watchdog: if /app.js (or a vendor module it statically
+      // imports) fails to fetch/parse/evaluate, no JS ever runs to replace the
+      // loading overlay, leaving an infinitely animating "Loading" bar (the
+      // 2026-07 stuck-loading UX through a different hole). Surface it instead.
+      window.addEventListener(
+        "error",
+        (e) => {
+          const overlay = document.getElementById("loading");
+          // Only while the pre-JS overlay is still pristine (bar present, no
+          // alert yet, and no fade-out started): after boot the kernel removes
+          // the overlay on transitionend, but between the first frame's
+          // fade-out and that removal the bar is still a child, so a stray
+          // uncaught runtime error in that window would otherwise convert a
+          // BOOTED terminal's invisible (opacity:0, pointer-events:none)
+          // overlay into a focus-stealing alertdialog.
+          if (
+            !overlay ||
+            overlay.hasAttribute("data-bootstrap-fatal") ||
+            !overlay.querySelector(".wt-loading-bar") ||
+            overlay.classList.contains("fade")
+          )
+            return;
+          // Stand down once createTerminal has built the UI inside #terminal:
+          // boot progressed past module load/eval, so a later uncaught error
+          // is a runtime error, not a bootstrap failure. Without this, a
+          // stray error between boot and the first frame converts a live
+          // terminal's overlay into this dialog and inerts #terminal; the
+          // kernel's first-frame dismiss then fades and REMOVES the
+          // overlay-turned-dialog while nothing un-inerts #terminal -- a
+          // frozen, message-less page.
+          const bootedRoot = document.getElementById("terminal");
+          if (bootedRoot && bootedRoot.firstElementChild) return;
+          // A failed <link rel="stylesheet"> is as fatal as a failed module:
+          // /style.css carries .wt-viewport/.term-output layout, so without it
+          // createTerminal builds an unstyled, unusable terminal (and measures
+          // cell metrics against unstyled text). Restricted to rel="stylesheet":
+          // icon/manifest links 404 in the wild and must NOT raise the dialog.
+          const failedStylesheet =
+            e.target instanceof HTMLLinkElement && e.target.rel === "stylesheet";
+          if (!(e.target instanceof HTMLScriptElement) && !failedStylesheet && !e.error)
+            return;
+          // alertdialog, not alert: the overlay carries an interactive Reload
+          // button and moves focus into it, the alertdialog interaction model
+          // (APG), the same treatment the library's panel gets. The role plus the
+          // focus transition supplies the announcement, so no aria-live is
+          // needed. The name comes from a VISIBLE title via aria-labelledby
+          // rather than an invisible aria-label, replacing the static "Loading"
+          // name: APG prefers one name serving both audiences, and a sighted
+          // user otherwise gets a bare message with no heading.
+          //
+          // Title and button copy MUST equal web-terminal-ui's exported
+          // STARTUP_FAILURE_COPY. This is the only fatal surface left outside the
+          // library -- app.ts no longer builds one, because createTerminal now
+          // owns every terminal startup failure -- and this one cannot be deleted:
+          // it reports "the JS bundle never ran", a rung below `import`, so it can
+          // never import the constant it must agree with. app.test.ts closes that
+          // gap by executing this very script and comparing what it renders
+          // against the real exported constant, so the agreement is checked rather
+          // than remembered. The MESSAGE below stays this builder's own: it names
+          // a cause the library cannot know, which is strictly more useful than
+          // the library's generic wording.
+          const title = document.createElement("h2");
+          title.id = "bootstrap-failure-title";
+          title.textContent = "Terminal failed to start";
+          const description = document.createElement("p");
+          description.id = "bootstrap-failure-message";
+          // Name the cause: the watchdog already discriminated it above, and
+          // web-terminal-ui's STARTUP_FAILURE_COPY doc assigns the specific message to
+          // the consumer for exactly this reason. Every branch keeps the
+          // "Web Terminal for Kiro failed to load" prefix -- app.test.ts pins it with
+          // toContain, and the shared prefix is also what makes the three messages read
+          // as one event with three causes rather than three unrelated errors.
+          // The script branch covers the /app.js bundle OR a vendor module it
+          // statically imports (the importmap's engine/ui modules): a module script
+          // fires error AT THE /app.js ELEMENT for any failure in its fetch tree, so
+          // that branch cannot tell the two apart and must not claim to.
+          description.textContent = failedStylesheet
+            ? "Web Terminal for Kiro failed to load its stylesheet (/style.css), so the terminal cannot be displayed. Reload the page to try again."
+            : e.target instanceof HTMLScriptElement
+              ? "Web Terminal for Kiro failed to load its program (/app.js or a module it imports). Check your connection and reload the page."
+              : "Web Terminal for Kiro failed to load: its program stopped with an error before the terminal appeared. Reload the page to try again.";
+          overlay.setAttribute("role", "alertdialog");
+          // Explicit handoff token for /app.js: app.ts keys its boot-abort on
+          // this marker, not on the ARIA role, so changing the dialog's a11y
+          // shape cannot silently sever the handoff.
+          overlay.setAttribute("data-bootstrap-fatal", "");
+          overlay.setAttribute("aria-modal", "true");
+          overlay.removeAttribute("aria-label");
+          overlay.setAttribute("aria-labelledby", title.id);
+          overlay.setAttribute("aria-describedby", description.id);
+          const reload = document.createElement("button");
+          reload.type = "button";
+          reload.textContent = "Reload page";
+          reload.addEventListener("click", () => window.location.reload());
+          // No Tab trap, matching the library's own panel: this button is the
+          // only focusable node in the document, so there is nothing to contain,
+          // and trapping Tab only blocked the address bar. Containment that does
+          // work (inert + aria-modal) is below.
+          overlay.replaceChildren(title, description, reload);
+          // aria-modal claims the rest of the page is inert; make it true
+          // (APG alertdialog focus containment; WCAG 2.4.11).
+          const terminalRoot = document.getElementById("terminal");
+          if (terminalRoot) terminalRoot.setAttribute("inert", "");
+          // Move focus to the recovery CTA, like the library's own panel: the
+          // page content never loaded and Reload is the only actionable
+          // element left (the alertdialog pattern's initial focus).
+          reload.focus({ focusVisible: true });
+        },
+        true,
+      );
+      // Late-registration reconciliation: the <link rel="stylesheet"> this
+      // watchdog guards lives in <head>, so its error event is queued when that
+      // fetch settles -- which for a fast 404 is BEFORE this script runs (a
+      // classic script is blocked by a pending stylesheet, and the parser spins
+      // the event loop, running the already-queued error task, before resuming).
+      // The listener above would then never see it, so the stylesheet branch
+      // would silently never fire. The same script-blocking rule makes the
+      // state decidable here: every same-document stylesheet has settled by
+      // now, so a null .sheet means it FAILED, not "still loading". Re-dispatch
+      // it through the one listener so there stays exactly one dialog builder.
+      // Exactly the rel the listener above accepts (e.target.rel === "stylesheet").
+      // The two halves of this guard MUST name the same thing: a [rel~=] token match
+      // selects rel="stylesheet preload" too, and the listener then discards it, so
+      // the re-dispatch would raise no dialog and report nothing. Tightened rather
+      // than broadening the listener, because relList.contains("stylesheet") also
+      // matches an unselected rel="alternate stylesheet", whose null .sheet is its
+      // normal state -- that direction raises the fatal dialog over a healthy page.
+      for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
+        if (
+          !link.sheet &&
+          !link.disabled &&
+          (!link.media || window.matchMedia(link.media).matches)
+        ) {
+          link.dispatchEvent(new Event("error"));
         }
       }
     </script>

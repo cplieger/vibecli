@@ -45,7 +45,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # the `typescript` package's per-platform `tsc`
 # (@typescript/typescript-linux-<arch>, published in lockstep with the
 # metapackage). Runtime LSPs are not baked — the toolbelt engine installs
-# them on demand from the /config/tools.json manifest.
+# them on demand from the /config/tools/tools.json manifest.
 # renovate: datasource=npm depName=typescript
 ARG TS_VERSION=7.0.2
 # sha256 of the platform-specific tsc tarball, per arch. npm publishes SHA-512
@@ -354,7 +354,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 #     script; Debian's /bin/sh is dash)
 #   - ca-certificates + curl + unzip: kiro-cli installer + HTTPS trust
 #   - git: source control from inside the terminal (gh is NOT baked; it
-#     is opt-in via /config/tools.json)
+#     is opt-in via /config/tools/tools.json)
 #   - openssh-client: git over ssh (and gh over ssh once gh is enabled)
 #   - jq + less: standard kiro-cli diagnostic dependencies
 #   - libasound2: kiro-cli dlopens libasound.so.2 at runtime. It is NOT
@@ -390,7 +390,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 # Language servers and developer tools (gh, linters, runtimes) are NOT
 # baked into the image: the server's toolbelt engine installs them from
-# the /config/tools.json manifest (schema v2) against the image-baked
+# the /config/tools/tools.json manifest (schema v2) against the image-baked
 # catalog. First boot seeds disabled templates (gopls,
 # typescript-language-server, pyright, rust-analyzer, gh) — enable one by
 # flipping "disabled": false and restarting, or through the loopback tools API.

@@ -188,6 +188,23 @@ esac
 	}
 }
 
+// writeToolsManifest plants a tools.json where startTools' engine reads it: the
+// tools ROOT (<configDir>/tools), which is the engine's ConfigDir and its
+// ToolsDir both, since the manifest, the machine state and the catalog cache now
+// live beside the artifacts they describe. Tests that construct toolbelt.New
+// directly still choose their own two directories; this is only for the ones
+// driving the real composition root.
+func writeToolsManifest(t *testing.T, configDir, manifest string) {
+	t.Helper()
+	root := filepath.Join(configDir, "tools")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("create tools root: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "tools.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+}
+
 // TestStartTools_configDirMissing pins the out-of-container shape: a missing
 // config dir disables the tools engine (bare `go run` / tests), returning the
 // engine-less runtime whose nil engine makes registerRoutes skip /api/tools
@@ -279,25 +296,29 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 	}
 }
 
-// TestStartTools_engineStartFailure pins degraded-not-dead: a config dir whose
-// tools.json is the retired v1 format fails toolbelt.New (strict v2 schema),
-// and startTools logs the Error and continues without an engine instead of
-// taking the server down. Unlike the missing-config-dir path (an intentionally
-// disabled subsystem: no engine, empty state, health omits the tools field
-// entirely), a FAILED production subsystem must stay visible: the returned
-// runtime carries state "degraded" so /api/health reports
+// TestStartTools_engineStartFailure pins degraded-not-dead for a NON-integrity
+// engine failure: a manifest in the retired v1 format fails toolbelt.New (strict
+// v2 schema), and startTools logs the Error and continues without an engine
+// instead of taking the server down. Unlike the missing-config-dir path (an
+// intentionally disabled subsystem: no engine, empty state, health omits the
+// tools field entirely), a FAILED production subsystem must stay visible: the
+// returned runtime carries state "degraded" so /api/health reports
 // {"status":"ok","tools":"degraded"} per the documented
 // tools=syncing|ok|degraded contract, while the engine stays nil and syncing
-// reports false so sessions remain ungated. Serial: mutates the global
-// default logger.
+// reports false so sessions remain ungated.
+//
+// It also pins the other half of the root-integrity wiring: this error is not a
+// *toolbelt.RootIntegrityError, so the errors.As recovery adds nothing and the
+// single failed-to-start line is all an operator gets — the integrity path's
+// per-root lines must not appear for every unrelated failure. Serial: mutates
+// the global default logger.
 func TestStartTools_engineStartFailure(t *testing.T) {
 	records := capture.Default(t)
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "tools.json"),
-		[]byte(`{"runtimes":{"node":{"enabled":false}}}`), 0o644); err != nil {
-		t.Fatalf("write retired manifest: %v", err)
-	}
+	// The manifest lives in the tools root now (ConfigDir == ToolsDir), so that
+	// is where a retired-format one has to be planted to be read at all.
+	writeToolsManifest(t, dir, `{"runtimes":{"node":{"enabled":false}}}`)
 
 	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 
@@ -319,6 +340,9 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 	rt.close()
 	if got := records.CountLevel(slog.LevelError, "tools engine failed to start"); got != 1 {
 		t.Errorf("log = %q, want exactly one failed-to-start Error (got %d)", records.Messages(), got)
+	}
+	if got := records.CountLevel(slog.LevelError, "tools engine refused a managed root"); got != 0 {
+		t.Errorf("log = %q, want no per-root integrity line for a schema failure (got %d); errors.As must find nothing outside the ErrRootIntegrity class", records.Messages(), got)
 	}
 
 	// Focused health assertion: an engine-initialization failure surfaces as
@@ -362,53 +386,163 @@ func TestStartTools_bootConvergenceLiftsGate(t *testing.T) {
 	}
 }
 
-// TestStartTools_toolsDirResolution pins the single-resolution-site contract for
-// the /config/tools tree: the toolbelt engine writes to the path the entrypoint
-// exported and hardened (baseTools.toolsDir, from KIRO_CLI_TOOLS_DIR) when it is
-// set, and falls back to <configDir>/tools only outside the container where no
-// pin is exported. Before this, startTools RE-DERIVED the tree from
-// KWEB_CONFIG_DIR while the kiro-cli install manager read the exported path, so a
-// non-default KWEB_CONFIG_DIR split the two co-owners of one tree with no signal
-// at all: every tool provisioned into a directory that is on no session's PATH
-// while /api/health still reported tools=ok. Observable because toolbelt.New
-// creates <ToolsDir>/bin (its single PATH dir) as it starts.
-func TestStartTools_toolsDirResolution(t *testing.T) {
-	t.Run("exported path wins over the derivation", func(t *testing.T) {
-		dir := t.TempDir()
-		exported := filepath.Join(t.TempDir(), "exported-tools")
-		rt := startTools(baseTools{
-			configDir:   dir,
-			toolsDir:    exported,
-			catalogPath: filepath.Join(dir, "absent-catalog.json"),
+// TestStartTools_toolsRootResolution pins the tool subsystem's ONE root: the
+// engine's ConfigDir (tools.json, tools-state.json, tool-catalog.cached.json)
+// and its ToolsDir (bin/opt/npm/python) are the same directory, and both resolve
+// to the path the entrypoint exported and hardened (baseTools.toolsDir, from
+// KIRO_CLI_TOOLS_DIR) when it is set, falling back to <configDir>/tools only
+// outside the container where no pin is exported.
+//
+// Before this, the metadata followed a config knob while the artifacts followed
+// the entrypoint's export, so the two halves of one subsystem could sit on
+// different volumes: state describing a tree that was not there, and a
+// hand-authored manifest the engine no longer read. Observable because
+// toolbelt.New creates <ToolsDir>/bin (its single PATH dir) and seeds
+// <ConfigDir>/tools.json as it starts.
+func TestStartTools_toolsRootResolution(t *testing.T) {
+	for name, exportRoot := range map[string]bool{
+		"the exported root wins over the derivation":     true,
+		"derives from the config mount when none is set": false,
+	} {
+		t.Run(name, func(t *testing.T) {
+			configDir := t.TempDir()
+			var exported string
+			wantRoot := filepath.Join(configDir, "tools")
+			if exportRoot {
+				exported = filepath.Join(t.TempDir(), "exported-tools")
+				wantRoot = exported
+			}
+
+			rt := startTools(baseTools{
+				configDir:   configDir,
+				toolsDir:    exported,
+				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
+			})
+			if rt.engine == nil {
+				t.Fatal("engine is nil for an existing config dir; want a running tools engine")
+			}
+			t.Cleanup(rt.close)
+
+			// bin/ proves ToolsDir, tools.json proves ConfigDir. Both under the
+			// same root is the whole point: one subsystem, one home.
+			for _, entry := range []string{"bin", "tools.json"} {
+				if _, err := os.Stat(filepath.Join(wantRoot, entry)); err != nil {
+					t.Errorf("stat %s = %v; want the engine's %s under the resolved tools root (the tree entrypoint.sh hardened and every session has on PATH)", filepath.Join(wantRoot, entry), err, entry)
+				}
+			}
+			// The metadata must not stay at the mount root, which is where the
+			// deleted config knob used to put it.
+			if _, err := os.Stat(filepath.Join(configDir, "tools.json")); err == nil {
+				t.Errorf("the manifest was seeded at %s, beside the mount instead of inside the tools tree it describes", filepath.Join(configDir, "tools.json"))
+			}
+			if exportRoot {
+				if _, err := os.Stat(filepath.Join(configDir, "tools")); err == nil {
+					t.Errorf("the engine provisioned into the derived %s/tools instead of the exported root; every tool would land off the session PATH", configDir)
+				}
+			}
 		})
-		if rt.engine == nil {
-			t.Fatal("engine is nil for an existing config dir; want a running tools engine")
-		}
-		t.Cleanup(rt.close)
+	}
+}
 
-		if _, err := os.Stat(filepath.Join(exported, "bin")); err != nil {
-			t.Errorf("stat %s/bin = %v; want the engine to provision into the EXPORTED tools tree (the one entrypoint.sh hardened and every session has on PATH)", exported, err)
-		}
-		if _, err := os.Stat(filepath.Join(dir, "tools", "bin")); err == nil {
-			t.Errorf("the engine provisioned into the derived %s/tools instead of the exported tree; a non-default KWEB_CONFIG_DIR would put every tool off PATH", dir)
-		}
-	})
+// TestStartTools_rootIntegrityRefusalDegrades pins the app's half of toolbelt's
+// opt-in root-integrity check (Config.VerifyRootIntegrity): the tools tree is an
+// operator-controlled persistent volume and this process runs as root, so a
+// managed root that is a symlink or that a foreign host user can write is a
+// root-code-execution surface (the engine's install probe EXECUTES what it finds
+// in <ToolsDir>/bin, first on PATH).
+//
+// Two contracts here, and the second is the one the app owns. (1) The refusal
+// DEGRADES rather than aborting boot, exactly like any other failed
+// toolbelt.New: engine nil, sessions ungated, state "degraded" so /api/health
+// carries the informational tools field (its projection is pinned by
+// TestStartTools_engineStartFailure). Per web-terminal-kiro.md "Failure posture"
+// a dev box must stay reachable so the volume can be repaired from inside.
+// (2) The findings are recovered with errors.As and logged ONE LINE PER ROOT,
+// with the path and the reason as fields — without that, "degraded" is backed
+// only by toolbelt's single joined message and an operator cannot see which root
+// or why. Serial: mutates the global default logger.
+func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
+	const perPathMsg = "tools engine refused a managed root"
 
-	t.Run("derives from configDir when no pin is exported", func(t *testing.T) {
-		dir := t.TempDir()
-		rt := startTools(baseTools{
-			configDir:   dir,
-			catalogPath: filepath.Join(dir, "absent-catalog.json"),
+	for name, tc := range map[string]struct {
+		// unfit makes the tools root at path unfit for the engine.
+		unfit      func(t *testing.T, path string)
+		wantReason string
+	}{
+		"symlinked root": {
+			unfit: func(t *testing.T, path string) {
+				t.Helper()
+				target := t.TempDir()
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("symlink unsupported here: %v", err)
+				}
+			},
+			wantReason: "is a symlink",
+		},
+		"group- or other-writable root": {
+			unfit: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("create tools root: %v", err)
+				}
+				// chmod, not the Mkdir perm: umask filters the latter, so a
+				// 0o777 request can silently land clean.
+				if err := os.Chmod(path, 0o777); err != nil {
+					t.Fatalf("loosen tools root: %v", err)
+				}
+			},
+			wantReason: "is group- or other-writable",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+			configDir := t.TempDir()
+			root := filepath.Join(configDir, "tools")
+			tc.unfit(t, root)
+
+			rt := startTools(baseTools{
+				configDir:   configDir,
+				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
+			})
+			t.Cleanup(rt.close)
+
+			if rt.engine != nil {
+				t.Fatal("engine is non-nil over an unfit managed root; want no engine (toolbelt refuses, the app degrades)")
+			}
+			if rt.syncing == nil || rt.state == nil {
+				t.Fatal("syncing/state funcs are nil; the route layer's policy contract is total, so a nil policy panics on first call")
+			}
+			if rt.syncing() {
+				t.Error("syncing reports true after a refusal; sessions must remain ungated (degraded-not-dead)")
+			}
+			if got := rt.state(); got != toolsStateDegraded {
+				t.Errorf("state = %q, want %q so /api/health reports the failed subsystem instead of omitting the field", got, toolsStateDegraded)
+			}
+			// The check runs before anything is written: no seeded manifest, no
+			// bin/ inside the tree it refused.
+			for _, entry := range []string{"tools.json", "bin"} {
+				if _, err := os.Stat(filepath.Join(root, entry)); err == nil {
+					t.Errorf("%s exists; the refusal must precede every write to the root it judged unfit", filepath.Join(root, entry))
+				}
+			}
+
+			if got := records.CountLevel(slog.LevelError, "tools engine failed to start"); got != 1 {
+				t.Errorf("log = %q, want exactly one failed-to-start Error (got %d)", records.Messages(), got)
+			}
+			// ConfigDir and ToolsDir are the same path, and toolbelt judges each
+			// of its arguments in turn, so the root is reported twice: the app
+			// collapses that into ONE line per path+reason.
+			if got := records.CountLevel(slog.LevelError, perPathMsg); got != 1 {
+				t.Errorf("log = %q, want exactly one per-root Error naming the offending root (got %d); ConfigDir == ToolsDir makes toolbelt report it twice", records.Messages(), got)
+			}
+			if !records.HasAttr(perPathMsg, "root", root) {
+				t.Errorf("log = %q, want a root=%s field so an operator can see WHICH root was refused", records.Messages(), root)
+			}
+			if !records.AttrContains(perPathMsg, "reason", tc.wantReason) {
+				t.Errorf("log = %q, want a reason field containing %q so an operator can see WHY", records.Messages(), tc.wantReason)
+			}
 		})
-		if rt.engine == nil {
-			t.Fatal("engine is nil for an existing config dir; want a running tools engine")
-		}
-		t.Cleanup(rt.close)
-
-		if _, err := os.Stat(filepath.Join(dir, "tools", "bin")); err != nil {
-			t.Errorf("stat %s/tools/bin = %v; want the out-of-container fallback (bare `go run` exports no KIRO_CLI_TOOLS_DIR)", dir, err)
-		}
-	})
+	}
 }
 
 // TestHostAllowlist pins the KWEB_ALLOWED_HOSTS anti-DNS-rebinding gate
@@ -618,10 +752,7 @@ func TestHostAllowlist_blankConfigurationStaysPermissive(t *testing.T) {
 // local (no catalog knowledge), so the test is offline and fast.
 func TestStartTools_reconcileFailureLiftsGateDegraded(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "tools.json"),
-		[]byte(`{"version":2,"tools":{"no-such-tool-xyz":{}}}`), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	writeToolsManifest(t, dir, `{"version":2,"tools":{"no-such-tool-xyz":{}}}`)
 
 	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
@@ -647,10 +778,7 @@ func TestStartTools_reconcileFailureLiftsGateDegraded(t *testing.T) {
 // is immediately "ok" — session creation is never blocked on a no-op pass.
 func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "tools.json"),
-		[]byte(`{"version":2,"tools":{}}`), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	writeToolsManifest(t, dir, `{"version":2,"tools":{}}`)
 
 	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
@@ -1150,9 +1278,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 		`"faketool":{"source":"manual","version":"1.0.0","probe":"faketool",` +
 		`"install":"printf '#!/bin/sh\nexit 0\n' > \"$BIN/faketool\"; chmod 0755 \"$BIN/faketool\""}` +
 		`}}`
-	if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
-		t.Fatalf("write manifest: %v", err)
-	}
+	writeToolsManifest(t, dir, manifest)
 
 	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {

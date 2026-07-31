@@ -11,6 +11,17 @@ require (
 	github.com/cplieger/webhttp v1.20.0
 )
 
+// TEMPORARY SCAFFOLDING — DELETE THIS REPLACE. toolbelt's opt-in
+// Config.VerifyRootIntegrity (the root-integrity prerequisite startTools sets)
+// exists in no published toolbelt version yet, so this build resolves the module
+// from the sibling working tree instead. Consequences while it is here: the
+// container image CANNOT be built (../toolbelt is not in the build context) and
+// nothing verifies against a published module. Remove it in the SAME change that
+// bumps the require above to the first toolbelt release carrying the field — and
+// bump the Dockerfile's TOOLBELT_TOOLCATALOG_VERSION ARG with it, since its
+// pin-parity gate reads the require line.
+replace github.com/cplieger/toolbelt/v2 => ../toolbelt
+
 require (
 	github.com/cplieger/atomicfile/v2 v2.5.0 // indirect
 	github.com/cplieger/httpx/v4 v4.2.1 // indirect

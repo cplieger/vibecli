@@ -60,7 +60,6 @@ The image ships working defaults; most setups only pick a port and a volume.
 | `KWEB_LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
 | `KWEB_LOG_OSC_TEXT` | Log the text of terminal notifications the server does not recognize (needs `KWEB_LOG_LEVEL=debug` to be visible). Off by default: any program running in the terminal can emit that text, so it may contain a token, a device code, or a tokenised URL, and logs are usually kept longer and searched more widely than terminal scrollback. Off, the log still records a per-wording fingerprint and a length, which is enough to tell that kiro-cli changed its wording and how many distinct ones appeared. Turn it on only for an active diagnostic session; it warns at startup while set. | `false` |
 | `KWEB_WORK_DIR` | Directory each terminal session starts in (must exist). | `/workspace` |
-| `KWEB_CONFIG_DIR` | Persistent config directory (kiro-cli home, tool state). When it does not exist, tool provisioning is skipped with a warning; terminal sessions still run. | `/config` |
 | `KIRO_CLI_CHAT_ARGS` | Extra launch flags appended to every session's `kiro-cli chat` command, whitespace-separated (for example `--effort high` or `--v3`). Handy for opting into kiro-cli features ahead of the image's defaults. Flag values never reach the logs — the startup line records only a flag count. | _(unset)_ |
 | `TOOL_CATALOG_REFRESH` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. | `24h` |
 | `TOOL_CATALOG_URL` | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact |
@@ -122,9 +121,10 @@ Because Web Terminal for Kiro drives kiro-cli's own terminal UI directly, every 
 ## Tools
 
 Web Terminal for Kiro ships kiro-cli, `git`, and base utilities. Everything else is
-declared in `/config/tools.json`, a small manifest the built-in tools engine
+declared in `/config/tools/tools.json`, a small manifest the built-in tools engine
 (the [`toolbelt`](https://github.com/cplieger/toolbelt) library) reconciles against
-on boot: enabled entries are installed into `/config/tools/` (persisting across
+on boot: enabled entries are installed into that same `/config/tools/` tree
+(persisting across
 restarts), disabled entries wait as templates, removed installs are cleaned up.
 There is no management UI; you edit the manifest and restart, or drive the
 loopback API from inside a session.

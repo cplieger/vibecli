@@ -33,7 +33,7 @@ stream. This guide covers the things the codebase won't tell you at a glance.
 - `static-src/`: TypeScript + CSS sources, compiled into `static/`.
 - Tool provisioning is the external
   [`cplieger/toolbelt`](https://github.com/cplieger/toolbelt) library, consumed
-  headless: `startTools` (main.go) reconciles `/config/tools.json` in the
+  headless: `startTools` (main.go) reconciles `/config/tools/tools.json` in the
   background after the listener binds, session creation waits on that first
   pass (503 "tools installing"), and `/api/tools` is the library's REST
   projection admitted for loopback socket peers only (`loopbackOnly` in
@@ -153,8 +153,9 @@ activates).
 
 `/api/health` reports readiness. Under a bare `go run` it reflects only that the
 HTTP listener is up: with no pins there is no install to gate on, and the tools
-engine is disabled when the config dir is missing (`KWEB_CONFIG_DIR`, default
-`/config`); a warn is logged and the `/api/tools` routes are simply absent. In
+engine is disabled when `/config` is missing (the container's persistent bind
+mount, and not configurable); a warn is logged and the `/api/tools` routes are
+simply absent. In
 the image it also reflects the install manager, so `/api/health` returns
 `503 {"reason":"kiro-cli installing"}` while the first-boot download runs and a
 different reason (`kiro-cli install retrying`, `kiro-cli unavailable`,

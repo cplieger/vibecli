@@ -335,7 +335,7 @@ func main() {
 	// exists (the container's /config bind mount); bare `go run` and
 	// tests outside the container run without a tools surface.
 	tools := startTools(baseTools{
-		configDir: envx.String("KWEB_CONFIG_DIR", "/config"),
+		configDir: configMountDir,
 		// The SAME env var startKiroCLI reads below, so the tools tree has one
 		// source of truth: entrypoint.sh exports the path it created and
 		// hardened, and both co-owners write to that one. Empty outside the
@@ -832,9 +832,26 @@ func sessionPathEnv(entry string) []string {
 	return []string{"PATH=" + entry}
 }
 
-// baseTools carries startTools's inputs (env-resolved paths + the
+// configMountDir is the persistent bind mount every deployment gives this
+// container, fixed by the image rather than configurable. The env knob that used
+// to name it is DELETED, and the deletion is guarded (see
+// tests/shell/pins_export_test.sh): it relocated only toolbelt's three metadata
+// files (tools.json, tools-state.json, tool-catalog.cached.json) while the
+// artifacts they describe, $HOME (/config/home, fixed by the Dockerfile and
+// refused outside /config by entrypoint.sh) and the kiro-cli install root all
+// stayed put — so its only reachable effect was splitting one subsystem across
+// two volumes. The one thing this path still decides is whether this process has
+// a /config to persist into at all (startTools' stat gate), plus the base the
+// tools root is derived from when no entrypoint exported one.
+const configMountDir = "/config"
+
+// baseTools carries startTools's inputs (resolved paths + the
 // catalog-refresh knobs).
 type baseTools struct {
+	// configDir is the persistence mount (configMountDir in the container, a
+	// temp dir in tests). It is NOT toolbelt's ConfigDir: the engine's config
+	// and tools dirs are both the tools root below, since the manifest, the
+	// machine state and the catalog cache describe the tree they now sit in.
 	configDir string
 	// toolsDir is the tools tree both co-owners write to: the entrypoint's
 	// exported, hardened KIRO_CLI_TOOLS_DIR when present, else derived from
@@ -1056,16 +1073,18 @@ func (t *toolsRuntime) close() {
 }
 
 // warnIfToolsBinUnreachable warns when the engine's single PATH directory
-// (<toolsDir>/bin) is absent from this process's PATH, which is the state a
-// non-default KWEB_CONFIG_DIR creates: the knob moves the toolbelt tree, while
-// the session PATH (the image's ENV PATH), $HOME and the kiro-cli install root
-// (KIRO_CLI_TOOLS_DIR, which entrypoint.sh sets to /config/tools) all stay where
-// the image put them. Every tool the manifest installs then provisions
-// successfully — /api/health reports tools=ok and the language-server nudge
-// stays silent because an LSP entry IS enabled — while no session, and
-// therefore no kiro-cli PATH scan, can see any of it. Sessions inherit this
-// process's environment plus the kiro-cli version overlay, so this process's
-// PATH is the right thing to test.
+// (<toolsDir>/bin) is absent from this process's PATH. Every tool the manifest
+// installs then provisions successfully — /api/health reports tools=ok and the
+// language-server nudge stays silent because an LSP entry IS enabled — while no
+// session, and therefore no kiro-cli PATH scan, can see any of it. Sessions
+// inherit this process's environment plus the kiro-cli version overlay, so this
+// process's PATH is the right thing to test.
+//
+// In the container the tools root is not configurable (entrypoint.sh hardens
+// /config/tools and exports it as KIRO_CLI_TOOLS_DIR), so the reachable cause is
+// a PATH that no longer contains it: a compose-level PATH override, or an image
+// whose ENV PATH dropped the segment. Outside the container a bare `go run`
+// inherits the developer's PATH, where the derived tree is expected to be absent.
 //
 // Warn, never fatal: a mismatch is the operator's to resolve (adjust PATH, or
 // move the mount), and this app's failure posture keeps a misconfigured dev box
@@ -1079,7 +1098,35 @@ func warnIfToolsBinUnreachable(toolsDir string) {
 	}
 	slog.Warn("the tools tree is not on PATH: every tool the manifest installs will be invisible to kiro-cli and to terminal sessions, even though /api/health will report tools=ok",
 		"tools_bin", binDir,
-		"hint", "add "+binDir+" to this process's PATH. In the container this means the tools tree was moved off the image default (KWEB_CONFIG_DIR moves the tools tree; the session PATH, $HOME and the kiro-cli install root stay at the image defaults); outside it, a bare `go run` inherits the developer's PATH, so the derived tree is expected to be absent from it.")
+		"hint", "add "+binDir+" to this process's PATH. In the container that means the image's ENV PATH (or a compose override of it) no longer leads with the tools tree entrypoint.sh hardened and exported; outside it, a bare `go run` inherits the developer's PATH, so the derived tree is expected to be absent from it.")
+}
+
+// logRootIntegrityFindings turns a toolbelt root-integrity refusal into one
+// operator-queryable line per offending root. toolbelt logs the refusal too, but
+// as a single joined string, so without this the degraded /api/health verdict is
+// backed only by a message nothing can be filtered on: which root and why are
+// the two things an operator needs, and they belong in fields.
+//
+// A non-integrity error is not this function's business (its caller logs every
+// error the same way it always did); errors.As simply finds nothing and returns.
+func logRootIntegrityFindings(err error) {
+	var unfit *toolbelt.RootIntegrityError
+	if !errors.As(err, &unfit) {
+		return
+	}
+	// ConfigDir and ToolsDir are the SAME directory for this app (one
+	// subsystem, one root), and toolbelt judges each of its two arguments in
+	// turn, so a finding about the root ITSELF arrives twice. The library sorts
+	// findings by path then reason, which puts any such pair adjacent.
+	var prev toolbelt.RootIntegrityFinding
+	for i, f := range unfit.Findings {
+		if i > 0 && f == prev {
+			continue
+		}
+		prev = f
+		slog.Error("tools engine refused a managed root as unfit to execute from; it stays unmanaged until the volume is repaired",
+			"root", f.Path, "reason", f.Reason)
+	}
 }
 
 // startTools builds the toolbelt engine and launches the boot
@@ -1099,7 +1146,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	// ABSENT directory is the intentionally-disabled out-of-container shape
 	// (zero runtime, health omits the tools field). A stat failure for any
 	// other reason (permission, I/O, ELOOP) or a non-directory mounted at
-	// KWEB_CONFIG_DIR is a FAILED production subsystem, so it follows the
+	// the config path is a FAILED production subsystem, so it follows the
 	// same degraded-not-dead contract as a failed toolbelt.New below —
 	// otherwise the operator reads a broken mount as "tools deliberately off".
 	fi, statErr := os.Stat(cfg.configDir)
@@ -1107,7 +1154,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	case errors.Is(statErr, fs.ErrNotExist):
 		slog.Warn("tools engine disabled: config dir missing",
 			"config_dir", cfg.configDir,
-			"hint", "bind-mount the persistent config volume (compose.yaml) or set KWEB_CONFIG_DIR")
+			"hint", "bind-mount the persistent config volume (compose.yaml)")
 		// No tools surface: engine stays nil (no /api/tools mount) while the
 		// policies stay callable; "" keeps health's omitempty tools field absent.
 		return toolsRuntime{
@@ -1123,15 +1170,21 @@ func startTools(cfg baseTools) toolsRuntime {
 			"config_dir", cfg.configDir)
 		return degradedRuntime()
 	}
-	// The engine's tree, named once: it is both the engine's ToolsDir and the
-	// directory whose bin/ every session must find on PATH. Prefer the path the
-	// entrypoint hardened and exported; the derivation is the out-of-container
-	// fallback only.
-	toolsDir := cfg.toolsDir
-	if toolsDir == "" {
-		toolsDir = filepath.Join(cfg.configDir, "tools")
+	// The tool subsystem's ONE root, named once: it is the engine's ToolsDir,
+	// the directory whose bin/ every session must find on PATH, AND the engine's
+	// ConfigDir. Those last two are the same path on purpose. toolbelt keeps
+	// three metadata files under ConfigDir — tools.json (hand-authored intent),
+	// tools-state.json (engine-owned machine state) and
+	// tool-catalog.cached.json — and every one of them describes the artifacts
+	// under ToolsDir, so a layout that let them sit in different volumes was one
+	// subsystem with two homes: state describing a tree that might not be there.
+	// Prefer the path the entrypoint hardened and exported; the derivation is the
+	// out-of-container fallback only.
+	toolsRoot := cfg.toolsDir
+	if toolsRoot == "" {
+		toolsRoot = filepath.Join(cfg.configDir, "tools")
 	}
-	warnIfToolsBinUnreachable(toolsDir)
+	warnIfToolsBinUnreachable(toolsRoot)
 	refresh := &toolbelt.CatalogRefresh{
 		URL:      cfg.catalogURL,
 		Require:  toolbelt.ParseRequireList(requiredToolsList),
@@ -1142,17 +1195,39 @@ func startTools(cfg baseTools) toolsRuntime {
 	// field follows live job outcomes, not just the boot verdict.
 	status := newToolsStatus()
 	eng, err := toolbelt.New(&toolbelt.Config{
-		ConfigDir:    cfg.configDir,
-		ToolsDir:     toolsDir,
+		ConfigDir:    toolsRoot,
+		ToolsDir:     toolsRoot,
 		CatalogPath:  cfg.catalogPath,
 		Refresh:      refresh,
 		Seed:         toolbelt.DefaultSeed(),
 		System:       []string{"git", "jq", "curl", "unzip", "xz", "ssh", "tar", "bash"},
 		Logger:       slog.Default(),
 		OnJobChanged: status.observeJob,
+		// The library's opt-in prerequisite check: refuse to construct an engine
+		// over a managed root that is a symlink, is not a directory, is
+		// group/other-writable, or resolves outside the tree. It fits this app's
+		// premises exactly — the tree is an operator-controlled persistent
+		// volume, this process runs as root, and toolbelt's install probe
+		// EXECUTES what it finds in <ToolsDir>/bin with that dir first on PATH.
+		//
+		// ADDITIVE to entrypoint.sh, which stays as it is: only the entrypoint
+		// can chmod and re-stat to prove a tightening took, produce the
+		// KIRO_CLI_TOOLS_TAINTED observation the kiro-cli install manager
+		// consumes, cover the trees outside toolbelt's four roots
+		// ($TOOLS/kiro-cli-versions, $TOOLS/go{,/bin}, /config, /config/home),
+		// and apply this app's fatal-vs-warn policy per directory. What the
+		// library adds is the window the entrypoint cannot cover: a root
+		// reshaped AFTER the entrypoint ran. It reports only, never repairs, so
+		// a refusal here degrades (below) and leaves the repair with the
+		// operator, per this app's failure posture.
+		VerifyRootIntegrity: true,
 	})
 	if err != nil {
 		slog.Error("tools engine failed to start; continuing without it", "error", err)
+		// A root-integrity refusal names every offending path; break those out
+		// into their own lines so "degraded" is diagnosable (no-op for any
+		// other error class, which keeps the single line above).
+		logRootIntegrityFindings(err)
 		// Unlike the missing-config-dir path (an intentionally disabled
 		// subsystem: no engine, empty state, no health detail), a FAILED
 		// production subsystem must stay visible: report state "degraded" so

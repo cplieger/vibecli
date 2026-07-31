@@ -303,6 +303,101 @@ prune_superseded_kas_runtimes() {
   return 0
 }
 
+# --- one-time relocation of the tool subsystem's metadata -----------------------
+# toolbelt keeps three metadata files -- tools.json (HAND-AUTHORED intent:
+# enabling a tool is a file edit plus a restart), tools-state.json (engine-owned
+# machine state) and tool-catalog.cached.json -- and they used to sit in /config
+# while every artifact they describe sits in $TOOLS. The server now points the
+# engine's config dir at $TOOLS, so all four converge; on a volume created by an
+# earlier image the three files are still in the old place, where the engine no
+# longer reads them and would seed a FRESH all-disabled manifest beside the tree
+# instead. That is the operator's own intent silently reset, not a clean break, so
+# move the files once.
+#
+# Guards, in the shape the sweeps above use, plus the marker the server's own
+# one-shot purge uses ($TOOLS/.kiro-cli-legacy-purged, main.go's legacyPurgeMarker):
+#
+#   1. Only a REGULAR file is moved. A symlink at the source is refused rather
+#      than moved: `mv` would relocate the link itself, landing a redirect inside
+#      the tree the server writes tools.json through -- the same reason
+#      prune_superseded_kas_runtimes refuses to act through one.
+#   2. A destination that already exists is NEVER overwritten. Both copies present
+#      means a partial migration or the operator's own doing; either way the file
+#      the engine reads today wins and the stale one is left for them to delete.
+#   3. Nothing here is fatal, per web-terminal-kiro.md "Failure posture": a
+#      container that cannot tidy its own volume must still boot.
+#   4. Completion is recorded, so a migrated volume stops being scanned. A failed
+#      `mv` WITHHOLDS the marker, so the next boot retries rather than recording a
+#      job it did not finish -- while a refusal by shape (1 and 2 above) does not,
+#      matching the purge's own distinction between "I could not" and "that is not
+#      mine to touch".
+#
+# The marker is dot-prefixed and directly under $TOOLS, where the toolbelt engine
+# never looks (it enumerates bin/, opt/, npm/ and python/) and where neither the
+# write-probe sweep (.write-probe.*) nor the server's staging sweep
+# (.kiro-cli-stage.*) can match it.
+move_legacy_tool_metadata() {
+  local from=$1 to=$2 marker name src dst stamp moved=0 failed=0
+  marker="$to/.tools-metadata-moved"
+  # Only a regular file counts as the marker: on anything else this would rather
+  # run again (every step is idempotent) than skip on evidence it did not write.
+  [ -f "$marker" ] && return 0
+  # Never act THROUGH a symlink at either end. The destination has already been
+  # proven by the make_config_dir/secure_tools_dir walk on the boot path, but this
+  # function is also the unit under test, so it states what it requires.
+  if [ -L "$from" ] || [ ! -d "$from" ] || [ -L "$to" ] || [ ! -d "$to" ]; then
+    printf 'level=warn msg="skipping the one-time tool-metadata move: one of the directories is missing or is a symlink, and moving through a link could place the manifest outside the /config mount" from="%s" to="%s" component=entrypoint\n' \
+      "$from" "$to" >&2
+    return 0
+  fi
+  for name in tools.json tools-state.json tool-catalog.cached.json; do
+    src="$from/$name"
+    dst="$to/$name"
+    # -L BEFORE -f: [ -f ] dereferences, so a symlink to a regular file would pass
+    # it and be moved as a link.
+    if [ -L "$src" ]; then
+      printf 'level=warn msg="refusing to move a symlinked tool metadata file into the tools tree; the engine would then write the manifest through a link that can point anywhere" path="%s" component=entrypoint\n' \
+        "$src" >&2
+      continue
+    fi
+    [ -f "$src" ] || continue
+    if [ -e "$dst" ]; then
+      printf 'level=warn msg="a tool metadata file exists in BOTH the old and the new location; keeping the one the engine reads and leaving the old copy alone (it is unused now and can be deleted)" old="%s" new="%s" component=entrypoint\n' \
+        "$src" "$dst" >&2
+      continue
+    fi
+    if mv "$src" "$dst"; then
+      moved=$((moved + 1))
+      printf 'level=info msg="moved tool metadata beside the tools tree it describes" old="%s" new="%s" component=entrypoint\n' \
+        "$src" "$dst" >&2
+    else
+      failed=1
+      printf 'level=warn msg="failed to move a tool metadata file beside the tools tree; the engine will seed a fresh manifest instead of adopting this one" old="%s" new="%s" component=entrypoint\n' \
+        "$src" "$dst" >&2
+    fi
+  done
+  if [ "$failed" -ne 0 ]; then
+    printf 'level=warn msg="not recording the tool-metadata move as complete: a file could not be moved, so the next boot retries it" dir="%s" component=entrypoint\n' \
+      "$from" >&2
+    return 0
+  fi
+  if [ "$moved" -ne 0 ]; then
+    printf 'level=info msg="tool metadata now sits beside the artifacts it describes" dir="%s" count=%d component=entrypoint\n' \
+      "$to" "$moved" >&2
+  fi
+  # A marker this boot could not write only costs a rescan next boot, which is a
+  # no-op on a migrated volume -- so warn like every other hygiene step here. The
+  # timestamp is resolved BEFORE the redirect, so the warning is true when it
+  # fires: only a redirect that could not create the file reaches it, and an
+  # unreadable clock degrades the content rather than the record.
+  stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || stamp="unknown"
+  if ! printf '%s\n' "$stamp" >"$marker"; then
+    printf 'level=warn msg="failed to record the tool-metadata move; the next boot rescans, which is a no-op once the files have moved" path="%s" component=entrypoint\n' \
+      "$marker" >&2
+  fi
+  return 0
+}
+
 # Warn about a rejected APT_PACKAGES token. The token is untrusted env content, so
 # bound its length first (one bad token must not dominate the log line), then strip
 # non-printable bytes and neutralize the quote that would close the logfmt field.
@@ -356,9 +451,11 @@ KIRO_CLI_SHA256="eabce0df2f37f071fcc7ec3f6d1e35fb11b94ca98e62f57d97d561d505d0b99
 KIRO_CLI_SHA256_ARM64="4db660fa2217cb8671a6f47afc5a48ca66e70d66c55ab99a4bb95c48e2001260" # kiro-cli 2.15.2
 
 # Hand the pins and the tools tree to the server. The manager selects the digest for
-# the architecture it is running on, so both travel; ToolsDir travels explicitly rather
-# than being re-derived from KWEB_CONFIG_DIR, so the one path this script hardens is
-# provably the one the manager writes to.
+# the architecture it is running on, so both travel; the tools tree travels
+# EXPLICITLY, so the one path this script hardens is provably the one the manager
+# writes to -- and the toolbelt engine now resolves both its config dir and its
+# tools dir from the same export, so the manifest and the state cannot end up
+# describing a tree they do not sit in.
 export KIRO_CLI_VERSION KIRO_CLI_SHA256 KIRO_CLI_SHA256_ARM64
 KIRO_CLI_TOOLS_DIR="$TOOLS"
 export KIRO_CLI_TOOLS_DIR
@@ -634,6 +731,13 @@ fi
 if ! rm -rf "$TOOLS"/.write-probe.*; then
   printf 'level=warn msg="failed to remove orphaned boot-time temp artifacts; they keep occupying the /config volume" dir="%s" component=entrypoint\n' "$TOOLS" >&2
 fi
+
+# Bring the tool subsystem's metadata beside the tree it describes, once per volume
+# (see move_legacy_tool_metadata). Placed here, after the walk proved $TOOLS is a real
+# private directory and after the write probe proved the mount is writable, so a move
+# into it cannot be redirected and a failure is a real failure rather than a read-only
+# mount reported three times.
+move_legacy_tool_metadata /config "$TOOLS"
 
 # Hygiene for the one residue class the manager's own purge does not reach: binaries an
 # EARLIER image version staged into $HOME/.local/bin (that install ran with the real

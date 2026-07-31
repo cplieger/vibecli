@@ -115,6 +115,35 @@ grep -q 'KIRO_CLI_PATH' "$README" \
   && no "KIRO_CLI_PATH in the README" "the README still documents KIRO_CLI_PATH; an operator setting a variable the server ignores gets no error and no managed install either" \
   || ok "the README config table does not offer KIRO_CLI_PATH"
 
+# --- KWEB_CONFIG_DIR is GONE, on all three surfaces --------------------------
+# Same class of deletion as KIRO_CLI_PATH above, and asserted the same way. The
+# knob claimed to relocate persistent state but reached only toolbelt's three
+# metadata files (tools.json, tools-state.json, tool-catalog.cached.json): the
+# artifacts they describe followed the entrypoint's exported KIRO_CLI_TOOLS_DIR,
+# $HOME is fixed at /config/home by the Dockerfile (and refused outside /config
+# here), and the kiro-cli install root sits under the exported tree -- so its only
+# reachable effect was splitting ONE subsystem across two volumes: a hand-edited
+# manifest and machine state describing a tree that was somewhere else, on no
+# session's PATH, while /api/health still reported tools=ok.
+#
+# Three surfaces, because the knob can come back through any of them and every
+# route is silent: a Go source re-reading the env (the split returns), the README
+# table re-advertising it (an operator sets a variable nothing reads), or this
+# script re-deriving $TOOLS from it (the split returns from the other end).
+if grep -rq --include='*.go' --exclude-dir='.*' 'KWEB_CONFIG_DIR' "$GO_SOURCE_ROOT"; then
+  no "KWEB_CONFIG_DIR in Go sources" "a Go source still mentions KWEB_CONFIG_DIR; reading it re-splits the tool subsystem, putting the manifest and state in a different tree from the artifacts they describe"
+else
+  ok "no Go source mentions KWEB_CONFIG_DIR: the tool subsystem has one root"
+fi
+
+grep -q 'KWEB_CONFIG_DIR' "$README" \
+  && no "KWEB_CONFIG_DIR in the README" "the README still documents KWEB_CONFIG_DIR; an operator setting a variable the server ignores gets no error and no relocated state either" \
+  || ok "the README config table does not offer KWEB_CONFIG_DIR"
+
+grep -q 'KWEB_CONFIG_DIR' "$ENTRYPOINT" \
+  && no "KWEB_CONFIG_DIR in entrypoint.sh" "entrypoint.sh still mentions KWEB_CONFIG_DIR; deriving \$TOOLS from it would move the hardened tree out from under the export the server reads" \
+  || ok "entrypoint.sh derives nothing from KWEB_CONFIG_DIR"
+
 # --- the tools dir the server writes to is the one this script hardened -------
 # The manager creates version directories under $KIRO_CLI_TOOLS_DIR/kiro-cli-versions,
 # and the symlink + mode guards only cover it because the same path is walked

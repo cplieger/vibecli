@@ -138,7 +138,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # the RUN below asserts the two pins are equal, so the build gate and the
 # runtime gate can never become different verifiers — same fail-loud treatment
 # the engine/UI/tsc pin pairs get against static-src/package.json.
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.0
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.1
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \

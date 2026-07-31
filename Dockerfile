@@ -448,6 +448,11 @@ RUN sed -i 's|^root:x:0:0:root:/root:|root:x:0:0:root:/config/home:|' /etc/passw
 COPY --from=builder /web-terminal-kiro /app/web-terminal-kiro
 COPY --from=builder /tmp/tool-catalog.json /app/tool-catalog.json
 COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
+# The kiro-cli hook that reports which kiro session a tab is running. Executed by
+# kiro-cli (not by this image's entrypoint), which is why it ships as its own
+# executable rather than a function in entrypoint.sh; entrypoint.sh only seeds the
+# hook CONFIG that points at this path. See sessiontitle.go.
+COPY --chmod=755 hooks/session-title.sh /opt/web-terminal-kiro/hooks/session-title.sh
 
 WORKDIR /workspace
 EXPOSE 9848

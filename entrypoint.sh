@@ -26,6 +26,11 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 TOOLS="/config/tools"
 
+# The kiro-cli hook that pairs a tab with its kiro session, shipped in the image
+# beside this script. Named here so the seeding block at the bottom and the
+# Dockerfile COPY cannot drift apart silently; see that block for what it does.
+SESSION_TITLE_HOOK="/opt/web-terminal-kiro/hooks/session-title.sh"
+
 # Fatal boot error: log it, then throttle the restart:unless-stopped crash loop
 # (an immediate exit would hot-spin the container) before failing. $2 carries
 # any extra structured fields, already formatted.
@@ -991,6 +996,44 @@ else
     || ! mv "$theme_tmp" "$theme_file"; then
     [ -z "${theme_tmp:-}" ] || rm -f "$theme_tmp"
     printf 'level=warn msg="failed to write kiro-cli theme file; diff colors may be unreadable" file="%s" component=entrypoint\n' "$theme_file" >&2
+  fi
+fi
+
+# Seed the kiro-cli hook that reports which kiro session each tab is running.
+#
+# This is the mapping half of the tab-title feature (sessiontitle.go). The server
+# injects KWEB_SESSION_ID + KWEB_TITLE_STATE_DIR into each PTY session, and this hook
+# — a descendant of that session, handed kiro's own session_id on stdin — writes the
+# pair where the server reads it. Without it every tab falls back to the engine's
+# automatic cwd/process name ladder, which is a degraded label rather than a failure.
+#
+# Rewritten on EVERY boot rather than created-if-missing, so an image upgrade updates
+# the hook and a deleted or edited file self-heals. Global hooks (~/.kiro/hooks) load
+# in every workspace, which is what makes this reach a session whatever directory it
+# starts in; the script itself no-ops when KWEB_SESSION_ID is absent, so an operator
+# running kiro-cli from `docker exec` is unaffected.
+#
+# Symlink handling follows the theme block above for the same reason: this writes a
+# FIXED-NAME file through the path, in the tree where kiro-cli persists mcp.json, so a
+# symlink whose target may be outside the /config mount is fatal. A failed mkdir stays
+# a warn -- a missing hook costs a tab label, not a boot.
+hooks_dir="$HOME/.kiro/hooks"
+hooks_file="$hooks_dir/web-terminal-session-title.json"
+hooks_tmp=''
+if [ -L "$hooks_dir" ]; then
+  fatal 'refusing to write kiro-cli hooks through a symlinked hooks directory; its target may be outside the /config mount' "dir=\"$hooks_dir\""
+fi
+if ! mkdir -p "$hooks_dir"; then
+  printf 'level=warn msg="failed to create kiro-cli hooks directory; tab titles fall back to the automatic name ladder" dir="%s" component=entrypoint\n' "$hooks_dir" >&2
+else
+  harden_config_dir "$hooks_dir"
+  if ! hooks_tmp=$(mktemp "${hooks_file}.XXXXXX") \
+    || ! printf '{"version":"v1","hooks":[{"name":"web-terminal-session-title","trigger":"SessionStart","action":{"type":"command","command":"%s"}},{"name":"web-terminal-session-title-prompt","trigger":"UserPromptSubmit","action":{"type":"command","command":"%s"}}]}\n' \
+      "$SESSION_TITLE_HOOK" "$SESSION_TITLE_HOOK" >"$hooks_tmp" \
+    || ! chmod 0644 "$hooks_tmp" \
+    || ! mv "$hooks_tmp" "$hooks_file"; then
+    [ -z "${hooks_tmp:-}" ] || rm -f "$hooks_tmp"
+    printf 'level=warn msg="failed to write the kiro-cli session-title hook; tab titles fall back to the automatic name ladder" file="%s" component=entrypoint\n' "$hooks_file" >&2
   fi
 fi
 

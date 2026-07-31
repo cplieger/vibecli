@@ -448,6 +448,11 @@ RUN sed -i 's|^root:x:0:0:root:/root:|root:x:0:0:root:/config/home:|' /etc/passw
 COPY --from=builder /web-terminal-kiro /app/web-terminal-kiro
 COPY --from=builder /tmp/tool-catalog.json /app/tool-catalog.json
 COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
+# The kiro-cli hook that reports which kiro session a tab is running. Executed by
+# kiro-cli (not by this image's entrypoint), which is why it ships as its own
+# executable rather than a function in entrypoint.sh; entrypoint.sh only seeds the
+# hook CONFIG that points at this path. See sessiontitle.go.
+COPY --chmod=755 hooks/session-title.sh /opt/web-terminal-kiro/hooks/session-title.sh
 
 WORKDIR /workspace
 EXPOSE 9848
@@ -527,6 +532,13 @@ EXPOSE 9848
 # but do not restart the container (restart policies react to process exit,
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.
+# DL3025 wants JSON notation, which cannot express this: the URL is built with
+# the shell parameter expansion ${KWEB_ADDR##*:} to read the port out of the
+# runtime listen address, and exec form performs no expansion at all -- it would
+# probe a literal. This image also runs as root with a shell for git/gh, so it
+# will never be shell-less, and the distroless case the rule guards does not
+# arise here.
+# hadolint ignore=DL3025
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20m \
     CMD curl -sfS --max-time 4 "http://127.0.0.1:${KWEB_ADDR##*:}/api/health" || exit 1
 

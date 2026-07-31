@@ -84,7 +84,14 @@ type routeDeps struct {
 	// directory leading PATH). A nil result leaves the child with the server's
 	// own environment, which is what the root's off-shape constructors return.
 	sessionEnv func() []string
-	workDir    string
+	// sessionTitleEnv returns the per-session variables a kiro-cli hook needs to
+	// report which kiro session this tab is running: the tab's own id and the
+	// state directory to write the pairing into. Takes the session id because it
+	// is the one part of the child environment that differs per tab. A nil
+	// function (the root's off-shape constructors) leaves tabs on the engine's
+	// automatic name ladder.
+	sessionTitleEnv func(id string) []string
+	workDir         string
 	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
 	// OSC 9 notification's full text is logged at Debug. Default false — the
 	// text is arbitrary child output that may carry a token or device code, so
@@ -294,6 +301,28 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 // capability token), the WithCommandLogValue argv redaction (the argv carries
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
+// childEnv is the environment overlay for one tab's kiro-cli process: the active
+// version's PATH lead, plus the two variables a hook needs to report which kiro
+// session this tab is running. Built as a fresh slice rather than appending to
+// sessionEnv's return, so one session's overlay can never alias another's backing
+// array. A nil sessionTitleEnv (the root's off-shape constructors, and tests with
+// no title syncer) contributes nothing and leaves the tab on the engine's
+// automatic name ladder.
+func (d *routeDeps) childEnv(id string) []string {
+	base := d.sessionEnv()
+	var extra []string
+	if d.sessionTitleEnv != nil {
+		extra = d.sessionTitleEnv(id)
+	}
+	if len(extra) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(extra))
+	out = append(out, base...)
+	out = append(out, extra...)
+	return out
+}
+
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	// Scrollback 5000 covers a /chat transcript restore on reconnect (matches
 	// the client store's retained-line cap). WithKeepUnfocused pins the process
@@ -338,17 +367,19 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// digest-verified install rather than out of a stale $TOOLS/bin copy
 			// left by a restored backup volume. A nil result (no version active,
 			// or no manager) leaves the server's own environment untouched.
-			terminal.WithEnv(deps.sessionEnv()),
-			// Name each tab after the first substantial thing the user asked
-			// for. This app is the engine's session-per-CONVERSATION consumer,
-			// which is the exact shape WithInputTitle is for: kiro-cli sets no
-			// OSC window title, so without it every tab falls to the automatic
-			// ladder's cwd rung and all of them read alike ("workspace",
-			// "workspace 2", …) forever — the label carries no information at
-			// the moment it matters most, picking one tab out of several. The
-			// generic web-terminal-server deliberately leaves it off: there the
-			// foreground-process name is the better automatic label.
-			terminal.WithInputTitle(),
+			// The version-directory PATH overlay, plus the two variables that
+			// let a kiro-cli hook report which kiro session this tab is running
+			// (sessionTitleEnv). Tab names come from kiro-cli's own session
+			// record, so the engine's input-stream deriver (WithInputTitle) is
+			// deliberately NOT requested here: reconstructing a submitted line
+			// from raw bytes means modelling the agent shell's composer, and
+			// every discard key it does not model (Escape dismissing the
+			// slash-command menu, Ctrl-U, Ctrl-W) fuses abandoned text onto the
+			// next prompt and latches that for the session's life. kiro-cli
+			// already knows the answer and keeps improving it as the
+			// conversation goes; see sessiontitle.go for the mapping and why it
+			// needs a hook.
+			terminal.WithEnv(deps.childEnv(id)),
 			// A session whose process dies within seconds of spawn is the
 			// kiro-cli-missing/broken signature (the sign-in guard exits 1
 			// when the binary is absent or login fails instantly). The

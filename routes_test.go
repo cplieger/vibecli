@@ -13,13 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
 
-	"github.com/coder/websocket"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 	"github.com/cplieger/webhttp"
@@ -682,72 +682,81 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 	}
 }
 
-// TestSessionTitleDerivesFromInput pins terminal.WithInputTitle() in the session
-// factory's option list: send one submitted line into a session's PTY and the
-// manager must report that line as the session's title.
+// TestSessionFactoryRequestsTheTitleEnv pins that the session factory consults
+// deps.sessionTitleEnv for the session it is building.
 //
 // This is a COMPOSITION test, and it exists because the composition is the part
-// that broke. The engine ships the deriver as an opt-in mechanism (off by
-// default, deliberately: a general-purpose terminal wants the
-// foreground-process name instead), so the whole feature reaching a user rests
-// on this app passing one option. When the client-side deriver was retired in
-// favour of the server-side one, that option was never added here — every tab
-// silently fell through to the automatic ladder's cwd rung and read "workspace"
-// forever, with no failing test anywhere. Asserting the derived title THROUGH
-// registerRoutes is the only place that catches a dropped option; a unit test
-// of the engine's deriver passes either way.
-func TestSessionTitleDerivesFromInput(t *testing.T) {
+// that breaks. Tab names come from kiro-cli's own session record, and the whole
+// chain rests on one thing this app must do per session: inject KWEB_SESSION_ID
+// into the child environment so a kiro-cli hook can report which kiro session the
+// tab is running (sessiontitle.go). Nothing else can supply that pairing. Drop the
+// option and every tab silently falls back to the engine's automatic cwd rung and
+// reads "workspace" forever, which is exactly how the PREVIOUS title mechanism
+// broke here: the engine shipped it as an opt-in and this app stopped passing it,
+// with no failing test anywhere. Asserting it THROUGH registerRoutes is the only
+// place that catches a dropped option.
+func TestSessionFactoryRequestsTheTitleEnv(t *testing.T) {
 	var ready webhttp.Ready
 	ready.Set(true)
+
+	var gotIDs []string
 	deps := withDefaultPolicies(&routeDeps{
 		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
 		ready:    &ready,
 		workDir:  "",
-		// /bin/cat stands in for kiro-cli: the deriver reads the bytes the
-		// client SENDS, so what the program does with them is irrelevant.
-		cmd: staticCmd("/bin/cat"),
+		cmd:      staticCmd("/bin/cat"),
+		sessionTitleEnv: func(id string) []string {
+			gotIDs = append(gotIDs, id)
+			return []string{"KWEB_SESSION_ID=" + id}
+		},
 	})
-	mux, mgr, csp, id := mustStartSession(t, deps)
+	_, _, _, id := mustStartSession(t, deps)
 
-	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
-	t.Cleanup(srv.Close)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?session=" + id
-	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPClient: srv.Client()})
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
+	if len(gotIDs) != 1 || gotIDs[0] != id {
+		t.Fatalf("sessionTitleEnv called with %v, want exactly [%q] -- the session factory no longer asks for the per-session title environment, so no kiro-cli hook can pair this tab with its session and every tab falls back to the cwd name", gotIDs, id)
 	}
-	if err != nil {
-		t.Fatalf("dial /ws: %v", err)
-	}
-	defer conn.CloseNow()
+}
 
-	// One binary frame is one atomic input event (the chunk boundary the
-	// deriver's escape parser relies on). The leading byte must not be 0x00,
-	// which the wire protocol reserves for control frames.
-	const want = "name this session"
-	if err := conn.Write(ctx, websocket.MessageBinary, []byte(want+"\r")); err != nil {
-		t.Fatalf("write input frame: %v", err)
-	}
-
-	// The title is resolved on read (no status sweep needed), but the frame
-	// still has to cross the socket and reach the PTY write.
-	deadline := time.Now().Add(5 * time.Second)
-	var got string
-	for time.Now().Before(deadline) {
-		for _, s := range mgr.List() {
-			if s.ID == id {
-				got = s.Title
-			}
+// TestChildEnvComposesBothOverlays pins that the per-session overlay carries the
+// PATH lead AND the title variables, and that a nil sessionTitleEnv (the root's
+// off-shape constructors, and tests that do not wire a syncer) degrades to the
+// PATH overlay alone rather than panicking.
+func TestChildEnvComposesBothOverlays(t *testing.T) {
+	t.Run("both overlays present", func(t *testing.T) {
+		d := &routeDeps{
+			sessionEnv:      func() []string { return []string{"PATH=/pinned:/usr/bin"} },
+			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
 		}
-		if got == want {
-			return
+		got := d.childEnv("tab7")
+		want := []string{"PATH=/pinned:/usr/bin", "KWEB_SESSION_ID=tab7"}
+		if !slices.Equal(got, want) {
+			t.Errorf("childEnv = %v, want %v", got, want)
 		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Errorf("session title = %q, want %q -- terminal.WithInputTitle() is missing from the session factory, so every tab falls back to the cwd/command name", got, want)
+	})
+	t.Run("nil title env is harmless", func(t *testing.T) {
+		d := &routeDeps{sessionEnv: func() []string { return []string{"PATH=/pinned"} }}
+		if got := d.childEnv("tab7"); !slices.Equal(got, []string{"PATH=/pinned"}) {
+			t.Errorf("childEnv = %v, want the PATH overlay alone", got)
+		}
+	})
+	t.Run("one session's overlay cannot alias another's", func(t *testing.T) {
+		// sessionEnv returning a slice with spare capacity is the aliasing trap:
+		// appending into it would let tab A's overlay overwrite tab B's.
+		base := make([]string, 1, 8)
+		base[0] = "PATH=/pinned"
+		d := &routeDeps{
+			sessionEnv:      func() []string { return base },
+			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
+		}
+		a := d.childEnv("tabA")
+		b := d.childEnv("tabB")
+		if a[1] != "KWEB_SESSION_ID=tabA" {
+			t.Errorf("first overlay = %v, want it unchanged by the second", a)
+		}
+		if b[1] != "KWEB_SESSION_ID=tabB" {
+			t.Errorf("second overlay = %v", b)
+		}
+	})
 }
 
 // TestClassifyStatus pins the kiro-cli OSC 9 -> latched-status mapping that

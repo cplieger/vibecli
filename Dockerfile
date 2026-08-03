@@ -90,7 +90,7 @@ ARG NERDFONT_VERSION=v3.5.0
 # sha256 of Monaspace.tar.xz for this tag. GitHub release assets are MUTABLE (a
 # retag can swap the bytes under a fixed tag), so this gate is the real
 # integrity anchor here. Update alongside NERDFONT_VERSION.
-ARG NERDFONT_SHA256=5fdb97828e1a23fd28ea5ed0e7d15cdebb77ef079aaa48b93f1526764b40ef8c
+ARG NERDFONT_SHA256=bc34fd1998deee7105573e4604ca3fc3d568c1549fc6035c53981eba4160c0dc
 
 WORKDIR /build
 COPY go.mod go.sum ./

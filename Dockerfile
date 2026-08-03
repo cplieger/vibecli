@@ -49,10 +49,10 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # renovate: datasource=npm depName=typescript
 ARG TS_VERSION=7.0.2
 # sha256 of the platform-specific tsc tarball, per arch. npm publishes SHA-512
-# (dist.integrity), not this SHA-256, so Renovate bumps TS_VERSION but cannot
-# move these — the manual-sha-bump rule in cplieger/.github (scoped to this
-# repo) labels the PR with the recompute commands. Update both alongside
-# TS_VERSION (the linux-x64 and linux-arm64 packages publish in lockstep).
+# (dist.integrity), not this SHA-256, so the digests come from a different
+# source than the version: Renovate bumps TS_VERSION and the repin
+# postUpgradeTask recomputes both shas from the markers below in the same
+# commit (the linux-x64 and linux-arm64 packages publish in lockstep).
 # Upstream toolchain vuln tracking: the pinned 7.0.2 tsc binaries were built
 # with Go 1.26.4 + golang.org/x/text v0.38.0, which govulncheck -mode=binary
 # flags for GO-2026-5970 / GO-2026-5856 / GO-2026-4970. The compiler lives
@@ -64,7 +64,9 @@ ARG TS_VERSION=7.0.2
 # shows Go >= 1.26.5 and x/text >= v0.39.0, and re-run
 # `govulncheck -mode=binary` as the gate. Never drop these sha256 checks or
 # substitute an unpinned latest package while waiting.
+# repin: dep=typescript url=https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-{version}.tgz
 ARG TS_SHA256_X64=7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
+# repin: dep=typescript url=https://registry.npmjs.org/@typescript/typescript-linux-arm64/-/typescript-linux-arm64-{version}.tgz
 ARG TS_SHA256_ARM64=c83d931ac9dd7549cde6e71246aa9d6a9812843023df3e277fe3b5dcf41dd0ea
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
@@ -89,7 +91,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
 ARG NERDFONT_VERSION=v3.5.0
 # sha256 of Monaspace.tar.xz for this tag. GitHub release assets are MUTABLE (a
 # retag can swap the bytes under a fixed tag), so this gate is the real
-# integrity anchor here. Update alongside NERDFONT_VERSION.
+# integrity anchor here.
+# repin: dep=ryanoasis/nerd-fonts url=https://github.com/ryanoasis/nerd-fonts/releases/download/{version}/Monaspace.tar.xz
 ARG NERDFONT_SHA256=bc34fd1998deee7105573e4604ca3fc3d568c1549fc6035c53981eba4160c0dc
 
 WORKDIR /build
@@ -120,15 +123,17 @@ COPY required-tools.txt ./
 # runtime refresh re-runs the same check before every swap. The two
 # checks cover different threats; both run, authenticity first.
 # TOOL_CATALOG_VERSION + TOOL_CATALOG_SHA256 move together in one
-# Renovate PR (the `# tool-catalog <version>` trailer is the digest's
-# version anchor — same trailer model as the kiro-cli/golang per-arch sha
-# pins; the grouping + digest recompute rule lives in cplieger/.github's
-# default.json, never in this repo's inherited renovate.json). The
-# publisher's cadence is daily; the pin means the baked fallback is a
-# REVIEWED catalog, while the runtime refresh keeps a running container
-# current.
+# Renovate PR: Renovate bumps the version and the repin postUpgradeTask
+# recomputes the digest from the marker below in the same commit. The
+# `# tool-catalog <version>` trailer is that digest's version anchor, the
+# same trailer model as the kiro-cli/golang per-arch sha pins; the
+# grouping + repin rule lives in cplieger/.github's default.json, never
+# in this repo's inherited renovate.json. The publisher's cadence is
+# daily; the pin means the baked fallback is a REVIEWED catalog, while
+# the runtime refresh keeps a running container current.
 # renovate: datasource=github-releases depName=cplieger/tool-catalog
 ARG TOOL_CATALOG_VERSION=v2026.07.24.1907
+# repin: dep=cplieger/tool-catalog url=https://github.com/cplieger/tool-catalog/releases/download/{version}/tool-catalog.json
 ARG TOOL_CATALOG_SHA256=651d11d218a313a029d7a7ad15eedccdaa1c2c7a48aad39661c33d0684b864cb # tool-catalog v2026.07.24.1907
 ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/${TOOL_CATALOG_VERSION}/tool-catalog.json
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
@@ -175,7 +180,10 @@ RUN mkdir -p static/vendor/fonts && \
 # --tlsv1.2 below). The residual risk (a registry-side byte-swap or a
 # first-party npm account takeover) is accepted here; add per-package sha256
 # ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
-# deemed in scope (at the cost of a manual sha bump on each engine/UI release).
+# deemed in scope. The old objection to doing so -- a manual sha bump on every
+# engine/UI release -- no longer applies: a `# repin:` marker would put both
+# pins on the same Renovate postUpgradeTask that maintains the four above, so
+# the cost is now one marker line each, not recurring toil.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
 ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.3.0
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui

@@ -627,22 +627,31 @@ func newWSUpgradeRequest(t *testing.T, srvURL, id, origin string) *http.Request 
 }
 
 // TestWSRejectsCrossOrigin pins the WebSocket CSWSH guard. /ws is mounted via
-// mgr.WebSocketHandler() with no WithAcceptOptions, so the engine relies on
-// coder/websocket's secure-by-default same-origin check (nil AcceptOptions ->
-// authenticateOrigin). http.NewCrossOriginProtection lets the GET upgrade
-// through, so this same-origin check is the ONLY thing standing between a
-// malicious page in the victim's browser and a kiro-cli PTY on localhost.
-// Unlike /debug (TestDebugRoutesNotExposed) this posture had no regression
-// guard: a future WithAcceptOptions{InsecureSkipVerify:true} would silently
-// re-open cross-site WebSocket hijacking. This test fails if that happens.
+// mgr.WebSocketHandler() with no origin policy, so the engine allows same-origin
+// only. http.NewCrossOriginProtection lets the GET upgrade through as a safe
+// method, so that check is the ONLY thing standing between a malicious page in
+// the victim's browser and a kiro-cli PTY on localhost.
+//
+// What this guard is DEFENDING against narrowed at engine v3.4.0, and the
+// difference is worth stating. The engine used to take a whole
+// websocket.AcceptOptions (WithAcceptOptions), so a single
+// InsecureSkipVerify:true anywhere in this app's session factory would have
+// silently reopened cross-site hijacking, and this test was the only thing
+// watching for it. That option is gone: widening now requires building an
+// explicit terminal.OriginPolicy from complete origins, there are no wildcards,
+// and the check cannot be disabled at all. So the "someone flips a boolean"
+// failure mode is structurally unreachable, and what remains testable is the
+// posture itself -- that this app configures no policy and therefore stays
+// same-origin. This test fails if a future change hands the manager or the
+// handler an origin policy without that being a deliberate, reviewed decision.
 func TestWSRejectsCrossOrigin(t *testing.T) {
 	// Drive the guard on a REAL session: the shape a malicious page in the
 	// victim's browser would actually target. The pinned engine runs the
 	// same-origin check on EVERY upgrade -- an unknown id is reported after the
 	// upgrade via close 4004 and a non-WebSocket GET gets Accept's 426 either
 	// way, so the response is no session-existence oracle -- so the 403 below is
-	// websocket.Accept's origin refusal (nil AcceptOptions) on a session that
-	// exists and is attachable, not an artifact of a missing session.
+	// the engine's same-origin refusal on a session that exists and is
+	// attachable, not an artifact of a missing session.
 	mux, _, csp, id := mustStartSession(t, newTestDeps(true))
 
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
@@ -655,7 +664,7 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("cross-origin /ws handshake = %d, want 403 (CSWSH must be blocked; do not set InsecureSkipVerify)", resp.StatusCode)
+		t.Errorf("cross-origin /ws handshake = %d, want 403 (CSWSH must be blocked; this app configures no terminal.OriginPolicy and must stay same-origin)", resp.StatusCode)
 	}
 }
 

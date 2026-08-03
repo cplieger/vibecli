@@ -508,6 +508,7 @@ func main() {
 		tools:           tools.engine,
 		toolsSyncing:    tools.syncing,
 		toolsState:      tools.state,
+		containment:     startContainment(),
 	})
 	if err != nil {
 		slog.Error("route registration failed; the embedded static tree is unusable",
@@ -1261,6 +1262,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	if toolsRoot == "" {
 		toolsRoot = filepath.Join(cfg.configDir, "tools")
 	}
+	manifestPath := manifestPathFor(toolsRoot)
 	warnIfToolsBinUnreachable(toolsRoot)
 	refresh := &toolbelt.CatalogRefresh{
 		URL:      cfg.catalogURL,
@@ -1332,10 +1334,10 @@ func startTools(cfg baseTools) toolsRuntime {
 	case rerr != nil:
 		slog.Warn("tools: boot reconcile not enqueued", "error", rerr)
 		finish(toolsStateDegraded)
-		warnIfNoLSPEnabled(eng)
+		warnIfNoLSPEnabled(eng, manifestPath)
 	case job == nil: // empty manifest: nothing to converge
 		finish(toolsStateOK)
-		warnIfNoLSPEnabled(eng)
+		warnIfNoLSPEnabled(eng, manifestPath)
 	default:
 		syncing.Store(true)
 		// Mark the gated window OPENING. Without this the only boot-convergence
@@ -1346,7 +1348,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		slog.Info("tools: boot convergence started; session creation is gated until it finishes",
 			"job", job.ID,
 			"hint", "POST /api/sessions answers 503 \"tools installing\" (Retry-After 5) and /api/health reports tools=syncing until this converges")
-		go awaitBootConvergence(eng, job.ID, finish)
+		go awaitBootConvergence(eng, job.ID, finish, manifestPath)
 	}
 	// Boot catalog fetch, explicitly AFTER the reconcile enqueue: the
 	// engine's schedule deliberately has no fire-on-start (an immediate
@@ -1367,8 +1369,9 @@ func startTools(cfg baseTools) toolsRuntime {
 // (lifting the session-create gate via finish), then runs the original
 // goroutine's post-convergence tail: the freshness pass for unpinned
 // entries (off the boot path — version-check network never holds the session
-// gate) and the language-server nudge.
-func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string)) {
+// gate) and the language-server nudge. manifestPath is threaded through purely
+// for that nudge's operator-facing `manifest` field.
+func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string), manifestPath string) {
 	final, werr := eng.Wait(context.Background(), jobID)
 	switch {
 	case werr != nil:
@@ -1408,7 +1411,16 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 	if _, uerr := eng.Update(); uerr != nil {
 		slog.Warn("tools: update pass not enqueued", "error", uerr)
 	}
-	warnIfNoLSPEnabled(eng)
+	warnIfNoLSPEnabled(eng, manifestPath)
+}
+
+// manifestPathFor names toolbelt's manifest inside a tools root, mirroring the
+// library's documented <ConfigDir>/tools.json layout (this app passes one
+// toolsRoot as both ConfigDir and ToolsDir). ONE derivation site, so an
+// operator-facing record cannot name a different file than the engine reads —
+// the drift that left the hints pointing at the pre-move /config/tools.json.
+func manifestPathFor(toolsRoot string) string {
+	return filepath.Join(toolsRoot, "tools.json")
 }
 
 // warnIfNoLSPEnabled logs the code-intelligence nudge when no
@@ -1417,13 +1429,23 @@ func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string
 // intelligence. Detection uses the inventory's catalog-derived Lsp
 // marker, so any enabled LSP (seeded template or hand-added) silences
 // it.
-func warnIfNoLSPEnabled(e *toolbelt.Engine) {
+//
+// manifestPath is the RESOLVED manifest both records point an operator at, as
+// its own `manifest` field rather than a path spelled into the hint prose. The
+// hints used to name /config/tools.json literally and silently went stale when
+// the manifest moved under /config/tools/ (one toolsRoot is now both toolbelt
+// ConfigDir and ToolsDir), telling an operator to edit a file that no longer
+// exists. A restated path drifts; a threaded one cannot, and it stays correct
+// for an out-of-container run whose root is a temp dir. The hint text itself
+// stays FIXED for the reason the TRUSTED_PROXIES hints are fixed: an
+// operator-facing hint must not grow an input-derived tail (CWE-532).
+func warnIfNoLSPEnabled(e *toolbelt.Engine, manifestPath string) {
 	inv, err := e.Inventory()
 	if err != nil {
 		// Warn, not Debug: Inventory's only failure mode is an unreadable or
-		// unparseable /config/tools.json, and toolbelt returns that error
-		// without logging it (Engine.Inventory), so at the default level this
-		// would be the one record of a manifest an operator has just broken.
+		// unparseable manifest, and toolbelt returns that error without logging
+		// it (Engine.Inventory), so at the default level this would be the one
+		// record of a manifest an operator has just broken.
 		// The nudge below is skipped either way — its ABSENCE must not be read
 		// as "a language server is enabled" when the answer is really unknown.
 		// Deliberately NOT the "no language servers enabled" wording: that is a
@@ -1431,7 +1453,8 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 		// subtest counts Warns by that message.
 		slog.Warn("tools: manifest unreadable; cannot tell whether a language server is enabled",
 			"error", err,
-			"hint", "fix /config/tools.json (schema v2 JSON); an unreadable manifest fails the tools engine outright on the next restart")
+			"manifest", manifestPath,
+			"hint", "fix the manifest (schema v2 JSON); an unreadable manifest fails the tools engine outright on the next restart")
 		return
 	}
 	for i := range inv.Tools {
@@ -1440,7 +1463,8 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine) {
 		}
 	}
 	slog.Warn("no language servers enabled; kiro code intelligence will be limited",
-		"hint", `enable gopls (Go), typescript-language-server (TypeScript), or pyright (Python): set "disabled": false in /config/tools.json and restart, or use the loopback tools API`)
+		"manifest", manifestPath,
+		"hint", `enable gopls (Go), typescript-language-server (TypeScript), or pyright (Python): set "disabled": false in the manifest and restart, or use the loopback tools API`)
 }
 
 // sessionNoStore marks the ENGINE's session surface uncacheable on the responses
@@ -1761,4 +1785,44 @@ func headerHasToken(r *http.Request, name, token string) bool {
 		}
 	}
 	return false
+}
+
+// containCgroupRoot is the container's own cgroup v2 root under a private cgroup
+// namespace, and containCgroupPrefix namespaces every cgroup this server creates
+// beneath it.
+//
+// Not an env var, deliberately, for the same reason this app removed its operator
+// override of the installed kiro-cli path: a knob whose only effect is to silently
+// disable a correctness feature does not belong in a config table. The entrypoint
+// decides whether containment is possible (it owns the one-time remount), and the
+// server discovers the answer by trying.
+const (
+	containCgroupRoot   = "/sys/fs/cgroup"
+	containCgroupPrefix = "wt-"
+)
+
+// startContainment prepares per-session process containment, or returns nil after
+// one warning when this host cannot support it.
+//
+// Nil is a fully supported outcome, not a failure: sessions then behave exactly as
+// they did before the feature existed. That matters because the reachable reasons
+// for nil are ordinary rather than exotic — a `go run` outside the container, a
+// kernel older than 5.19, a seccomp profile that refuses clone3, or an entrypoint
+// whose `mount -o remount,rw /sys/fs/cgroup` did not run — and this app's failure
+// posture is explicit that a dev box must keep serving a terminal rather than
+// refuse to boot over disk hygiene.
+//
+// What is lost when it is nil, stated in the log so an operator can act on it: a
+// tab's kiro-cli tree can outlive the tab. The agent server calls setsid() and has
+// no stdin-EOF exit path, so no signal the engine can aim reaches it, and it
+// strands holding hundreds of megabytes.
+func startContainment() *terminal.Containment {
+	c, err := terminal.NewContainment(containCgroupRoot, containCgroupPrefix, slog.Default())
+	if err != nil {
+		slog.Warn("per-session process containment unavailable; a closed tab's kiro-cli tree may outlive it",
+			"error", err,
+			"hint", "containment needs a writable cgroup v2 root: the entrypoint remounts /sys/fs/cgroup rw with CAP_SYS_ADMIN (compose cap_add) and then drops the capability. Outside the container this warning is expected.")
+		return nil
+	}
+	return c
 }

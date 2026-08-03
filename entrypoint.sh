@@ -40,6 +40,133 @@ fatal() {
   exit 1
 }
 
+# Make the container's own cgroup tree writable so the server can put each tab's
+# kiro-cli process tree in its own cgroup, then hand the rest of this script a
+# process WITHOUT the capability that made it possible.
+#
+# Why this exists at all: `kiro-cli chat` is a four-deep tree (kiro-cli ->
+# kiro-cli-chat -> the TUI -> the agent server) whose last process calls setsid().
+# That leaves both the process group and the session, so neither a group-scoped
+# kill nor the PTY-close SIGHUP can reach it, and since it installs no stdin-EOF
+# exit path it can outlive the tab that spawned it holding hundreds of megabytes.
+# A cgroup is the only boundary it cannot leave. Measured on this image: 13
+# stranded processes holding 1.35 GB on a container with two tabs open.
+#
+# Docker mounts /sys/fs/cgroup read-only and offers no option to change that, so a
+# one-time remount is the established workaround (the same one runc documents for
+# running systemd in a container). It needs CAP_SYS_ADMIN, which the compose file
+# must add.
+#
+# WARN, never fatal, per this app's failure posture: without containment the
+# server still serves terminals exactly as it did before the feature existed, and
+# the public compose example deliberately adds no capability. The server logs what
+# is lost when it finds the tree read-only, so the degradation is visible without
+# being fatal.
+enable_session_containment() {
+  if mount -o remount,rw /sys/fs/cgroup 2>/dev/null; then
+    printf 'level=info msg="cgroup tree remounted rw; per-session process containment available" component=entrypoint\n'
+    return 0
+  fi
+  printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' >&2
+  return 1
+}
+
+# One remount, then drop the capability that allowed it, as early as this script
+# can. The ordering is the point: the remaining boot work includes `apt-get update`
+# plus an APT_PACKAGES install on every start, and holding the broadest capability
+# there is across network-fetched package installation to buy a single mount call
+# would be a bad trade. Re-executing here reduces the window to that one call.
+#
+# This block must stay BELOW enable_session_containment's definition: bash resolves
+# a function at call time, so a call placed above the definition does not fail
+# loudly, it reports "command not found", gets swallowed by the `|| true`, and boot
+# continues with containment silently never enabled. Nothing above this point needs
+# the capability, so being a few assignments late costs nothing.
+#
+# Verified safe to run unconditionally: setpriv exits 0 when asked to drop a
+# capability the container never had (so the public compose example, which adds
+# none, is unaffected), and it is idempotent if somehow reached twice. The marker is
+# an env var rather than an argv flag so "$@" reaches the server untouched. setpriv
+# ships in util-linux, which Debian marks Essential, so it cannot be missing; the
+# guard is there so a hand-built image without it degrades to a warning rather than
+# a container that cannot boot.
+if [ "${KWEB_CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
+  enable_session_containment || true
+  export KWEB_CONTAINMENT_CAPS_DROPPED=1
+  # PRE-FLIGHT the drop before committing to it, because this is an `exec`: a
+  # setpriv that fails here does not degrade, it ends the container. Two ways it
+  # can fail on an image this one does not control -- setpriv absent from a
+  # hand-built variant, and dropping from the BOUNDING set requiring CAP_SETPCAP,
+  # which a container started with a reduced capability set or as a non-root user
+  # does not have (observed: "setpriv: apply bounding set: Operation not
+  # permitted"). One throwaway invocation distinguishes "will work" from "would
+  # brick boot" for the cost of a fork, and this app's failure posture is explicit
+  # that a dev box must keep serving a terminal rather than refuse to start.
+  if setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin -- true 2>/dev/null; then
+    exec setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin -- "$0" "$@"
+  fi
+  # The drop is impossible here. What happens next depends on whether the
+  # capability is actually HELD, and the two cases are not the same decision:
+  #
+  #   not held (the public compose example, no cap_add) - nothing to drop, so this
+  #     is the ordinary degraded path. Warn and continue; containment is off.
+  #   held but undroppable - continuing would run the server AND every user
+  #     terminal with CAP_SYS_ADMIN for the container's life, which is exactly the
+  #     standing privilege this whole re-exec exists to avoid. That is a security
+  #     regression against today's behaviour rather than a degradation of it, so it
+  #     is one of the two cases "Failure posture" reserves fatal for: continuing
+  #     would compromise something.
+  if [ "$((0x$(awk '$1 == "CapEff:" { print $2 }' /proc/self/status) & (1 << 21)))" -ne 0 ]; then
+    fatal "CAP_SYS_ADMIN is held and cannot be dropped; refusing to run the server and terminal sessions with it" \
+      'hint="setpriv could not drop the bounding set (needs CAP_SETPCAP). Remove cap_add: [SYS_ADMIN] from the compose service to run without containment."'
+  fi
+  printf 'level=warn msg="CAP_SYS_ADMIN not held and containment unavailable; continuing without it" component=entrypoint\n' >&2
+fi
+
+# Report a non-root run, because every downstream symptom of one blames something
+# else.
+#
+# This image is root-by-design and there is no second user in it: the Dockerfile
+# repoints ROOT's /etc/passwd home to /config/home so OpenSSH -- which resolves "~"
+# through getpwuid(), not $HOME -- finds the persisted ~/.ssh. A compose `user:`
+# line therefore does not select a supported mode, it selects a UID that appears in
+# no passwd entry. The reflex to add one is strong: `user: "${PUID}:${PGID}"` is
+# correct in most of this fleet's compose files and in the whole *arr ecosystem it
+# borrows from, so an operator adds it here from habit rather than from a decision.
+#
+# Warn, never fatal, and the split matters. A non-root run is DEGRADED, not
+# impossible: with the volume chowned to that UID, /config is writable, the mode
+# hardening below succeeds (the UID owns what it chmods), the terminal serves, and
+# git over HTTPS works. Only the getpwuid-dependent paths and the root-only ones
+# break. That is squarely outside both cases "Failure posture" reserves fatal for,
+# and a fatal would additionally remove the only way IN to undo the mistake.
+#
+# The reason to say it HERE, before any of it happens, is that each failure reports
+# a misleading cause in isolation: ssh blames a missing user, make_config_dir blames
+# an unmounted /config, the apt phase blames the package, and the containment
+# pre-flight above blames a missing capability. None of them names the `user:` line
+# that caused all four. One warning up front is the only place that connection is
+# legible.
+#
+# uid/gid are parameters rather than reads of $EUID so the branch is testable; the
+# defaults are what the real call site uses. Always returns 0: nothing consumes the
+# verdict, and a non-zero return would be one `set -e` away from ending boot over a
+# diagnostic.
+warn_if_not_root() {
+  local uid=${1:-$EUID} gid=${2:-${GROUPS[0]:-unknown}}
+  if [ "$uid" -eq 0 ]; then
+    return 0
+  fi
+  # Single-quoted inside the hint: logfmt closes a field on the first unescaped
+  # double quote, the same reason warn_skipped_apt_token rewrites quotes.
+  printf 'level=warn msg="running as a non-root user, but this image is root-by-design; several subsystems will fail" uid=%s gid=%s hint="%s" component=entrypoint\n' \
+    "$uid" "$gid" \
+    'git and gh over ssh fail with '\''No user exists for uid'\'' because only root has a passwd entry pointing at /config/home; APT_PACKAGES cannot install; session containment cannot engage (dropping CAP_SYS_ADMIN needs CAP_SETPCAP); and the /config mode hardening cannot chmod paths this UID does not own. Remove the user: line from the compose service. See the README run block.' >&2
+  return 0
+}
+
+warn_if_not_root
+
 # Create ONE level of a persistent directory and prove the created path is a real
 # directory rather than a symlink, BEFORE anything is written to or deleted beneath
 # it. `mkdir -p a/b/c` FOLLOWS a symlink at any component, so creating a deep path in
@@ -745,7 +872,7 @@ prune_superseded_kas_runtimes "$KIRO_CLI_VERSION"
 # lives in the ephemeral container layer — never on /config — so it is
 # re-applied on every container start: compose-level intent, not volume
 # intent. Everything else in /config/tools is owned by the server's
-# toolbelt engine (manifest: /config/tools.json v2), which converges in
+# toolbelt engine (manifest: /config/tools/tools.json v2), which converges in
 # the background after the listener binds; session creation waits on it
 # so kiro-cli never scans PATH before the manifest's tools are present.
 #

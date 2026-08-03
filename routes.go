@@ -65,6 +65,18 @@ type routeDeps struct {
 	tools        *toolbelt.Engine
 	toolsSyncing func() bool
 	toolsState   func() string
+	// containment, when non-nil, puts each tab's kiro-cli process tree in its own
+	// cgroup so ending the session ends the tree, and reports the session's peak
+	// memory in the logs. Nil is the off-shape and the only shape outside the
+	// container: the composition root logs one warning and passes nil when the
+	// host has no writable cgroup v2 root, which leaves sessions behaving exactly
+	// as they did before the feature existed.
+	//
+	// This app needs it more than its siblings because `kiro-cli chat` is a
+	// four-deep tree whose agent server calls setsid() and installs no stdin-EOF
+	// exit path, so it can outlive the session that spawned it; measured at 13
+	// stranded processes holding 1.35 GB on a two-tab container.
+	containment *terminal.Containment
 	// kiroReady is the kiro-cli install manager's readiness verdict plus the
 	// reason to report when it is false (installing, retrying, terminally
 	// unavailable, or required settings unenforced). It gates /api/health AND
@@ -380,6 +392,22 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// conversation goes; see sessiontitle.go for the mapping and why it
 			// needs a hook.
 			terminal.WithEnv(deps.childEnv(id)),
+			// Per-session process containment. Closing a tab (or the process
+			// dying) must end the whole tree, and for this app it otherwise does
+			// not: `kiro-cli chat` runs kiro-cli -> kiro-cli-chat -> the TUI ->
+			// the agent server, and that last process calls setsid(), so it
+			// leaves both the process group and the session and no signal the
+			// engine can aim reaches it. A nil containment is a no-op, so this
+			// line is safe on a host that cannot support the feature.
+			terminal.WithContainment(deps.containment, id),
+			// One cost line per session per interval. A dev-box tab can live for
+			// days, and the state worth seeing is a tab whose agent connection
+			// died while its TUI is still alive: containment reclaims at teardown
+			// and never earlier, so that tab keeps holding its memory for as long
+			// as it stays open, deliberately. The log line is what makes that
+			// visible so the decision to close it stays the user's; nothing here
+			// ends a session on a timer.
+			terminal.WithContainmentSampleInterval(sessionCostInterval),
 			// A session whose process dies within seconds of spawn is the
 			// kiro-cli-missing/broken signature (the sign-in guard exits 1
 			// when the binary is absent or login fails instantly). The
@@ -979,3 +1007,13 @@ func loopbackOnly(surface string, next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// sessionCostInterval is how often a contained session logs what it is currently
+// costing (memory, pid count, unreaped-task count, age).
+//
+// Fifteen minutes because the question this answers is "what is this tab costing
+// me", not "watch a leak develop": the moment a session strands a process is
+// already reported the instant it happens, by the engine's reclaim WARN at
+// teardown. At the observed concurrency of a personal dev box this is single-digit
+// lines per hour, which is why it is on by default here rather than behind a knob.
+const sessionCostInterval = 15 * time.Minute

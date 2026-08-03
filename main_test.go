@@ -803,10 +803,14 @@ func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 func TestWarnIfNoLSPEnabled(t *testing.T) {
 	const warnMsg = "no language servers enabled"
 
+	// Returns the engine and the RESOLVED manifest path, which is both what
+	// warnIfNoLSPEnabled must echo in its `manifest` field and the file the
+	// inventory-failure subtest corrupts.
 	newEngine := func(t *testing.T, manifest, catalog string) (*toolbelt.Engine, string) {
 		t.Helper()
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
+		manifestPath := filepath.Join(dir, "tools.json")
+		if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
 			t.Fatalf("write manifest: %v", err)
 		}
 		catalogPath := filepath.Join(dir, "catalog.json")
@@ -824,14 +828,14 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 			t.Fatalf("toolbelt.New: %v", err)
 		}
 		t.Cleanup(eng.Close)
-		return eng, dir
+		return eng, manifestPath
 	}
 	t.Run("enabled catalog-marked LSP silences the warn", func(t *testing.T) {
-		eng, _ := newEngine(t,
+		eng, manifestPath := newEngine(t,
 			`{"version":2,"tools":{"gopls":{}}}`,
 			`{"entries":{"gopls":{"name":"gopls","source":"go:golang.org/x/tools/gopls","lsp":true}}}`)
 		records := capture.Default(t)
-		warnIfNoLSPEnabled(eng)
+		warnIfNoLSPEnabled(eng, manifestPath)
 		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
 			t.Errorf("log = %q; an enabled Lsp-marked tool must silence the nudge (got %d Warns)", records.Messages(), got)
 		}
@@ -839,34 +843,51 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 
 	t.Run("no enabled LSP warns", func(t *testing.T) {
 		// gopls present but disabled (a template), so the nudge must fire.
-		eng, _ := newEngine(t,
+		eng, manifestPath := newEngine(t,
 			`{"version":2,"tools":{"gopls":{"disabled":true}}}`,
 			`{"entries":{"gopls":{"name":"gopls","source":"go:golang.org/x/tools/gopls","lsp":true}}}`)
 		records := capture.Default(t)
-		warnIfNoLSPEnabled(eng)
+		warnIfNoLSPEnabled(eng, manifestPath)
 		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 1 {
 			t.Errorf("log = %q, want exactly one %q Warn (no enabled language server; got %d)", records.Messages(), warnMsg, got)
+		}
+		// The nudge tells an operator to edit a file, so it must name the file the
+		// engine actually reads. Both hints used to spell "/config/tools.json"
+		// literally and went stale when the manifest moved under /config/tools/,
+		// sending the operator to a path that no longer exists. Pinning the field
+		// to the resolved path is what makes that regression fail here.
+		// AttrValue (substring), not AttrValueExact: warnMsg is the stable prefix
+		// the count assertions key on, while the emitted message carries a
+		// "; kiro code intelligence will be limited" tail.
+		if got, ok := records.AttrValue(warnMsg, "manifest"); !ok || got != manifestPath {
+			t.Errorf("manifest attr = %q (present=%t), want %q; the nudge must name the manifest the engine reads, not a hardcoded path", got, ok, manifestPath)
 		}
 	})
 
 	t.Run("inventory failure reports itself, not the nudge", func(t *testing.T) {
-		eng, dir := newEngine(t, `{"version":2,"tools":{}}`, "")
+		eng, manifestPath := newEngine(t, `{"version":2,"tools":{}}`, "")
 		// Corrupt the manifest AFTER engine start: Inventory re-reads it from
 		// disk, so the read now fails. The property pinned here is that the
 		// failure must NOT surface as the LSP nudge Warn (the nudge's absence
 		// would otherwise be read as "a language server is enabled"); it
 		// reports itself under its own message instead.
-		if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte("{not json"), 0o644); err != nil {
+		if err := os.WriteFile(manifestPath, []byte("{not json"), 0o644); err != nil {
 			t.Fatalf("corrupt manifest: %v", err)
 		}
 		records := capture.Default(t)
-		warnIfNoLSPEnabled(eng)
+		warnIfNoLSPEnabled(eng, manifestPath)
 		if got := records.CountLevel(slog.LevelWarn, warnMsg); got != 0 {
 			t.Errorf("log = %q; an inventory failure must not produce the LSP Warn (got %d)", records.Messages(), got)
 		}
 		const readFailMsg = "tools: manifest unreadable; cannot tell whether a language server is enabled"
 		if got := records.CountLevel(slog.LevelWarn, readFailMsg); got != 1 {
 			t.Errorf("log = %q, want exactly one %q Warn (the read failure must not regress to Debug; got %d)", records.Messages(), readFailMsg, got)
+		}
+		// Same regression pin as the nudge above: this record is the one telling
+		// an operator which file to repair, so it must name the resolved manifest
+		// rather than a path spelled into the hint.
+		if got, ok := records.AttrValueExact(readFailMsg, "manifest"); !ok || got != manifestPath {
+			t.Errorf("manifest attr = %q (present=%t), want %q; the unreadable-manifest Warn must name the file to repair", got, ok, manifestPath)
 		}
 	})
 }
@@ -1054,7 +1075,7 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	t.Cleanup(eng.Close)
 
 	var verdicts []string
-	awaitBootConvergence(eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) })
+	awaitBootConvergence(eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if len(verdicts) != 1 || verdicts[0] != "degraded" {
 		t.Fatalf("verdicts = %v, want exactly one \"degraded\" (the syncing gate must lift even when the job outcome is unknowable)", verdicts)
@@ -2240,7 +2261,7 @@ func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
 	eng.Close() // the SIGTERM shape: Engine.Close cancels the active job
 
 	var verdicts []string
-	awaitBootConvergence(eng, job.ID, func(v string) { verdicts = append(verdicts, v) })
+	awaitBootConvergence(eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
 		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift on a cancelled boot pass too",

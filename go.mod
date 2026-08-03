@@ -12,7 +12,7 @@ require (
 )
 
 require (
-	github.com/cplieger/atomicfile/v2 v2.6.0 // indirect
+	github.com/cplieger/atomicfile/v2 v2.7.0 // indirect
 	github.com/cplieger/httpx/v4 v4.3.0 // indirect
 	github.com/cplieger/keyenc v1.0.1 // indirect
 	github.com/cplieger/runesafe v1.4.0 // indirect

@@ -86,7 +86,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # faces grow the web-terminal-kiro binary via go:embed and ship gzipped
 # over the wire.
 # renovate: datasource=github-releases depName=ryanoasis/nerd-fonts
-ARG NERDFONT_VERSION=v3.4.0
+ARG NERDFONT_VERSION=v3.5.0
 # sha256 of Monaspace.tar.xz for this tag. GitHub release assets are MUTABLE (a
 # retag can swap the bytes under a fixed tag), so this gate is the real
 # integrity anchor here. Update alongside NERDFONT_VERSION.

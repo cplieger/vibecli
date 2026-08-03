@@ -136,14 +136,19 @@ ARG TOOL_CATALOG_VERSION=v2026.07.24.1907
 # repin: dep=cplieger/tool-catalog url=https://github.com/cplieger/tool-catalog/releases/download/{version}/tool-catalog.json
 ARG TOOL_CATALOG_SHA256=651d11d218a313a029d7a7ad15eedccdaa1c2c7a48aad39661c33d0684b864cb # tool-catalog v2026.07.24.1907
 ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/${TOOL_CATALOG_VERSION}/tool-catalog.json
-# renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
 # This is the SAME module go.mod requires (the runtime engine that re-verifies
 # required-tools.txt before every catalog swap), pinned a second time here to
 # select the build-time `toolcatalog verify` binary. The toolbelt-pin-gate in
 # the RUN below asserts the two pins are equal, so the build gate and the
 # runtime gate can never become different verifiers — same fail-loud treatment
 # the engine/UI/tsc pin pairs get against static-src/package.json.
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.1
+# The marker comment MUST stay immediately above the ARG line: the inherited
+# Dockerfile-ARG customManager matches `# renovate: ...` followed directly by
+# `ARG ...`, so prose wedged between them silently untracks the pin. That is
+# how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
+# fail-closing every image build on the gate below.
+# renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.2
 # hadolint ignore=DL3062
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \

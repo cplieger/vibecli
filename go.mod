@@ -4,10 +4,10 @@ go 1.26.5
 
 require (
 	github.com/cplieger/pathinside v1.0.0
-	github.com/cplieger/pinstall v1.0.2
+	github.com/cplieger/pinstall v1.0.3
 	github.com/cplieger/slogx v1.6.0
 	github.com/cplieger/toolbelt/v2 v2.4.2
-	github.com/cplieger/web-terminal-engine/v3 v3.4.1
+	github.com/cplieger/web-terminal-engine/v3 v3.4.2
 	github.com/cplieger/webhttp v1.21.0
 )
 

@@ -10,8 +10,8 @@ github.com/cplieger/keyenc v1.0.1 h1:2NXyt2JTLC6J/b6DgBn0es7i3YjLsBxp2b+wJNKc1Pg
 github.com/cplieger/keyenc v1.0.1/go.mod h1:p1k0R76F3pZH5i+OrNd3UazKrcsYL26H3kXly083ozA=
 github.com/cplieger/pathinside v1.0.0 h1:w58q7tntX7VcVnDmF4r/FNKnvl1yLq4tDac845XTdBU=
 github.com/cplieger/pathinside v1.0.0/go.mod h1:yHMRs1HFsqkCGWYUzRCD+DoKWCIZE8Uj0wTKkFTFUsg=
-github.com/cplieger/pinstall v1.0.2 h1:5iXJzS6FkVLK+NkEVC9017nYbIARRBNoQRUrqxIpqz8=
-github.com/cplieger/pinstall v1.0.2/go.mod h1:hUA0lNFkPQ5+eFF0QUjya3F9AZinuT3/1uQYjT0lxdc=
+github.com/cplieger/pinstall v1.0.3 h1:oM62BZRe8sMKuJtGybTKyB0K5ey8CbUCjsiQYlMQhuU=
+github.com/cplieger/pinstall v1.0.3/go.mod h1:hUA0lNFkPQ5+eFF0QUjya3F9AZinuT3/1uQYjT0lxdc=
 github.com/cplieger/runesafe v1.4.0 h1:gdDYtWTysEl32n68fJM9hfrjoebT/QGiXuSQ08XyQ1g=
 github.com/cplieger/runesafe v1.4.0/go.mod h1:37oz7JJVn1PIWv5UHrJhDhCabmqhMY+eRavwZ6Lp6NI=
 github.com/cplieger/scheduler/v3 v3.0.0 h1:vka8qTY7q6yK6pOQyoi8YXB+4fW59RqUD1XaMNIx0ZU=
@@ -22,8 +22,8 @@ github.com/cplieger/ssrf/v3 v3.0.0 h1:wIrJ6rDkuMvsNqGQ1J25iTnn/xFxLD2fEwOsdiwNrY
 github.com/cplieger/ssrf/v3 v3.0.0/go.mod h1:887QK6H7IDoYavU5I/0K/0rFRX29bTfP9SeS1x75tls=
 github.com/cplieger/toolbelt/v2 v2.4.2 h1:UyRANQNhWAyoqvuzupA1rbVp1m1q9YptkoaQjlLsDHQ=
 github.com/cplieger/toolbelt/v2 v2.4.2/go.mod h1:IpvEY8nCclaVBqYLbY/qhTQR7xpra5pFDDaWQSItDJA=
-github.com/cplieger/web-terminal-engine/v3 v3.4.1 h1:iHNLE4WtCjScfr7gw6ZVLeHCvrnQzGEw/yNTqyOM8Hs=
-github.com/cplieger/web-terminal-engine/v3 v3.4.1/go.mod h1:yL1d/bkJSriYF7U6urrvDt8VYMn2vrnG/GYAjNk4mPU=
+github.com/cplieger/web-terminal-engine/v3 v3.4.2 h1:Im98sQX5xlI2VSTzirMrJOZgTQ+mxINVQiPCVI9JbwQ=
+github.com/cplieger/web-terminal-engine/v3 v3.4.2/go.mod h1:yL1d/bkJSriYF7U6urrvDt8VYMn2vrnG/GYAjNk4mPU=
 github.com/cplieger/webhttp v1.21.0 h1:dTfAcAZqLO3Fen9xKiWkZ/CH3775+6dkoS4UiG0hi7M=
 github.com/cplieger/webhttp v1.21.0/go.mod h1:RYtweYFUohqE5DIOt06Ypr0j9VHXjxSPBLIG3vM0H44=
 github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=

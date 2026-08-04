@@ -30,9 +30,13 @@ export default defineConfig({
     // "**/.stryker-tmp/**" keeps a leftover Stryker sandbox (an interrupted
     // mutation run does not clean it up) from double-collecting the suite's
     // test files with stale or mutated copies.
+    // "**/*.e2e.test.ts" is Playwright's namespace (playwright.config.ts
+    // testMatch), not vitest's: a playwright spec imports @playwright/test,
+    // which fails at collection under vitest, so without this exclusion the
+    // unit gate goes red on a file it can never run.
     // (Compiled output under ../static needs no entry: include/exclude resolve
     // against this directory, so files outside it are never collected.)
-    exclude: [...configDefaults.exclude, "**/.stryker-tmp/**"],
+    exclude: [...configDefaults.exclude, "**/.stryker-tmp/**", "**/*.e2e.test.ts"],
 
     // Forbid .only tests unconditionally — not just in CI.
     allowOnly: false,

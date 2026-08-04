@@ -26,5 +26,5 @@
     "allowUnusedLabels": false
   },
   "include": ["*.ts", "*.d.ts"],
-  "exclude": ["vitest.config.ts", "**/*.test.ts"]
+  "exclude": ["vitest.config.ts", "playwright.config.ts", "**/*.test.ts"]
 }

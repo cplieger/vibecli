@@ -190,7 +190,7 @@ RUN mkdir -p static/vendor/fonts && \
 # pins on the same Renovate postUpgradeTask that maintains the four above, so
 # the cost is now one marker line each, not recurring toil.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.4.0
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.4.2
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
 ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.2.1
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the

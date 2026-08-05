@@ -21,7 +21,29 @@ set -u
 # planted stat/chmod there would BE the oracle every directory check below trusts. Resolve
 # the entrypoint's tools from the image only; the session PATH (which must keep the
 # engine-managed dir first) is restored for the exec'd server at the bottom.
-SESSION_PATH="$PATH"
+#
+# The saved value travels in its OWN exported variable, and that is load-bearing rather
+# than defensive. The containment block below RE-EXECS this script through setpriv, and
+# PATH is exported, so the NARROWED value crosses that exec: a plain SESSION_PATH="$PATH"
+# captures the narrowed list on the second invocation, and the restore at the bottom then
+# hands the server a PATH carrying none of the three /config-resident tool dirs. Observed
+# on borgcube (2026-08): the server ran with exactly the narrow list below, so every binary
+# the toolbelt engine installs was unreachable by bare name in the server, in every PTY
+# session, and to any agent running in one -- including the engine's own npm and uv, which
+# is why /api/health reported tools "degraded" while the tools themselves were installed
+# and fine, and why a failed install left a dangling bin/ symlink behind. Deriving from
+# KWEB_SESSION_PATH when it is already set makes the capture idempotent across any number
+# of re-execs. It is not an operator knob and is unset again before the final exec; a
+# deployment that wants a different PATH sets PATH itself, which compose can already do.
+#
+# Two shapes that look simpler and are wrong. Restoring PATH immediately before that
+# re-exec would run the re-exec'd child's whole /config hardening pass with
+# /config/tools/bin back on PATH, which is the oracle-poisoning this narrowing exists to
+# prevent. Moving the save/narrow pair BELOW the containment block would resolve that
+# block's own `mount`, `setpriv` and `awk` through /config/tools/bin for the same reason.
+# Both are pinned by tests/shell/session_path_test.sh.
+SESSION_PATH="${KWEB_SESSION_PATH:-$PATH}"
+export KWEB_SESSION_PATH="$SESSION_PATH"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 TOOLS="/config/tools"
@@ -1169,7 +1191,13 @@ fi
 # PTY session additionally gets the ACTIVE kiro-cli version directory prepended by the
 # server, which is what makes bare-name `kiro-cli` and its sidecar resolve to the pinned
 # install regardless of what else is on this PATH.
+#
+# The carry variable is dropped here rather than inherited: it exists only to survive the
+# setpriv re-exec above, and nothing past this point re-execs this script, so leaving a
+# second copy of PATH in the environment of the server and every terminal session would be
+# noise an operator could mistake for a knob.
 PATH="$SESSION_PATH"
 export PATH
+unset KWEB_SESSION_PATH
 printf 'level=info msg="entrypoint complete; starting the web server" component=entrypoint\n' >&2
 exec /app/web-terminal-kiro

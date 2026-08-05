@@ -78,7 +78,11 @@ grep -Eq 'enable_session_containment \|\| true' "$ENTRYPOINT" \
 # The whole point of re-execing early is to not hold CAP_SYS_ADMIN across a
 # network-fetched package install. If the exec ever moves below the apt block this
 # silently becomes a much wider capability window, with no functional symptom.
-exec_line=$(grep -n 'exec setpriv' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+# Every anchor below carries the same `^[^#]*` guard as the apt one: a PROSE mention
+# of the statement is not the statement. Adding a comment to entrypoint.sh that said
+# `exec setpriv` broke six assertions in this file at once (2026-08), because head -1
+# happily returned the comment's line number.
+exec_line=$(grep -nE '^[^#]*exec setpriv' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 # Match the real invocation, not the several comments that mention it: the command
 # runs under `timeout`, which no comment in this file does.
 apt_line=$(grep -nE '^[^#]*timeout .*apt-get update' "$ENTRYPOINT" | head -1 | cut -d: -f1)
@@ -105,10 +109,10 @@ call_line=$(grep -n 'enable_session_containment || true' "$ENTRYPOINT" | head -1
 # dropping from the BOUNDING set requiring CAP_SETPCAP, which a non-root or
 # capability-reduced container lacks. Both must be discovered by a throwaway
 # invocation BEFORE the exec, never by the exec itself.
-grep -Eq 'if setpriv .*--bounding-set=-sys_admin.* -- true' "$ENTRYPOINT" \
+grep -Eq '^[^#]*if setpriv .*--bounding-set=-sys_admin.* -- true' "$ENTRYPOINT" \
   && ok "the drop is pre-flighted before the exec" \
   || no "the drop is pre-flighted before the exec" "a failing setpriv would end the container"
-preflight_line=$(grep -n 'setpriv .* -- true' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+preflight_line=$(grep -nE '^[^#]*setpriv .* -- true' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 [ -n "$preflight_line" ] && [ "$preflight_line" -lt "$exec_line" ] \
   && ok "the pre-flight runs before the exec" \
   || no "the pre-flight runs before the exec" "preflight at ${preflight_line:-none}, exec at $exec_line"
@@ -156,7 +160,7 @@ grep -Eq 'exec setpriv .* -- "\$0" "\$@"' "$ENTRYPOINT" \
 # --- 8. the drop names both capability sets -----------------------------------
 # Dropping from the inheritable set alone leaves it in the bounding set, so a later
 # setuid execve could regain it. Both are required for the drop to be real.
-line=$(grep -m1 'exec setpriv' "$ENTRYPOINT")
+line=$(grep -m1 -E '^[^#]*exec setpriv' "$ENTRYPOINT")
 case "$line" in
   *--bounding-set=-sys_admin*--inh-caps=-sys_admin*) ok "the drop clears bounding AND inheritable" ;;
   *) no "the drop clears bounding AND inheritable" "got: $line" ;;

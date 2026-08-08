@@ -28,23 +28,36 @@ new_workdir >/dev/null
 
 load_function enable_session_containment
 
-# --- 1. the success path: a vacated, writable tree reports availability ----------
+# --- 1. the success path: a writable tree reports the REMOUNT, nothing more -----
 # `mount` is the only external command the function runs, so stubbing it is the
 # whole environment. The cgroup root is a PARAMETER (default /sys/fs/cgroup) purely
-# so this case can hand it a temp dir: the body now WRITES to the tree, and an
-# assertion that depended on the CI host's own /sys/fs/cgroup would pass or fail on
-# the runner's kernel state rather than on this function. An EMPTY cgroup.procs is
-# the vacated state the server needs before it can enable controllers there.
+# so this case can hand it a temp dir rather than depend on the CI runner's own
+# mount state. The function inspects nothing inside the tree: vacating the root and
+# enabling controllers belong to the server's NewContainment, whose verifyOwnRoot
+# REFUSES a root holding any non-"wt-" child directory -- so a leaf created here
+# would disable the very feature this line used to claim.
 mount() { return 0; }
 mkdir -p "$WORK/cg"
-: >"$WORK/cg/cgroup.procs"
 out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "a successful remount returns 0" \
   || no "a successful remount returns 0" "rc=$rc"
 case "$out" in
-  *level=info*containment\ available*) ok "success logs at info" ;;
-  *) no "success logs at info" "got: $out" ;;
+  *level=info*"remounted rw"*) ok "success logs the remount at info" ;;
+  *) no "success logs the remount at info" "got: $out" ;;
+esac
+# The defect this pins is what shipped: the message claimed "per-session process
+# containment available" on the strength of the remount alone, while the server
+# failed with EBUSY on cgroup.subtree_control six seconds later (measured on
+# borgcube, image v2.7.7) and every session ran uncontained. This script proves the
+# MOUNT; only the server can report containment, and it does.
+case "$out" in
+  *containment\ available*) no "the remount report must not claim containment is available" "got: $out" ;;
+  *) ok "the remount report does not claim containment is available" ;;
+esac
+case "$out" in
+  *"by the server"*) ok "the remount report names the server as the reporter of the verdict" ;;
+  *) no "the remount report names who reports the verdict" "got: $out" ;;
 esac
 
 # --- 2. the refusal path: warn, non-zero, and NEVER fatal -----------------------
@@ -72,28 +85,37 @@ case "$out" in
 esac
 unset -f mount
 
-# --- 2b. remounted but NOT vacated: the claim must say containment is off --------
-# The defect this case pins is what shipped: the old function reported "containment
-# available" on the strength of the remount alone, while the server then failed with
-# EBUSY on cgroup.subtree_control six seconds later (measured on borgcube, image
-# v2.7.7). cgroup v2 refuses a controller to a cgroup that still holds member
-# processes, so a root with a live pid in cgroup.procs means containment will NOT
-# engage -- and the log line has to say so, or the operator reads the info line and
-# concludes the feature is on.
+# --- 2b. the function creates NOTHING inside the cgroup root --------------------
+# This replaces a case that asserted a pid-count report the function no longer
+# makes, and it pins the reason that report is gone. An earlier fix here created an
+# `init` leaf and migrated the root's pids into it, to clear cgroup v2's
+# no-internal-process constraint before the server writes cgroup.subtree_control.
+# Read against the pinned engine (v3.4.3 terminal/containment_linux.go), that is
+# both redundant and actively harmful: NewContainment's own vacateRoot (step 5)
+# already moves every pid into its "wt-server" leaf before delegating, and its
+# verifyOwnRoot (step 2, which runs FIRST) refuses the entire root the moment it
+# holds a child directory not prefixed "wt-" -- a foreign child being how it detects
+# a HOST cgroup root it must not reshape. So an `init` leaf here does not enable
+# containment, it disables it, on precisely the hosts where it would have worked.
 mount() { return 0; }
 mkdir -p "$WORK/cg2"
 printf '1\n' >"$WORK/cg2/cgroup.procs"
+before=$(ls -A "$WORK/cg2")
 out=$(enable_session_containment "$WORK/cg2" 2>&1)
 rc=$?
-[ "$rc" -eq 0 ] && ok "a remounted-but-occupied root still returns 0 (hygiene, never fatal)" \
+[ "$rc" -eq 0 ] && ok "an occupied root still returns 0 (hygiene, never fatal)" \
   || no "an occupied root returns 0" "rc=$rc"
+[ "$(ls -A "$WORK/cg2")" = "$before" ] \
+  && ok "the remount creates no cgroup child, so the server's verifyOwnRoot cannot refuse the root" \
+  || no "the remount creates no cgroup child" "tree changed: $before -> $(ls -A "$WORK/cg2")"
+[ "$(cat "$WORK/cg2/cgroup.procs")" = "1" ] \
+  && ok "the remount migrates no process; vacating the root is the engine's step 5" \
+  || no "the remount migrates no process" "cgroup.procs = $(cat "$WORK/cg2/cgroup.procs")"
+# An occupied root is now ORDINARY -- the server vacates it -- so this function must
+# not warn about it, or every boot carries a warn for the expected state.
 case "$out" in
-  *level=warn*"will NOT engage"*) ok "an occupied cgroup root warns that containment will not engage" ;;
-  *) no "an occupied cgroup root warns" "got: $out" ;;
-esac
-case "$out" in
-  *level=info*containment\ available*) no "an occupied root must not claim availability" "got: $out" ;;
-  *) ok "an occupied root does not claim containment is available" ;;
+  *level=warn*) no "an occupied root must not warn: the server vacates it" "got: $out" ;;
+  *) ok "an occupied root does not warn; it is the expected pre-vacate state" ;;
 esac
 unset -f mount
 

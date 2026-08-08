@@ -1106,6 +1106,29 @@ func newToolsDeps(t *testing.T) *routeDeps {
 	})
 }
 
+// TestLoopbackHint pins the KWEB_ADDR -> "localhost[:port]" mapping the loopback
+// surfaces' refusals quote. The 403 is the whole of what a refused caller is told, so a
+// hint naming a port the deployment moved away from sends the operator to
+// connection-refused with nothing else to work from; the fallback arm must degrade to a
+// reachable host rather than to a broken URL like "localhost:" or ":9848".
+func TestLoopbackHint(t *testing.T) {
+	for name, tc := range map[string]struct{ addr, want string }{
+		"the default host-less form": {":9848", "localhost:9848"},
+		"a moved port":               {":8080", "localhost:8080"},
+		"an explicit bind address":   {"0.0.0.0:8080", "localhost:8080"},
+		"a loopback bind":            {"127.0.0.1:9848", "localhost:9848"},
+		"an IPv6 bind":               {"[::1]:9848", "localhost:9848"},
+		"no port at all":             {"localhost", "localhost"},
+		"empty":                      {"", "localhost"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := loopbackHint(tc.addr); got != tc.want {
+				t.Errorf("loopbackHint(%q) = %q, want %q", tc.addr, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestToolsAPI_LoopbackOnly pins the tools API's only boundary on this
 // unauthenticated port: the SOCKET PEER and the Host header must BOTH be
 // loopback. A remote peer gets 403 regardless of headers (forwarded headers
@@ -1116,6 +1139,9 @@ func newToolsDeps(t *testing.T) *routeDeps {
 func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
+	// A non-default port, so the assertion below fails if the refusal goes back to a
+	// hardcoded address instead of this deployment's own.
+	deps.listenHint = loopbackHint(":8080")
 	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
@@ -1143,6 +1169,11 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	}
 	if !strings.Contains(denied.Error, "loopback-only") || denied.Code != "" {
 		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message with an empty code", denied.Error, denied.Code)
+	}
+	// The remedy the 403 names must be this deployment's address, not the default
+	// port: a refused caller sees nothing else.
+	if !strings.Contains(denied.Error, "curl localhost:8080") {
+		t.Errorf("remote peer: envelope error = %q, want it to name this deployment's address (curl localhost:8080)", denied.Error)
 	}
 
 	// Loopback peer AND loopback Host: served. The fresh engine has an empty

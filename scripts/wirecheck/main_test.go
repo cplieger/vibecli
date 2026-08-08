@@ -165,9 +165,20 @@ func gateBuildOutput(segments []string) (string, int) {
 // with an unusable pairing and exits 2 — a step that never reports a floor
 // violation. An invocation carrying NEITHER is not a gate: the program would
 // exit 2 on every build for the same reason.
+//
+// The manifest arm is matched as an exact FIELD with a value after it, not as a
+// substring. A bare trailing `-manifest`, or an unrelated `-manifest-backup path`,
+// each contain the text while leaving the gate with no parsable declaration, so it
+// exits 2 and checks no floor — the same never-reports-a-violation state the
+// half-pair cases above are rejected for. A substring test called both of those a
+// valid declaration, which is a weaker oracle than this test's own error message
+// claims.
 func gateFlagsPresent(seg string) bool {
-	if strings.Contains(seg, "-manifest") {
-		return true
+	fields := strings.Fields(seg)
+	for i, field := range fields {
+		if field == "-manifest" && i+1 < len(fields) {
+			return true
+		}
 	}
 	return strings.Contains(seg, "-client-rev") && strings.Contains(seg, "-client-min-server")
 }
@@ -301,7 +312,12 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"missing the client-rev flag":                    {"    " + build + ` && ` + bin + ` -client-min-server "$CLIENT_MIN_SERVER"`, false},
 		"missing the min-server flag":                    {"    " + build + ` && ` + bin + ` -client-rev "$CLIENT_REV"`, false},
 		"invoked with no client-side declaration at all": {"    " + build + " && " + bin, false},
-		"prose mentioning the gate":                      {"# public Go API inside scripts/wirecheck (no source scraping)", false},
+		// A bare `-manifest` with no path, and an unrelated flag that merely
+		// CONTAINS the text: both leave the gate with nothing to parse, so it exits
+		// 2 and checks no floor. A substring test accepted both as a declaration.
+		"a bare -manifest with no path":   {"    " + build + " && " + bin + " -manifest", false},
+		"an unrelated -manifest-ish flag": {"    " + build + ` && ` + bin + " -manifest-backup /tmp/x.json", false},
+		"prose mentioning the gate":       {"# public Go API inside scripts/wirecheck (no source scraping)", false},
 		// The gate must be BUILT and then RUN. `go run` still gates the pair but
 		// reports its own status 1 for the gate's exit 2, so the "fix the gate, do
 		// not bump a pin" signal is lost; TestDockerfileBuildsTheGateInsteadOfGoRun

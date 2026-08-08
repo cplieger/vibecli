@@ -186,6 +186,45 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	}
 }
 
+// TestSessionTitleReclaimsAMappingWhoseTabIsGone pins pass()'s liveness sweep, which
+// is the reclaim path production actually takes: an ordinary close leaves the tab's
+// session.json title FROZEN, so syncOne's `s.pushed[tabID] == title` memo returns
+// before the SetSessionTitle-false probe and that probe never fires again. The manager
+// no longer lists the tab, which is the only signal that does not depend on a title
+// still changing. TestSessionTitleForgetsClosedTabs covers the other arm (still listed
+// at snapshot time, gone at the push), so without this case deleting the whole
+// liveness branch leaves the suite green while the mapping file, its pushed entry and
+// its per-tick ReadDir + session.json read survive for the container's life.
+func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
+	f := newTitleFixture(t)
+	id := "sess_11111111-2222-3333-4444-555555555555"
+	f.mapping("closedtab", id)
+	f.session("hash0", id, titleJSON("a real title"))
+
+	// First sweep with the tab live: the title is pushed and memoized, which is the
+	// state that used to hide the dead tab from the reclaim.
+	set := &fakeSetter{live: []string{"closedtab"}}
+	f.sync.pass(set)
+	if len(set.calls) != 1 {
+		t.Fatalf("first pass pushed %v, want exactly one push before the tab closes", set.calls)
+	}
+
+	// The tab closes. The title never changes again, so only the manager's list can
+	// report it: the mapping file must go, and no further push may be attempted.
+	set.live = nil
+	f.sync.pass(set)
+
+	if _, err := os.Stat(filepath.Join(f.sync.titleStateDir(), "closedtab")); !os.IsNotExist(err) {
+		t.Errorf("mapping for a tab the manager no longer lists is still present (stat err = %v), want it reclaimed", err)
+	}
+	if len(set.calls) != 1 {
+		t.Errorf("pushed %v after the tab left the manager's list, want no second push: the sweep must reclaim before syncOne runs", set.calls)
+	}
+	if _, memoized := f.sync.pushed["closedtab"]; memoized {
+		t.Error("the pushed memo still holds the reclaimed tab; a recycled id would then be judged unchanged and never pushed")
+	}
+}
+
 // TestSessionTitleRejectsHostileIdentifiers is the security half: both identifiers
 // become path components, and the state directory is writable by anything in the
 // container, so a traversal attempt must not make the server read outside the

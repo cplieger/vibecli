@@ -29,10 +29,13 @@ import (
 // that keys on the same path cannot drift apart across files.
 const (
 	// apiPrefix is the JSON API surface's shared prefix. It names the app's own
-	// API mounts below; it is no longer a middleware scope — the /api/-wide
-	// no-store wrapper is gone now that each route owner (toolbelt's httpapi,
-	// handleHealth, handleKiroRescan) sets the header itself. See
-	// main.go's sessionNoStore for what remains and why.
+	// API mounts below; it is no longer a middleware scope, and no app middleware
+	// sets the header any more. Every route owner covers itself: toolbelt's
+	// httpapi upstream of its own mux, handleHealth and handleKiroRescan at the
+	// top of the handler, and the engine's session surface through
+	// terminal.MountSessionRoutes' own withNoStore (applied to the REST handler
+	// at both mounts and outside the create gate, so it reaches the statuses no
+	// handler writes). TestAPICachePolicy_EveryAPIPathSetsNoStore enumerates them.
 	apiPrefix = "/api/"
 	// healthPath is the readiness route; buildHandler's ProbeLogLevel policy
 	// must name the same path the mux registers, or a healthy probe stops
@@ -484,12 +487,12 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// contract wherever it is mounted: a readiness verdict must never be
 		// cached (a 200 with no explicit freshness is heuristically cacheable
 		// under RFC 9111, and a cached "ok" keeps traffic arriving at an instance
-		// that has begun draining). This is now the only thing setting it — the
-		// app's /api/-wide no-store middleware is gone, narrowed to the engine's
-		// session surface (see main.go's sessionNoStore) once every other route
-		// owner covered itself, which is exactly the independence this line
-		// already had. The same header comes from webhttp.ReadinessHandler for
-		// the apps that use it directly.
+		// that has begun draining). This is the only thing setting it on THIS
+		// route — the app carries no no-store middleware at all now that every
+		// route owner covers itself (the engine's session surface included, via
+		// terminal.MountSessionRoutes' withNoStore), which is exactly the
+		// independence this line already had. The same header comes from
+		// webhttp.ReadinessHandler for the apps that use it directly.
 		w.Header().Set("Cache-Control", "no-store")
 		unready := func(reason string) {
 			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthResponse("unready", reason))

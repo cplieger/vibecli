@@ -137,40 +137,40 @@ warn_if_not_root
 # being fatal.
 enable_session_containment() {
   # cg_root is a parameter with the real default purely for testability, matching
-  # warn_if_not_root's uid/gid: the body now WRITES to the tree, so a unit test must be
-  # able to hand it a temp dir instead of the host's own /sys/fs/cgroup.
-  local cg_root=${1:-/sys/fs/cgroup} cg_pids cg_pid moved=0 left
+  # warn_if_not_root's uid/gid: a unit test must be able to hand it a temp dir instead
+  # of the host's own /sys/fs/cgroup, whose mount state is the CI runner's, not this
+  # function's.
+  local cg_root=${1:-/sys/fs/cgroup}
   if ! mount -o remount,rw "$cg_root" 2>/dev/null; then
     printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' >&2
     return 1
   fi
-  # cgroup v2's no-internal-process constraint: a non-root cgroup cannot gain a
-  # controller in cgroup.subtree_control while it still holds member processes, and the
-  # container's namespace-root cgroup holds PID 1 (this script, then the exec'd server)
-  # by the time startContainment() runs. The remount alone therefore never made
-  # containment work -- measured on borgcube 2026-08-06 (image v2.7.7), the server logged
-  # "enable controllers in /sys/fs/cgroup/cgroup.subtree_control: device or resource busy"
-  # six seconds after this function reported success, and every session ran uncontained.
-  # Vacate the root into a leaf so it becomes a pure delegation parent; /init is the same
-  # shape runc and systemd use for this. Snapshot the pid list first: each successful
-  # write removes a pid from the source file, so re-reading it through an open handle
-  # skips entries. Best-effort and warn-only per the failure posture -- on failure
-  # containment stays off, which is exactly today's behaviour.
-  if mkdir -p "$cg_root/init" 2>/dev/null; then
-    cg_pids=$(cat "$cg_root/cgroup.procs" 2>/dev/null) || cg_pids=""
-    for cg_pid in $cg_pids; do
-      printf '%s\n' "$cg_pid" >"$cg_root/init/cgroup.procs" 2>/dev/null && moved=$((moved + 1))
-    done
-  fi
-  # Report what was PROVEN rather than what was attempted, and on stderr like every
-  # other line in this file. The old message asserted availability on the strength of the
-  # mount alone, which is precisely what hid the EBUSY above.
-  left=$(wc -l <"$cg_root/cgroup.procs" 2>/dev/null || printf '0\n')
-  if [ "$left" -eq 0 ]; then
-    printf 'level=info msg="cgroup tree remounted rw and the container cgroup root vacated; per-session process containment available" moved=%d component=entrypoint\n' "$moved" >&2
-    return 0
-  fi
-  printf 'level=warn msg="cgroup tree remounted rw but the container cgroup root still holds processes, so the server cannot enable cgroup controllers there (EBUSY) and per-session process containment will NOT engage; a closed tab kiro-cli tree may outlive it" moved=%d remaining=%d component=entrypoint\n' "$moved" "$left" >&2
+  # Report ONLY what the remount proved, and on stderr like every other line in this
+  # file. The old message said "per-session process containment available", which is a
+  # claim about the MOUNT rather than about containment: measured on borgcube
+  # 2026-08-06 (image v2.7.7) the server failed six seconds later with "enable
+  # controllers in /sys/fs/cgroup/cgroup.subtree_control: device or resource busy" and
+  # every session ran uncontained, while an operator reading only this line concluded
+  # the feature was on.
+  #
+  # Vacating the cgroup root is deliberately NOT done here, and an earlier attempt to
+  # do it BROKE containment outright. cgroup v2 does forbid enabling a controller on a
+  # cgroup that still holds member processes -- that is the EBUSY above -- but the
+  # engine's own NewContainment already moves every pid out of the root into its
+  # "wt-server" leaf (vacateRoot, step 5 of its documented order) before it writes
+  # cgroup.subtree_control, so that EBUSY was measured against an image predating the
+  # step. And a leaf created HERE cannot be named acceptably: step 2, verifyOwnRoot,
+  # refuses the entire root as soon as it holds any child directory whose name does not
+  # start with the server's prefix ("wt-", main.go's containCgroupPrefix), because a
+  # foreign child is exactly how it detects a HOST cgroup root it must not reshape. An
+  # entrypoint-created "init" leaf therefore made NewContainment refuse before it ever
+  # reached the vacate, disabling containment on the hosts where it would otherwise
+  # work -- and this line would have claimed availability while it did.
+  #
+  # So: remount, say only that, and leave the topology to the process that owns it. The
+  # server logs the verdict either way ("terminal: containment enabled", or
+  # startContainment's warn naming the reason), and that is the line to read.
+  printf 'level=info msg="cgroup tree remounted rw, which is the only step here that needs privilege; whether per-session process containment engages is decided and logged by the server at startup" component=entrypoint\n' >&2
   return 0
 }
 
@@ -650,12 +650,16 @@ fi
 # Containment is asserted ONCE, on the RESOLVED path (-m, so a not-yet-created
 # HOME still resolves). A lexical `case "$HOME" in /config/*` used to run first
 # and is gone: it could not decide the question either way (/config/../etc
-# matches it and is not a symlink), while this check refuses every path the
-# lexical one refused -- /etc/foo, /configx/home, /config itself, and an empty
-# HOME whose realpath fails -- plus the '..' and symlinked-ANCESTOR cases it let
-# through. The -L test above stays: it enforces the separate, stricter policy
-# that $HOME's own final component must not be a link even when it resolves
-# inside /config.
+# matches it and is not a symlink). This check refuses the shapes it refused
+# (/etc/foo, /configx/home, /config itself, an empty HOME whose realpath fails)
+# plus the '..' and symlinked-ANCESTOR escapes it let through. One acceptance
+# deliberately widened: a HOME that lexically sits outside /config but RESOLVES
+# inside it (an ancestor symlinked INTO the mount) used to fatal on the lexical
+# gate and now boots -- which is what the invariant this gate enforces ("must
+# resolve beneath /config") says should happen; everything the walk below
+# creates through such a HOME still lands under /config. The -L test above
+# stays: it enforces the separate, stricter policy that $HOME's own final
+# component must not be a link even when it resolves inside /config.
 home_real=$(realpath -m "$HOME" 2>/dev/null) || home_real=""
 case "$home_real" in
   /config/?*) ;;

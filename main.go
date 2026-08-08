@@ -1521,11 +1521,165 @@ func sessionNoStore(next http.Handler) http.Handler {
 	})
 }
 
+// canonicalPathRefusal is the message the canonical-path guard writes. A const
+// so a test can pin the exact wording without a second copy of the literal
+// (goconst) drifting from this one, the same reason wsAttachMsg is one.
+//
+// It names the remedy and stops there. It deliberately does NOT echo the path
+// the caller sent, nor the cleaned one the guard computed from it: net/http
+// carries up to MaxHeaderBytes (webhttp.NewServer's default 1 MiB) of request
+// line, so reflecting either turns a one-line refusal into a caller-sized
+// response body, and the fix does not need the value quoted back — the sender
+// has it. Same posture as loopbackOnly's refusal, which names the surface and
+// the remedy and never the request.
+const canonicalPathRefusal = "request path is not canonical; resend it with no empty, \".\" or \"..\" path segments " +
+	"(this route refuses rather than redirecting, because a redirect is a success status to a client without -L)"
+
+// canonicalPathGuardedRoute reports whether p is one of the routes whose caller
+// must be REFUSED a non-canonical spelling rather than redirected to the right
+// one. p is the CLEANED path — the one http.ServeMux will actually route — which
+// is what makes the test work at all: the spellings this guard exists to catch
+// are exactly the ones that do not carry a guarded prefix literally
+// ("/api//tools" does not begin with "/api/tools"), so asking the question of
+// the path as sent would answer "out of scope" for every request in scope.
+//
+// The set is this app's own control plane and its probe, named by the same
+// constants registerRoutes mounts them under so a rename moves both:
+//
+//   - toolsPath, exact AND subtree — the loopback tools API is mounted twice
+//     (mux.Handle(toolsPath) + mux.Handle(toolsPath+"/")), and its documented
+//     callers are the README's plain `curl -s` lines that add a tool, enable one,
+//     or read the inventory. The subtree arm is the mutating half.
+//   - kiroRescanPath — the README's documented repair POST
+//     (`curl -X POST localhost:9848/api/kiro-cli/rescan`), the endpoint whose
+//     entire purpose is a side effect on a server that is already answering 503.
+//   - healthPath — probed by the baked Docker HEALTHCHECK (`curl -sfS
+//     --max-time 4`, no -L) and by Gatus. A redirect read as success here reports
+//     a container healthy without ever consulting readiness.
+//
+// Every other surface is deliberately absent, which is the point of a set rather
+// than a blanket check; see canonicalPathGuard.
+func canonicalPathGuardedRoute(p string) bool {
+	switch p {
+	case healthPath, kiroRescanPath, toolsPath:
+		return true
+	}
+	return strings.HasPrefix(p, toolsPath+"/")
+}
+
+// canonicalPathGuard refuses a request whose path http.ServeMux would REWRITE
+// before routing, when the path it would rewrite to is one of
+// canonicalPathGuardedRoute's. Everything else passes through untouched.
+//
+// # What it prevents
+//
+// net/http cleans the request path before it selects a pattern, and answers 307
+// with a Location when the cleaned path differs — see webhttp.CanonicalRequestPath,
+// which is that same computation as a pure function. Measured against this app's
+// real mux on go1.26.5: "/api//tools", "/api/tools/.", "/api/./tools",
+// "/api/x/../tools", "//api/kiro-cli/rescan", "/api/kiro-cli/./rescan" and
+// "/api//health" are all 307, and none of them reaches any handler.
+//
+// A browser follows that redirect and nothing is lost. The senders these routes
+// actually have do not: the README documents the repair POST and the mutating
+// tool calls as plain `curl` with no -L, and the image's HEALTHCHECK is
+// `curl -sfS --max-time 4` with no -L. To all three a 307 is a SUCCESS — the
+// process exits 0 — so the mutation never ran, the probe never consulted
+// readiness, and nothing anywhere says the URL was malformed. Refusing is the
+// only answer that reaches such a caller, which is why this is a refusal and not
+// a log line.
+//
+// # Why it cannot be a route-level wrapper
+//
+// It is chain middleware, upstream of the mux, because the canonicalization runs
+// BEFORE pattern selection: no registered pattern can intercept a request that
+// is about to be redirected, so a wrapper installed at the mount — where
+// loopbackOnly sits — would never see one. That asymmetry is the whole reason the
+// two admission gates live at different layers while making the same kind of
+// decision.
+//
+// # Which value is fed, and why the DECODED one
+//
+// r.URL.Path, the decoded path, not r.URL.EscapedPath(). EscapedPath is what
+// reproduces ServeMux's cleaning decision exactly; the decoded path is a
+// deliberately WIDER verdict, and both halves of that width were measured
+// against this app's mux rather than assumed:
+//
+//   - It is what the SENDER believed it was addressing. "%2e%2e" decodes to
+//     ".." and "%74ools" to "tools", and Go's ServeMux matches patterns on
+//     unescaped segments — "/api/%74ools" is served 200 by the tools handler.
+//     So the decoded path is the one that says which route a request reaches.
+//   - It also refuses an encoded dot segment ServeMux would NOT redirect:
+//     "/api/tools/sub/%2e%2e" is handed to the toolbelt subtree handler today
+//     with r.URL.Path == "/api/tools/sub/..", a path its inner router then
+//     interprets however it interprets it. On a loopback-only mutating control
+//     plane and a health probe there is no legitimate caller spelling a dot
+//     segment either way, so the wider refusal costs nothing real and closes that
+//     class too.
+//
+// The width is bounded by the same scope rule as everything else, which is worth
+// stating because it is easy to over-claim: an encoded dot segment whose cleaned
+// form leaves the guarded set is NOT refused. "/api/tools/%2e%2e" cleans to
+// "/api" — no guarded route — so it passes through and keeps exactly the response
+// it has today, just as "/static//app.js" does.
+//
+// # What is NOT guarded, deliberately
+//
+// The static mount, the /ws upgrade and the SSE stream are all outside the set,
+// so their behaviour is byte-for-byte what it was:
+//
+//   - Static — this app serves a browser UI, where ServeMux's and FileServer's
+//     directory/cleanup redirects are legitimate and wanted. A blanket guard
+//     would turn a harmless "/vendor//app.js" into a 400 for a real browser.
+//   - terminal.WSPath and terminal.SessionEventsPath — the engine's upgrade and
+//     stream. A non-canonical spelling of either still gets today's 307; both
+//     have browser clients that follow it, the guard's premise (a non-following
+//     machine sender) does not hold for them, and neither is a route whose
+//     purpose is a one-shot side effect.
+//
+// # Status, body and ordering
+//
+// 400 with the standard webhttp.WriteError envelope and an empty code, like
+// every other app-owned refusal here (the two 403 gates, the 405, the 503s): the
+// route exists and the caller is authorized, so this is neither 404 nor 403 —
+// what is wrong is the request target's spelling. A 4xx is also what makes
+// `curl -f` and `curl -sfS` fail, which is the behaviour change that matters. No
+// Cache-Control is set and none is needed: 400 is not among RFC 9111 §4.2.2's
+// heuristically-cacheable statuses, and the body is this constant message with no
+// session, tool or volume state in it. Nothing is logged here either — the access
+// line already records the method, status, request id and client_ip for these
+// routes, and a second record would only duplicate it.
+//
+// Placed as the innermost chain entry, in front of the mux and INSIDE
+// CrossOriginProtection, which is where the app already puts an admission
+// decision of this kind (loopbackOnly is a layer further in still, at the
+// mount). The consequence is deliberate: a forged cross-origin POST at a
+// mis-spelled rescan path keeps its 403, because the security gate outranks a
+// spelling complaint.
+//
+// # What it does not claim
+//
+// Only the cleaning redirect. ServeMux's OTHER redirect — subtree
+// "/tree" -> "/tree/" — depends on the route table rather than the spelling and
+// is invisible to a pure function over the path, so it is out of scope here as it
+// is in the library. Concretely "/api/kiro-cli/rescan/" is canonical, passes this
+// guard, and remains the static mount's 404 it already was.
+func canonicalPathGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clean, canonical := webhttp.CanonicalRequestPath(r.URL.Path)
+		if canonical || !canonicalPathGuardedRoute(clean) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		webhttp.WriteError(w, r, http.StatusBadRequest, "", canonicalPathRefusal)
+	})
+}
+
 // buildHandler wraps the route mux in web-terminal-kiro's middleware stack via
 // webhttp.Chain. Chain(h, A, B, C, D) == A(B(C(D(h)))), so the first entry is
 // the outermost wrapper; a request flows Logging -> Recoverer -> wsAttachLog ->
 // SecurityHeaders -> sessionNoStore -> host allowlist -> CrossOriginProtection ->
-// mux, and the response unwinds the other way.
+// canonicalPathGuard -> mux, and the response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
@@ -1573,8 +1727,16 @@ func sessionNoStore(next http.Handler) http.Handler {
 //     unset/blank) collapses
 //     to a pass-through per the library's off-contract.
 //   - CrossOriginProtection — the stdlib cross-origin/CSRF guard, kept
-//     innermost (its long-standing position directly in front of the routes) so
-//     it rejects a forged cross-origin unsafe request with 403.
+//     directly in front of the routes (its long-standing position) so it
+//     rejects a forged cross-origin unsafe request with 403.
+//   - canonicalPathGuard — refuses a non-canonical request path aimed at the
+//     loopback control plane or the health probe, instead of letting ServeMux
+//     answer the 307 a `curl` without -L reads as success (see
+//     canonicalPathGuard for the measured redirect set, why the guard cannot
+//     live at the mount like loopbackOnly, and what is deliberately left
+//     unguarded). Innermost, so the Host and origin gates both outrank it and
+//     an admitted request's spelling is the last thing checked before routing —
+//     the same order the app already gives loopbackOnly, one layer further in.
 func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hostPolicy *webhttp.HostPolicy) http.Handler {
 	return webhttp.Chain(mux,
 		webhttp.Logging(
@@ -1711,6 +1873,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 		sessionNoStore,
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
+		canonicalPathGuard,
 	)
 }
 

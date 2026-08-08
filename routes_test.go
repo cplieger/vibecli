@@ -1119,7 +1119,12 @@ func TestLoopbackHint(t *testing.T) {
 		"a loopback bind":            {"127.0.0.1:9848", "localhost:9848"},
 		"an IPv6 bind":               {"[::1]:9848", "localhost:9848"},
 		"no port at all":             {"localhost", "localhost"},
-		"empty":                      {"", "localhost"},
+		// net.SplitHostPort returns NO error for an empty port, so `port != ""` is
+		// the only thing standing between these two and the broken "localhost:"
+		// URL this test's comment promises to prevent.
+		"a host with an empty port": {"localhost:", "localhost"},
+		"a bare colon":              {":", "localhost"},
+		"empty":                     {"", "localhost"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := loopbackHint(tc.addr); got != tc.want {

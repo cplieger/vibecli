@@ -409,3 +409,47 @@ func TestSessionTitleSanitizesUntrustedTitle(t *testing.T) {
 		t.Errorf("pushed %q, want [%q]; browser and log title sinks must not receive bidi, C1, or line-control runes", set.calls, want)
 	}
 }
+
+// TestSessionTitleClearsTheRungWhenTheTabIsRepointed pins the /chat and /tangent
+// switch: the hook re-points a live tab from one kiro session to another and the new
+// conversation has no usable title yet. Without the clear the tab keeps displaying the
+// PREVIOUS conversation's title -- forever if the new session never gains one --
+// because the engine retains clientTitle until something replaces it. This is the only
+// input that distinguishes the mapping-identity memo from the title-only memo it
+// replaced, so without this case the whole re-point branch can be deleted and every
+// other title test stays green.
+func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
+	f := newTitleFixture(t)
+	const first = "sess_11111111-2222-3333-4444-555555555555"
+	const second = "sess_99999999-8888-7777-6666-555555555555"
+	f.mapping("tab1", first)
+	f.session("hash0", first, titleJSON("the first conversation"))
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+	if want := "tab1=the first conversation"; len(set.calls) != 1 || set.calls[0] != want {
+		t.Fatalf("first pass pushed %v, want [%q]", set.calls, want)
+	}
+
+	// The hook re-points the tab. The new session's record exists but holds kiro's own
+	// placeholder, which readTitle reads as "no title" -- the case that used to strand
+	// the first conversation's title on the tab.
+	f.mapping("tab1", second)
+	f.session("hash0", second, titleJSON(placeholderTitle))
+	f.sync.pass(set)
+
+	if want := "tab1="; len(set.calls) != 2 || set.calls[1] != want {
+		t.Fatalf("after the re-point pushed %v, want a clearing %q so the tab falls back to the engine's automatic ladder", set.calls, want)
+	}
+	if _, memoized := f.sync.pushed["tab1"]; memoized {
+		t.Error("the memo still holds the cleared tab; the new conversation's first real title would then be judged against the old one's")
+	}
+
+	// The new conversation gains a real title: it must still be pushed after the clear
+	// dropped the tab's memo entry.
+	f.session("hash0", second, titleJSON("the second conversation"))
+	f.sync.pass(set)
+	if want := "tab1=the second conversation"; len(set.calls) != 3 || set.calls[2] != want {
+		t.Errorf("after the new session gained a title pushed %v, want %q", set.calls, want)
+	}
+}

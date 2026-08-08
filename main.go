@@ -1269,8 +1269,9 @@ func logRootIntegrityFindings(err error) {
 // the retired setup-tools.sh warn-and-continue posture — and the
 // health detail records the verdict. That detail then keeps tracking the
 // engine's counted jobs for the rest of the run (toolsStatus), so a repair
-// through the loopback tools API heals it without a restart; the gate is a
-// separate cell the reducer cannot reach. After convergence an async update
+// through the loopback tools API heals it without a restart; the gate reads
+// the same cell's one-way "syncing" state, which recordBoot replaces once
+// and observeJob can never restore. After convergence an async update
 // pass refreshes unpinned tools, and a boot warning nudges when no
 // language server is enabled (kiro-cli scans PATH for LSPs at session
 // start).

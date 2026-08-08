@@ -100,17 +100,20 @@ unset -f mount
 mount() { return 0; }
 mkdir -p "$WORK/cg2"
 printf '1\n' >"$WORK/cg2/cgroup.procs"
-before=$(ls -A "$WORK/cg2")
+# Snapshot the tree RECURSIVELY, not just the root's own entries: the removed
+# migration wrote into $cg_root/init/cgroup.procs, so it created a path BELOW the
+# root that an `ls -A` of the root alone does not report. A content check on the
+# root's cgroup.procs cannot serve here at all -- only the kernel removes a pid from
+# a parent's file, so a plain temp file reads "1" whether the function migrated or
+# not, which is why that assertion is gone rather than kept alongside.
+before=$(find "$WORK/cg2" | sort)
 out=$(enable_session_containment "$WORK/cg2" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "an occupied root still returns 0 (hygiene, never fatal)" \
   || no "an occupied root returns 0" "rc=$rc"
-[ "$(ls -A "$WORK/cg2")" = "$before" ] \
-  && ok "the remount creates no cgroup child, so the server's verifyOwnRoot cannot refuse the root" \
-  || no "the remount creates no cgroup child" "tree changed: $before -> $(ls -A "$WORK/cg2")"
-[ "$(cat "$WORK/cg2/cgroup.procs")" = "1" ] \
-  && ok "the remount migrates no process; vacating the root is the engine's step 5" \
-  || no "the remount migrates no process" "cgroup.procs = $(cat "$WORK/cg2/cgroup.procs")"
+[ "$(find "$WORK/cg2" | sort)" = "$before" ] \
+  && ok "the remount writes nothing below the cgroup root, so verifyOwnRoot cannot refuse it" \
+  || no "the remount writes nothing below the cgroup root" "tree changed"
 # An occupied root is now ORDINARY -- the server vacates it -- so this function must
 # not warn about it, or every boot carries a warn for the expected state.
 case "$out" in

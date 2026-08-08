@@ -224,24 +224,24 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 		return
 	}
 	previous, pushed := s.pushed[tabID]
-	if pushed && previous.kiroID != kiroID {
-		// The hook re-pointed this tab to another conversation. Clear the old
-		// client rung now so a placeholder, absent or not-yet-written title on the
-		// new session falls through to the engine's automatic name ladder instead
-		// of displaying the previous conversation's title.
-		if !mgr.SetSessionTitle(tabID, "") {
-			delete(s.pushed, tabID)
-			s.forget(tabID)
-			return
-		}
-		delete(s.pushed, tabID)
-		pushed = false
-	}
+	repointed := pushed && previous.kiroID != kiroID
 	title, ok := s.readTitle(kiroID)
 	if !ok {
+		if !repointed {
+			return
+		}
+		// The hook re-pointed this tab to a conversation with no usable title yet.
+		// Clear the old client rung so the tab falls through to the engine's
+		// automatic name ladder instead of displaying the previous conversation's
+		// title. Only this arm needs a clear: a usable title REPLACES the rung in
+		// one store below, so the old title is never observable in between.
+		if !mgr.SetSessionTitle(tabID, "") {
+			s.forget(tabID)
+		}
+		delete(s.pushed, tabID)
 		return
 	}
-	if pushed && previous.title == title {
+	if pushed && !repointed && previous.title == title {
 		return
 	}
 	// A false return means the tab closed between this sweep's liveness snapshot

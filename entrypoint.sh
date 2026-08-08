@@ -159,11 +159,16 @@ enable_session_containment() {
   #
   # Vacating the cgroup root is deliberately NOT done here, and an earlier attempt to
   # do it BROKE containment outright. cgroup v2 does forbid enabling a controller on a
-  # cgroup that still holds member processes -- that is the EBUSY above -- but the
-  # engine's own NewContainment already moves every pid out of the root into its
-  # "wt-server" leaf (vacateRoot, step 5 of its documented order) before it writes
-  # cgroup.subtree_control, so that EBUSY was measured against an image predating the
-  # step. And a leaf created HERE cannot be named acceptably: step 2, verifyOwnRoot,
+  # cgroup that still holds member processes -- that is the EBUSY above -- and the
+  # engine's own NewContainment already handles it: vacateRoot (step 5) moves every pid
+  # out of the root into its "wt-server" leaf before delegate() writes
+  # cgroup.subtree_control. That does NOT explain the borgcube measurement, and the
+  # reason is worth recording rather than assuming: image v2.7.7 pinned engine v3.4.2,
+  # whose terminal/containment_linux.go is byte-identical to the v3.4.3 pinned here
+  # (containment landed in one engine commit, first tagged v3.4.0, vacate included), so
+  # that EBUSY occurred WITH the vacate running. Its cause is still open; do not read
+  # this block as having closed it. What is settled is only that the fix does not
+  # belong here. A leaf created HERE cannot be named acceptably: step 2, verifyOwnRoot,
   # refuses the entire root as soon as it holds any child directory whose name does not
   # start with the server's prefix ("wt-", main.go's containCgroupPrefix), because a
   # foreign child is exactly how it detects a HOST cgroup root it must not reshape. An

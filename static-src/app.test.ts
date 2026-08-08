@@ -879,10 +879,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // watchdog. An EARLIER bootstrap error it already handled set
     // data-bootstrap-fatal, and a later error reaching this capture-phase
     // listener must NOT rebuild the dialog or overwrite that first, specific
-    // message with the generic "failed to load" text. A pristine overlay carrying
-    // only the marker isolates that clause from the replaced-.wt-loading-bar side
-    // effect it supersedes:
-    // with the marker guard removed the watchdog builds its dialog here.
+    // message with the generic "failed to load" text. data-bootstrap-fatal is the
+    // only ownership signal the watchdog reads, so the fixture is a pristine
+    // overlay carrying just the marker: with that guard removed the watchdog
+    // builds its dialog here.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
     overlay.setAttribute("data-bootstrap-fatal", "");
@@ -959,6 +959,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     );
     // ...and the runtime-error arm of the ternary, not the program-load arm: the
     // shared prefix is identical, so only this substring separates them.
+    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "its program stopped with an error before the terminal appeared",
+    );
+  });
+
+  it("watchdog fires on a runtime error whose thrown value is falsy", () => {
+    evaluateWatchdog(readWatchdogSource());
+
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+
+    // `throw null` (or undefined/false/0/"") is legal, and the window error event
+    // still reports a real module-evaluation failure. index.html classifies by
+    // event SHAPE (`"error" in e`) for exactly this case: a truthiness test on
+    // e.error stands down here and leaves the user behind a pristine, infinitely
+    // animating loading overlay with no recovery dialog. The helper defines the
+    // property for any non-undefined argument, so `error: null` recreates that
+    // shape and this test is red on the pre-fix classifier.
+    dispatchWindowError({ target: window, error: null });
+
+    expectFatalOverlayShape(overlay, root);
     expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
       "its program stopped with an error before the terminal appeared",
     );
@@ -1072,12 +1093,15 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
     // Why this test exists: the watchdog's stand-down guards read index.html's
-    // REAL markup (a .wt-loading-bar child, no .fade) while appendPristineOverlay()
-    // re-creates that markup by hand. If index.html's overlay ever loses the
-    // .wt-loading-bar (or #terminal ships a pre-JS child), the watchdog silently
-    // never fires in production while every watchdog test above still passes
-    // against its own fabricated overlay -- so pin the hand-built fixture to
-    // the served file here.
+    // REAL markup (role="status", no .fade, an empty #terminal) while
+    // appendPristineOverlay() re-creates that markup by hand. If the served
+    // overlay ever drifts from the fixture -- a .fade already present, or
+    // #terminal shipping a pre-JS child -- the watchdog silently never fires in
+    // production while every watchdog test above still passes against its own
+    // fabricated overlay, so pin the hand-built fixture to the served file here.
+    // The .wt-loading-bar assertion below is NOT a watchdog guard (the watchdog
+    // stands down on data-bootstrap-fatal and .fade only): it pins the bar the
+    // library's page.css animates, and the fixture's fidelity to it.
     // The guards below live entirely in the markup, read through the suite's
     // shared served-document policy.
     const doc = parseServedDocument();

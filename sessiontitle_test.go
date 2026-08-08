@@ -1,10 +1,15 @@
 package main
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 // fakeSetter records what the syncer pushed onto the engine's client title rung,
@@ -12,11 +17,23 @@ import (
 type fakeSetter struct {
 	calls   []string // "id=title" in call order, so a repeat push is visible
 	missing map[string]bool
+	// live is the tab set List reports, i.e. what the engine's session manager
+	// still holds. pass() reclaims any mapping whose tab is not in it, so a test
+	// that expects a push has to name its tab here.
+	live []string
 }
 
 func (f *fakeSetter) SetSessionTitle(id, title string) bool {
 	f.calls = append(f.calls, id+"="+title)
 	return !f.missing[id]
+}
+
+func (f *fakeSetter) List() []terminal.SessionInfo {
+	out := make([]terminal.SessionInfo, 0, len(f.live))
+	for _, id := range f.live {
+		out = append(out, terminal.SessionInfo{ID: id})
+	}
+	return out
 }
 
 // titleFixture builds a syncer over temp dirs plus helpers to plant the two inputs
@@ -75,7 +92,7 @@ func TestSessionTitlePushesKiroTitle(t *testing.T) {
 	f.session("hash0", "sess_11111111-2222-3333-4444-555555555555",
 		titleJSON("Kopia audit: landed, verified, cleaned"))
 
-	set := &fakeSetter{}
+	set := &fakeSetter{live: []string{"tab1"}}
 	f.sync.pass(set)
 
 	want := "tab1=Kopia audit: landed, verified, cleaned"
@@ -93,7 +110,7 @@ func TestSessionTitlePushesOnlyOnChange(t *testing.T) {
 	f.mapping("tab1", id)
 	f.session("hash0", id, titleJSON("first message verbatim"))
 
-	set := &fakeSetter{}
+	set := &fakeSetter{live: []string{"tab1"}}
 	f.sync.pass(set)
 	f.sync.pass(set)
 	if len(set.calls) != 1 {
@@ -126,7 +143,7 @@ func TestSessionTitleSkipsUnusableTitles(t *testing.T) {
 			f.mapping("tab1", id)
 			f.session("hash0", id, body)
 
-			set := &fakeSetter{}
+			set := &fakeSetter{live: []string{"tab1"}}
 			f.sync.pass(set)
 			if len(set.calls) != 0 {
 				t.Errorf("pushed %v, want nothing pushed", set.calls)
@@ -158,7 +175,10 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	f.mapping("gonetab", id)
 	f.session("hash0", id, titleJSON("a real title"))
 
-	set := &fakeSetter{missing: map[string]bool{"gonetab": true}}
+	// The tab is still in the manager's list at snapshot time and disappears at the
+	// push, which is the within-sweep race this arm exists for -- not the ordinary
+	// close, which pass() now reclaims before syncOne is reached at all.
+	set := &fakeSetter{missing: map[string]bool{"gonetab": true}, live: []string{"gonetab"}}
 	f.sync.pass(set)
 
 	if _, err := os.Stat(filepath.Join(f.sync.titleStateDir(), "gonetab")); !os.IsNotExist(err) {
@@ -197,7 +217,7 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 	t.Run("traversal in a mapping file reads nothing", func(t *testing.T) {
 		f := newTitleFixture(t)
 		f.mapping("tab1", "../../../../etc")
-		set := &fakeSetter{}
+		set := &fakeSetter{live: []string{"tab1"}}
 		f.sync.pass(set)
 		if len(set.calls) != 0 {
 			t.Errorf("pushed %v from a traversal mapping, want nothing", set.calls)
@@ -206,22 +226,18 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 }
 
 // TestSessionTitleBoundsFileReads pins that neither state file can make the server
-// allocate without bound: a huge mapping file is truncated at the read, and the
-// truncated value then fails the session-id shape check.
+// allocate without bound: an oversized mapping file is REFUSED at the read
+// (atomicfile.ErrFileTooLarge) rather than truncated, and nothing is pushed.
 func TestSessionTitleBoundsFileReads(t *testing.T) {
 	f := newTitleFixture(t)
 	huge := filepath.Join(f.sync.titleStateDir(), "tab1")
 	if err := os.WriteFile(huge, []byte(strings.Repeat("a", maxTitleFileBytes*3)), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	raw, err := readSmallFile(huge)
-	if err != nil {
-		t.Fatalf("readSmallFile: %v", err)
+	if _, err := readSmallFile(huge); !errors.Is(err, atomicfile.ErrFileTooLarge) {
+		t.Fatalf("readSmallFile(oversized) = %v, want ErrFileTooLarge", err)
 	}
-	if len(raw) > maxTitleFileBytes {
-		t.Errorf("read %d bytes, want at most %d", len(raw), maxTitleFileBytes)
-	}
-	set := &fakeSetter{}
+	set := &fakeSetter{live: []string{"tab1"}}
 	f.sync.pass(set)
 	if len(set.calls) != 0 {
 		t.Errorf("pushed %v from an oversized mapping, want nothing", set.calls)
@@ -265,5 +281,77 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 		if !strings.Contains(string(script), k) {
 			t.Errorf("hooks/session-title.sh does not mention %s; the hook and the server disagree on the variable name, so no tab would ever be named", k)
 		}
+	}
+}
+
+// TestSessionTitleHookWriteFormatReachesThePoller is the OTHER half of the
+// cross-language contract: TestSessionTitleEnvNamesWhatTheHookReads pins the two
+// variable NAMES, this one pins the FILE FORMAT by running the shipped script and
+// letting the real poller consume what it wrote. Nothing else executes
+// hooks/session-title.sh — every other test fabricates the mapping file itself, so
+// without this leg the agreement that the file is named for the tab id and holds a
+// bare `sess_...` line is asserted only against the consumer's own idea of it. Both
+// sides fail SILENTLY by construction (the hook exits 0 on every failure path
+// because a non-zero exit can block the user's prompt, and the poller says nothing
+// when the name or location is wrong), so a drift would surface only as tabs
+// quietly reverting to the engine's automatic cwd label.
+func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
+	sh, err := exec.LookPath("/bin/sh")
+	if err != nil {
+		t.Skipf("no /bin/sh on this host: %v", err)
+	}
+	const kiroID = "sess_0f8fad5b-d9cb-469f-a165-70867728950e"
+	const title = "Kopia audit: landed"
+
+	f := newTitleFixture(t)
+	// Run the REAL hook the image ships, in the environment the session factory
+	// injects, with the payload kiro-cli hands a hook on stdin.
+	cmd := exec.Command(sh, "hooks/session-title.sh")
+	cmd.Env = append(os.Environ(),
+		"KWEB_SESSION_ID=tab42",
+		"KWEB_TITLE_STATE_DIR="+f.sync.titleStateDir())
+	cmd.Stdin = strings.NewReader(`{"session_id":"` + kiroID + `"}`)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("hook: %v (output %q)", err, out)
+	}
+
+	// Seed the kiro session record the poller resolves, then assert the pairing
+	// lands: the mapping file the hook chose to write is one the poller finds,
+	// reads and believes.
+	f.session("hash0", kiroID, titleJSON(title))
+	set := &fakeSetter{live: []string{"tab42"}}
+	f.sync.pass(set)
+	if len(set.calls) != 1 || set.calls[0] != "tab42="+title {
+		t.Errorf("the hook's mapping did not reach the poller: got %v, want [%q]", set.calls, "tab42="+title)
+	}
+}
+
+// TestSessionTitleScansEveryWorkspaceHashDir pins the reason readTitle loops over
+// the hash level at all: kiro-cli files each session under a per-workspace hash
+// directory, a /config volume accumulates one per workspace path it has ever
+// seen, and os.ReadDir returns them sorted -- so a tab's session is routinely NOT
+// under the first entry. Every other test in this file plants exactly one hash
+// directory holding exactly the session under test, so collapsing the scan to the
+// first entry (turning the read-miss continue into a return, or breaking out of
+// the loop) keeps the whole suite green while every tab whose session lives under
+// a later hash silently keeps the engine's automatic cwd label.
+func TestSessionTitleScansEveryWorkspaceHashDir(t *testing.T) {
+	f := newTitleFixture(t)
+	id := "sess_abcdef01-2345-6789-abcd-ef0123456789"
+	f.mapping("tab1", id)
+	// Two earlier-sorting hash directories that do not hold this session: one
+	// belonging to another workspace, one with no sessions in it at all.
+	f.session("hash0", "sess_00000000-0000-0000-0000-000000000000", titleJSON("another workspace"))
+	if err := os.MkdirAll(filepath.Join(f.home, ".kiro", "sessions", "hash1"), 0o750); err != nil {
+		t.Fatalf("mkdir a hash directory with no sessions in it: %v", err)
+	}
+	f.session("hash2", id, titleJSON("Kopia audit: landed, verified, cleaned"))
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+
+	want := "tab1=Kopia audit: landed, verified, cleaned"
+	if len(set.calls) != 1 || set.calls[0] != want {
+		t.Errorf("pushed %v, want exactly [%q]: the scan must carry on past a hash directory that does not hold this session", set.calls, want)
 	}
 }

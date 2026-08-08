@@ -349,6 +349,19 @@ exec "$0" chat "$@"`
 	return append([]string{"/bin/sh", "-c", script, cliPath}, chatArgs...)
 }
 
+// loopbackHint renders the address an in-container caller uses to reach this
+// server, for the loopback surfaces' refusal messages (routeDeps.listenHint).
+// Derived from the listen address (KWEB_ADDR) so a deployment that moved the port
+// is not told to curl the default one — the 403 is the whole of what a refused
+// caller is told. A port-less or malformed addr degrades to the bare host rather
+// than to a broken URL.
+func loopbackHint(addr string) string {
+	if _, port, err := net.SplitHostPort(addr); err == nil && port != "" {
+		return "localhost:" + port
+	}
+	return "localhost"
+}
+
 func main() {
 	// Parse the level BEFORE Setup so the handler installs at the configured
 	// level; warn AFTER Setup so the warning emits through the configured
@@ -495,8 +508,31 @@ func main() {
 			"hint", "kiro-cli session titles need this directory writable by the server and by the hook it seeds")
 	}
 
-	mgr, cspPolicy, err := registerRoutes(mux, &routeDeps{
-		staticFS:        staticFS,
+	// The subsystem teardown, named once: both background owners, in the order
+	// they were started. Every exit below runs it, and a fifth subsystem is then
+	// added in one place instead of four.
+	stopSubsystems := func() {
+		kiro.stop()
+		tools.close()
+	}
+
+	// The static tree's two derivatives, assembled together and fail-loud
+	// (buildStaticSurface), then handed to their own consumers: the serving
+	// handler to the route table, the hash-pinned CSP to buildHandler's
+	// SecurityHeaders layer. The root builds them because it is the only place
+	// that consumes both.
+	staticSrv, cspPolicy, err := buildStaticSurface(staticFS)
+	if err != nil {
+		slog.Error("the embedded static tree is unusable",
+			"error", err,
+			"hint", "this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block; rebuild the image (go generate ./... plus the Dockerfile static build). The container will crash-loop under its restart policy until it is rebuilt.")
+		stopSubsystems()
+		os.Exit(1)
+	}
+
+	mgr := registerRoutes(mux, &routeDeps{
+		static:          staticSrv,
+		listenHint:      loopbackHint(addr),
 		cmd:             kiro.cmd,
 		sessionEnv:      kiro.env,
 		sessionTitleEnv: titles.sessionEnv,
@@ -510,14 +546,6 @@ func main() {
 		toolsState:      tools.state,
 		containment:     startContainment(),
 	})
-	if err != nil {
-		slog.Error("route registration failed; the embedded static tree is unusable",
-			"error", err,
-			"hint", "this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block; rebuild the image (go generate ./... plus the Dockerfile static build). The container will crash-loop under its restart policy until it is rebuilt.")
-		kiro.stop()
-		tools.close()
-		os.Exit(1)
-	}
 
 	// Bind the listener before building the base context + server so the
 	// listen-failure os.Exit(1) runs with no pending defer (gocritic
@@ -526,8 +554,7 @@ func main() {
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		slog.Error("listen failed", "addr", addr, "error", err)
-		kiro.stop()
-		tools.close()
+		stopSubsystems()
 		os.Exit(1)
 	}
 
@@ -591,12 +618,10 @@ func main() {
 		// do the same or a teardown would emit a false broken-install alert).
 		ready.Set(false)
 		mgr.Shutdown()
-		kiro.stop()
-		tools.close()
+		stopSubsystems()
 		os.Exit(1) //nolint:gocritic // exitAfterDefer: a failed Serve must exit non-zero; the deferred stop()/cancelBase() only release signal+context state the process exit reclaims anyway.
 	}
-	kiro.stop()
-	tools.close()
+	stopSubsystems()
 }
 
 // The layout facts this app brings to the kiro-cli install: where the convenience
@@ -1467,60 +1492,6 @@ func warnIfNoLSPEnabled(e *toolbelt.Engine, manifestPath string) {
 		"hint", `enable gopls (Go), typescript-language-server (TypeScript), or pyright (Python): set "disabled": false in the manifest and restart, or use the loopback tools API`)
 }
 
-// sessionNoStore marks the ENGINE's session surface uncacheable on the responses
-// the engine itself does not cover. It is what remains of the app's former
-// /api/-wide apiNoStore middleware, narrowed to the one place a header would
-// otherwise be lost.
-//
-// Why any wrapper is still here. A session id is the /ws attach + resume
-// capability token — the same value routes.go's LogID truncates before logging
-// and WithTemplatePathsUnder keeps out of the access log — and a response with no
-// freshness information is heuristically cacheable under RFC 9111 §4.2.2 (200,
-// 203, 204, 206, 300, 301, 308, 404, 405, 410, 414, 501), so with no directive it
-// is stored by the browser's disk cache and by a caching reverse proxy, the
-// README's recommended deployment shape.
-//
-// Why it is scoped HERE and nowhere else, measured rather than assumed against
-// engine v3.2.1 (the enumeration is TestAPICachePolicy_EveryAPIPathSetsNoStore,
-// which fails if any row's owner stops setting the header):
-//
-//   - /api/tools + subtree — toolbelt's httpapi sets no-store on every response
-//     of its own as of v2.3.0, upstream of its mux, so its 404s and 405s are
-//     covered too. This is what let the /api/-wide wrapper go.
-//   - /api/health, POST /api/kiro-cli/rescan — each handler sets it itself.
-//   - /api/sessions, POST /api/sessions, /api/sessions/events — the engine sets
-//     it: terminal's writeJSON on create/list, "no-cache, no-store" on the SSE
-//     stream.
-//   - EVERYTHING ELSE under /api/sessions — NOT covered by the engine. writeJSON
-//     is reached only by create and list, so the REST handler's 204s (close,
-//     set/clear title), its http.Error 400/404s, and its inner mux's own 404/405
-//     (e.g. GET on a session path that only serves DELETE) all carry no
-//     Cache-Control at all. That is this wrapper's entire remaining job.
-//
-// Most of that uncovered set is unreachable by a cache anyway — RFC 9111 §3
-// forbids storing a response to a method a cache does not understand as
-// cacheable, which excludes every DELETE/PUT/PATCH — so the genuinely cacheable
-// remainder is the GET/HEAD 404s and 405s in the subtree, whose bodies are
-// net/http's constant error text and carry no session data. The header is kept
-// anyway rather than reasoned away: this costs one map write on a surface that
-// issues capability tokens, and the argument that a 405 is harmless has to be
-// re-derived correctly by every future reader.
-//
-// This is the ENGINE's gap to close, not the app's. When the engine adopts the
-// same upstream-of-mux default toolbelt just did, delete this wrapper and its
-// chain entry — the enumeration test then holds with no app middleware at all.
-// Scoped by the engine's own exported path constant (a prefix, so it covers the
-// exact path and the subtree) so the static surface keeps kiroCacheControl's
-// ETag/immutable policy untouched.
-func sessionNoStore(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, terminal.SessionsPath) {
-			w.Header().Set("Cache-Control", "no-store")
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // canonicalPathRefusal is the message the canonical-path guard writes. A const
 // so a test can pin the exact wording without a second copy of the literal
 // (goconst) drifting from this one, the same reason wsAttachMsg is one.
@@ -1678,8 +1649,8 @@ func canonicalPathGuard(next http.Handler) http.Handler {
 // buildHandler wraps the route mux in web-terminal-kiro's middleware stack via
 // webhttp.Chain. Chain(h, A, B, C, D) == A(B(C(D(h)))), so the first entry is
 // the outermost wrapper; a request flows Logging -> Recoverer -> wsAttachLog ->
-// SecurityHeaders -> sessionNoStore -> host allowlist -> CrossOriginProtection ->
-// canonicalPathGuard -> mux, and the response unwinds the other way.
+// SecurityHeaders -> host allowlist -> CrossOriginProtection -> canonicalPathGuard
+// -> mux, and the response unwinds the other way.
 //
 //   - Logging — webhttp's access logger. Outermost so it observes every final
 //     status on logged routes, including a recovered 500 and a cross-origin
@@ -1712,12 +1683,6 @@ func canonicalPathGuard(next http.Handler) http.Handler {
 //     'none' — web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
-//   - sessionNoStore — Cache-Control: no-store on the responses the ENGINE's
-//     session surface leaves without one (see sessionNoStore for the measured
-//     enumeration and the capability-token rationale). Scoped to the engine's
-//     session path so the static surface keeps kiroCacheControl's policy, and
-//     placed outside the host/origin gates so even a rejected request is
-//     uncacheable.
 //   - hostPolicy.Middleware — the KWEB_ALLOWED_HOSTS exact-host check
 //     (webhttp.HostPolicy; see parseAllowedHosts for the DNS-rebinding
 //     rationale). Placed before CrossOriginProtection because rebinding makes
@@ -1870,7 +1835,6 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			webhttp.WithReferrerPolicy("same-origin"),
 			webhttp.WithPermissionsPolicy("camera=(), microphone=(), geolocation=()"),
 		),
-		sessionNoStore,
 		hostPolicy.Middleware(),
 		http.NewCrossOriginProtection().Handler,
 		canonicalPathGuard,

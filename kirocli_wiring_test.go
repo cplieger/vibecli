@@ -48,6 +48,26 @@ func TestSessionPathEnv_versionDirectoryLeads(t *testing.T) {
 	}
 }
 
+// TestSessionPathEnv_emptyInheritedPATHDoesNotWidenTheSearchPath pins the
+// degenerate branch: with no inherited PATH the overlay is the version directory
+// ALONE. Appending an empty inherited value instead emits "PATH=<dir>:", and a
+// trailing separator is an EMPTY PATH element, which resolves to the child's
+// working directory -- KWEB_WORK_DIR, the user's own repo checkouts. A
+// kiro-cli-chat dropped in /workspace would then win bare-name resolution inside
+// the session, the opposite of what leading with the version directory is for.
+// TestSessionPathEnv_versionDirectoryLeads sets a non-empty PATH, so nothing else
+// in the suite reaches this branch.
+func TestSessionPathEnv_emptyInheritedPATHDoesNotWidenTheSearchPath(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	versionDir := "/config/tools/kiro-cli-versions/2.14.2"
+	got := sessionPathEnv(versionDir)
+	want := "PATH=" + versionDir
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("sessionPathEnv(%q) with no inherited PATH = %q, want [%q]: an empty PATH element resolves to the child's cwd, which is the user's workspace", versionDir, got, want)
+	}
+}
+
 // TestSessionEnv_reachesSpawnedPTY proves the PATH overlay survives the whole
 // path from routeDeps to a live child process. The engine composes each child's
 // environment itself (os.Environ plus its TERM identity, with the consumer's

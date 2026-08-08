@@ -67,9 +67,9 @@ func TestDockerfileInvokesTheGate(t *testing.T) {
 	// somewhere else in the file.
 	if !slices.ContainsFunc(dockerfileLogicalLines(dockerfileUnderTest(t)), lineInvokesTheGate) {
 		t.Error("Dockerfile has no un-commented `go build -o <path> ./scripts/wirecheck " +
-			"&& <path> -client-rev ... -client-min-server ...` line; the wire-floor gate is " +
-			"not invoked (deleted OR commented out), so an incompatible Go/TS pair " +
-			"would build clean and refuse every session with close 4002 at runtime")
+			"&& <path> -manifest ...` (or `-client-rev ... -client-min-server ...`) line; the " +
+			"wire-floor gate is not invoked (deleted OR commented out), so an incompatible " +
+			"Go/TS pair would build clean and refuse every session with close 4002 at runtime")
 	}
 }
 
@@ -94,17 +94,40 @@ func TestDockerfileBuildsTheGateInsteadOfGoRun(t *testing.T) {
 	}
 }
 
+// shellSegment strips a logical line's leading `RUN` and the instruction FLAGS
+// that belong to it (`--mount=…`, `--network=…`, `--security=…`), so the shell
+// command that follows can still be anchored at the START of its `&&` segment.
+// The gate is the FIRST command in its RUN — nothing precedes it to create an
+// `&&` boundary — so without this the three cache/tmpfs mounts and the `go build`
+// share one segment and a field-exact match on the raw segment cannot see the
+// build at all. Only `--`-prefixed words immediately following `RUN` are dropped,
+// so no shell word is ever skipped and inert data (`echo go build …`) keeps its
+// echo at the anchor position.
+func shellSegment(seg string) string {
+	trimmed := strings.TrimSpace(seg)
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 || fields[0] != "RUN" {
+		return trimmed
+	}
+	fields = fields[1:]
+	for len(fields) > 0 && strings.HasPrefix(fields[0], "--") {
+		fields = fields[1:]
+	}
+	return strings.Join(fields, " ")
+}
+
 // lineRunsTheGateUnbuilt reports whether one LOGICAL Dockerfile line executes the
 // gate through `go run` rather than as a built binary. Anchored at an `&&` segment
-// start for the same reason as lineInvokesTheGate: the prose above the RUN
-// mentions the package, and an `echo go run …` is not an execution.
+// start (past any RUN instruction flags, see shellSegment) for the same reason as
+// lineInvokesTheGate: the prose above the RUN mentions the package, and an
+// `echo go run …` is not an execution.
 func lineRunsTheGateUnbuilt(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if strings.HasPrefix(trimmed, "#") {
 		return false
 	}
 	for seg := range strings.SplitSeq(trimmed, "&&") {
-		if strings.HasPrefix(strings.TrimSpace(seg), "go run "+gatePackage) {
+		if strings.HasPrefix(shellSegment(seg), "go run "+gatePackage) {
 			return true
 		}
 	}
@@ -114,14 +137,15 @@ func lineRunsTheGateUnbuilt(line string) bool {
 // gateBuildOutput finds the `go build -o <path> ./scripts/wirecheck` segment of a
 // split logical line and returns the output path plus that segment's index (index
 // -1 and an empty path when the line does not build the gate). The shape is
-// matched on FIELDS anchored at the segment start, not as a substring, so inert
-// shell data (`echo go build -o … ./scripts/wirecheck`) is not mistaken for a
+// matched on FIELDS anchored at the segment start (past any RUN instruction
+// flags, see shellSegment), not as a substring, so inert shell data
+// (`echo go build -o … ./scripts/wirecheck`) is not mistaken for a
 // build. Exactly the five-field form is accepted: extra flags on the step would
 // fail this test loudly and get the assertion consciously updated, which is the
 // right direction of error for a gate whose false pass ships an incompatible pair.
 func gateBuildOutput(segments []string) (string, int) {
 	for i, seg := range segments {
-		fields := strings.Fields(strings.TrimSpace(seg))
+		fields := strings.Fields(shellSegment(seg))
 		if len(fields) != 5 {
 			continue
 		}
@@ -133,9 +157,25 @@ func gateBuildOutput(segments []string) (string, int) {
 	return "", -1
 }
 
+// gateFlagsPresent reports whether an invocation segment carries a client-side
+// declaration for the gate to check. Either shape counts: `-manifest <path>`
+// (the engine artifact's own wire-compatibility.json, which the gate parses
+// itself) or the explicit `-client-rev`/`-client-min-server` pair. Both halves
+// of the pair are required together, because either one alone leaves the gate
+// with an unusable pairing and exits 2 — a step that never reports a floor
+// violation. An invocation carrying NEITHER is not a gate: the program would
+// exit 2 on every build for the same reason.
+func gateFlagsPresent(seg string) bool {
+	if strings.Contains(seg, "-manifest") {
+		return true
+	}
+	return strings.Contains(seg, "-client-rev") && strings.Contains(seg, "-client-min-server")
+}
+
 // lineInvokesTheGate reports whether one LOGICAL Dockerfile line (see
 // dockerfileLogicalLines) BUILDS the wire-floor gate and then RUNS the built
-// binary with both flags attached. Both halves are required and in that order:
+// binary with a client-side declaration attached (see gateFlagsPresent). Both
+// halves are required and in that order:
 // the built path is read out of the `go build -o` segment rather than hardcoded
 // here, so moving the binary (a tmpfs mount elsewhere) does not fail the test,
 // while dropping either half does. The executable is anchored at the start of an
@@ -169,9 +209,7 @@ func lineInvokesTheGate(line string) bool {
 	}
 	for i := built + 1; i < len(segments); i++ {
 		seg := strings.TrimSpace(segments[i])
-		if !strings.HasPrefix(seg, bin+" ") ||
-			!strings.Contains(seg, "-client-rev") ||
-			!strings.Contains(seg, "-client-min-server") {
+		if !strings.HasPrefix(seg, bin+" ") || !gateFlagsPresent(seg) {
 			continue
 		}
 		// `;` discards the verdict the same way `||` does (`<gate> ... ; true`
@@ -179,11 +217,10 @@ func lineInvokesTheGate(line string) bool {
 		// trailing `;` command supplies the whole step's exit status), but it is
 		// refused from the BUILD segment onward rather than over the whole
 		// logical line: a `;` in an EARLIER segment cannot touch the gate's exit
-		// status, and the live chain has several -- inside the quoted sed scripts
-		// that read the client constants out of the vendored artifact. Starting
-		// at the build segment (which sits after those seds) is strictly the
-		// stronger window: a discarded `go build` status would leave the next
-		// segment invoking a stale or absent binary. A `|` discards the verdict
+		// status, and an earlier segment may legitimately carry one (a quoted
+		// shell script preparing the step). Starting at the build segment is
+		// strictly the stronger window: a discarded `go build` status would leave
+		// the next segment invoking a stale or absent binary. A `|` discards the verdict
 		// too (a pipeline's status is the LAST command's), and a `&` backgrounds
 		// the gate so the step never waits for it -- both are refused on the same
 		// build-onward terms. Backgrounding is judged as the presence of the `&`
@@ -243,22 +280,28 @@ func dockerfileLogicalLines(dockerfile string) []string {
 // the text intact while the build stops executing it.
 func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 	const (
-		flags = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
-		bin   = "/tmp/wirecheck-bin/wirecheck"
-		build = "go build -o " + bin + " " + gatePackage
+		flags    = `-client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"`
+		manifest = `-manifest static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json`
+		bin      = "/tmp/wirecheck-bin/wirecheck"
+		build    = "go build -o " + bin + " " + gatePackage
 	)
-	live := "    " + build + " && " + bin + " " + flags
+	live := "    " + build + " && " + bin + " " + manifest
 	cases := map[string]struct {
 		line string
 		want bool
 	}{
-		"the live Dockerfile form":    {live, true},
-		"echoed, so never executed":   {"    " + build + " && echo " + bin + " " + flags, false},
-		"quoted into a no-op builtin": {"    " + build + " && : '" + bin + " " + flags + "'", false},
-		"commented out":               {"#    " + build + " && " + bin + " " + flags, false},
-		"missing the client-rev flag": {"    " + build + ` && ` + bin + ` -client-min-server "$CLIENT_MIN_SERVER"`, false},
-		"missing the min-server flag": {"    " + build + ` && ` + bin + ` -client-rev "$CLIENT_REV"`, false},
-		"prose mentioning the gate":   {"# public Go API inside scripts/wirecheck (no source scraping)", false},
+		"the live Dockerfile form": {live, true},
+		// The explicit client-side pair stays a legitimate invocation (dev-build
+		// and any consumer without a manifest use it), so the recognizer must
+		// accept it too — dropping it would fail a build that still gates.
+		"the explicit client-flag pair":                  {"    " + build + " && " + bin + " " + flags, true},
+		"echoed, so never executed":                      {"    " + build + " && echo " + bin + " " + manifest, false},
+		"quoted into a no-op builtin":                    {"    " + build + " && : '" + bin + " " + manifest + "'", false},
+		"commented out":                                  {"#    " + build + " && " + bin + " " + manifest, false},
+		"missing the client-rev flag":                    {"    " + build + ` && ` + bin + ` -client-min-server "$CLIENT_MIN_SERVER"`, false},
+		"missing the min-server flag":                    {"    " + build + ` && ` + bin + ` -client-rev "$CLIENT_REV"`, false},
+		"invoked with no client-side declaration at all": {"    " + build + " && " + bin, false},
+		"prose mentioning the gate":                      {"# public Go API inside scripts/wirecheck (no source scraping)", false},
 		// The gate must be BUILT and then RUN. `go run` still gates the pair but
 		// reports its own status 1 for the gate's exit 2, so the "fix the gate, do
 		// not bump a pin" signal is lost; TestDockerfileBuildsTheGateInsteadOfGoRun
@@ -308,6 +351,18 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"a chain whose verdict is discarded by a trailing ;": {
 			`RUN WIRE_TS=x && ` + build + " && " + bin + " " + flags + ` ; true`, false,
 		},
+		// The live shape: the gate is the FIRST command in its RUN, so the build
+		// shares a segment with the RUN's cache/tmpfs mounts and is only visible
+		// once those instruction flags are stripped (shellSegment).
+		"the live RUN-with-mounts shape": {
+			`RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build --mount=type=tmpfs,target=/tmp/wirecheck-bin ` +
+				build + " && " + bin + " " + manifest, true,
+		},
+		// ...and stripping them must not make an echoed build look live: the
+		// anchor moves past the RUN flags only, never past a shell word.
+		"a RUN-with-mounts shape whose build is echoed": {
+			`RUN --mount=type=tmpfs,target=/tmp/wirecheck-bin echo ` + build + " && " + bin + " " + manifest, false,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -329,6 +384,13 @@ func TestLineRunsTheGateUnbuilt(t *testing.T) {
 	}{
 		"go run with flags":            {"    go run " + gatePackage + " " + flags, true},
 		"go run at the end of a chain": {"RUN WIRE_TS=x && go run " + gatePackage + " " + flags, true},
+		// Reverting the live step is now a one-word edit INSIDE the RUN's own
+		// segment (the gate is its first command), so the detector has to see past
+		// the instruction flags or the regression it exists to name goes unreported.
+		"go run as the RUN's first command, behind its mounts": {
+			"RUN --mount=type=cache,target=/root/.cache/go-build go run " + gatePackage +
+				" -manifest static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json", true,
+		},
 		"the live build-then-invoke form": {
 			"    go build -o /tmp/wirecheck-bin/wirecheck " + gatePackage +
 				" && /tmp/wirecheck-bin/wirecheck " + flags, false,
@@ -549,5 +611,101 @@ func TestDockerfileLogicalLines_foldsAContinuedChain(t *testing.T) {
 	}
 	if invoked(swallowed) {
 		t.Errorf("a verdict swallowed by a continuation-line `|| true` was recognized as a live gate; logical lines = %q", dockerfileLogicalLines(swallowed))
+	}
+}
+
+// TestReadManifest is the payoff of moving the client-side parse out of the
+// Dockerfile: every failure shape below was previously a shell `sed` capture
+// whose only guard was `${VAR:?}`, in a RUN no test could reach. Each case
+// asserts the parse's OWN contract — a usable pairing, or a refusal that says
+// the gate cannot read the client's declaration (which the caller turns into
+// exit 2, "fix the gate, do not bump a pin", never a floor verdict).
+func TestReadManifest(t *testing.T) {
+	const good = `{"schemaVersion":1,"generatedBy":"web/src/wire-manifest.ts",` +
+		`"wireCompatibility":{"protocolVersion":4,"minimumServerProtocolVersion":3,"incompatibleCloseCode":4002}}`
+	cases := map[string]struct {
+		content         string // "" = do not create the file at all
+		wantOK          bool
+		wantRev         int
+		wantMinServer   int
+		wantStderrNames string // a fragment naming WHY the manifest is unusable
+	}{
+		"the engine's published shape": {
+			content: good, wantOK: true, wantRev: 4, wantMinServer: 3,
+		},
+		// Unknown-schema is the case the engine's own manifest declares
+		// schemaVersion FOR: the format moved ahead of this gate, so the gate is
+		// behind and no pin should move.
+		"a newer schema is refused rather than guessed at": {
+			content:         `{"schemaVersion":2,"wireCompatibility":{"protocolVersion":9,"minimumServerProtocolVersion":9}}`,
+			wantStderrNames: "schemaVersion 2",
+		},
+		"a schemaVersion-less document is refused": {
+			content:         `{"wireCompatibility":{"protocolVersion":4,"minimumServerProtocolVersion":3}}`,
+			wantStderrNames: "schemaVersion 0",
+		},
+		// The silent-empty-capture failure the `${VAR:?}` guards existed for: a
+		// renamed or absent field must not read as revision 0 and reach the
+		// engine's comparator.
+		"a manifest with no usable revisions is refused": {
+			content:         `{"schemaVersion":1,"wireCompatibility":{}}`,
+			wantStderrNames: "no usable wireCompatibility revisions",
+		},
+		"a non-JSON document is refused": {
+			content:         "export const WIRE_PROTOCOL_VERSION = 4;\n",
+			wantStderrNames: "cannot parse",
+		},
+		"an absent manifest is refused": {
+			wantStderrNames: "cannot read",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "wire-compatibility.json")
+			if tc.content != "" {
+				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+					t.Fatalf("write manifest fixture: %v", err)
+				}
+			}
+			var stderr bytes.Buffer
+			rev, minServer, ok := readManifest(path, &stderr)
+			if ok != tc.wantOK {
+				t.Fatalf("readManifest ok = %v, want %v (stderr %q)", ok, tc.wantOK, stderr.String())
+			}
+			if !tc.wantOK {
+				if !strings.Contains(stderr.String(), tc.wantStderrNames) {
+					t.Errorf("stderr = %q, want it to name %q; \"fix the gate\" is only actionable when it says what could not be read",
+						stderr.String(), tc.wantStderrNames)
+				}
+				if !strings.Contains(stderr.String(), usageErrMsg) {
+					t.Errorf("stderr = %q, want it to carry the usage line so the reader is told not to bump a pin", stderr.String())
+				}
+				return
+			}
+			if rev != tc.wantRev || minServer != tc.wantMinServer {
+				t.Errorf("readManifest = (%d, %d), want (%d, %d)", rev, minServer, tc.wantRev, tc.wantMinServer)
+			}
+		})
+	}
+}
+
+// TestReadManifest_readsTheVendoredEngineArtifact closes the loop the Dockerfile
+// step depends on: the manifest the image build actually points the gate at must
+// parse, and the pairing it declares must be the one the engine's Go constants
+// agree with. A shape change in the published artifact (a renamed field, a bumped
+// schemaVersion) would otherwise surface only as an exit-2 image build.
+func TestReadManifest_readsTheVendoredEngineArtifact(t *testing.T) {
+	const vendored = "../../static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json"
+	if _, err := os.Stat(vendored); err != nil {
+		t.Skip("vendored engine artifact absent (no npm install here); the image build reads it")
+	}
+	var stderr bytes.Buffer
+	rev, minServer, ok := readManifest(vendored, &stderr)
+	if !ok {
+		t.Fatalf("readManifest(%s) refused the vendored artifact: %s", vendored, stderr.String())
+	}
+	if code := run(rev, minServer, &bytes.Buffer{}, &stderr); code != 0 {
+		t.Errorf("the vendored engine artifact's declared pairing (client rev %d, min server %d) fails the gate: exit %d, %s",
+			rev, minServer, code, stderr.String())
 	}
 }

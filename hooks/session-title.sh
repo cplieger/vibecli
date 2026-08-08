@@ -35,10 +35,15 @@ set -u
 # guaranteed jq, and the payload is machine-written by kiro-cli. A shape change
 # yields an empty match, which the guard below turns into a silent no-op (the
 # tab keeps the server's automatic name) rather than a wrong mapping.
-payload=$(cat)
-kiro_session=$(printf '%s' "$payload" \
-  | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-  | head -n 1)
+# Stream stdin straight through the extraction. Two reasons not to buffer it first: this
+# hook fires on EVERY UserPromptSubmit in every tab and the payload carries the user's
+# whole prompt, so `$(cat)` plus `printf '%s'` held two full copies of an unbounded
+# machine-written blob to produce a ~45-byte result; and `grep -o` reports matches
+# leftmost-first, so `head -n 1` now takes the FIRST "session_id" in the payload. The old
+# `sed 's/.*"session_id"...'` was greedy, so on a single-line payload it took the LAST one.
+kiro_session=$(grep -ao '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | head -n 1 \
+  | sed 's/.*"\([^"]*\)"$/\1/')
 
 case "$kiro_session" in
   sess_*) ;;

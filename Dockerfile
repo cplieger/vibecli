@@ -178,21 +178,21 @@ RUN mkdir -p static/vendor/fonts && \
 # matching how local TS files in static-src/ are treated. Extracted side by
 # side under static-src/node_modules/@cplieger so tsc's bundler resolution
 # finds the engine when compiling the UI's `@cplieger/web-terminal-engine` import.
-# Integrity note: unlike the Go, tsc, and Nerd Font fetches above, the two
-# @cplieger npm tarballs are NOT sha256-pinned. npm published package versions
-# are immutable (the registry refuses to re-publish an existing version), and
-# both are first-party packages fetched over pinned TLS (--proto '=https'
-# --tlsv1.2 below). The residual risk (a registry-side byte-swap or a
-# first-party npm account takeover) is accepted here; add per-package sha256
-# ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
-# deemed in scope. The old objection to doing so -- a manual sha bump on every
-# engine/UI release -- no longer applies: a `# repin:` marker would put both
-# pins on the same Renovate postUpgradeTask that maintains the four above, so
-# the cost is now one marker line each, not recurring toil.
+# Integrity note: all four of the Go, tsc, Nerd Font and tool-catalog fetches
+# above are sha256-gated, and so are both @cplieger npm tarballs below — each
+# carries a `# repin:`-marked sha256 ARG that the Renovate postUpgradeTask
+# recomputes in the same commit that bumps its version.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
 ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.4.2
+# sha256 of the published tarball. npm publishes SHA-512 (dist.integrity), not this
+# digest, so the version and the digest come from different sources: Renovate bumps
+# the version and the repin postUpgradeTask recomputes this line in the same commit.
+# repin: dep=@cplieger/web-terminal-engine url=https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-{version}.tgz
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=f74e030522ff3c2de6bc64ffbc1b5098beb9a9c7f808550b589b3d7f823d0caf
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
 ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.2.3
+# repin: dep=@cplieger/web-terminal-ui url=https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-{version}.tgz
+ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=b8ad87efc28c1dc2596ef2a1230aab4c36d16af2ea8c7d4b07d02aebb7621bdc
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is
@@ -229,9 +229,11 @@ RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p
     fi && \
     mkdir -p static-src/node_modules/@cplieger/web-terminal-engine static-src/node_modules/@cplieger/web-terminal-ui && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/engine.tgz "https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-${CPLIEGER_WEB_TERMINAL_ENGINE_VERSION}.tgz" && \
+    printf '%s  /tmp/engine.tgz\n' "$CPLIEGER_WEB_TERMINAL_ENGINE_SHA256" | sha256sum -c - && \
     tar -xz -C static-src/node_modules/@cplieger/web-terminal-engine --strip-components=1 -f /tmp/engine.tgz && \
     rm /tmp/engine.tgz && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/ui.tgz "https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-${CPLIEGER_WEB_TERMINAL_UI_VERSION}.tgz" && \
+    printf '%s  /tmp/ui.tgz\n' "$CPLIEGER_WEB_TERMINAL_UI_SHA256" | sha256sum -c - && \
     tar -xz -C static-src/node_modules/@cplieger/web-terminal-ui --strip-components=1 -f /tmp/ui.tgz && \
     rm /tmp/ui.tgz
 
@@ -247,37 +249,24 @@ COPY . ./
 # floors, not version strings. Assert both directional floors at build time —
 # a declared-incompatible pairing would refuse every session at first connect
 # (close code 4002) while /api/health stays green, so fail HERE instead.
-# Client constants come from the vendored artifact fetched above (published
-# source, frozen export shape); server constants come from the engine's
-# public Go API inside scripts/wirecheck (no source scraping on the Go half).
+# Client constants come from the vendored artifact's own language-neutral
+# manifest (`wire-compatibility.json` at its package root, published via the
+# npm `files` list and the `./wire-compatibility.json` export subpath — the
+# engine generates it for exactly this consumer); server constants come from
+# the engine's public Go API inside scripts/wirecheck. Neither half scrapes
+# engine source: the gate reads the manifest with encoding/json, where the
+# parse is unit-testable and cannot depend on the engine's src layout.
 #
 # The gate is BUILT and then INVOKED, never `go run`: `go run` reports its OWN
 # exit status 1 for any non-zero program exit (it prints "exit status 2" to
 # stderr but does not propagate the 2), which collapses the gate's two failure
-# modes into one code. They mean opposite things — exit 2 is "the extraction
-# below is broken, fix the gate, do NOT bump a pin", exit 1 is "genuine wire
-# incompatibility, move a pin" — so the machine-readable half of that
-# distinction only survives when the compiled binary is the process the shell
-# observes. The binary is written into a tmpfs mount, so it is discarded when
-# the RUN ends and lands in neither this stage's layer nor a later one; it is a
-# build-time gate with no runtime role.
-#
-# FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): the two
-# `sed` scrapes below parse the vendored engine's TypeScript SOURCE for the
-# client wire constants. The engine now generates a language-neutral manifest
-# for exactly this consumer — `wire-compatibility.json` at the package root
-# (published via the npm `files` list and the `./wire-compatibility.json`
-# export subpath, so the vendored tarball carries it at
-# static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json).
-# Shape: {"schemaVersion":1,"generatedBy":...,"wireCompatibility":
-# {"protocolVersion","minimumServerProtocolVersion","incompatibleCloseCode"}};
-# read `schemaVersion` first and reject an unknown one. When the engine version
-# this Dockerfile pins carries that file, the parsing should move INTO
-# scripts/wirecheck (a `-manifest <path>` flag reading the JSON with
-# encoding/json), where it is unit-testable, rather than being reimplemented as
-# a shell JSON scrape: these `sed` lines and their `${VAR:?}` guards exist only
-# because shell had to do the parsing, and their failure mode (a silently empty
-# capture) is the reason the guards are loud.
+# modes into one code. They mean opposite things — exit 2 is "the gate cannot
+# read the client's declaration, fix the gate, do NOT bump a pin", exit 1 is
+# "genuine wire incompatibility, move a pin" — so the machine-readable half of
+# that distinction only survives when the compiled binary is the process the
+# shell observes. The binary is written into a tmpfs mount, so it is discarded
+# when the RUN ends and lands in neither this stage's layer nor a later one; it
+# is a build-time gate with no runtime role.
 #
 # No `hadolint ignore=DL3062` here any more: that rule fires on an unpinned
 # `go run`/`go install <pkg>` (it wants `@<version>`), which is meaningless for
@@ -286,27 +275,23 @@ COPY . ./
 # an unneeded one suppresses a real future warning on this step.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=tmpfs,target=/tmp/wirecheck-bin \
-    WIRE_TS=static-src/node_modules/@cplieger/web-terminal-engine/src/wire-compatibility.ts && \
-    CLIENT_REV=$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
-    CLIENT_MIN_SERVER=$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
-    : "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
-    : "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
     go build -o /tmp/wirecheck-bin/wirecheck ./scripts/wirecheck && \
-    /tmp/wirecheck-bin/wirecheck -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+    /tmp/wirecheck-bin/wirecheck -manifest static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json
 
 # Compile client TypeScript and the engine + UI libs in a single layer.
 # Must run before the binary build because main.go's `//go:embed static`
 # captures static/ at `go build` time.
 #
-# Re-arm the bash SHELL before the bash-only RUNs below. It is already declared
-# at the top of this stage and nothing changed it, but hadolint (>=2.15.0) resets
-# its shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
+# Re-arm the bash SHELL for the RUNs below. It is already declared at the top of
+# this stage and nothing changed it, but hadolint (>=2.15.0) resets its
+# shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
 # directive -- the Renovate-pinned ARGs above do exactly that -- and then
-# shellchecks the rest of the stage as sh, calling this file's bash arrays
-# (SC3054) and process substitution (SC3001) undefined. Re-declaring keeps those
-# two checks live and real, where suppressing the codes on the instruction would
-# switch them off for good. Docker-side this is a no-op: same shell, no layer.
-# Drop it when upstream honours the first declaration again.
+# shellchecks the rest of the stage as sh. The bash-only constructs that used to
+# live in these RUNs (arrays, process substitution) now live in
+# scripts/vendor-tsc.sh, which shellcheck reads as bash from its own shebang, so
+# what this keeps honest is the stage's declared dialect matching the shell that
+# actually runs it -- `-o pipefail` included. Docker-side this is a no-op: same
+# shell, no layer. Drop it when upstream honours the first declaration again.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Step 1: tsc --project compiles app TS — tsconfig.json's outDir is
@@ -319,41 +304,26 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # browser can fetch the compiled JS via the importmap. Internal imports (the
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
-# -type f, not a bare -name: a directory, symlink or FIFO named *.ts in a
-# mis-published or crafted vendored tarball would otherwise be handed to tsc, and
-# a FIFO blocks the build forever with no deadline -- the same class
-# scripts/css-bundle.sh refuses per MANIFEST entry for the CSS half of this build.
-RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -type f -name '*.ts') && \
-    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -type f -name '*.ts') && \
-    { [ "${#ui_ts[@]}" -gt 0 ] \
-      || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
-    { [ "${#engine_ts[@]}" -gt 0 ] \
-      || { echo "ERROR engine-src-empty: no *.ts under the vendored @cplieger/web-terminal-engine src tree (tarball layout changed?)" >&2; exit 1; }; } && \
-    /tmp/package/lib/tsc --project static-src/tsconfig.json && \
-    /tmp/package/lib/tsc \
-        --module ESNext \
-        --target ESNext \
-        --moduleResolution bundler \
-        --outDir static/vendor/cplieger-web-terminal-engine \
-        --rootDir static-src/node_modules/@cplieger/web-terminal-engine/src \
-        --skipLibCheck \
-        --strict \
-        "${engine_ts[@]}" && \
-    /tmp/package/lib/tsc \
-        --module ESNext \
-        --target ESNext \
-        --moduleResolution bundler \
-        --outDir static/vendor/cplieger-web-terminal-ui \
-        --rootDir static-src/node_modules/@cplieger/web-terminal-ui/src \
-        --skipLibCheck \
-        --strict \
-        "${ui_ts[@]}" && \
-    for emitted in static/app.js \
-        static/vendor/cplieger-web-terminal-engine/index.js \
-        static/vendor/cplieger-web-terminal-ui/index.js \
-        static/vendor/cplieger-web-terminal-ui/presets.js; do \
-      [ -s "$emitted" ] || { echo "ERROR tsc-emit-missing: $emitted is absent or empty after the tsc steps; static/index.html's script and importmap targets would 404 at runtime (outDir/rootDir or vendored src layout drift?)" >&2; exit 1; }; \
-    done
+#
+# Canonical recipes: scripts/vendor-tsc.sh (the flag set, the source collection
+# and the <label>-src-empty gate) and scripts/assert-emit.sh (every module the
+# page loads was emitted non-empty), both shared with scripts/dev-build.sh -- the
+# same shape the CSS half of this build already uses via scripts/css-bundle.sh.
+# Spelling the recipe here AND in dev-build.sh meant a flag added to one gave a
+# dev binary typechecked differently from the shipped image, and assert-emit.sh
+# now DERIVES its target list from static/index.html's importmap instead of
+# restating it, so a new importmap entry cannot leave a build path unchecked.
+# Step 1 (the app tsc --project) stays at the call site: dev-build.sh has to
+# `rm -f static/app.js` first for a persistent gitignored emit the image build
+# cannot have, so that asymmetry is deliberately not shared.
+RUN /tmp/package/lib/tsc --project static-src/tsconfig.json && \
+    bash scripts/vendor-tsc.sh /tmp/package/lib/tsc engine \
+      static-src/node_modules/@cplieger/web-terminal-engine/src \
+      static/vendor/cplieger-web-terminal-engine && \
+    bash scripts/vendor-tsc.sh /tmp/package/lib/tsc ui \
+      static-src/node_modules/@cplieger/web-terminal-ui/src \
+      static/vendor/cplieger-web-terminal-ui && \
+    sh scripts/assert-emit.sh
 
 # Concatenate the UI package's per-feature CSS splits into the served bundle
 # (canonical recipe: scripts/css-bundle.sh, shared with scripts/dev-build.sh).

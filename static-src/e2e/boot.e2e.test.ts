@@ -81,8 +81,23 @@ test.describe("served page boots", () => {
     });
 
     await page.goto("/", { waitUntil: "load" });
-    // Give module evaluation and the first frame a moment to surface errors.
-    await page.waitForTimeout(1500);
+    // Wait for a DETERMINISTIC boot outcome rather than a fixed delay: either the
+    // library rendered into #terminal, or the watchdog raised its fatal dialog.
+    // This wait IS the test's verdict -- every assertion below only reads what the
+    // listeners captured before it returned -- so a fixed 1500ms reports "no
+    // console errors" about a boot that had not finished on any machine slower
+    // than the author's, green for the exact failure class this suite exists for.
+    const terminal = page.locator("#terminal");
+    const bootFatal = page.locator('#loading[role="alertdialog"]');
+    await expect
+      .poll(
+        async () => (await terminal.innerHTML()).trim() !== "" || (await bootFatal.count()) > 0,
+        {
+          message: "boot must reach either a mounted shell or the watchdog's fatal dialog",
+          timeout: 15_000,
+        },
+      )
+      .toBe(true);
 
     expect(pageErrors, "uncaught exceptions during boot").toEqual([]);
     expect(failedRequests, "static resources that failed to load").toEqual([]);
@@ -112,6 +127,27 @@ test.describe("served page boots", () => {
         `the bootstrap watchdog reported a fatal: ${(await fatal.innerText()).trim()}`,
       );
     }
+
+    // ...and the overlay came down, which is the half this test's name promises and
+    // nothing asserted. #loading is opaque at z-index 200, so a shell that mounted
+    // UNDER a spinner nobody dismissed satisfies the mount poll above while the user
+    // stares at an animating bar -- the stuck-loading failure this app has hit twice.
+    // The kernel adds "fade" on the first frame and removes the element on
+    // transitionend, so either state is a pass. Asserted on the class rather than
+    // Playwright visibility, because a faded overlay is opacity:0: still visible to
+    // Playwright, already invisible and inert to the user.
+    const overlay = page.locator("#loading");
+    await expect
+      .poll(
+        async () =>
+          (await overlay.count()) === 0 ||
+          ((await overlay.getAttribute("class")) ?? "").includes("fade"),
+        {
+          message: "the loading overlay must be dismissed once the first frame renders",
+          timeout: 15_000,
+        },
+      )
+      .toBe(true);
   });
 
   // Runtime accessibility. html-validate's :a11y preset already gates the static
@@ -139,7 +175,11 @@ test.describe("served page boots", () => {
 
   test("has no NEW axe-core accessibility violations", async ({ page }) => {
     await page.goto("/", { waitUntil: "load" });
-    await page.waitForTimeout(1500);
+    // Audit the RENDERED shell, not the pre-boot page. This scan is the only check
+    // on the library's rendered tree, and after a fixed 1500ms on a loaded machine
+    // it can still be looking at the loading overlay -- which has no violations, so
+    // the audit passes having examined nothing it was written for.
+    await expect(page.locator("#terminal > *").first()).toBeAttached({ timeout: 15_000 });
 
     const results = await new AxeBuilder({ page })
       .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])

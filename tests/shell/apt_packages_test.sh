@@ -44,6 +44,7 @@ if [ ! -s "$WORK/block.sh" ] || ! bash -n "$WORK/block.sh" 2>/dev/null; then
   printf 'harness error: the extracted APT_PACKAGES block is empty or does not parse\n' >&2
   exit 1
 fi
+extract_function logfmt_value "$WORK/logfmt.sh" >/dev/null
 extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 
 # RUN_CWD lets a case choose the directory the harness runs FROM. Empty means "here":
@@ -159,6 +160,7 @@ rm() {
   esac
   command rm "\$@"
 }
+$(cat "$WORK/logfmt.sh")
 $(cat "$WORK/warn.sh")
 $(cat "$WORK/block.sh")
 HARNESS

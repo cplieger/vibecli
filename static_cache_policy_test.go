@@ -23,11 +23,17 @@ import (
 func TestStaticCachePolicyServedOnResponses(t *testing.T) {
 	deps := newTestDeps(true)
 	// The font entry is what this test adds to the shared default tree: the
-	// two Cache-Control branches are fonts vs everything else.
-	deps.staticFS = fstest.MapFS{
+	// two Cache-Control branches are fonts vs everything else. Built through
+	// buildStaticSurface, the same call the composition root makes, so the
+	// option under test is wired exactly as production wires it.
+	staticSrv, _, err := buildStaticSurface(fstest.MapFS{
 		"static/index.html":              &fstest.MapFile{Data: []byte(testIndexHTML)},
 		"static/vendor/fonts/mono.woff2": &fstest.MapFile{Data: []byte("font-bytes")},
+	})
+	if err != nil {
+		t.Fatalf("buildStaticSurface: %v", err)
 	}
+	deps.static = staticSrv
 	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	for _, tc := range []struct{ path, wantCache string }{

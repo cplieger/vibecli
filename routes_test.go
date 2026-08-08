@@ -364,7 +364,7 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 // rather than against a handler directly, because three of the four owners set
 // the header somewhere the handler-level call cannot see: toolbelt's httpapi
 // wraps its own mux, the engine's REST handler has an inner mux of its own, and
-// the app's remaining sessionNoStore is chain middleware. Calling a handler
+// the engine's own withNoStore wraps that handler at its mount. Calling a handler
 // directly would assert the wrong thing and stay green through a chain edit.
 func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 	deps := newToolsDeps(t)
@@ -400,22 +400,23 @@ func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 
 		// The engine's session surface BEYOND writeJSON. writeJSON is reached
 		// only by create and list, so every row below carries no Cache-Control
-		// from the engine and is covered by the app's sessionNoStore. Delete
-		// that middleware and exactly these rows go red — which is the test
-		// that keeps it from being deleted as dead weight, and the test that
-		// tells the next reader it can go once the engine covers its own mux.
-		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
-		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "app sessionNoStore"},
-		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "app sessionNoStore"},
-		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "app sessionNoStore"},
-		{"set pinned title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/pinned-title", `{"title":"x"}`, noStore, "app sessionNoStore"},
-		{"clear pinned title, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef/pinned-title", "", noStore, "app sessionNoStore"},
+		// from writeJSON — the header comes from the engine's own withNoStore,
+		// applied to the REST handler at BOTH mounts (SessionsPath and
+		// SessionsSubtreePath) and outside the create gate, so it reaches the
+		// statuses no handler writes. These rows hold with no app middleware at
+		// all; they go red if the engine stops covering its own mux.
+		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set pinned title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/pinned-title", `{"title":"x"}`, noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"clear pinned title, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef/pinned-title", "", noStore, "engine withNoStore (MountSessionRoutes)"},
 		// The engine's INNER mux generates these itself, which is why no
 		// per-handler fix inside the engine would reach them: a 405 for a
 		// method the session path does not serve, and a 404 for the bare
 		// subtree path (no {id} segment to match).
-		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
-		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "app sessionNoStore"},
+		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "engine withNoStore (MountSessionRoutes)"},
 
 		// The app's own handlers, each setting the header at the top of the
 		// function rather than relying on middleware.
@@ -709,11 +710,12 @@ func TestSessionFactoryRequestsTheTitleEnv(t *testing.T) {
 	ready.Set(true)
 
 	var gotIDs []string
+	staticSrv, _ := testStaticSurface()
 	deps := withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
+		static:  staticSrv,
+		ready:   &ready,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
 		sessionTitleEnv: func(id string) []string {
 			gotIDs = append(gotIDs, id)
 			return []string{"KWEB_SESSION_ID=" + id}
@@ -965,18 +967,38 @@ func withDefaultPolicies(d *routeDeps) *routeDeps {
 	return d
 }
 
+// testStaticFS is the index fixture that satisfies the fail-loud CSP build,
+// standing in for the embedded static tree.
+func testStaticFS() fs.FS {
+	return fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}}
+}
+
+// testStaticSurface builds the two derivatives the composition root builds in
+// production — the serving handler routeDeps.static carries, and the hash-pinned
+// CSP buildHandler is given — from that fixture. It panics rather than taking a
+// *testing.T so the t-free fixture helpers (newTestDeps) can call it: the fixture
+// is a constant, so a failure here is a broken harness rather than a test case.
+func testStaticSurface() (http.Handler, string) {
+	srv, csp, err := buildStaticSurface(testStaticFS())
+	if err != nil {
+		panic("buildStaticSurface on the test index fixture: " + err.Error())
+	}
+	return srv, csp
+}
+
 // newTestDeps returns the minimal routeDeps the route tests build
-// repeatedly: the index fixture that satisfies the fail-loud CSP build,
-// a ready flag, and a short-lived cat as the session command. Tests
+// repeatedly: the static handler the composition root builds from the index
+// fixture, a ready flag, and a short-lived cat as the session command. Tests
 // tweak fields (cmd, kiroReady) before registering.
 func newTestDeps(ready bool) *routeDeps {
 	var r webhttp.Ready
 	r.Set(ready)
+	staticSrv, _ := testStaticSurface()
 	return withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &r,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
+		static:  staticSrv,
+		ready:   &r,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
 	})
 }
 
@@ -996,15 +1018,15 @@ func unreadyDepsWithTools() *routeDeps {
 	return d
 }
 
-// mustRegisterRoutes wires deps on a fresh mux, failing the test on
-// error and scheduling manager shutdown.
+// mustRegisterRoutes wires deps on a fresh mux and schedules manager shutdown.
+// It also returns the hash-pinned CSP the composition root derives from the
+// same static fixture (buildStaticSurface), which is what production hands
+// buildHandler — registerRoutes itself no longer produces it.
 func mustRegisterRoutes(t *testing.T, deps *routeDeps) (*http.ServeMux, *terminal.SessionManager, string) {
 	t.Helper()
 	mux := http.NewServeMux()
-	mgr, csp, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	_, csp := testStaticSurface()
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 	return mux, mgr, csp
 }
@@ -1074,12 +1096,13 @@ func newToolsDeps(t *testing.T) *routeDeps {
 	t.Cleanup(eng.Close)
 	var ready webhttp.Ready
 	ready.Set(true)
+	staticSrv, _ := testStaticSurface()
 	return withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-		tools:    eng,
+		static:  staticSrv,
+		ready:   &ready,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
+		tools:   eng,
 	})
 }
 
@@ -1093,10 +1116,7 @@ func newToolsDeps(t *testing.T) *routeDeps {
 func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	// Remote peer: refused, even claiming loopback via forwarded headers.
@@ -1250,10 +1270,7 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 func TestToolsAPI_LoopbackOnly_malformedPeerFailsClosed(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	for _, tc := range []struct{ name, remoteAddr string }{
@@ -1296,10 +1313,7 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	syncing.Store(true)
 	deps.toolsSyncing = syncing.Load
 	deps.toolsState = func() string { return "syncing" }
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	create := func() *httptest.ResponseRecorder {
@@ -1359,21 +1373,14 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	}
 }
 
-// TestRegisterRoutes_failsLoudOnMalformedStatic pins the error propagation of
-// the fail-loud CSP build through registerRoutes: an embedded index.html with
-// no inline <script> (a malformed build) must abort route registration with an
-// error, never register routes with a silently-degraded CSP.
-func TestRegisterRoutes_failsLoudOnMalformedStatic(t *testing.T) {
-	mux := http.NewServeMux()
-	var ready webhttp.Ready
-	deps := withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-	})
-	if _, _, err := registerRoutes(mux, deps); err == nil {
-		t.Fatal("registerRoutes returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
+// TestBuildStaticSurface_failsLoudOnMalformedStatic pins the fail-loud CSP leg
+// of buildStaticSurface, which the composition root calls before it wires any
+// route: an embedded index.html with no inline <script> (a malformed build) must
+// abort startup with an error, never yield a silently-degraded CSP.
+func TestBuildStaticSurface_failsLoudOnMalformedStatic(t *testing.T) {
+	fsys := fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}}
+	if _, _, err := buildStaticSurface(fsys); err == nil {
+		t.Fatal("buildStaticSurface returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
 	}
 }
 
@@ -1430,29 +1437,21 @@ func (f failOpenFS) Open(name string) (fs.File, error) {
 	return f.FS.Open(name)
 }
 
-// TestRegisterRoutes_failsLoudOnUnreadableStaticTree pins the static-handler
+// TestBuildStaticSurface_failsLoudOnUnreadableStaticTree pins the static-handler
 // leg of buildStaticSurface's fail-loud contract, which
-// TestRegisterRoutes_failsLoudOnMalformedStatic (the CSP leg) does not reach:
+// TestBuildStaticSurface_failsLoudOnMalformedStatic (the CSP leg) does not reach:
 // webhttp.StaticHandler walks and hashes every file at construction, so a
-// static tree with an unreadable file (a malformed build) must abort route
-// registration with an error rather than serve a partial site. index.html
+// static tree with an unreadable file (a malformed build) must abort startup
+// with an error rather than serve a partial site. index.html
 // itself stays readable so the CSP build succeeds and the failure is
 // attributable to the static-handler leg alone.
-func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
+func TestBuildStaticSurface_failsLoudOnUnreadableStaticTree(t *testing.T) {
 	base := fstest.MapFS{
 		"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)},
 		"static/broken.js":  &fstest.MapFile{Data: []byte("x")},
 	}
-	mux := http.NewServeMux()
-	var ready webhttp.Ready
-	deps := withDefaultPolicies(&routeDeps{
-		staticFS: failOpenFS{FS: base, failPath: "static/broken.js"},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-	})
-	if _, _, err := registerRoutes(mux, deps); err == nil {
-		t.Fatal("registerRoutes returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
+	if _, _, err := buildStaticSurface(failOpenFS{FS: base, failPath: "static/broken.js"}); err == nil {
+		t.Fatal("buildStaticSurface returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
 	}
 }
 
@@ -1517,10 +1516,7 @@ func TestNotifyFingerprint(t *testing.T) {
 	seen := make(map[string]string, len(inputs))
 	for name, msg := range inputs {
 		t.Run(name, func(t *testing.T) {
-			got, ok := fp.fingerprint(msg)
-			if !ok {
-				t.Fatalf("fingerprint(%q) reported no key on a keyed fingerprinter; the Warn and Debug records would lose their only identifier", msg)
-			}
+			got := fp.fingerprint(msg)
 			if len(got) != notifyFingerprintHexDigits {
 				t.Errorf("fingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
 			}
@@ -1529,7 +1525,7 @@ func TestNotifyFingerprint(t *testing.T) {
 			if strings.Trim(got, "0123456789abcdef") != "" {
 				t.Errorf("fingerprint(%q) = %q, want lowercase hex only; anything else means child output reached the log verbatim", msg, got)
 			}
-			if again, _ := fp.fingerprint(msg); again != got {
+			if again := fp.fingerprint(msg); again != got {
 				t.Errorf("fingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
 			}
 			// metadata is the integration point: it supplies the attrs routes.go
@@ -1545,7 +1541,7 @@ func TestNotifyFingerprint(t *testing.T) {
 				t.Errorf("metadata(%q) = %v, want [message_fingerprint %s message_runes %d]; the logged attribute must BE the keyed fingerprint, not another hex-shaped encoding of the notification", msg, meta, got, len([]rune(msg)))
 			}
 		})
-		got, _ := fp.fingerprint(msg)
+		got := fp.fingerprint(msg)
 		if other, dup := seen[got]; dup {
 			t.Errorf("fingerprint collides for %q and %q (both %q); two distinct wordings would read as one", msg, other, got)
 		}
@@ -1557,23 +1553,12 @@ func TestNotifyFingerprint(t *testing.T) {
 	// digest of it is recoverable by offline enumeration. Two keys must not
 	// agree on it — a plain hash would.
 	const deviceCode = "ABCD-EFGH"
-	underOneKey, _ := fp.fingerprint(deviceCode)
-	underAnotherKey, _ := otherKey.fingerprint(deviceCode)
+	underOneKey := fp.fingerprint(deviceCode)
+	underAnotherKey := otherKey.fingerprint(deviceCode)
 	if underOneKey == underAnotherKey {
 		t.Errorf("fingerprint(%q) = %q under two different keys; the identifier is unkeyed, so anyone reading the log can enumerate short candidates offline and confirm the notification's text", deviceCode, underOneKey)
 	}
 
-	// Fail-closed: a fingerprinter with no key (crypto/rand unavailable at
-	// construction) must omit the identifier rather than emit a predictable one,
-	// and must still report the rune count so the record stays diagnosable.
-	unkeyed := notifyFingerprinter{}
-	if got, ok := unkeyed.fingerprint(deviceCode); ok || got != "" {
-		t.Errorf("unkeyed fingerprint(%q) = (%q, %v), want (%q, false); a keyless fallback would be a guessable copy of child output", deviceCode, got, ok, "")
-	}
-	attrs := unkeyed.metadata(deviceCode)
-	if len(attrs) != 2 || attrs[0] != "message_runes" || attrs[1] != len([]rune(deviceCode)) {
-		t.Errorf("unkeyed metadata(%q) = %v, want exactly [message_runes %d]; the record must drop the fingerprint and keep the length", deviceCode, attrs, len([]rune(deviceCode)))
-	}
 	if keyed := fp.metadata(deviceCode); len(keyed) != 4 || keyed[0] != "message_fingerprint" {
 		t.Errorf("keyed metadata(%q) = %v, want [message_fingerprint <hex> message_runes <n>]", deviceCode, keyed)
 	}

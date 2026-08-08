@@ -25,7 +25,7 @@ TSC="static-src/node_modules/.bin/tsc"
 # or a typo'd ENGINE_DIR/UI_DIR override fails cleanly instead of half-deleting
 # the installed packages (repaired only by a fresh npm install).
 for required in \
-  "$ENGINE_DIR/web/package.json" \
+  "$ENGINE_DIR/web/package.json" "$ENGINE_DIR/web/wire-compatibility.json" \
   "$UI_DIR/package.json" "$UI_DIR/css/MANIFEST"; do
   [ -f "$required" ] || {
     printf 'error: required local checkout input is not a regular file: %s\n' "$required" >&2
@@ -44,17 +44,25 @@ done
 # trees before copying, so an empty (or test-only) source tree otherwise slips
 # past preflight and leaves node_modules broken — cp exits on a literal
 # unmatched *.ts, or tsc exits 1 with no input files, in both cases only after
-# the destructive overlay. Mirror each copy loop's own exclusions (matched on
-# the basename, so a checkout path containing 'fuzz' is not itself excluded) so
-# preflight and execution cannot drift.
-[ -n "$(find "$ENGINE_DIR/web/src" -type d -name 'test-helpers' -prune -o \
-  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
+# the destructive overlay. Match the basename, not the full path (so a checkout
+# path containing 'fuzz' is not itself excluded); src/test-helpers/ is pruned as a
+# DIRECTORY because recursion would otherwise pull test-support modules (which
+# carry no *.test.ts basename) into the vendor emit and make the dev build depend
+# on test-only code typechecking under --strict — the published tarball excludes
+# them, so this keeps the local overlay matching what the image gets. The list
+# captured here IS the list step [2/6] copies, so preflight and execution cannot
+# drift.
+mapfile -d '' -t engine_src < <(cd "$ENGINE_DIR/web/src" && find . \
+  -type d -name 'test-helpers' -prune -o \
+  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0)
+[ "${#engine_src[@]}" -gt 0 ] || {
   printf 'error: engine-src-empty: no eligible *.ts under %s (wrong ENGINE_DIR or src layout change?)\n' \
     "$ENGINE_DIR/web/src" >&2
   exit 1
 }
-[ -n "$(find "$UI_DIR/src" -type f -name '*.ts' \
-  ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print -quit)" ] || {
+mapfile -d '' -t ui_src < <(cd "$UI_DIR/src" && find . \
+  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0)
+[ "${#ui_src[@]}" -gt 0 ] || {
   printf 'error: ui-src-empty: no eligible *.ts under %s (wrong UI_DIR or src layout change?)\n' \
     "$UI_DIR/src" >&2
   exit 1
@@ -86,42 +94,38 @@ printf '[2/6] overlay local engine + UI TS into the bundler-resolved packages\n'
 rm -rf "$ENGINE_PKG/src" "$UI_PKG/src"
 mkdir -p "$ENGINE_PKG/src" "$UI_PKG/src"
 cp "$ENGINE_DIR/web/package.json" "$ENGINE_PKG/package.json"
-# Recursive, matching the UI loop below: the engine's src tree is flat today, but a
-# future nested module must not be silently dropped (the emit assertions only check
-# index.js, so the miss would surface as a runtime 404, not a build failure).
-# Match the basename, not the full path: ENGINE_DIR is user-overridable and a
-# checkout path containing 'fuzz' must not skip every source file. src/test-helpers/
-# is pruned as a directory: recursion would otherwise pull test-support modules
-# (which carry no *.test.ts basename) into the vendor emit and make the dev build
-# depend on test-only code typechecking under --strict. The published tarball
-# excludes them, so this keeps the local overlay matching what the image gets.
-(cd "$ENGINE_DIR/web/src" && find . -type d -name 'test-helpers' -prune -o \
-  -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0) \
-  | while IFS= read -r -d '' f; do
-    mkdir -p "$ENGINE_PKG/src/$(dirname "$f")"
-    cp "$ENGINE_DIR/web/src/$f" "$ENGINE_PKG/src/$f"
-  done
+# The wire-compatibility manifest is a PACKAGE-ROOT file, so the src overlay
+# below does not carry it: without this copy the gate would read whatever the
+# installed tarball shipped — stale for an unpublished local engine, which is
+# exactly the case the gate exists for. The engine generates it from
+# web/src/wire-manifest.ts, so a local checkout has it (preflight asserts so
+# before the destructive overlay starts).
+cp "$ENGINE_DIR/web/wire-compatibility.json" "$ENGINE_PKG/wire-compatibility.json"
+# Copy the list captured in preflight (recursive, matching the UI loop below: the
+# engine's src tree is flat today, but a future nested module must not be silently
+# dropped — the emit assertions only check index.js, so the miss would surface as a
+# runtime 404, not a build failure).
+for f in "${engine_src[@]}"; do
+  mkdir -p "$ENGINE_PKG/src/$(dirname "$f")"
+  cp "$ENGINE_DIR/web/src/$f" "$ENGINE_PKG/src/$f"
+done
 cp "$UI_DIR/package.json" "$UI_PKG/package.json"
-# The UI ships a nested src tree (src/kernel/, src/features/) since v3, so copy
-# recursively, preserving subdirectories and excluding tests.
-(cd "$UI_DIR/src" && find . -type f -name '*.ts' ! -name '*.test.ts' ! -name '*fuzz*' ! -name '*fc-strict-setup*' -print0) \
-  | while IFS= read -r -d '' f; do
-    mkdir -p "$UI_PKG/src/$(dirname "$f")"
-    cp "$UI_DIR/src/$f" "$UI_PKG/src/$f"
-  done
+# The UI ships a nested src tree (src/kernel/, src/features/) since v3, so the
+# captured list is recursive and preserves subdirectories.
+for f in "${ui_src[@]}"; do
+  mkdir -p "$UI_PKG/src/$(dirname "$f")"
+  cp "$UI_DIR/src/$f" "$UI_PKG/src/$f"
+done
 
 # Wire-floor gate, mirroring the Dockerfile step after its vendor fetch: the Go
 # half comes from go.work (the LOCAL engine) and the client half from the overlay
 # above, so a dev build of an unpublished engine is exactly where the two floors
 # can disagree. Without this the pairing fails at first connect (close 4002) with
 # /api/health green and no build-time diagnostic. Built and then invoked, never
-# `go run`, which collapses the gate's exit 2 ("the extraction is broken, do NOT
-# bump a pin") into a plain 1.
-WIRE_TS="$ENGINE_PKG/src/wire-compatibility.ts"
-CLIENT_REV="$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS")"
-CLIENT_MIN_SERVER="$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS")"
-: "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in $WIRE_TS (engine src layout changed?)}"
-: "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in $WIRE_TS}"
+# `go run`, which collapses the gate's exit 2 ("the gate cannot read the client's
+# declaration, do NOT bump a pin") into a plain 1. The client half is read from
+# the engine's own manifest by the gate itself (encoding/json), so this script
+# parses nothing.
 wirecheck_bin="$(mktemp)"
 # The gate's whole purpose is to EXIT non-zero (1 on a floor violation, 2 on a broken
 # extraction), and under set -euo pipefail either exit -- like a failing go build --
@@ -130,7 +134,7 @@ wirecheck_bin="$(mktemp)"
 # that trap's predecessor at a stale path.
 trap 'rm -f "$wirecheck_bin"' EXIT
 go build -o "$wirecheck_bin" ./scripts/wirecheck
-"$wirecheck_bin" -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+"$wirecheck_bin" -manifest "$ENGINE_PKG/wire-compatibility.json"
 rm -f "$wirecheck_bin"
 trap - EXIT
 
@@ -145,30 +149,20 @@ rm -f static/app.js
 
 printf '[4/6] tsc: engine + UI libs -> static/vendor/\n'
 rm -rf static/vendor/cplieger-web-terminal-engine static/vendor/cplieger-web-terminal-ui
-# Compile the whole overlaid engine tree (flat today; recursive so a future nested
-# engine module is not silently dropped, matching the UI handling below).
-mapfile -t engine_ts < <(find "$ENGINE_PKG/src" -type f -name '*.ts')
-"$TSC" --module ESNext --target ESNext --moduleResolution bundler \
-  --outDir static/vendor/cplieger-web-terminal-engine \
-  --rootDir "$ENGINE_PKG/src" --skipLibCheck --strict "${engine_ts[@]}"
-# Compile the whole nested UI src tree (index.ts + presets.ts + kernel/ +
-# features/); find collects every .ts (the overlay already excluded tests).
-mapfile -t ui_ts < <(find "$UI_PKG/src" -type f -name '*.ts')
-"$TSC" --module ESNext --target ESNext --moduleResolution bundler \
-  --outDir static/vendor/cplieger-web-terminal-ui \
-  --rootDir "$UI_PKG/src" --skipLibCheck --strict "${ui_ts[@]}"
+# Canonical recipe: scripts/vendor-tsc.sh, shared with the Dockerfile builder, so
+# the dev binary and the image cannot end up compiled with different flags. It
+# collects the whole tree recursively (the engine's is flat today; a future nested
+# module must not be silently dropped) and carries the <label>-src-empty gate.
+bash scripts/vendor-tsc.sh "$TSC" engine "$ENGINE_PKG/src" \
+  static/vendor/cplieger-web-terminal-engine
+bash scripts/vendor-tsc.sh "$TSC" ui "$UI_PKG/src" \
+  static/vendor/cplieger-web-terminal-ui
 # Assert the emit produced every module static/index.html loads: a tsconfig
 # outDir/rootDir change or a lib src-layout move otherwise yields a clean
-# build whose page 404s at runtime.
-for emitted in static/app.js \
-  static/vendor/cplieger-web-terminal-engine/index.js \
-  static/vendor/cplieger-web-terminal-ui/index.js \
-  static/vendor/cplieger-web-terminal-ui/presets.js; do
-  [ -s "$emitted" ] || {
-    printf 'error: expected emit is absent or empty: %s (outDir/rootDir or lib src layout drift?)\n' "$emitted" >&2
-    exit 1
-  }
-done
+# build whose page 404s at runtime. Canonical recipe: scripts/assert-emit.sh,
+# shared with the Dockerfile builder, and it DERIVES the target list from the
+# page's own importmap rather than restating it here.
+sh scripts/assert-emit.sh
 
 printf '[5/6] fonts (Monaspace Nerd Font, cached) + CSS bundle (from UI package)\n'
 # Single source of truth: the Dockerfile's Renovate-managed NERDFONT_* ARGs.

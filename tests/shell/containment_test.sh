@@ -28,11 +28,17 @@ new_workdir >/dev/null
 
 load_function enable_session_containment
 
-# --- 1. the success path: a writable tree reports availability -------------------
+# --- 1. the success path: a vacated, writable tree reports availability ----------
 # `mount` is the only external command the function runs, so stubbing it is the
-# whole environment.
+# whole environment. The cgroup root is a PARAMETER (default /sys/fs/cgroup) purely
+# so this case can hand it a temp dir: the body now WRITES to the tree, and an
+# assertion that depended on the CI host's own /sys/fs/cgroup would pass or fail on
+# the runner's kernel state rather than on this function. An EMPTY cgroup.procs is
+# the vacated state the server needs before it can enable controllers there.
 mount() { return 0; }
-out=$(enable_session_containment 2>&1)
+mkdir -p "$WORK/cg"
+: >"$WORK/cg/cgroup.procs"
+out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "a successful remount returns 0" \
   || no "a successful remount returns 0" "rc=$rc"
@@ -46,7 +52,7 @@ esac
 # `fatal` here (or any exit) would be an unbootable image for every user of the
 # public compose example.
 mount() { return 32; }
-out=$(enable_session_containment 2>&1)
+out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
 [ "$rc" -ne 0 ] && ok "a refused remount reports failure to its caller" \
   || no "a refused remount reports failure" "rc=0"
@@ -63,6 +69,31 @@ esac
 case "$out" in
   *SYS_ADMIN*) ok "the refusal warn names the capability to add" ;;
   *) no "the refusal warn names the capability" "got: $out" ;;
+esac
+unset -f mount
+
+# --- 2b. remounted but NOT vacated: the claim must say containment is off --------
+# The defect this case pins is what shipped: the old function reported "containment
+# available" on the strength of the remount alone, while the server then failed with
+# EBUSY on cgroup.subtree_control six seconds later (measured on borgcube, image
+# v2.7.7). cgroup v2 refuses a controller to a cgroup that still holds member
+# processes, so a root with a live pid in cgroup.procs means containment will NOT
+# engage -- and the log line has to say so, or the operator reads the info line and
+# concludes the feature is on.
+mount() { return 0; }
+mkdir -p "$WORK/cg2"
+printf '1\n' >"$WORK/cg2/cgroup.procs"
+out=$(enable_session_containment "$WORK/cg2" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "a remounted-but-occupied root still returns 0 (hygiene, never fatal)" \
+  || no "an occupied root returns 0" "rc=$rc"
+case "$out" in
+  *level=warn*"will NOT engage"*) ok "an occupied cgroup root warns that containment will not engage" ;;
+  *) no "an occupied cgroup root warns" "got: $out" ;;
+esac
+case "$out" in
+  *level=info*containment\ available*) no "an occupied root must not claim availability" "got: $out" ;;
+  *) ok "an occupied root does not claim containment is available" ;;
 esac
 unset -f mount
 

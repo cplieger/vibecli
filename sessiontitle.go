@@ -44,6 +44,11 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/cplieger/atomicfile/v2"
+	"github.com/cplieger/runesafe"
+	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
 const (
@@ -79,6 +84,11 @@ const (
 // rather than the concrete manager so the poller is testable without a PTY.
 type titleSetter interface {
 	SetSessionTitle(id, title string) bool
+	// List is the live-tab set, and it is the only reclaim signal that does not
+	// depend on a title still CHANGING. A closed tab's kiro-cli is gone, so its
+	// session.json title is frozen, so syncOne's memo returns early and the
+	// SetSessionTitle-false probe below it is never reached again.
+	List() []terminal.SessionInfo
 }
 
 // sessionTitleSync pushes kiro-cli session titles onto the engine's client rung.
@@ -111,6 +121,15 @@ type sessionTitleSync struct {
 // object's sessionEnv before registerRoutes has returned a manager; it is handed
 // to Run instead.
 func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
+	if home == "" {
+		// filepath.Join("", ".kiro", "sessions") is RELATIVE, so every title read
+		// would resolve against the server's cwd and fail. The feature degrades to
+		// the engine's automatic name ladder either way; the point of the line is
+		// that the degradation says why. Named env only, no value, like every other
+		// startup warning in main.go.
+		slog.Warn("HOME is empty; kiro-cli session titles cannot be resolved and tabs keep the automatic name ladder",
+			"hint", "the image sets HOME=/config/home; a compose environment entry that blanks it disables tab titles")
+	}
 	return &sessionTitleSync{
 		stateDir:     filepath.Join(stateRoot, titleStateDirName),
 		sessionsRoot: filepath.Join(home, ".kiro", "sessions"),
@@ -155,8 +174,8 @@ func (s *sessionTitleSync) Run(ctx context.Context, mgr titleSetter) {
 	}
 }
 
-// pass runs one sweep: for every mapping the hook has written, read that kiro
-// session's title and push it if it changed.
+// pass runs one sweep: reclaim every mapping whose tab is gone, then for the ones
+// that remain, read that kiro session's title and push it if it changed.
 func (s *sessionTitleSync) pass(mgr titleSetter) {
 	entries, err := os.ReadDir(s.stateDir)
 	if err != nil {
@@ -167,8 +186,24 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 		}
 		return
 	}
+	// One liveness snapshot per sweep rather than per entry: the manager takes its
+	// own lock, and every mapping is then judged against the same picture.
+	live := make(map[string]struct{}, len(entries))
+	for _, info := range mgr.List() {
+		live[info.ID] = struct{}{}
+	}
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		if _, ok := live[e.Name()]; !ok {
+			// The tab is gone. Reclaim now rather than waiting for a title change
+			// that will never come: syncOne's memo short-circuits before the
+			// SetSessionTitle-false probe, so an ordinary close (stable title)
+			// used to keep its mapping file, its pushed entry and its per-tick
+			// I/O for the container's life.
+			delete(s.pushed, e.Name())
+			s.forget(e.Name())
 			continue
 		}
 		s.syncOne(mgr, e.Name())
@@ -188,16 +223,24 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 	if s.pushed[tabID] == title {
 		return
 	}
-	// A false return means the tab is gone (closed while we were reading). Drop
-	// the mapping file so a recycled state dir does not accumulate dead tabs.
+	// A false return means the tab closed between this sweep's liveness snapshot
+	// and this push. pass() reclaims every mapping whose tab was already gone at
+	// snapshot time, so this arm is the within-sweep race backstop only.
 	if !mgr.SetSessionTitle(tabID, title) {
 		delete(s.pushed, tabID)
 		s.forget(tabID)
 		return
 	}
 	s.pushed[tabID] = title
+	// The tab id is the /ws attach+resume capability token and the title is
+	// kiro-cli's verbatim copy of the user's first message, so this record carries
+	// the truncated id and the title's LENGTH -- the same treatment main.go:1905,
+	// routes.go:360 and newStatusClassifier's fingerprint already give their
+	// respective values. kiro_session is kiro-cli's own internal id, not a
+	// network capability, so it stays whole.
 	slog.Debug("session title: adopted kiro session title",
-		"session", tabID, "kiro_session", kiroID, "title", title)
+		"session", terminal.LogID(tabID), "kiro_session", kiroID,
+		"title_runes", utf8.RuneCountInString(title))
 }
 
 // readMapping reads the tab -> kiro-session-id file the hook wrote. The value is
@@ -216,7 +259,7 @@ func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
 	if !validKiroSessionID(id) {
 		if id != "" {
 			slog.Debug("session title: mapping file holds no usable session id",
-				"session", tabID)
+				"session", terminal.LogID(tabID))
 		}
 		return "", false
 	}
@@ -228,6 +271,15 @@ func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
 func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 	hashDirs, err := os.ReadDir(s.sessionsRoot)
 	if err != nil {
+		// A missing tree is the normal state before kiro-cli has written its first
+		// session, so it stays silent (same rule as pass()'s state dir). Anything
+		// else -- a wrong HOME, EACCES on the volume, ENOTDIR -- kills every tab's
+		// title with no record at any level, which is the one failure a log-only
+		// diagnosis path cannot have.
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("session title: kiro session store unreadable",
+				"dir", s.sessionsRoot, "error", err)
+		}
 		return "", false
 	}
 	for _, hd := range hashDirs {
@@ -246,7 +298,16 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 				"kiro_session", kiroID, "error", err)
 			return "", false
 		}
-		title := strings.TrimSpace(rec.Title)
+		// One rune policy for untrusted upstream text (runesafe). This title is
+		// kiro-cli's record of the user's first message verbatim, or a label the
+		// agent produced from tool output, and it reaches two sinks this function
+		// does not own: the slog attribute in syncOne, and the engine's client
+		// title rung, whose sanitizeTitle drops only C0 + DEL -- so C1 controls,
+		// Unicode Bidi_Control and U+2028/29 reach the browser tab label. The
+		// single-line preset is the right one for a label sink, and sanitizing
+		// BEFORE the trim matters: unsafe runes become spaces, so a control-only
+		// title collapses to "" and is correctly read as "no title" below.
+		title := strings.TrimSpace(runesafe.SanitizeSingleLine(rec.Title))
 		if title == "" || title == placeholderTitle {
 			return "", false
 		}
@@ -261,35 +322,28 @@ func (s *sessionTitleSync) forget(tabID string) {
 		return
 	}
 	if err := os.Remove(filepath.Join(s.stateDir, tabID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		slog.Debug("session title: could not drop a stale mapping", "session", tabID, "error", err)
+		slog.Debug("session title: could not drop a stale mapping",
+			"session", terminal.LogID(tabID), "error", err)
 	}
 }
 
-// readSmallFile reads at most maxTitleFileBytes, so neither state file can be used
-// to make this server allocate without bound.
+// readSmallFile reads at most maxTitleFileBytes from one of the two state files.
+// atomicfile.OpenRegular is the library's own open-a-file-in-a-directory-others-
+// can-write sequence -- O_NOFOLLOW (a symlink under the name is refused, not
+// followed), O_NONBLOCK (a planted FIFO is refused instead of blocking this
+// goroutine in open(2)) and a stat of the OPEN HANDLE rather than of the pathname
+// a second time -- and ReadBoundedFile applies the byte bound to that same
+// descriptor, refusing a larger file with ErrFileTooLarge rather than truncating
+// it. Both files are small and machine-written, and both callers treat any error
+// as "no usable value", so refusing is the same outcome as the old truncation
+// with none of the three details to re-derive.
 func readSmallFile(path string) ([]byte, error) {
-	f, err := os.Open(path) // #nosec G304 -- path components are validated by the callers
+	f, _, err := atomicfile.OpenRegular(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }() // read-only
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !st.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
-	buf := make([]byte, 0, min(int(st.Size())+1, maxTitleFileBytes))
-	tmp := make([]byte, 4096)
-	for len(buf) < maxTitleFileBytes {
-		n, err := f.Read(tmp)
-		buf = append(buf, tmp[:n]...)
-		if err != nil {
-			break
-		}
-	}
-	return buf, nil
+	return atomicfile.ReadBoundedFile(context.Background(), f, maxTitleFileBytes)
 }
 
 // validSessionFileName gates a tab id used as a path component. The engine's ids

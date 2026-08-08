@@ -45,17 +45,14 @@ func FuzzNotifyFingerprint(f *testing.F) {
 	f.Add("verify at https://example.com/device?user_code=ABCD-EFGH and confirm the code shown there")
 	f.Add("\xff\xfe invalid bytes")
 	f.Fuzz(func(t *testing.T, msg string) {
-		got, ok := fp.fingerprint(msg)
-		if !ok {
-			t.Fatalf("fingerprint(%q) reported no key on a keyed fingerprinter; the record would lose its only identifier", msg)
-		}
+		got := fp.fingerprint(msg)
 		if len(got) != notifyFingerprintHexDigits {
 			t.Fatalf("fingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
 		}
 		if strings.Trim(got, "0123456789abcdef") != "" {
 			t.Fatalf("fingerprint(%q) = %q, want lowercase hex only; any other character means child output reached the log verbatim", msg, got)
 		}
-		if again, _ := fp.fingerprint(msg); again != got {
+		if again := fp.fingerprint(msg); again != got {
 			t.Fatalf("fingerprint(%q) is unstable (%q then %q); the Warn and its Debug twin would no longer correlate", msg, got, again)
 		}
 		// Metamorphic: a one-bit change to the notification must change the
@@ -66,7 +63,7 @@ func FuzzNotifyFingerprint(f *testing.F) {
 		if len(msg) > 0 {
 			mutated := []byte(msg)
 			mutated[0] ^= 0x01
-			if other, _ := fp.fingerprint(string(mutated)); other == got {
+			if other := fp.fingerprint(string(mutated)); other == got {
 				t.Fatalf("fingerprint(%q) and its one-bit mutation both = %q; distinct wordings must not collapse into one record", msg, got)
 			}
 		}
@@ -80,7 +77,7 @@ func FuzzNotifyFingerprint(f *testing.F) {
 		// alone. An unkeyed digest -- the shape this replaced -- would return the
 		// same value here, which is exactly the offline oracle that makes a short
 		// token or device code recoverable from the log.
-		if underOther, _ := otherKey.fingerprint(msg); underOther == got {
+		if underOther := otherKey.fingerprint(msg); underOther == got {
 			t.Fatalf("fingerprint(%q) = %q under two different keys; a log reader could enumerate candidates offline and confirm the text", msg, got)
 		}
 	})

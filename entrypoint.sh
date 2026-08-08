@@ -49,9 +49,15 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 TOOLS="/config/tools"
 
 # The kiro-cli hook that pairs a tab with its kiro session, shipped in the image
-# beside this script. Named here so the seeding block at the bottom and the
-# Dockerfile COPY cannot drift apart silently; see that block for what it does.
-SESSION_TITLE_HOOK="/opt/web-terminal-kiro/hooks/session-title.sh"
+# beside this script (Dockerfile COPY). Derived from this script's own location
+# rather than restated, so the Dockerfile's COPY destination is the ONE place the
+# install path is decided: a literal here would let that COPY move while this kept
+# seeding a hook config pointing at the old path, and the whole feature would then
+# no-op with no log line anywhere (every tab silently falls back to the engine's
+# automatic name ladder). CDPATH='' cd -- "$(dirname -- "$0")" is the same idiom
+# tests/image-smoke.sh uses for SMOKE_DIR, and it yields an absolute path even if
+# $0 arrives relative. See the seeding block at the bottom for what it does.
+SESSION_TITLE_HOOK="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/hooks/session-title.sh"
 
 # Fatal boot error: log it, then throttle the restart:unless-stopped crash loop
 # (an immediate exit would hot-spin the container) before failing. $2 carries
@@ -61,6 +67,51 @@ fatal() {
   sleep 10
   exit 1
 }
+
+# Report a non-root run, because every downstream symptom of one blames something
+# else.
+#
+# This image is root-by-design and there is no second user in it: the Dockerfile
+# repoints ROOT's /etc/passwd home to /config/home so OpenSSH -- which resolves "~"
+# through getpwuid(), not $HOME -- finds the persisted ~/.ssh. A compose `user:`
+# line therefore does not select a supported mode, it selects a UID that appears in
+# no passwd entry. The reflex to add one is strong: `user: "${PUID}:${PGID}"` is
+# correct in most of this fleet's compose files and in the whole *arr ecosystem it
+# borrows from, so an operator adds it here from habit rather than from a decision.
+#
+# Warn, never fatal, and the split matters. A non-root run is DEGRADED, not
+# impossible: with the volume chowned to that UID, /config is writable, the mode
+# hardening below succeeds (the UID owns what it chmods), the terminal serves, and
+# git over HTTPS works. Only the getpwuid-dependent paths and the root-only ones
+# break. That is squarely outside both cases "Failure posture" reserves fatal for,
+# and a fatal would additionally remove the only way IN to undo the mistake.
+#
+# The reason to say it HERE, before any of it happens, is that each failure reports
+# a misleading cause in isolation: ssh blames a missing user, make_config_dir blames
+# an unmounted /config, the apt phase blames the package, and the containment
+# pre-flight below blames a missing capability. None of them names the `user:` line
+# that caused all four. One warning up front is the only place that connection is
+# legible -- which is why this sits above the containment block rather than after
+# it: the CAP_SYS_ADMIN warning is one of the four misleading causes.
+#
+# uid/gid are parameters rather than reads of $EUID so the branch is testable; the
+# defaults are what the real call site uses. Always returns 0: nothing consumes the
+# verdict, and a non-zero return would be one `set -e` away from ending boot over a
+# diagnostic.
+warn_if_not_root() {
+  local uid=${1:-$EUID} gid=${2:-${GROUPS[0]:-unknown}}
+  if [ "$uid" -eq 0 ]; then
+    return 0
+  fi
+  # Single-quoted inside the hint: logfmt closes a field on the first unescaped
+  # double quote, the same reason warn_skipped_apt_token rewrites quotes.
+  printf 'level=warn msg="running as a non-root user, but this image is root-by-design; several subsystems will fail" uid=%s gid=%s hint="%s" component=entrypoint\n' \
+    "$uid" "$gid" \
+    'git and gh over ssh fail with '\''No user exists for uid'\'' because only root has a passwd entry pointing at /config/home; APT_PACKAGES cannot install; session containment cannot engage (dropping CAP_SYS_ADMIN needs CAP_SETPCAP); and the /config mode hardening cannot chmod paths this UID does not own. Remove the user: line from the compose service. See the README run block.' >&2
+  return 0
+}
+
+warn_if_not_root
 
 # Make the container's own cgroup tree writable so the server can put each tab's
 # kiro-cli process tree in its own cgroup, then hand the rest of this script a
@@ -85,12 +136,42 @@ fatal() {
 # is lost when it finds the tree read-only, so the degradation is visible without
 # being fatal.
 enable_session_containment() {
-  if mount -o remount,rw /sys/fs/cgroup 2>/dev/null; then
-    printf 'level=info msg="cgroup tree remounted rw; per-session process containment available" component=entrypoint\n'
+  # cg_root is a parameter with the real default purely for testability, matching
+  # warn_if_not_root's uid/gid: the body now WRITES to the tree, so a unit test must be
+  # able to hand it a temp dir instead of the host's own /sys/fs/cgroup.
+  local cg_root=${1:-/sys/fs/cgroup} cg_pids cg_pid moved=0 left
+  if ! mount -o remount,rw "$cg_root" 2>/dev/null; then
+    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' >&2
+    return 1
+  fi
+  # cgroup v2's no-internal-process constraint: a non-root cgroup cannot gain a
+  # controller in cgroup.subtree_control while it still holds member processes, and the
+  # container's namespace-root cgroup holds PID 1 (this script, then the exec'd server)
+  # by the time startContainment() runs. The remount alone therefore never made
+  # containment work -- measured on borgcube 2026-08-06 (image v2.7.7), the server logged
+  # "enable controllers in /sys/fs/cgroup/cgroup.subtree_control: device or resource busy"
+  # six seconds after this function reported success, and every session ran uncontained.
+  # Vacate the root into a leaf so it becomes a pure delegation parent; /init is the same
+  # shape runc and systemd use for this. Snapshot the pid list first: each successful
+  # write removes a pid from the source file, so re-reading it through an open handle
+  # skips entries. Best-effort and warn-only per the failure posture -- on failure
+  # containment stays off, which is exactly today's behaviour.
+  if mkdir -p "$cg_root/init" 2>/dev/null; then
+    cg_pids=$(cat "$cg_root/cgroup.procs" 2>/dev/null) || cg_pids=""
+    for cg_pid in $cg_pids; do
+      printf '%s\n' "$cg_pid" >"$cg_root/init/cgroup.procs" 2>/dev/null && moved=$((moved + 1))
+    done
+  fi
+  # Report what was PROVEN rather than what was attempted, and on stderr like every
+  # other line in this file. The old message asserted availability on the strength of the
+  # mount alone, which is precisely what hid the EBUSY above.
+  left=$(wc -l <"$cg_root/cgroup.procs" 2>/dev/null || printf '0\n')
+  if [ "$left" -eq 0 ]; then
+    printf 'level=info msg="cgroup tree remounted rw and the container cgroup root vacated; per-session process containment available" moved=%d component=entrypoint\n' "$moved" >&2
     return 0
   fi
-  printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' >&2
-  return 1
+  printf 'level=warn msg="cgroup tree remounted rw but the container cgroup root still holds processes, so the server cannot enable cgroup controllers there (EBUSY) and per-session process containment will NOT engage; a closed tab kiro-cli tree may outlive it" moved=%d remaining=%d component=entrypoint\n' "$moved" "$left" >&2
+  return 0
 }
 
 # One remount, then drop the capability that allowed it, as early as this script
@@ -144,50 +225,6 @@ if [ "${KWEB_CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
   fi
   printf 'level=warn msg="CAP_SYS_ADMIN not held and containment unavailable; continuing without it" component=entrypoint\n' >&2
 fi
-
-# Report a non-root run, because every downstream symptom of one blames something
-# else.
-#
-# This image is root-by-design and there is no second user in it: the Dockerfile
-# repoints ROOT's /etc/passwd home to /config/home so OpenSSH -- which resolves "~"
-# through getpwuid(), not $HOME -- finds the persisted ~/.ssh. A compose `user:`
-# line therefore does not select a supported mode, it selects a UID that appears in
-# no passwd entry. The reflex to add one is strong: `user: "${PUID}:${PGID}"` is
-# correct in most of this fleet's compose files and in the whole *arr ecosystem it
-# borrows from, so an operator adds it here from habit rather than from a decision.
-#
-# Warn, never fatal, and the split matters. A non-root run is DEGRADED, not
-# impossible: with the volume chowned to that UID, /config is writable, the mode
-# hardening below succeeds (the UID owns what it chmods), the terminal serves, and
-# git over HTTPS works. Only the getpwuid-dependent paths and the root-only ones
-# break. That is squarely outside both cases "Failure posture" reserves fatal for,
-# and a fatal would additionally remove the only way IN to undo the mistake.
-#
-# The reason to say it HERE, before any of it happens, is that each failure reports
-# a misleading cause in isolation: ssh blames a missing user, make_config_dir blames
-# an unmounted /config, the apt phase blames the package, and the containment
-# pre-flight above blames a missing capability. None of them names the `user:` line
-# that caused all four. One warning up front is the only place that connection is
-# legible.
-#
-# uid/gid are parameters rather than reads of $EUID so the branch is testable; the
-# defaults are what the real call site uses. Always returns 0: nothing consumes the
-# verdict, and a non-zero return would be one `set -e` away from ending boot over a
-# diagnostic.
-warn_if_not_root() {
-  local uid=${1:-$EUID} gid=${2:-${GROUPS[0]:-unknown}}
-  if [ "$uid" -eq 0 ]; then
-    return 0
-  fi
-  # Single-quoted inside the hint: logfmt closes a field on the first unescaped
-  # double quote, the same reason warn_skipped_apt_token rewrites quotes.
-  printf 'level=warn msg="running as a non-root user, but this image is root-by-design; several subsystems will fail" uid=%s gid=%s hint="%s" component=entrypoint\n' \
-    "$uid" "$gid" \
-    'git and gh over ssh fail with '\''No user exists for uid'\'' because only root has a passwd entry pointing at /config/home; APT_PACKAGES cannot install; session containment cannot engage (dropping CAP_SYS_ADMIN needs CAP_SETPCAP); and the /config mode hardening cannot chmod paths this UID does not own. Remove the user: line from the compose service. See the README run block.' >&2
-  return 0
-}
-
-warn_if_not_root
 
 # Create ONE level of a persistent directory and prove the created path is a real
 # directory rather than a symlink, BEFORE anything is written to or deleted beneath
@@ -375,15 +412,17 @@ secure_tools_dir() {
 # under $HOME/.local/bin can win bare-name resolution while a version is active. That
 # is why the sweep is warn-only and why the bare-name resolution check it used to feed
 # is gone -- the invariant it asserted now holds by construction.
+# Takes ONE directory, deliberately. The only residue dir left in this script's
+# remit is $HOME/.local/bin; $TOOLS/bin is the manager's, per the block comment
+# above, so a variadic signature only invited the second argument that comment
+# forbids.
 sweep_legacy_dispatchers() {
-  local dir
-  for dir in "$@"; do
-    # Never expand to /kiro-cli* on an unset/empty argument.
-    [ -n "$dir" ] || continue
-    if ! rm -rf "$dir/kiro-cli"*; then
-      printf 'level=warn msg="failed to remove legacy kiro-cli residue" dir="%s" component=entrypoint\n' "$dir" >&2
-    fi
-  done
+  local dir=${1:-}
+  # Never expand to /kiro-cli* on an unset/empty argument.
+  [ -n "$dir" ] || return 0
+  if ! rm -rf "$dir/kiro-cli"*; then
+    printf 'level=warn msg="failed to remove legacy kiro-cli residue" dir="%s" component=entrypoint\n' "$dir" >&2
+  fi
   # Always 0, deliberately: per the block comment above, rm's status answers 'did the
   # unlink succeed', never 'is an unpinned kiro-cli still reachable'. Returning a
   # failure count here only invited a caller to read it as the safety verdict.
@@ -437,7 +476,7 @@ prune_superseded_kas_runtimes() {
     "$data_home"/kiro-cli/kas) ;;
     *)
       printf 'level=warn msg="kiro-cli kas store does not resolve inside the data dir; refusing to prune" dir="%s" resolved="%s" component=entrypoint\n' \
-        "$kas_dir" "${kas_real:-unknown}" >&2
+        "$kas_dir" "$(logfmt_value "${kas_real:-unknown}")" >&2
       return 0
       ;;
   esac
@@ -460,13 +499,13 @@ prune_superseded_kas_runtimes() {
     # this is a no-op against the current CLI; log the skip so a layout change is
     # visible instead of silent.
     if [[ ! "$name" =~ ^[0-9]+\.[0-9]+\.[0-9]+- ]]; then
-      printf 'level=info msg="leaving unrecognized (non version-keyed) entry in the kiro-cli agent runtime store" entry="%s" component=entrypoint\n' "$name" >&2
+      printf 'level=info msg="leaving unrecognized (non version-keyed) entry in the kiro-cli agent runtime store" entry="%s" component=entrypoint\n' "$(logfmt_value "$name")" >&2
       continue
     fi
     if rm -rf "$entry"; then
-      printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" keep=%s pinned=%s component=entrypoint\n' "$name" "$keep" "$KIRO_CLI_VERSION" >&2
+      printf 'level=info msg="pruned superseded kiro-cli agent runtime" entry="%s" keep=%s pinned=%s component=entrypoint\n' "$(logfmt_value "$name")" "$keep" "$KIRO_CLI_VERSION" >&2
     else
-      printf 'level=warn msg="failed to prune superseded kiro-cli agent runtime" entry="%s" component=entrypoint\n' "$name" >&2
+      printf 'level=warn msg="failed to prune superseded kiro-cli agent runtime" entry="%s" component=entrypoint\n' "$(logfmt_value "$name")" >&2
     fi
   done
   return 0
@@ -523,21 +562,36 @@ warn_legacy_tool_metadata() {
   return 0
 }
 
-# Warn about a rejected APT_PACKAGES token. The token is untrusted env content, so
-# bound its length first (one bad token must not dominate the log line), then strip
-# non-printable bytes and neutralize the quote that would close the logfmt field.
-# Backslash is logfmt's escape character, so double it: otherwise the field's closing
-# quote can itself be escaped. The RAW token is bounded BEFORE that doubling, because
-# truncating after it could split a `\\` pair and leave a trailing lone backslash that
-# escapes the closing quote. The bound is therefore 64 INPUT chars (at most 128
-# emitted), not 64 emitted chars. Shared by both rejection paths (grammar and
-# known-name) so the sanitizing rules cannot drift between them.
-warn_skipped_apt_token() {
-  local msg=$1 raw=$2 safe
-  safe=${raw:0:64}
+# Make a value this script did not author safe inside a quoted logfmt field. Two
+# untrusted classes reach these log lines and they share one implementation so the rules
+# cannot drift: APT_PACKAGES tokens (env content) and names read off the /config bind
+# mount, which this script's threat model treats as writable by a foreign host user --
+# the same premise secure_tools_dir and the taint flag exist for. So the actor a warning
+# describes chooses the bytes inside the field that reports him: a file named
+# `x" level=info msg="tools tree clean` would otherwise close the field early and append
+# attacker-authored logfmt keys, losing the rest of the real message.
+#
+# Bound the RAW length first (one bad value must not dominate the line, and truncating
+# after the backslash doubling could split a `\\` pair and leave a trailing lone
+# backslash that escapes the closing quote), double logfmt's escape character, replace
+# non-printables, then neutralize the quote that would close the field. $2 is the INPUT
+# bound, defaulting to 200 (at most 2x that emitted).
+logfmt_value() {
+  local raw=$1 safe
+  safe=${raw:0:${2:-200}}
   safe=${safe//\\/\\\\}
   safe=${safe//[![:print:]]/?}
   safe=${safe//\"/\'}
+  printf '%s' "$safe"
+}
+
+# Warn about a rejected APT_PACKAGES token. The token is untrusted env content, so it
+# goes through the shared sanitizer above with a tighter 64 INPUT char bound (at most 128
+# emitted). Shared by both rejection paths (grammar and known-name) so the sanitizing
+# rules cannot drift between them.
+warn_skipped_apt_token() {
+  local msg=$1 raw=$2 safe
+  safe=$(logfmt_value "$raw" 64)
   printf 'level=warn msg="%s" token="%s" component=entrypoint\n' "$msg" "$safe" >&2
 }
 
@@ -590,20 +644,18 @@ export KIRO_CLI_TOOLS_DIR
 # a target outside the /config mount -- creating and populating the credential
 # dirs somewhere with no enforced mode. Check the boundary BEFORE any child path
 # is created: a real directory under /config, not a link.
-case "$HOME" in
-  /config/*) ;;
-  *) fatal 'HOME must resolve beneath the /config mount' "home=\"$HOME\"" ;;
-esac
 if [ -L "$HOME" ]; then
   fatal 'refusing to use a symlinked HOME; its target may be outside the /config mount' "home=\"$HOME\""
 fi
-# The pattern above is a LEXICAL prefix match, so it accepts a path that only
-# looks contained: /config/../etc matches /config/* and is not a symlink, and
-# the walk below would then create .ssh / .kiro/settings under it while
-# harden_config_dir chmod 700's the target. Re-assert the boundary on the
-# RESOLVED path (-m, so a not-yet-created HOME still resolves) -- that closes
-# '..' components and a symlinked ANCESTOR in one check, which the -L test on
-# the final component alone cannot.
+# Containment is asserted ONCE, on the RESOLVED path (-m, so a not-yet-created
+# HOME still resolves). A lexical `case "$HOME" in /config/*` used to run first
+# and is gone: it could not decide the question either way (/config/../etc
+# matches it and is not a symlink), while this check refuses every path the
+# lexical one refused -- /etc/foo, /configx/home, /config itself, and an empty
+# HOME whose realpath fails -- plus the '..' and symlinked-ANCESTOR cases it let
+# through. The -L test above stays: it enforces the separate, stricter policy
+# that $HOME's own final component must not be a link even when it resolves
+# inside /config.
 home_real=$(realpath -m "$HOME" 2>/dev/null) || home_real=""
 case "$home_real" in
   /config/?*) ;;
@@ -711,7 +763,7 @@ for version_entry in "$TOOLS/kiro-cli-versions"/* "$TOOLS/kiro-cli-versions"/*/*
   if [ -L "$version_entry" ]; then
     tools_tree_was_writable=1
     printf 'level=warn msg="an entry inside the kiro-cli install root is a symlink; treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" component=entrypoint\n' \
-      "$version_entry" >&2
+      "$(logfmt_value "$version_entry")" >&2
     continue
   fi
   [ -e "$version_entry" ] || continue
@@ -731,7 +783,7 @@ for version_entry in "$TOOLS/kiro-cli-versions"/* "$TOOLS/kiro-cli-versions"/*/*
   fi
   tools_tree_was_writable=1
   printf 'level=warn msg="an entry inside the kiro-cli install root is group/other-writable or its mode cannot be read; tightening it and treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" mode=%s component=entrypoint\n' \
-    "$version_entry" "${version_entry_mode:-unknown}" >&2
+    "$(logfmt_value "$version_entry")" "${version_entry_mode:-unknown}" >&2
   chmod go-w "$version_entry" 2>/dev/null || true
 done
 # The Dockerfile's ENV PATH puts ONE more /config-resident dir ahead of /usr/bin
@@ -804,7 +856,7 @@ for tool_bin in "$TOOLS/bin"/*; do
     "$TOOLS"/*) ;;
     *)
       printf 'level=warn msg="skipping a group/other-writable tools bin entry whose target resolves outside the tools tree; tightening it would chmod a path this container does not own" path="%s" resolved="%s" mode=%s component=entrypoint\n' \
-        "$tool_bin" "${tool_bin_real:-unknown}" "${tool_bin_mode:-unknown}" >&2
+        "$(logfmt_value "$tool_bin")" "$(logfmt_value "${tool_bin_real:-unknown}")" "${tool_bin_mode:-unknown}" >&2
       continue
       ;;
   esac
@@ -820,7 +872,7 @@ for tool_bin in "$TOOLS/bin"/*; do
   tool_bin_mode=$(stat -Lc '%a' "$tool_bin" 2>/dev/null) || tool_bin_mode=""
   if [ -z "$tool_bin_mode" ] || [ $((8#$tool_bin_mode & 0022)) -ne 0 ]; then
     printf 'level=warn msg="a binary on the first-on-PATH tools tree is still group/other-writable, or its mode cannot be verified after tightening; a foreign host user could rewrite it in place and this container runs it as root" path="%s" mode=%s was=%s chmod_rc=%d component=entrypoint\n' \
-      "$tool_bin" "${tool_bin_mode:-unknown}" "${loose_mode:-unknown}" "$chmod_rc" >&2
+      "$(logfmt_value "$tool_bin")" "${tool_bin_mode:-unknown}" "${loose_mode:-unknown}" "$chmod_rc" >&2
     continue
   fi
   tightened_tool_bins=$((tightened_tool_bins + 1))
@@ -1086,7 +1138,7 @@ if [ -n "${APT_PACKAGES:-}" ]; then
     if [ "$dpkg_audit_rc" -ne 0 ] || [ -n "$dpkg_audit_out" ] \
       || [ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ]; then
       printf 'level=warn msg="dpkg is in an interrupted state (an earlier APT_PACKAGES install was killed mid-transaction); reconfiguring before installing" audit_rc=%d audit="%s" component=entrypoint\n' \
-        "$dpkg_audit_rc" "$dpkg_audit_summary" >&2
+        "$dpkg_audit_rc" "$(logfmt_value "$dpkg_audit_summary" 400)" >&2
       dpkg_fix_rc=0
       timeout --signal=TERM --kill-after=30s 300s dpkg --configure -a || dpkg_fix_rc=$?
       if [ "$dpkg_fix_rc" -ne 0 ]; then
@@ -1199,5 +1251,11 @@ fi
 PATH="$SESSION_PATH"
 export PATH
 unset KWEB_SESSION_PATH
+# Same reason as the PATH carry above, and the same lifetime: this is the setpriv
+# re-exec marker, meaningful only until that exec has happened. Nothing past this
+# point re-execs this script and no Go code reads it, so leaving it exported would
+# advertise an internal control-flow flag to the server and every terminal session
+# as though it were a supported knob.
+unset KWEB_CONTAINMENT_CAPS_DROPPED
 printf 'level=info msg="entrypoint complete; starting the web server" component=entrypoint\n' >&2
 exec /app/web-terminal-kiro

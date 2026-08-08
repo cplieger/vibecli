@@ -3,8 +3,10 @@ module github.com/cplieger/web-terminal-kiro
 go 1.26.5
 
 require (
+	github.com/cplieger/atomicfile/v2 v2.7.0
 	github.com/cplieger/pathinside v1.0.0
 	github.com/cplieger/pinstall v1.0.3
+	github.com/cplieger/runesafe v1.4.0
 	github.com/cplieger/slogx v1.6.0
 	github.com/cplieger/toolbelt/v2 v2.4.3
 	github.com/cplieger/web-terminal-engine/v3 v3.4.3
@@ -12,10 +14,8 @@ require (
 )
 
 require (
-	github.com/cplieger/atomicfile/v2 v2.7.0 // indirect
 	github.com/cplieger/httpx/v4 v4.3.0 // indirect
 	github.com/cplieger/keyenc v1.0.1 // indirect
-	github.com/cplieger/runesafe v1.4.0 // indirect
 	github.com/cplieger/scheduler/v3 v3.0.0 // indirect
 	github.com/cplieger/ssrf/v3 v3.0.0 // indirect
 	github.com/expr-lang/expr v1.17.8 // indirect

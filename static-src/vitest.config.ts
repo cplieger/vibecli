@@ -4,7 +4,7 @@
 // test file to get window/document/localStorage/etc. No browser binary
 // needed — happy-dom is a pure JS DOM implementation running in Node.
 // Run: vitest --run (single pass) or vitest (watch mode)
-import { configDefaults, defineConfig } from "vitest/config";
+import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
@@ -99,7 +99,13 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       include: ["*.ts"],
-      exclude: ["*.test.ts", "*.d.ts"],
+      // Spread the defaults rather than replacing them, for the same reason
+      // test.exclude above does: a bare array silently drops vitest's built-in
+      // exclusions. "*.config.ts" is ours to add on top -- the defaults' config
+      // glob names vite/vitest/eslint/... but not playwright, so
+      // playwright.config.ts was reported at 0% and held the 90% thresholds
+      // permanently red.
+      exclude: [...coverageConfigDefaults.exclude, "*.test.ts", "*.config.ts"],
       reportOnFailure: true,
       reporter: ["text", "text-summary", "lcov"],
       thresholds: {

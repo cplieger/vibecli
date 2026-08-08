@@ -58,14 +58,13 @@ fi
 member_count=0
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in '' | \#*) continue ;; esac
-  case "$line" in
-    /* | ../* | */../* | */.. | ..)
-      printf 'css-bundle: MANIFEST entry escapes css dir, refusing: %s\n' "$line" >&2
-      exit 1
-      ;;
-  esac
-  # Resolve symlinks and re-assert containment: the literal guard above
-  # cannot see a symlink shipped inside a crafted UI tarball.
+  # Resolve the entry and assert containment under css_root. This is the ONE
+  # containment check: realpath collapses '..' components and follows every
+  # symlink, so a leading '/', a '..' escape and a symlink shipped inside a
+  # crafted UI tarball all land on the same refusal below. (A leading '/'
+  # cannot escape on its own anyway -- "${css_dir}/${line}" keeps the css_dir
+  # prefix, so an absolute-looking entry resolves to css_dir/etc/passwd, not
+  # /etc/passwd.)
   entry=$(realpath -e "${css_dir}/${line}") || {
     printf 'css-bundle: MANIFEST entry does not resolve: %s\n' "$line" >&2
     exit 1

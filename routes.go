@@ -49,8 +49,19 @@ const (
 )
 
 type routeDeps struct {
-	staticFS fs.FS
-	ready    *webhttp.Ready
+	// static is the embedded-static serving handler, built by the composition
+	// root (buildStaticSurface) together with the hash-pinned CSP the same tree
+	// produces: the root keeps the CSP for buildHandler's SecurityHeaders layer
+	// and hands the handler here, so neither derivative travels through the
+	// route registrar to reach its consumer.
+	static http.Handler
+	ready  *webhttp.Ready
+	// listenHint is "localhost[:port]" for THIS deployment, derived from the
+	// address the server actually listens on (KWEB_ADDR). The loopback surfaces'
+	// refusals quote it so the remedy they name works on a server that did not
+	// keep the default port. Empty (a test building routeDeps by hand) yields
+	// today's message minus the address, so no consumer is required to set it.
+	listenHint string
 	// nil is reserved for the two MOUNTING decisions (tools, kiroRescan); every
 	// policy function below is always non-nil, defaulted by the composition
 	// root's off-shape constructors (main.go's unmanagedKiroRuntime,
@@ -138,15 +149,13 @@ func buildStaticSurface(staticFS fs.FS) (http.Handler, string, error) {
 }
 
 // registerRoutes wires the full route table on mux and returns the session
-// manager (for shutdown) plus the hash-pinned CSP policy string built from the
-// embedded index.html (for buildHandler's SecurityHeaders layer) — both derive
-// from the same static tree, so they are assembled together, fail-loud.
-func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManager, string, error) {
-	staticSrv, cspPolicy, err := buildStaticSurface(deps.staticFS)
-	if err != nil {
-		return nil, "", err
-	}
-	mux.Handle("/", staticSrv)
+// manager (for shutdown). The static handler and the hash-pinned CSP policy
+// string both derive from the embedded static tree, and buildStaticSurface
+// assembles them together, fail-loud; the composition root calls it and gives
+// each derivative to its own consumer — the handler here as deps.static, the
+// CSP to buildHandler's SecurityHeaders layer.
+func registerRoutes(mux *http.ServeMux, deps *routeDeps) *terminal.SessionManager {
+	mux.Handle("/", deps.static)
 
 	mgr := terminal.NewSessionManager(newSessionFactory(deps),
 		terminal.WithManagerLogger(slog.Default()),
@@ -198,7 +207,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// Config-file edits + restart remain the primary toggle path; this
 	// API is the no-restart alternative.
 	if deps.tools != nil {
-		toolsAPI := loopbackOnly("tools API", httpapi.Handler(deps.tools, toolsPath))
+		toolsAPI := loopbackOnly("tools API", deps.listenHint, httpapi.Handler(deps.tools, toolsPath))
 		mux.Handle(toolsPath, toolsAPI)
 		mux.Handle(toolsPath+"/", toolsAPI)
 	}
@@ -211,7 +220,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// it until the container is recreated. This is the endpoint that makes such a
 	// repair observable without a recreate. It downloads nothing.
 	if deps.kiroRescan != nil {
-		mux.Handle("POST "+kiroRescanPath, loopbackOnly("kiro-cli rescan hook", handleKiroRescan(deps)))
+		mux.Handle("POST "+kiroRescanPath, loopbackOnly("kiro-cli rescan hook", deps.listenHint, handleKiroRescan(deps)))
 		// ServeMux synthesizes 405 only when NO pattern matches the request, and
 		// the "/" static mount matches every path — so without this mount a GET or
 		// PUT here is answered by the static handler's bare 404, which reads as "no
@@ -220,17 +229,17 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 		// -> 405 Allow: POST). This pattern is less specific than the POST one
 		// above, so POST still reaches the handler, and it sits behind the same
 		// loopback gate so a remote caller learns nothing new.
-		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook",
+		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook", deps.listenHint,
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Allow", http.MethodPost)
 				webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "",
-					"kiro-cli rescan is POST-only (curl -X POST localhost:9848"+kiroRescanPath+")")
+					"kiro-cli rescan is POST-only (curl -X POST "+deps.listenHint+kiroRescanPath+")")
 			})))
 	}
 
 	mux.HandleFunc(healthPath, handleHealth(deps))
 
-	return mgr, cspPolicy, nil
+	return mgr
 }
 
 // kiroRescanBody is the repair hook's response envelope, matching healthBody's key
@@ -296,8 +305,8 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// error text: err can name a filesystem path, and this response is not
 		// the place to widen what a caller learns about the volume.
 		reason := reasonUnavailable
-		if _, r := deps.kiroReady(); r != "" {
-			reason = r
+		if _, why := deps.kiroReady(); why != "" {
+			reason = why
 		}
 		slog.Warn("kiro-cli rescan found no usable version", "reason", reason, "error", err)
 		webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
@@ -305,14 +314,6 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 	}
 }
 
-// newSessionFactory builds the per-session handler factory the session manager
-// calls once per tab: one independent PTY-backed kiro-cli chat process with its
-// own VT screen and scrollback. It owns four session-scoped policies — the
-// argv and PATH resolved from the install manager AT session-create time, the
-// LogID-truncated per-session logger (the session id is the /ws attach/resume
-// capability token), the WithCommandLogValue argv redaction (the argv carries
-// operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
-// surfaces a broken kiro-cli install.
 // childEnv is the environment overlay for one tab's kiro-cli process: the active
 // version's PATH lead, plus the two variables a hook needs to report which kiro
 // session this tab is running. Built as a fresh slice rather than appending to
@@ -335,6 +336,14 @@ func (d *routeDeps) childEnv(id string) []string {
 	return out
 }
 
+// newSessionFactory builds the per-session handler factory the session manager
+// calls once per tab: one independent PTY-backed kiro-cli chat process with its
+// own VT screen and scrollback. It owns four session-scoped policies — the
+// argv and PATH resolved from the install manager AT session-create time, the
+// LogID-truncated per-session logger (the session id is the /ws attach/resume
+// capability token), the WithCommandLogValue argv redaction (the argv carries
+// operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
+// surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	// Scrollback 5000 covers a /chat transcript restore on reconnect (matches
 	// the client store's retained-line cap). WithKeepUnfocused pins the process
@@ -607,53 +616,38 @@ const notifyFingerprintKeyBytes = 32
 // deliberately do NOT correlate across restarts; recovering the text itself is
 // a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus KWEB_LOG_LEVEL=debug),
 // not a side effect of raising the log level.
-//
-// A zero-value notifyFingerprinter (no key) is the FAIL-CLOSED state: it
-// produces no identifier at all rather than a predictable one, so a keying
-// failure costs the correlation hint and never the confidentiality property.
 type notifyFingerprinter struct {
 	key []byte
 }
 
-// newNotifyFingerprinter draws the per-classifier key. crypto/rand.Read does
-// not report failure on any supported platform (Go 1.24+ panics instead of
-// returning an error), so the error arm is a floor rather than a reachable
-// path: it exists so that a future or alternate source degrades to omitting the
-// identifier instead of silently keying every fingerprint with zeros.
+// newNotifyFingerprinter draws the per-classifier key. crypto/rand.Read never
+// returns an error: it calls io.ReadFull on Reader and crashes the program
+// irrecoverably if the OS source fails, so there is no keyless state to degrade
+// into and the identifier is always present.
 func newNotifyFingerprinter() notifyFingerprinter {
 	key := make([]byte, notifyFingerprintKeyBytes)
-	if _, err := rand.Read(key); err != nil {
-		slog.Warn("notification fingerprint key unavailable; unrecognized-notification records will carry a rune count only (a predictable fingerprint would be a guessable copy of arbitrary child output)",
-			"error", err)
-		return notifyFingerprinter{}
-	}
+	_, _ = rand.Read(key) // documented never to fail; it crashes the process instead
 	return notifyFingerprinter{key: key}
 }
 
 // fingerprint returns the leading notifyFingerprintHexDigits hex digits of
-// HMAC-SHA-256(key, msg), and false when this fingerprinter holds no key (see
-// the type's fail-closed note).
-func (f notifyFingerprinter) fingerprint(msg string) (string, bool) {
-	if len(f.key) == 0 {
-		return "", false
-	}
+// HMAC-SHA-256(key, msg).
+func (f notifyFingerprinter) fingerprint(msg string) string {
 	mac := hmac.New(sha256.New, f.key)
 	// hash.Hash.Write is documented never to return an error.
 	_, _ = mac.Write([]byte(msg))
-	return hex.EncodeToString(mac.Sum(nil))[:notifyFingerprintHexDigits], true
+	return hex.EncodeToString(mac.Sum(nil))[:notifyFingerprintHexDigits]
 }
 
 // metadata is the content-free description of a notification both the Warn arm
 // and the default (text-disabled) Debug arm log: which distinct wording it was,
-// and how long it was. The fingerprint attribute is omitted entirely when
-// keying failed; the rune count is always present, so a record never degrades
-// to "something unrecognized happened, no detail at all".
+// and how long it was. Both attributes are always present, so a record never
+// degrades to "something unrecognized happened, no detail at all".
 func (f notifyFingerprinter) metadata(msg string) []any {
-	attrs := make([]any, 0, 4)
-	if fp, ok := f.fingerprint(msg); ok {
-		attrs = append(attrs, "message_fingerprint", fp)
+	return []any{
+		"message_fingerprint", f.fingerprint(msg),
+		"message_runes", utf8.RuneCountInString(msg),
 	}
-	return append(attrs, "message_runes", utf8.RuneCountInString(msg))
 }
 
 // notifyWarningState is newStatusClassifier's bounded warn budget for
@@ -997,11 +991,15 @@ func proxiedOrigin(h http.Header) bool {
 // refused, as is a DNS-rebound page whose loopback socket peer carries an
 // attacker Host, and a same-loopback proxy that rewrites Host to its upstream
 // address (nginx's and Apache's defaults) and so satisfies both loopback legs.
-func loopbackOnly(surface string, next http.Handler) http.Handler {
+//
+// hint is the deployment's own "localhost[:port]" (deps.listenHint): the 403 is
+// the whole of what a refused caller is told, so it must not name a port the
+// operator moved away from.
+func loopbackOnly(surface, hint string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !webhttp.LoopbackRequest(r) || proxiedOrigin(r.Header) {
 			webhttp.WriteError(w, r, http.StatusForbidden, "",
-				surface+" is loopback-only; call it from inside the container (curl localhost:9848)")
+				surface+" is loopback-only; call it from inside the container (curl "+hint+")")
 			return
 		}
 		next.ServeHTTP(w, r)

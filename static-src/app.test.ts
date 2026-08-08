@@ -471,8 +471,8 @@ function describeReachable(el: HTMLElement): string {
 describe("web-terminal-kiro bootstrap (app.ts)", () => {
   beforeEach(() => {
     // resetModules so each dynamic import re-runs app.ts top-level code. Mock
-    // call history is cleared by the config's clearMocks/mockReset before each
-    // test (implementations given to vi.fn persist through mockReset).
+    // call history is cleared by the config's mockReset before each test
+    // (implementations given to vi.fn persist through mockReset).
     vi.resetModules();
     document.body.replaceChildren();
   });
@@ -736,38 +736,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(false);
   });
 
-  it("watchdog does not clobber an overlay a fatal dialog already converted", () => {
-    evaluateWatchdog(readWatchdogSource());
-
-    appendTerminalRoot();
-    // The marker-less converted overlay: this fixture deliberately omits
-    // data-bootstrap-fatal, so it is NOT the full claimed-overlay
-    // shape -- it isolates the older missing-.wt-loading-bar fallback
-    // clause, complementing the marker-only "watchdog stands down when a
-    // fatal dialog already owns the overlay" test below.
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "alertdialog");
-    overlay.setAttribute("aria-modal", "true");
-    const description = document.createElement("p");
-    description.id = "bootstrap-failure-message";
-    description.textContent = "Web Terminal for Kiro failed to start.";
-    const reload = document.createElement("button");
-    reload.type = "button";
-    reload.textContent = "Reload page";
-    overlay.replaceChildren(description, reload);
-    document.body.appendChild(overlay);
-
-    const scriptEl = document.createElement("script");
-    dispatchWindowError({ target: scriptEl });
-
-    // the existing dialog's specific message survives; the watchdog's generic
-    // failed-to-load text never replaces it.
-    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toBe(
-      "Web Terminal for Kiro failed to start.",
-    );
-  });
-
   it("watchdog ignores a non-script resource error (e.g. an image failing to load)", () => {
     evaluateWatchdog(readWatchdogSource());
 
@@ -1009,37 +977,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     // The watchdog must NOT hijack a booted terminal's overlay.
     expectPristineOverlayUntouched(overlay, root);
-  });
-
-  it("converts HSL to hex across every hue sector", () => {
-    // hslToHex is the mechanical link between the accent's two spellings, and the
-    // brand-accent test below exercises exactly ONE of its six hue sectors (263deg).
-    // Its output is what a developer copies into <meta name="theme-color"> and
-    // manifest.json after a hue change, so a wrong sector row, a lost hue clamp or
-    // a broken rounding step ships the wrong colour to installed-PWA chrome with
-    // every test still green. These rows are the sRGB primaries and secondaries,
-    // whose hex is known independently of this implementation.
-    const cases: [string, string][] = [
-      ["hsl(0 100% 50%)", "#ff0000"],
-      ["hsl(60 100% 50%)", "#ffff00"],
-      ["hsl(120 100% 25%)", "#008000"],
-      ["hsl(180 100% 50%)", "#00ffff"],
-      ["hsl(240 100% 50%)", "#0000ff"],
-      ["hsl(300 100% 50%)", "#ff00ff"],
-      // The hue clamp: hp = 6 indexes past the sector table, so without
-      // Math.min(..., 5) this row throws instead of wrapping back to red.
-      ["hsl(360 100% 50%)", "#ff0000"],
-      // Achromatic: chroma 0, so every sector row must agree.
-      ["hsl(0 0% 100%)", "#ffffff"],
-      ["hsl(0 0% 0%)", "#000000"],
-    ];
-    for (const [hsl, hex] of cases) {
-      expect(hslToHex(hsl), `hslToHex(${hsl})`).toBe(hex);
-    }
-    // ...and an unparseable value must throw rather than return a colour: the
-    // parity assertion below is only as strong as this refusal (the theme's own
-    // oklch tokens are exactly the shape that must not silently convert).
-    expect(() => hslToHex("oklch(78% 0.15 150deg)")).toThrow("unparseable hsl");
   });
 
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {

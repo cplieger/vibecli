@@ -1,9 +1,13 @@
 #!/bin/bash
-# web-terminal-kiro entrypoint. Four jobs, and no more: declare the
-# Renovate-pinned kiro-cli version plus both per-arch archive digests, make
-# /config present, private and writable, export the pins, and exec the Go web
-# server. The server OWNS the kiro-cli install (the cplieger/pinstall library,
-# wired in main.go): it downloads
+# web-terminal-kiro entrypoint. It prepares persistent user and tool state,
+# hardens the paths root executes from, prunes superseded KAS runtimes, notices
+# legacy tool metadata, seeds the Kiro theme and the session-title hook,
+# optionally installs requested apt packages, prepares per-session containment,
+# declares the Renovate-pinned kiro-cli version plus both per-arch archive
+# digests, exports the pins, and execs the Go web server.
+#
+# It does NOT install kiro-cli. The server OWNS that install (the
+# cplieger/pinstall library, wired in main.go): it downloads
 # the pinned archive, verifies its SHA-256, installs it into a
 # version-addressed directory under /config/tools/kiro-cli-versions, and decides
 # readiness. It does that AFTER the listener binds, so a slow first-boot

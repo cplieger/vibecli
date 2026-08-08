@@ -56,8 +56,8 @@ export default defineConfig({
       requireAssertions: true,
     },
 
-    // Auto-clean/reset/restore all mocks and stubs before each test.
-    clearMocks: true,
+    // Reset/restore all mocks and stubs before each test. mockReset clears call
+    // history first, so no separate clearMocks is needed.
     mockReset: true,
     restoreMocks: true,
     unstubEnvs: true,

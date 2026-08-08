@@ -3,14 +3,16 @@ import { expect, test } from "@playwright/test";
 
 // Boot verification against the served page. What each test defends:
 //
-//   1. Every importmap specifier resolves. This is the failure class the suite
-//      exists for: a vendor copy the Docker build forgot, or a subpath the
-//      library renamed, leaves tsc green and the browser dead.
-//   2. No uncaught exception or console error during module evaluation.
-//   3. The loading overlay clears and the terminal shell actually mounts, so a
+//   1. No uncaught exception or console error during module evaluation.
+//   2. The loading overlay clears and the terminal shell actually mounts, so a
 //      boot that stalls behind the spinner fails here rather than in a user's
 //      browser.
-//   4. The page is accessible at the axe-core WCAG-A/AA rule level.
+//   3. The page is accessible at the axe-core WCAG-A/AA rule level.
+//
+// What every test here has in common is the BROWSER: module evaluation, mounting,
+// rendering. The served importmap's targets are not re-probed by request, because
+// tests/image-smoke.conf already reads the built image's importmap and fails
+// unless every target returns successfully with a non-empty body.
 //
 // Deliberately NOT here: sending keystrokes, asserting terminal output, or
 // exercising a session. Those need an authenticated kiro-cli.
@@ -20,41 +22,6 @@ import { expect, test } from "@playwright/test";
 // the app's bind-first boot: static assets and the shell are reachable regardless.
 
 test.describe("served page boots", () => {
-  test("every importmap specifier resolves to a real module", async ({ page, baseURL }) => {
-    // Read the importmap the SERVER served rather than the one in the repo, so a
-    // build that shipped a different index.html is caught too.
-    const res = await page.request.get(`${baseURL}/`);
-    expect(res.ok(), "index.html must be served").toBeTruthy();
-    const html = await res.text();
-
-    const match = /<script type="importmap">([\s\S]*?)<\/script>/.exec(html);
-    const importmapJSON = match?.[1];
-    expect(importmapJSON, "the served page must carry an importmap").toBeDefined();
-    if (importmapJSON === undefined) {
-      return; // unreachable after the expect; narrows the type for tsc
-    }
-
-    const imports = JSON.parse(importmapJSON).imports as Record<string, string>;
-    const specifiers = Object.keys(imports);
-    expect(specifiers.length, "importmap must not be empty").toBeGreaterThan(0);
-
-    for (const [specifier, target] of Object.entries(imports)) {
-      const url = new URL(target, baseURL!).toString();
-      const probe = await page.request.get(url);
-      expect(
-        probe.status(),
-        `importmap entry "${specifier}" -> ${target} must be served; a missing ` +
-          `vendor tree aborts module loading in the browser while tsc and the ` +
-          `Docker build both stay green`,
-      ).toBe(200);
-      const body = await probe.text();
-      expect(
-        body.length,
-        `importmap entry "${specifier}" resolved to an empty body`,
-      ).toBeGreaterThan(0);
-    }
-  });
-
   test("boots with no console errors and no uncaught exceptions", async ({ page }) => {
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];

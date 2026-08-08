@@ -225,21 +225,14 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	}
 }
 
-// TestSessionTitleRejectsHostileIdentifiers is the security half: both identifiers
-// become path components, and the state directory is writable by anything in the
-// container, so a traversal attempt must not make the server read outside the
-// session tree. Checked at the Go boundary independently of the hook's own guard.
+// TestSessionTitleRejectsHostileIdentifiers is the security half for the one
+// identifier this package validates: the kiro session id read OUT of a mapping
+// file, which a hostile writer chooses freely and which becomes a path component
+// under the kiro session store. The tab id needs no predicate — every production
+// value is an os.ReadDir basename of the state dir, so it is one path component
+// by construction — so only the kiro id is gated at the Go boundary, and that
+// gate is checked here independently of the hook's own.
 func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
-	t.Run("tab id with a separator is not read", func(t *testing.T) {
-		for _, bad := range []string{"../escape", "a/b", ".", "..", "", strings.Repeat("x", 129)} {
-			if validSessionFileName(bad) {
-				t.Errorf("validSessionFileName(%q) = true, want false", bad)
-			}
-		}
-		if !validSessionFileName("ok") {
-			t.Error("sanity: a plain name must be valid")
-		}
-	})
 	t.Run("kiro id must look like a kiro session id", func(t *testing.T) {
 		for _, bad := range []string{
 			"../../../etc", "sess_../..", "sess_", "", "notasession",
@@ -392,5 +385,27 @@ func TestSessionTitleScansEveryWorkspaceHashDir(t *testing.T) {
 	want := "tab1=Kopia audit: landed, verified, cleaned"
 	if len(set.calls) != 1 || set.calls[0] != want {
 		t.Errorf("pushed %v, want exactly [%q]: the scan must carry on past a hash directory that does not hold this session", set.calls, want)
+	}
+}
+
+// TestSessionTitleSanitizesUntrustedTitle pins the rune policy readTitle applies
+// before the title reaches either sink it does not own: the slog attribute in
+// syncOne and the engine's client title rung, whose own sanitizer drops only C0 +
+// DEL. The other title tests cover blank, placeholder, malformed JSON and ordinary
+// text, so replacing the sanitizer with a bare strings.TrimSpace keeps them green
+// while bidi overrides, C1 controls and line separators from a kiro session record
+// reach the browser tab label and the structured log verbatim.
+func TestSessionTitleSanitizesUntrustedTitle(t *testing.T) {
+	f := newTitleFixture(t)
+	id := "sess_11111111-2222-3333-4444-555555555555"
+	f.mapping("tab1", id)
+	f.session("hash0", id, `{"title":"alpha\u202ebeta\nline\u0085tail"}`)
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+
+	const want = "tab1=alpha beta line tail"
+	if len(set.calls) != 1 || set.calls[0] != want {
+		t.Errorf("pushed %q, want [%q]; browser and log title sinks must not receive bidi, C1, or line-control runes", set.calls, want)
 	}
 }

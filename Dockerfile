@@ -340,9 +340,10 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Baked-in dependencies. kiro-cli itself is downloaded on first boot
-# by entrypoint.sh (licensing prevents us from baking it into the
-# image); everything else is stable utility surface web-terminal-kiro or the
+# Baked-in dependencies. kiro-cli itself is NOT one of them: it is
+# proprietary and cannot be redistributed in the image, so the Go server's
+# pinstall manager downloads and verifies it after the listener binds.
+# Everything else here is stable utility surface web-terminal-kiro or the
 # interactive user needs:
 #   - bash: the entrypoint interpreter (entrypoint.sh is a bash
 #     script; Debian's /bin/sh is dash)
@@ -391,8 +392,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # This keeps the image
 # ~32 MB slimmer and free of the daily LSP-bump rebuild churn.
 
-# kiro-cli installs under $HOME/.local. Home is under /config so the
-# install survives container restarts.
+# HOME is under /config so Kiro authentication, settings and SSH state survive
+# container recreation. It does NOT hold the kiro-cli install: server-managed
+# versions live separately under /config/tools/kiro-cli-versions.
 ENV HOME=/config/home
 # PATH leads with the engine-managed bin dir. The two `runtimes/{go,node}/bin`
 # segments are GONE: the audit they were gated on ran on the borgcube volume

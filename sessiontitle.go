@@ -91,6 +91,13 @@ type titleSetter interface {
 	List() []terminal.SessionInfo
 }
 
+// pushedTitle is one tab's last push: which kiro session it came from, and the
+// title text itself.
+type pushedTitle struct {
+	kiroID string
+	title  string
+}
+
 // sessionTitleSync pushes kiro-cli session titles onto the engine's client rung.
 //
 // It owns no session list of its own: the set of live tabs is the engine's, and the
@@ -103,10 +110,10 @@ type sessionTitleSync struct {
 	// the pointer-bearing prefix ends as early as possible. Re-check the linter
 	// when adding a field.
 	//
-	// pushed remembers the last title pushed per tab so an unchanged title does
-	// not call into the manager every tick. The manager already de-duplicates for
-	// the event stream; this keeps the common case free.
-	pushed   map[string]string
+	// pushed remembers the kiro session and title last pushed per tab. Keeping
+	// the mapping identity lets syncOne clear the old conversation's title when a
+	// hook re-points the tab before the new session has a usable title.
+	pushed   map[string]pushedTitle
 	stateDir string
 	// sessionsRoot is kiro-cli's session store ($HOME/.kiro/sessions). Sessions
 	// live one level down under a per-workspace hash directory, so a session id
@@ -133,7 +140,7 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 	return &sessionTitleSync{
 		stateDir:     filepath.Join(stateRoot, titleStateDirName),
 		sessionsRoot: filepath.Join(home, ".kiro", "sessions"),
-		pushed:       make(map[string]string),
+		pushed:       make(map[string]pushedTitle),
 	}
 }
 
@@ -216,11 +223,25 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 	if !ok {
 		return
 	}
+	previous, pushed := s.pushed[tabID]
+	if pushed && previous.kiroID != kiroID {
+		// The hook re-pointed this tab to another conversation. Clear the old
+		// client rung now so a placeholder, absent or not-yet-written title on the
+		// new session falls through to the engine's automatic name ladder instead
+		// of displaying the previous conversation's title.
+		if !mgr.SetSessionTitle(tabID, "") {
+			delete(s.pushed, tabID)
+			s.forget(tabID)
+			return
+		}
+		delete(s.pushed, tabID)
+		pushed = false
+	}
 	title, ok := s.readTitle(kiroID)
 	if !ok {
 		return
 	}
-	if s.pushed[tabID] == title {
+	if pushed && previous.title == title {
 		return
 	}
 	// A false return means the tab closed between this sweep's liveness snapshot
@@ -231,7 +252,7 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 		s.forget(tabID)
 		return
 	}
-	s.pushed[tabID] = title
+	s.pushed[tabID] = pushedTitle{kiroID: kiroID, title: title}
 	// The tab id is the /ws attach+resume capability token and the title is
 	// kiro-cli's verbatim copy of the user's first message, so this record carries
 	// the truncated id and the title's LENGTH -- the same treatment main.go:1905,
@@ -248,9 +269,6 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 // filesystem path below, and the file is written by a shell hook this app does not
 // execute itself.
 func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
-	if !validSessionFileName(tabID) {
-		return "", false
-	}
 	raw, err := readSmallFile(filepath.Join(s.stateDir, tabID))
 	if err != nil {
 		return "", false
@@ -316,11 +334,10 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 	return "", false
 }
 
-// forget removes a mapping whose tab no longer exists.
+// forget removes a mapping whose tab no longer exists. tabID is one path
+// component by construction: every caller takes it from an os.ReadDir entry of
+// stateDir, whose Name is a single basename and never "." or "..".
 func (s *sessionTitleSync) forget(tabID string) {
-	if !validSessionFileName(tabID) {
-		return
-	}
 	if err := os.Remove(filepath.Join(s.stateDir, tabID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Debug("session title: could not drop a stale mapping",
 			"session", terminal.LogID(tabID), "error", err)
@@ -344,26 +361,6 @@ func readSmallFile(path string) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }() // read-only
 	return atomicfile.ReadBoundedFile(context.Background(), f, maxTitleFileBytes)
-}
-
-// validSessionFileName gates a tab id used as a path component. The engine's ids
-// are hex, but this is the untrusted direction (a filename in a directory any
-// process in the container can write to), so it is checked rather than assumed: no
-// separators, no dots, no empty, bounded length.
-func validSessionFileName(name string) bool {
-	if name == "" || len(name) > 128 {
-		return false
-	}
-	for i := range len(name) {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '-', c == '_':
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 // validKiroSessionID gates the id read out of a mapping file before it becomes a

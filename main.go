@@ -20,6 +20,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -362,21 +363,59 @@ func loopbackHint(addr string) string {
 	return "localhost"
 }
 
+// main is the process's ONLY exit site. Everything else lives in run, which
+// reports failure by returning an error, so no startup branch can exit past a
+// pending defer and skip the subsystem teardown — the hazard the four
+// hand-coordinated os.Exit calls this replaced each had to remember.
 func main() {
-	// Parse the level BEFORE Setup so the handler installs at the configured
-	// level; warn AFTER Setup so the warning emits through the configured
-	// handler (the slogx contract). KWEB_LOG_LEVEL=debug surfaces the
-	// diagnostic lines that are invisible at the default info — e.g. the
-	// newStatusClassifier trace for a kiro-cli notification-wording drift.
-	logLevelRaw := envx.String("KWEB_LOG_LEVEL", "")
-	logLevel, logLevelOK := slogx.ParseLevel(logLevelRaw, slog.LevelInfo)
+	if err := run(); err != nil {
+		// Rendered once, here: the failure branches in run carry their operator
+		// hint inside the returned error rather than logging it themselves, so a
+		// startup failure produces exactly one ERROR line.
+		slog.Error("web-terminal-kiro exited with error", "error", err)
+		os.Exit(1)
+	}
+}
+
+// setupLogging installs the slog handler this app's whole observability story
+// rests on. Parse the level BEFORE Setup so the handler installs at the
+// configured level; warn AFTER Setup so the warning emits through the configured
+// handler (the slogx contract). KWEB_LOG_LEVEL=debug surfaces the diagnostic
+// lines that are invisible at the default info — e.g. the newStatusClassifier
+// trace for a kiro-cli notification-wording drift.
+func setupLogging() {
+	logLevel, ok := slogx.ParseLevel(envx.String("KWEB_LOG_LEVEL", ""), slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: logLevel})
-	if !logLevelOK {
+	if !ok {
 		// Field-name-only: a compose expansion mistake could put a secret in
 		// the value, so the raw string never reaches the log.
 		slog.Warn("unparseable KWEB_LOG_LEVEL; using the info default",
 			"hint", "use debug, info, warn, or error")
 	}
+}
+
+// checkWorkDir refuses a work directory that is absent or is not a directory.
+// Both are compose-mount mistakes rather than runtime states, so each returned
+// error carries the remedy: main renders it as the process's single ERROR line.
+func checkWorkDir(workDir string) error {
+	fi, err := os.Stat(workDir)
+	switch {
+	case err != nil:
+		return fmt.Errorf("work directory %s is missing (bind-mount a host directory to /workspace in compose.yaml): %w", workDir, err)
+	case !fi.IsDir():
+		return fmt.Errorf("work directory %s is not a directory: the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml", workDir)
+	}
+	return nil
+}
+
+// run is the composition root: it wires the tools engine, the kiro-cli install
+// manager, the route table and the HTTP server, then blocks on the
+// signal-driven lifecycle. It returns nil on a clean shutdown and a wrapped
+// error on any startup or serve failure; main turns that into the exit code.
+// Keeping the body here rather than in main is what lets the deferred teardown
+// run on every failure path.
+func run() error {
+	setupLogging()
 
 	addr := envx.String("KWEB_ADDR", ":9848")
 	// Warn for any bind reachable beyond loopback (wildcards, routable IPs,
@@ -390,19 +429,8 @@ func main() {
 			"hint", "any client that can reach this port gets a kiro-cli PTY with filesystem access to /workspace and the /config home (auth tokens, ssh keys, gitconfig)")
 	}
 	workDir := envx.String("KWEB_WORK_DIR", "/workspace")
-
-	fi, statErr := os.Stat(workDir)
-	switch {
-	case statErr != nil:
-		slog.Error("work directory missing",
-			"work_dir", workDir, "error", statErr,
-			"hint", "bind-mount a host directory to /workspace in compose.yaml")
-		os.Exit(1)
-	case !fi.IsDir():
-		slog.Error("work directory is not a directory",
-			"work_dir", workDir,
-			"hint", "the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml")
-		os.Exit(1)
+	if err := checkWorkDir(workDir); err != nil {
+		return err
 	}
 
 	// Tools engine (cplieger/toolbelt): declarative provisioning of the
@@ -508,13 +536,14 @@ func main() {
 			"hint", "kiro-cli session titles need this directory writable by the server and by the hook it seeds")
 	}
 
-	// The subsystem teardown, named once: both background owners, in the order
-	// they were started. Every exit below runs it, and a fifth subsystem is then
-	// added in one place instead of four.
-	stopSubsystems := func() {
+	// The subsystem teardown, named once and deferred once: both background
+	// owners, in the order the four hand-coordinated exit paths this replaced
+	// used. Every return below runs it, and a third subsystem is then added in
+	// one place instead of four.
+	defer func() {
 		kiro.stop()
 		tools.close()
-	}
+	}()
 
 	// The static tree's two derivatives, assembled together and fail-loud
 	// (buildStaticSurface), then handed to their own consumers: the serving
@@ -523,11 +552,9 @@ func main() {
 	// that consumes both.
 	staticSrv, cspPolicy, err := buildStaticSurface(staticFS)
 	if err != nil {
-		slog.Error("the embedded static tree is unusable",
-			"error", err,
-			"hint", "this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block; rebuild the image (go generate ./... plus the Dockerfile static build). The container will crash-loop under its restart policy until it is rebuilt.")
-		stopSubsystems()
-		os.Exit(1)
+		return fmt.Errorf("the embedded static tree is unusable: %w"+
+			" (this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block;"+
+			" rebuild the image — go generate ./... plus the Dockerfile static build. The container will crash-loop under its restart policy until it is rebuilt.)", err)
 	}
 
 	mgr := registerRoutes(mux, &routeDeps{
@@ -547,15 +574,15 @@ func main() {
 		containment:     startContainment(),
 	})
 
-	// Bind the listener before building the base context + server so the
-	// listen-failure os.Exit(1) runs with no pending defer (gocritic
-	// exitAfterDefer).
+	// The listener is bound before the base context + server are built, which
+	// used to be forced by gocritic exitAfterDefer (a listen-failure os.Exit had
+	// to run with no pending defer). The exit is gone, so the ordering is now
+	// only what it always read as: nothing request-scoped exists until there is
+	// something to serve on.
 	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
-		slog.Error("listen failed", "addr", addr, "error", err)
-		stopSubsystems()
-		os.Exit(1)
+		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
 	baseCtx, cancelBase := context.WithCancel(context.Background())
@@ -610,7 +637,6 @@ func main() {
 			cancelBase()
 			slog.Info("shutting down", "cause", context.Cause(ctx))
 		})); err != nil {
-		slog.Error("http server exited", "error", err)
 		// Clear readiness before shutting sessions down: the fast-death Warn
 		// in registerRoutes keys on it to distinguish app-initiated process
 		// cancellation from a spontaneous early child failure (the normal
@@ -618,10 +644,9 @@ func main() {
 		// do the same or a teardown would emit a false broken-install alert).
 		ready.Set(false)
 		mgr.Shutdown()
-		stopSubsystems()
-		os.Exit(1) //nolint:gocritic // exitAfterDefer: a failed Serve must exit non-zero; the deferred stop()/cancelBase() only release signal+context state the process exit reclaims anyway.
+		return fmt.Errorf("http server exited: %w", err)
 	}
-	stopSubsystems()
+	return nil
 }
 
 // The layout facts this app brings to the kiro-cli install: where the convenience
@@ -1051,21 +1076,25 @@ const (
 // The two phases are ORDERED rather than racing, which is why `booted` exists.
 // The boot reconcile is itself a counted kind, and its terminal callback fires
 // (under toolbelt's queue lock) up to one Wait poll BEFORE startTools' finish
-// closure runs — so without the flag a converged boot would publish "ok" while
-// the session gate was still closed, contradicting what "syncing" promises a
-// health consumer above. The boot verdict is therefore authoritative until it
-// is recorded, and the live reducer starts only after.
+// closure runs — so without the flag a converged boot would publish "ok", and
+// with it lift the session-create gate derived from this same cell, before the
+// boot pass's own verdict was recorded. The boot verdict is therefore
+// authoritative until it is recorded, and the live reducer starts only after.
 //
-// This type is deliberately IGNORANT of the session-create gate and of
-// kiro-cli readiness. It holds no reference to either, so a post-boot job
-// failure cannot re-close session creation (the gate lifts on boot failure by
-// design — degraded-not-dead — and that decision stays made) and cannot touch
-// the install manager's separate verdict.
+// This type is deliberately IGNORANT of kiro-cli readiness: it holds no
+// reference to the install manager's separate verdict. The session-create gate
+// IS derived from it — startTools' predicate is `get() == syncing` — which is
+// safe precisely because syncing is never re-entered: a post-boot job failure
+// stores degraded, so it cannot re-close session creation (the gate lifts on
+// boot failure by design — degraded-not-dead — and that decision stays made).
+// Deriving both from one cell is what keeps them from contradicting each other
+// mid-boot; two cells could not be stored simultaneously.
 type toolsStatus struct {
-	// state is the current value. atomic rather than a mutex to match the
-	// syncing gate beside it, and because OnJobChanged fires under
-	// toolbelt's own queue lock and must not block: the health handler
-	// reads it on request goroutines.
+	// state is the current value, and — through the syncing state — the
+	// session-create gate's only predicate. atomic rather than a mutex
+	// because OnJobChanged fires under toolbelt's own queue lock and must
+	// not block: the health handler and the session-create gate read it on
+	// request goroutines.
 	state atomic.Value // string: syncing | ok | degraded
 	// booted reports whether the boot verdict has been recorded, i.e.
 	// whether the live half of the reducer is armed. Set last by recordBoot
@@ -1087,10 +1116,11 @@ func (s *toolsStatus) get() string {
 }
 
 // recordBoot stores the boot convergence pass's verdict and arms the live
-// half. Called once, from startTools' finish closure, which separately lifts
-// the session-create gate; the reducer half below never sees that gate. The
-// store order is load-bearing: state first, then booted, so no job transition
-// can land between them and be mistaken for the boot outcome.
+// half. Called once, from startTools' finish closure; storing a terminal
+// verdict is also what lifts the session-create gate, since that gate reads
+// this same cell for the syncing state. The store order is load-bearing: state
+// first, then booted, so no job transition can land between them and be
+// mistaken for the boot outcome.
 func (s *toolsStatus) recordBoot(v string) {
 	s.state.Store(v)
 	s.booted.Store(true)
@@ -1341,17 +1371,18 @@ func startTools(cfg baseTools) toolsRuntime {
 		return degradedRuntime()
 	}
 
-	var syncing atomic.Bool
-	// finish is the ONLY function that touches both halves: it records the boot
-	// convergence verdict (arming the live reducer) and lifts the session-create
-	// gate. The gate is a separate cell from the health field on purpose — the
-	// live reducer (status.observeJob, wired above) closes over no gate state at
-	// all, so a post-boot job failure can update the informational field without
-	// ever re-closing session creation. Boot failure lifting the gate is
-	// deliberate (degraded-not-dead), and nothing may put it back.
+	// finish records the boot convergence verdict, which BOTH arms the live
+	// reducer and lifts the session-create gate: the gate is derived from the
+	// reducer's one-way "syncing" state rather than kept in a second cell, so a
+	// request cannot observe tools=ok while session creation still refuses with
+	// "tools installing" (the two stores could not be made simultaneous, and
+	// either order contradicts what "syncing" promises a health consumer). A
+	// post-boot job failure stores only ok or degraded (observeJob), so it can
+	// update the informational field without ever re-closing session creation.
+	// Boot failure lifting the gate is deliberate (degraded-not-dead), and
+	// nothing may put it back.
 	finish := func(v string) {
 		status.recordBoot(v)
-		syncing.Store(false)
 	}
 
 	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
@@ -1364,7 +1395,8 @@ func startTools(cfg baseTools) toolsRuntime {
 		finish(toolsStateOK)
 		warnIfNoLSPEnabled(eng, manifestPath)
 	default:
-		syncing.Store(true)
+		// No gate store: newToolsStatus already parks the reducer at "syncing",
+		// which IS the closed gate until recordBoot replaces it.
 		// Mark the gated window OPENING. Without this the only boot-convergence
 		// records are the terminal ones (converged / degraded), so an operator
 		// looking at 503 "tools installing" answers has no line saying the gate
@@ -1385,7 +1417,7 @@ func startTools(cfg baseTools) toolsRuntime {
 	}
 	return toolsRuntime{
 		engine:  eng,
-		syncing: syncing.Load,
+		syncing: func() bool { return status.get() == toolsStateSyncing },
 		state:   status.get,
 	}
 }

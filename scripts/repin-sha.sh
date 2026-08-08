@@ -46,13 +46,27 @@ if [ $# -eq 0 ]; then
 fi
 
 tmp=$(mktemp -d)
-# shellcheck disable=SC2064 # expand $tmp now: it must not depend on later state
-trap "rm -rf '$tmp'" EXIT INT TERM
+# $rewrite_tmp is the in-progress atomic-commit file (see the rename below); it
+# lives beside the tracked Dockerfile, so a failed run must not leave it behind.
+cleanup() {
+  rm -rf "$tmp"
+  [ -z "${rewrite_tmp:-}" ] || rm -f "$rewrite_tmp"
+}
+trap cleanup EXIT INT TERM HUP
 
 updated=0
 
 for dockerfile in "$@"; do
   [ -f "$dockerfile" ] || continue
+
+  # Resolve the real file ONCE. The commit below is a same-directory rename, so
+  # it has to land beside the actual file, and resolving first is also what keeps
+  # a Dockerfile reached through a symlink updated at its TARGET rather than
+  # replaced by a regular file.
+  dockerfile_target=$(realpath "$dockerfile") || {
+    echo "repin: $dockerfile: cannot resolve target path" >&2
+    exit 1
+  }
 
   # Emit "<ARG name> <url template>" for every marker naming this dep. The
   # marker must sit on the line immediately above its ARG so the pairing is
@@ -121,15 +135,23 @@ for dockerfile in "$@"; do
     # Anchored on the ARG name and the 64-hex value, so nothing else in the
     # file can match; the optional trailing group preserves an inline
     # Renovate anchor comment (ARG X=<sha>  # tool v1.2.3).
+    rewrite_tmp=$(mktemp "${dockerfile_target}.XXXXXX")
     sed -E "s|^(ARG ${name}=)[0-9a-f]{64}([[:space:]].*)?\$|\1${sha}\2|" \
-      "$dockerfile" >"$tmp/rewritten"
+      "$dockerfile_target" >"$rewrite_tmp"
 
-    if ! grep -qE "^ARG ${name}=${sha}([[:space:]]|\$)" "$tmp/rewritten"; then
+    if ! grep -qE "^ARG ${name}=${sha}([[:space:]]|\$)" "$rewrite_tmp"; then
       echo "repin: $name: no 64-hex pin to rewrite in $dockerfile" >&2
       exit 1
     fi
 
-    cat "$tmp/rewritten" >"$dockerfile"
+    # Commit by rename, never by truncating copy: `cat >"$dockerfile"` opens the
+    # tracked file with O_TRUNC before reading a byte, so an interrupt, a write
+    # error or a full filesystem during that copy destroys the Dockerfile. The
+    # temp file is in the target's own directory, so the rename is atomic and
+    # every reader sees either the old or the new pin.
+    chmod --reference="$dockerfile_target" "$rewrite_tmp"
+    mv "$rewrite_tmp" "$dockerfile_target"
+    rewrite_tmp=
     updated=$((updated + 1))
   done <"$tmp/pins"
 done

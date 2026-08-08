@@ -92,9 +92,6 @@ export default defineConfig({
     // Print stack traces with every console.* call in tests.
     printConsoleTrace: true,
 
-    // Show full diff when a snapshot fails.
-    expandSnapshotDiff: true,
-
     // V8 coverage with AST-accurate remapping.
     coverage: {
       provider: "v8",
@@ -126,11 +123,6 @@ export default defineConfig({
       truncateThreshold: 0,
       showDiff: true,
       includeStack: true,
-    },
-
-    experimental: {
-      fsModuleCache: true,
-      fsModuleCachePath: ".vitest-cache",
     },
   },
 });

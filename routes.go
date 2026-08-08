@@ -889,7 +889,7 @@ const cspTemplate = "default-src 'self'; " +
 // the bootstrap watchdog (the script-load-failure alertdialog) — both hashed;
 // the external /app.js module is covered by script-src 'self'.
 //
-// FAIL LOUD: a malformed build — a nil FS, an unreadable index.html, zero
+// FAIL LOUD: a malformed build — an unreadable index.html, zero
 // inline scripts, or anything other than exactly one <style> block — aborts
 // startup rather than silently dropping the script-src or style-src hardening,
 // or serving a hash set that would block the importmap and break ES module
@@ -898,9 +898,6 @@ const cspTemplate = "default-src 'self'; " +
 // The one-block assertion stays HERE rather than in the library: "exactly one"
 // is this app's contract about its own page, not a property of style hashing.
 func buildCSPPolicy(sub fs.FS) (string, error) {
-	if sub == nil {
-		return "", errors.New("buildCSPPolicy: nil static FS")
-	}
 	html, err := fs.ReadFile(sub, "index.html")
 	if err != nil {
 		return "", fmt.Errorf("buildCSPPolicy: read index.html: %w", err)

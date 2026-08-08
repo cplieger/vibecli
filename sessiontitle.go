@@ -144,10 +144,6 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 	}
 }
 
-// titleStateDir is the directory the hook writes into. Exported to the session
-// factory so the child's environment and the poller cannot disagree on the path.
-func (s *sessionTitleSync) titleStateDir() string { return s.stateDir }
-
 // sessionEnv returns the two variables one tab's kiro-cli process needs so a hook
 // can report its kiro session id. This is the whole mechanism on the child's side:
 // the tab id it should report under, and where to write it.
@@ -201,6 +197,14 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 	}
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), ".") {
+			// The hook's in-flight write temps (".<tabID>.$$", renamed into place by
+			// hooks/session-title.sh) share this directory. They are never a live tab's
+			// name, so the reclaim below would delete one mid-write and silently drop
+			// that prompt's mapping update. A dot prefix is the hook's documented temp
+			// shape and no engine session id starts with a dot, so skipping costs nothing.
 			continue
 		}
 		if _, ok := live[e.Name()]; !ok {
@@ -271,6 +275,13 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
 	raw, err := readSmallFile(filepath.Join(s.stateDir, tabID))
 	if err != nil {
+		// pass() just enumerated this entry, so any failure here is abnormal --
+		// EACCES, a refused symlink/FIFO (OpenRegular), an oversized file -- not
+		// absence. Same ErrNotExist carve-out as the directory-level reads.
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("session title: mapping file unreadable",
+				"session", terminal.LogID(tabID), "error", err)
+		}
 		return "", false
 	}
 	id := strings.TrimSpace(string(raw))
@@ -304,34 +315,55 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 		if !hd.IsDir() {
 			continue
 		}
-		raw, err := readSmallFile(filepath.Join(s.sessionsRoot, hd.Name(), kiroID, "session.json"))
-		if err != nil {
-			continue
+		if title, settled := s.titleFromRecord(hd.Name(), kiroID); settled {
+			return title, title != ""
 		}
-		var rec struct {
-			Title string `json:"title"`
-		}
-		if err := json.Unmarshal(raw, &rec); err != nil {
-			slog.Debug("session title: session.json is not decodable",
-				"kiro_session", kiroID, "error", err)
-			return "", false
-		}
-		// One rune policy for untrusted upstream text (runesafe). This title is
-		// kiro-cli's record of the user's first message verbatim, or a label the
-		// agent produced from tool output, and it reaches two sinks this function
-		// does not own: the slog attribute in syncOne, and the engine's client
-		// title rung, whose sanitizeTitle drops only C0 + DEL -- so C1 controls,
-		// Unicode Bidi_Control and U+2028/29 reach the browser tab label. The
-		// single-line preset is the right one for a label sink, and sanitizing
-		// BEFORE the trim matters: unsafe runes become spaces, so a control-only
-		// title collapses to "" and is correctly read as "no title" below.
-		title := strings.TrimSpace(runesafe.SanitizeSingleLine(rec.Title))
-		if title == "" || title == placeholderTitle {
-			return "", false
-		}
-		return title, true
 	}
 	return "", false
+}
+
+// titleFromRecord reads one candidate session.json and reports whether it SETTLED
+// the lookup. A session id lives under exactly one hash directory, so once the
+// record has been reached at all its contents are the answer -- a corrupt or
+// title-less record settles the lookup as "no title" rather than sending the scan
+// on to the remaining directories. Only an absent record is the ordinary miss that
+// keeps scanning. An empty returned title means "no usable title", which is why
+// readTitle derives its own ok from the string rather than from a third result.
+func (s *sessionTitleSync) titleFromRecord(hashDir, kiroID string) (string, bool) {
+	raw, err := readSmallFile(filepath.Join(s.sessionsRoot, hashDir, kiroID, "session.json"))
+	if err != nil {
+		// ENOENT is the normal miss (the session lives under one hash dir);
+		// anything else -- EACCES, a refused symlink/FIFO, an oversized
+		// record -- silently kills this tab's title, the failure class the
+		// ReadDir comment in readTitle says a log-only diagnosis path cannot have.
+		if !errors.Is(err, fs.ErrNotExist) {
+			slog.Debug("session title: session.json unreadable",
+				"kiro_session", kiroID, "error", err)
+		}
+		return "", false
+	}
+	var rec struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		slog.Debug("session title: session.json is not decodable",
+			"kiro_session", kiroID, "error", err)
+		return "", true
+	}
+	// One rune policy for untrusted upstream text (runesafe). This title is
+	// kiro-cli's record of the user's first message verbatim, or a label the
+	// agent produced from tool output, and it reaches two sinks this function
+	// does not own: the slog attribute in syncOne, and the engine's client
+	// title rung, whose sanitizeTitle drops only C0 + DEL -- so C1 controls,
+	// Unicode Bidi_Control and U+2028/29 reach the browser tab label. The
+	// single-line preset is the right one for a label sink, and sanitizing
+	// BEFORE the trim matters: unsafe runes become spaces, so a control-only
+	// title collapses to "" and is correctly read as "no title".
+	title := strings.TrimSpace(runesafe.SanitizeSingleLine(rec.Title))
+	if title == placeholderTitle {
+		return "", true
+	}
+	return title, true
 }
 
 // forget removes a mapping whose tab no longer exists. tabID is one path

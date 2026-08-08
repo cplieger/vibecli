@@ -57,7 +57,7 @@ func newTitleFixture(t *testing.T) *titleFixture {
 // mapping plants what the hook writes: a file named for the tab holding kiro's id.
 func (f *titleFixture) mapping(tabID, kiroID string) {
 	f.t.Helper()
-	path := filepath.Join(f.sync.titleStateDir(), tabID)
+	path := filepath.Join(f.sync.stateDir, tabID)
 	if err := os.WriteFile(path, []byte(kiroID+"\n"), 0o600); err != nil {
 		f.t.Fatalf("write mapping %s: %v", tabID, err)
 	}
@@ -181,7 +181,7 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	set := &fakeSetter{missing: map[string]bool{"gonetab": true}, live: []string{"gonetab"}}
 	f.sync.pass(set)
 
-	if _, err := os.Stat(filepath.Join(f.sync.titleStateDir(), "gonetab")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.sync.stateDir, "gonetab")); !os.IsNotExist(err) {
 		t.Errorf("mapping for a closed tab still present (stat err = %v), want it removed", err)
 	}
 }
@@ -214,7 +214,7 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	set.live = nil
 	f.sync.pass(set)
 
-	if _, err := os.Stat(filepath.Join(f.sync.titleStateDir(), "closedtab")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.sync.stateDir, "closedtab")); !os.IsNotExist(err) {
 		t.Errorf("mapping for a tab the manager no longer lists is still present (stat err = %v), want it reclaimed", err)
 	}
 	if len(set.calls) != 1 {
@@ -262,7 +262,7 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 // (atomicfile.ErrFileTooLarge) rather than truncated, and nothing is pushed.
 func TestSessionTitleBoundsFileReads(t *testing.T) {
 	f := newTitleFixture(t)
-	huge := filepath.Join(f.sync.titleStateDir(), "tab1")
+	huge := filepath.Join(f.sync.stateDir, "tab1")
 	if err := os.WriteFile(huge, []byte(strings.Repeat("a", maxTitleFileBytes*3)), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 
 	want := map[string]string{
 		"KWEB_SESSION_ID":      "tab42",
-		"KWEB_TITLE_STATE_DIR": f.sync.titleStateDir(),
+		"KWEB_TITLE_STATE_DIR": f.sync.stateDir,
 	}
 	got := make(map[string]string, len(env))
 	for _, kv := range env {
@@ -341,7 +341,7 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	cmd := exec.Command(sh, "hooks/session-title.sh")
 	cmd.Env = append(os.Environ(),
 		"KWEB_SESSION_ID=tab42",
-		"KWEB_TITLE_STATE_DIR="+f.sync.titleStateDir())
+		"KWEB_TITLE_STATE_DIR="+f.sync.stateDir)
 	cmd.Stdin = strings.NewReader(`{"session_id":"` + kiroID + `"}`)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("hook: %v (output %q)", err, out)

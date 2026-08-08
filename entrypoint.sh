@@ -144,9 +144,17 @@ enable_session_containment() {
   # warn_if_not_root's uid/gid: a unit test must be able to hand it a temp dir instead
   # of the host's own /sys/fs/cgroup, whose mount state is the CI runner's, not this
   # function's.
-  local cg_root=${1:-/sys/fs/cgroup}
-  if ! mount -o remount,rw "$cg_root" 2>/dev/null; then
-    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' >&2
+  local cg_root=${1:-/sys/fs/cgroup} mount_err
+  if ! mount_err=$(mount -o remount,rw "$cg_root" 2>&1); then
+    # Carry mount's own error into the warn: the hint below is only ONE of the ways
+    # this remount fails, and the discarded text is the only discriminator between
+    # "add the capability" and "this host cannot do this at all". Sanitized inline
+    # (newline flatten, quote swap, length bound) rather than via logfmt_value,
+    # which is defined further down and bash resolves functions at call time --
+    # the same ordering trap the call-site comment below documents.
+    mount_err=${mount_err//$'\n'/ }
+    mount_err=${mount_err//\"/\'}
+    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" error="%s" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' "${mount_err:0:200}" >&2
     return 1
   fi
   # Report ONLY what the remount proved, and on stderr like every other line in this
@@ -1244,7 +1252,6 @@ else
   if ! hooks_tmp=$(mktemp "${hooks_file}.XXXXXX") \
     || ! printf '{"version":"v1","hooks":[{"name":"web-terminal-session-title","trigger":"SessionStart","action":{"type":"command","command":"%s"}},{"name":"web-terminal-session-title-prompt","trigger":"UserPromptSubmit","action":{"type":"command","command":"%s"}}]}\n' \
       "$SESSION_TITLE_HOOK" "$SESSION_TITLE_HOOK" >"$hooks_tmp" \
-    || ! chmod 0644 "$hooks_tmp" \
     || ! mv "$hooks_tmp" "$hooks_file"; then
     [ -z "${hooks_tmp:-}" ] || rm -f "$hooks_tmp"
     printf 'level=warn msg="failed to write the kiro-cli session-title hook; tab titles fall back to the automatic name ladder" file="%s" component=entrypoint\n' "$hooks_file" >&2

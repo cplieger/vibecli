@@ -14,7 +14,11 @@ export default defineConfig({
   testDir: "./e2e",
   testMatch: "**/*.e2e.test.ts",
   fullyParallel: false,
-  forbidOnly: !!process.env["CI"],
+  // Forbid .only unconditionally, matching vitest.config.ts's
+  // allowOnly: false — this suite never runs in CI, so a CI-gated
+  // guard can never fire and a committed .only would silently skip
+  // every other check here forever.
+  forbidOnly: true,
   retries: 0,
   reporter: [["list"]],
   use: {

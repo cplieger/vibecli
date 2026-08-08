@@ -532,7 +532,7 @@ func run() error {
 	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
 	if err := titles.ensureStateDir(); err != nil {
 		slog.Warn("session title state dir could not be created; tabs will fall back to the automatic name ladder",
-			"dir", titles.titleStateDir(), "error", err,
+			"dir", titles.stateDir, "error", err,
 			"hint", "kiro-cli session titles need this directory writable by the server and by the hook it seeds")
 	}
 
@@ -1130,7 +1130,7 @@ func (s *toolsStatus) recordBoot(v string) {
 // transition into the field. Fires from toolbelt's job worker under the queue
 // lock, so it does exactly one atomic store and never blocks.
 func (s *toolsStatus) observeJob(j *toolbelt.Job) {
-	if j == nil || !s.booted.Load() || !toolsStatusCounts(j.Kind) {
+	if !s.booted.Load() || !toolsStatusCounts(j.Kind) {
 		return
 	}
 	switch j.State {

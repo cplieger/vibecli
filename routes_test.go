@@ -572,8 +572,8 @@ func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
 }
 
 // TestBuildCSPPolicyFailsLoud pins the fail-loud contract: buildCSPPolicy
-// returns an error (never a silent 'unsafe-inline' degrade) when the static FS
-// is nil, index.html is missing, index.html holds no inline <script>, or its
+// returns an error (never a silent 'unsafe-inline' degrade) when
+// index.html is missing, index.html holds no inline <script>, or its
 // inline <style> block is absent, unterminated, or duplicated. A
 // production build always embeds index.html with its inline importmap and its
 // single critical-CSS <style>, so any of these means a malformed build that must
@@ -583,7 +583,6 @@ func TestBuildCSPPolicyFailsLoud(t *testing.T) {
 		name string
 		fsys fs.FS
 	}{
-		{"nil FS", nil},
 		{"missing index.html", fstest.MapFS{}},
 		{"only external scripts", fstest.MapFS{
 			"index.html": &fstest.MapFile{Data: []byte(`<html><body><script src="/app.js"></script></body></html>`)},

@@ -1133,11 +1133,6 @@ func TestToolsStatus_reducerTransitions(t *testing.T) {
 			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobFailed)},
 			want: toolsStateSyncing,
 		},
-		"nil job is ignored": {
-			boot: toolsStateOK,
-			jobs: []*toolbelt.Job{nil},
-			want: toolsStateOK,
-		},
 		"boot failure then a successful install heals": {
 			boot: toolsStateDegraded,
 			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone)},

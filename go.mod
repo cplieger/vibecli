@@ -7,7 +7,7 @@ require (
 	github.com/cplieger/pinstall v1.1.0
 	github.com/cplieger/slogx v1.6.0
 	github.com/cplieger/toolbelt/v2 v2.4.4
-	github.com/cplieger/web-terminal-engine/v3 v3.5.0
+	github.com/cplieger/web-terminal-engine/v3 v3.6.0
 	github.com/cplieger/webhttp v1.23.0
 )
 

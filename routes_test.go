@@ -1670,21 +1670,6 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 	}
 }
 
-// The two tests that used to sit here pinned this app's OWN admission gate and
-// its context.WithoutCancel wrapper: that an abandoned queued caller never
-// entered pinstall, and that an admitted rescan survived a client disconnect.
-// Both behaviours are now the LIBRARY's (pinstall >= v1.1.0 makes waiting for its
-// operation slot cancellable and runs an admitted rescan detached), and they are
-// pinned there by TestRescanQueuedCallerCanAbandon and
-// TestAdmittedRescanIgnoresCallerCancellation, which exercise the real manager.
-// These app-level versions drove a FAKE kiroRescan, so after the move they could
-// only ever assert that the fake had no gate — a test of the stub, not the app.
-//
-// What is still this app's to get wrong is the one line below, and it is the
-// reason this test exists rather than nothing: the handler must hand the REQUEST
-// context to the manager unchanged. Re-detaching it here (the shape that was
-// correct before the bump) would defeat the library's cancellable wait, silently
-// restoring the unbounded-queue hazard the gate was written for.
 // TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached pins the two non-ok
 // outcomes, neither of which any other test reaches. pinstall's ORDINARY refusal
 // is (false, nil) -- no candidate selected, and recording that verdict succeeded
@@ -1736,6 +1721,21 @@ func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
 	}
 }
 
+// The two tests that used to sit here pinned this app's OWN admission gate and
+// its context.WithoutCancel wrapper: that an abandoned queued caller never
+// entered pinstall, and that an admitted rescan survived a client disconnect.
+// Both behaviours are now the LIBRARY's (pinstall >= v1.1.0 makes waiting for its
+// operation slot cancellable and runs an admitted rescan detached), and they are
+// pinned there by TestRescanQueuedCallerCanAbandon and
+// TestAdmittedRescanIgnoresCallerCancellation, which exercise the real manager.
+// These app-level versions drove a FAKE kiroRescan, so after the move they could
+// only ever assert that the fake had no gate — a test of the stub, not the app.
+//
+// What is still this app's to get wrong is the one line below, and it is the
+// reason this test exists rather than nothing: the handler must hand the REQUEST
+// context to the manager unchanged. Re-detaching it here (the shape that was
+// correct before the bump) would defeat the library's cancellable wait, silently
+// restoring the unbounded-queue hazard the gate was written for.
 func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
 	seen := make(chan context.Context, 1)
 	deps := newTestDeps(true)

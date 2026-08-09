@@ -287,7 +287,8 @@
         "error",
         (e) => {
           const overlay = document.getElementById("loading");
-          // Three stand-down states, and they are the only ones: no overlay at
+          // Three of the four stand-down states -- the fourth, a booted
+          // #terminal, is checked separately below: no overlay at
           // all (after boot the kernel removes it on transitionend), an overlay
           // this watchdog already claimed through data-bootstrap-fatal, or one
           // the kernel has started fading out -- between the first frame's

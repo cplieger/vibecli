@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cplieger/atomicfile/v2"
@@ -119,6 +120,35 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 		s := newSessionTitleSync(root, t.TempDir())
 		if err := s.ensureStateDir(); err == nil {
 			t.Error("ensureStateDir accepted a pre-existing group-writable level; another user could swap the mapping files under it")
+		}
+	})
+	t.Run("a level created off-mode is tightened to 0700", func(t *testing.T) {
+		// umask is process-wide: this subtest must NOT call t.Parallel, and it
+		// restores the mask before any assertion can fail. A umask of 0o200 makes
+		// os.Mkdir(0o700) yield 0o500, which is exactly the shape the created flag
+		// exists for -- a level WE created whose mode is not what was asked for --
+		// and it is the only seam that reaches the chmod-tighten branch on a
+		// filesystem that does not widen modes (the ZFS nfs4acl case the code
+		// comment measures). The temp parents are made BEFORE the mask changes, so
+		// only the two levels ensureStateDir creates are born off-mode. Without
+		// the chmod-tighten branch the levels stay 0500 and this fails.
+		parent, home := t.TempDir(), t.TempDir()
+		root := filepath.Join(parent, "state")
+		s := newSessionTitleSync(root, home)
+		old := syscall.Umask(0o200)
+		err := s.ensureStateDir()
+		syscall.Umask(old)
+		if err != nil {
+			t.Fatalf("ensureStateDir over a self-created off-mode tree: %v", err)
+		}
+		for _, dir := range []string{root, s.stateDir} {
+			fi, statErr := os.Lstat(dir)
+			if statErr != nil {
+				t.Fatalf("lstat %s: %v", dir, statErr)
+			}
+			if perm := fi.Mode().Perm(); perm != 0o700 {
+				t.Errorf("%s mode = %#o, want 0700: a level we created off-mode must be tightened", dir, perm)
+			}
 		}
 	})
 }

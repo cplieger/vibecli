@@ -618,14 +618,28 @@ func run() error {
 			" rebuild the image — go generate ./... plus the Dockerfile static build. The container will crash-loop under its restart policy until it is rebuilt.)", err))
 	}
 
-	// Collect the exit statuses of orphans re-parented onto this process. In the
-	// container this binary IS pid 1, so every process whose own parent died —
-	// each language server, each git a session forked — lands here, and Go's
-	// os/exec waits only on the children it created itself. Measured on borgcube
-	// before this was wired: 17,323 zombies against 88 live processes, every one
-	// of them parented on this server. It costs a /proc walk every 30s and frees
-	// a pid slot per collection; it can never touch a live process.
-	defer terminal.StartZombieReaper(slog.Default(), 0)()
+	// Orphan reaping is the CONTAINER INIT's job, not this server's, and that is
+	// why no reaper is installed here. Compose runs the image with `init: true`, so
+	// tini is pid 1 and this server is pid 2: every process whose own parent died —
+	// each language server, each git a session forked — re-parents onto tini, which
+	// owns no child anyone else waits on and therefore collects it safely, while
+	// this process waits only for the children it created. Without an init the
+	// server IS pid 1 and Go's os/exec collects nothing it did not spawn: measured
+	// on borgcube 2026-08-09, 17,323 zombies against 88 live processes.
+	//
+	// The engine's in-process terminal.StartZombieReaper is DELIBERATELY not used,
+	// and it is not merely redundant here — it is incompatible. It sets
+	// PR_SET_CHILD_SUBREAPER, which re-parents orphans onto this server even behind
+	// an init shim, so it would take the orphans back off tini and then sweep them
+	// itself, excluding only the pids in the engine's own private spawn registry.
+	// This app also spawns through os/exec outside that registry (pinstall's version
+	// probes and settings assertions, toolbelt's package managers, decompressors, gh
+	// and bash), so the sweep can win the race for one of THOSE exit statuses and
+	// make successful work report as failed.
+	//
+	// SESSION reaping is a different engine mechanism and stays on by default: it
+	// ends a closed session's still-ALIVE descendants from an inherited environment
+	// marker, needs no capability, and is unaffected by which process is pid 1.
 
 	mgr := registerRoutes(mux, &routeDeps{
 		static:          staticSrv,

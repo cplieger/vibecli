@@ -155,17 +155,19 @@ warn_if_not_root
 # That LEAK is no longer what this buys, and the distinction decides whether an
 # operator should grant a capability. Engine v3.6.0 reaps a closed session's
 # surviving tree from an inherited environment marker with no host support at all
-# (terminal.StartZombieReaper in main.go, plus the engine's session reaping), so what
-# containment adds ON TOP is the per-session peak numbers (mem_peak_bytes,
+# (the engine's marker-based SESSION reaping; collecting orphan zombies is a separate
+# job and it belongs to the container init, which compose supplies with `init: true`),
+# so what containment adds ON TOP is the per-session peak numbers (mem_peak_bytes,
 # tasks_peak) and a kill domain a scrubbed-environment descendant cannot escape.
 # Keep this paragraph in step with startContainment's doc comment in main.go: they
 # are the same tradeoff, told to the same operator, on the same boot.
 #
 # Docker mounts /sys/fs/cgroup read-only and offers no option to change that, so a
 # one-time remount is the established workaround (the same one runc documents for
-# running systemd in a container). It needs CAP_SYS_ADMIN to OPT IN; neither the
-# public compose example nor the homelab compose grants it, which is why the refusal
-# path below is the ordinary one rather than the exception.
+# running systemd in a container). It needs CAP_SYS_ADMIN to OPT IN; the public
+# compose example grants no capability, so the refusal path below is the ordinary one
+# there, while the homelab deployment does carry cap_add: [SYS_ADMIN] and takes the
+# remount path.
 #
 # WARN, never fatal, per this app's failure posture: without containment the
 # server still serves terminals exactly as it did before the feature existed, and

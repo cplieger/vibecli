@@ -5,14 +5,13 @@
 // its runtime handshake reaches, so this gate can never disagree with the
 // close-4002 refusal); this program supplies the Go side from the engine's
 // public constants and the client side from the engine artifact's own
-// wire-compatibility manifest (-manifest), or from explicit flags.
+// wire-compatibility manifest (-manifest, required).
 //
 // Exit 0: the pairing is declared-compatible. Exit 1: a declared floor is
 // violated — the pairing would refuse at first connect with close code 4002,
-// so fail the build instead. Exit 2: usage error (an unreadable, malformed,
-// unknown-schema or value-less manifest, or a missing/non-positive
-// -client-rev / -client-min-server flag). A MIS-declared floor is out of
-// scope here; that is the engine conformance suite's contract.
+// so fail the build instead. Exit 2: usage error (a missing, unreadable,
+// malformed, unknown-schema or value-less manifest). A MIS-declared floor is
+// out of scope here; that is the engine conformance suite's contract.
 package main
 
 import (
@@ -26,14 +25,14 @@ import (
 )
 
 // usageErrMsg is the exit-2 line: the client-side values are unusable, so the
-// extraction is broken. Shared by run's own validation and flag's parse-error
-// path (a non-numeric flag value lands there), so both exit-2 shapes tell the
+// extraction is broken. Shared by readManifest's refusals and flag's parse-error
+// path (an unknown flag lands there), so both exit-2 shapes tell the
 // reader to fix the gate rather than move a pin. It is deliberately NOT
 // installed as flag.Usage: flag calls Usage for -h as well as for a parse
 // error, so doing that would tell a maintainer reading the flag names that the
 // gate is broken — on the one program whose job is to be trusted about whether
 // the gate or the pin is at fault.
-const usageErrMsg = "ERROR wire-floor-gate-usage: the client wire revisions are unusable — pass -manifest <engine-pkg>/wire-compatibility.json, or -client-rev and -client-min-server as required positive integers (the extraction is broken — fix the gate, do not bump a pin)"
+const usageErrMsg = "ERROR wire-floor-gate-usage: the client wire revisions are unusable — pass -manifest <engine-pkg>/wire-compatibility.json (the extraction is broken — fix the gate, do not bump a pin)"
 
 // readManifest resolves the client half of the pairing from the engine artifact's
 // own manifest, via the engine's exported decoder (terminal.ReadWireManifest).
@@ -67,9 +66,7 @@ func readManifest(path string, stderr io.Writer) (clientRev, clientMinServer int
 }
 
 func main() {
-	manifest := flag.String("manifest", "", "path to the vendored engine artifact's wire-compatibility.json (preferred over the -client-* flags)")
-	clientRev := flag.Int("client-rev", 0, "client WIRE_PROTOCOL_VERSION, when no -manifest is available")
-	clientMinServer := flag.Int("client-min-server", 0, "client MIN_SUPPORTED_SERVER_WIRE_VERSION, when no -manifest is available")
+	manifest := flag.String("manifest", "", "path to the vendored engine artifact's wire-compatibility.json (required)")
 	// ContinueOnError so a parse error can be told apart from -h, which
 	// flag.Usage cannot do: an ExitOnError FlagSet exits 0 for ErrHelp, so a
 	// Usage override prints the broken-gate ERROR on a successful help request.
@@ -81,20 +78,21 @@ func main() {
 		fmt.Fprintln(flag.CommandLine.Output(), usageErrMsg)
 		os.Exit(2)
 	}
-	rev, minServer := *clientRev, *clientMinServer
-	if *manifest != "" {
-		var ok bool
-		if rev, minServer, ok = readManifest(*manifest, os.Stderr); !ok {
-			os.Exit(2)
-		}
+	// An absent -manifest reaches terminal.ReadWireManifest as "", which fails
+	// to open and produces the same exit-2 "cannot read the engine's
+	// wire-compatibility manifest" line the absent-file case produces, so the
+	// requirement needs no separate check.
+	rev, minServer, ok := readManifest(*manifest, os.Stderr)
+	if !ok {
+		os.Exit(2)
 	}
 	os.Exit(run(rev, minServer, os.Stdout, os.Stderr))
 }
 
 // run performs the wire-floor gate against the engine's exported constants and
 // returns the process exit code main hands to os.Exit: 0 declared-compatible,
-// 1 floor violated (fail the build), 2 usage error (missing/non-positive flag
-// values).
+// 1 floor violated (fail the build). The third code, 2, is main's: a manifest
+// the gate cannot read (see readManifest).
 //
 // All three codes reach the Dockerfile's wire-floor gate, which BUILDS this
 // program and invokes the binary for exactly that reason: `go run` reports its
@@ -103,17 +101,9 @@ func main() {
 // and left only the stderr line to tell "the gate's extraction is broken, do NOT
 // bump a pin" from "genuine wire incompatibility". Do not put the step back on
 // `go run`; TestDockerfileBuildsTheGateInsteadOfGoRun fails if anyone does, and
-// TestGateProcessPropagatesExitCodes pins main's propagation of these codes.
-//
-// The client-side values are validated here rather than left to the engine's
-// comparator so a missing extraction is reported as the usage error it is (exit
-// 2, the "required positive integers" line, "fix the gate") instead of a
-// compatibility verdict (exit 1, "bump a pin").
+// TestGateProcessReadsTheManifestFlagTheDockerfilePasses pins main's propagation
+// of these codes through the shipped invocation.
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
-	if clientRev <= 0 || clientMinServer <= 0 {
-		fmt.Fprintln(stderr, usageErrMsg)
-		return 2
-	}
 	if reason := terminal.WirePairIncompatibility(
 		terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion,
 		clientRev, clientMinServer,

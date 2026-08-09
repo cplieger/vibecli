@@ -2683,3 +2683,113 @@ func TestStageValuesAreStable(t *testing.T) {
 		}
 	}
 }
+
+// parseCatalogRefresh is deliberately STRICTER than the fleet's config-echo
+// policy: envx states that config values are not secrets and its own tolerant
+// warnings include the raw value, scheduler's steering doc says plain *_INTERVAL
+// env reads should not redact, and 9 apps echo raw config values today. This app
+// does not, because its compose file is the operator's whole config surface, it
+// serves an unauthenticated root shell, and its README publishes a no-values
+// promise. See "Settled review decisions".
+//
+// The cost of that deviation is the only thing worth guarding: the pre-parse
+// duplicates scheduler's accept vocabulary, and nothing keeps the two in step.
+// These tests derive the expected behaviour from the REAL library rather than
+// from a copy of its rules, so a scheduler or toolbelt release that adds a
+// sentinel fails here on the Renovate bump PR instead of silently changing what
+// this app accepts.
+
+// The invariant that makes the pre-parse safe to keep: it is OUTCOME-TRANSPARENT.
+// It may change what is LOGGED and must never change what is RETURNED. Any
+// divergence means the local vocabulary has drifted from the library's and this
+// app is now rejecting (or accepting) something the library does not.
+func TestParseCatalogRefreshIsOutcomeTransparent(t *testing.T) {
+	for _, raw := range []string{
+		"", " ", "off", "OFF", "disabled", "Disabled", "off ", " disabled ",
+		"0", "0s", "24h", "90m", "1h30m", "24H", "1H30M", // case-sensitive units
+		"-5m", "5", "5min", "abc", "24 h", "1e3s", "0x10s",
+		"9999999h", "-0", "+24h", ".5h", "1.5h",
+	} {
+		t.Run("value="+raw, func(t *testing.T) {
+			want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+			if got := parseCatalogRefresh(raw); got != want {
+				t.Errorf("parseCatalogRefresh(%q) = %v, library returns %v — the local pre-parse changed the OUTCOME, so its accept vocabulary has drifted from scheduler's",
+					raw, got, want)
+			}
+		})
+	}
+}
+
+// The same invariant over arbitrary bytes, so a vocabulary change upstream is
+// caught even for a spelling no hand-written case anticipated.
+func FuzzParseCatalogRefreshIsOutcomeTransparent(f *testing.F) {
+	for _, seed := range []string{
+		"", "off", "disabled", "24h", "24H", "0", "0s", "-5m", "5min", "abc",
+		" 90m ", "OFF", "1h30m", "\x00", "1e3s",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+		if got := parseCatalogRefresh(raw); got != want {
+			t.Fatalf("parseCatalogRefresh(%q) = %v, library returns %v — outcome divergence", raw, got, want)
+		}
+	})
+}
+
+// The protection itself: whatever the operator set must never reach the log. This
+// is what the deviation buys, and it is the half a library change would have
+// taken away. Mutates the process-global default logger, so no t.Parallel.
+func TestParseCatalogRefreshNeverLogsTheValue(t *testing.T) {
+	// Values chosen to look like a misrouted credential rather than a duration,
+	// which is the case the deviation exists for: a compose expansion mistake
+	// putting ${SOME_TOKEN} on this key.
+	for _, secret := range []string{
+		"hunter2-not-a-duration",
+		"ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+		"postgres://user:pa55w0rd@db:5432/app",
+	} {
+		t.Run(secret[:8], func(t *testing.T) {
+			records := capture.Default(t)
+			if got := parseCatalogRefresh(secret); got == 0 {
+				t.Fatalf("parseCatalogRefresh(%q) = 0; an unusable value must fall back to a positive cadence", secret)
+			}
+			for _, r := range records.Records() {
+				if strings.Contains(r.Message, secret) {
+					t.Errorf("the rejected value reached a log MESSAGE: %q", r.Message)
+				}
+				r.Attrs(func(a slog.Attr) bool {
+					if strings.Contains(a.Value.String(), secret) {
+						t.Errorf("the rejected value reached log attr %q = %q", a.Key, a.Value)
+					}
+					return true
+				})
+			}
+		})
+	}
+}
+
+// The by-name-only warning must still FIRE, or the redaction has been achieved by
+// saying nothing at all — which would leave an operator with a silently ignored
+// setting.
+func TestParseCatalogRefreshStillWarnsByName(t *testing.T) {
+	records := capture.Default(t)
+	parseCatalogRefresh("definitely-not-a-duration")
+
+	for _, r := range records.Records() {
+		if strings.Contains(r.Message, catalogRefreshKey) {
+			return
+		}
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Value.String(), catalogRefreshKey) {
+				found = true
+			}
+			return true
+		})
+		if found {
+			return
+		}
+	}
+	t.Errorf("no warning named %s for an unusable value; the operator gets no diagnostic at all", catalogRefreshKey)
+}

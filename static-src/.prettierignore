@@ -1,10 +1,14 @@
 coverage/
 
-# Stryker's sandbox + report output and the Kiro skill scratch trees. All are
-# gitignored, but Prettier does not read .gitignore, so a leftover sandbox (an
-# interrupted mutation run never cleans it up) or a review run makes
-# `npm run lint:prettier` fail on ~100 copied files. vitest.config.ts excludes
-# the same trees for the same reason.
+# Stryker's sandbox + report output, Playwright's output tree, and the Kiro skill
+# scratch trees. All are gitignored, but Prettier does not read .gitignore, so a
+# leftover sandbox (an interrupted mutation run never cleans it up), a review run, or
+# any `npm run test:e2e` makes `npm run lint:prettier` fail. test-results/ is the
+# smallest of them and the easiest to miss: Playwright writes .last-run.json there on
+# every run, unindented-tail and newline-less, so exactly one generated JSON file is
+# enough to fail the check. vitest.config.ts excludes the same trees for the same
+# reason.
 .stryker-tmp/
 reports/
+test-results/
 .code-review/

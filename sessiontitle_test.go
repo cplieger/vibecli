@@ -84,6 +84,44 @@ func quote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 }
 
+// TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel pins the distinction the
+// created flag exists for: a level this process created is tightened to 0700 and
+// accepted (a filesystem with an inheritable group-write ACL widens os.Mkdir's
+// requested mode, and refusing our own directory would disable tab titles for the
+// container's life), while a level that was ALREADY group/other-writable is refused
+// -- that one is somebody else's shape and is the hostile case the check is for.
+func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
+	t.Run("a level we created is tightened, not refused", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		s := newSessionTitleSync(root, t.TempDir())
+		if err := s.ensureStateDir(); err != nil {
+			t.Fatalf("ensureStateDir over a self-created tree: %v", err)
+		}
+		for _, dir := range []string{root, s.stateDir} {
+			fi, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatalf("lstat %s: %v", dir, err)
+			}
+			if perm := fi.Mode().Perm(); perm != 0o700 {
+				t.Errorf("%s mode = %#o, want 0700: a level we created must be tightened to what was asked for", dir, perm)
+			}
+		}
+	})
+	t.Run("a pre-existing group-writable level is refused", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatalf("plant the root: %v", err)
+		}
+		if err := os.Chmod(root, 0o770); err != nil {
+			t.Fatalf("widen the planted root: %v", err)
+		}
+		s := newSessionTitleSync(root, t.TempDir())
+		if err := s.ensureStateDir(); err == nil {
+			t.Error("ensureStateDir accepted a pre-existing group-writable level; another user could swap the mapping files under it")
+		}
+	})
+}
+
 // TestSessionTitlePushesKiroTitle is the happy path end to end through the two
 // files the real system produces.
 func TestSessionTitlePushesKiroTitle(t *testing.T) {

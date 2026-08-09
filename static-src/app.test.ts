@@ -1099,9 +1099,12 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // #terminal shipping a pre-JS child -- the watchdog silently never fires in
     // production while every watchdog test above still passes against its own
     // fabricated overlay, so pin the hand-built fixture to the served file here.
-    // The .wt-loading-bar assertion below is NOT a watchdog guard (the watchdog
-    // stands down on data-bootstrap-fatal and .fade only): it pins the bar the
-    // library's page.css animates, and the fixture's fidelity to it.
+    // The role and .wt-loading-bar assertions below are NOT watchdog guards. The
+    // watchdog's stand-down states are the four its own error listener checks --
+    // no #loading at all, data-bootstrap-fatal, .fade, and a non-empty #terminal
+    // -- and neither role nor the bar is among them: they pin the bar the
+    // library's page.css animates, and the fixture's fidelity to the served
+    // markup.
     // The guards below live entirely in the markup, read through the suite's
     // shared served-document policy.
     const doc = parseServedDocument();

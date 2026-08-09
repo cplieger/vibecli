@@ -1289,10 +1289,13 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 		}
 	}
 
-	// The provenance leg (proxiedOrigin): a request that passes BOTH loopback legs
-	// but carries proxy or browser evidence is refused. Without these rows, deleting
-	// `|| proxiedOrigin(r.Header)` from loopbackOnly -- or emptying
-	// proxyProvenanceHeaders -- keeps the entire suite green while a same-loopback
+	// The provenance leg (webhttp.ProxiedRequest): a request that passes BOTH
+	// loopback legs but carries proxy or browser evidence is refused. The deny
+	// lives in the library since the webhttp.LoopbackOnly adoption (the app-local
+	// proxiedOrigin / proxyProvenanceHeaders copies are deleted), so these rows
+	// pin that loopbackOnly still COMPOSES that middleware: rewiring it around
+	// webhttp.LoopbackRequest alone -- the shape it had before the adoption's
+	// library existed -- keeps the rest of the suite green while a same-loopback
 	// proxy that rewrites Host to its upstream address readmits the API that runs
 	// `manual` install strings as root. Refuse-only by design: a header can never
 	// ADMIT, which is why the positive cases above carry none.
@@ -1682,6 +1685,57 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 // context to the manager unchanged. Re-detaching it here (the shape that was
 // correct before the bump) would defeat the library's cancellable wait, silently
 // restoring the unbounded-queue hazard the gate was written for.
+// TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached pins the two non-ok
+// outcomes, neither of which any other test reaches. pinstall's ORDINARY refusal
+// is (false, nil) -- no candidate selected, and recording that verdict succeeded
+// -- which must answer 503 with the manager's own reason. A context error can
+// ONLY be the caller's own abandonment while queued for pinstall's operation slot
+// (Rescan detaches with context.WithoutCancel once admitted, and a probe or
+// assertion that times out surfaces as *exec.ExitError, not as a context error),
+// so it must answer nothing at all: recording it as "no usable version" would be
+// a false broken-install report on the one endpoint an operator uses while the
+// manager is already unready. Without this the branch reads as redundant with the
+// 503 below it, and deleting it keeps the whole suite green while turning a failed
+// repair into a silent 200.
+func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
+	for name, tc := range map[string]struct {
+		rescanErr error
+		wantCode  int
+		wantBody  string
+	}{
+		"a refusal that reached a verdict reports unready": {
+			rescanErr: nil,
+			wantCode:  http.StatusServiceUnavailable,
+			wantBody:  `{"status":"unready","reason":"kiro-cli unavailable"}`,
+		},
+		"an abandoned queued caller reports nothing": {
+			rescanErr: context.Canceled,
+			wantCode:  http.StatusOK,
+			wantBody:  "",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			deps := newTestDeps(true)
+			deps.kiroReady = func() (bool, string) { return false, "kiro-cli unavailable" }
+			deps.kiroRescan = func(context.Context) (bool, error) { return false, tc.rescanErr }
+			mux, _, _ := mustRegisterRoutes(t, deps)
+
+			req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
+			req.RemoteAddr = "127.0.0.1:5555"
+			req.Host = "localhost:9848"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+				t.Errorf("body = %q, want %q", got, tc.wantBody)
+			}
+		})
+	}
+}
+
 func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
 	seen := make(chan context.Context, 1)
 	deps := newTestDeps(true)

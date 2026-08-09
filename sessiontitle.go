@@ -44,6 +44,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -177,19 +178,66 @@ func (s *sessionTitleSync) sessionEnv(tabID string) []string {
 func (s *sessionTitleSync) ensureStateDir() error {
 	// filepath.Dir is titleStateRoot: stateDir is always <root>/titleStateDirName.
 	for _, dir := range []string{filepath.Dir(s.stateDir), s.stateDir} {
-		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		if err := ensureStateLevel(dir); err != nil {
 			return err
 		}
-		fi, err := os.Lstat(dir)
-		if err != nil {
+	}
+	return nil
+}
+
+// ensureStateLevel creates ONE level of the drop directory and verifies it. Split
+// out of ensureStateDir so each level's create-then-verify reads as one unit.
+func ensureStateLevel(dir string) error {
+	created := true
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
 			return err
 		}
-		if !fi.Mode().IsDir() {
-			return fmt.Errorf("%s is not a directory: a symlink or a plain file is planted at that path", dir)
+		created = false
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsDir() {
+		return fmt.Errorf("%s is not a directory: a symlink or a plain file is planted at that path", dir)
+	}
+	// OWNERSHIP, not just mode. A level somebody else owns is one they can rename
+	// or replace AFTER this check returns — including replacing it with a symlink,
+	// which pass()'s os.ReadDir and forget()'s os.Remove then follow — so mode
+	// 0755 owned by another uid passes every other check here and still leaves the
+	// planted-path delete loop reachable. Both levels are checked, not only the
+	// leaf: the owner of the root controls the child's name.
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s ownership could not be verified", dir)
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s is owned by uid %d, want server uid %d: its owner could replace the checked path", dir, stat.Uid, os.Geteuid())
+	}
+	if created && fi.Mode().Perm() != 0o700 {
+		// os.Mkdir's mode is a REQUEST. A filesystem carrying an inheritable
+		// group-write ACL widens what we just created whatever was asked for
+		// (measured on a ZFS nfs4acl dataset: 0770 from a 0o700 mkdir, and a child
+		// of an already-0700 parent is 0770 too, so tightening the parent does not
+		// cover it), and the check below would then refuse this process's OWN
+		// directory with nothing retrying. Chmod is the only call that SETS the
+		// mode. Safe here and only here: os.Mkdir reported that we created this
+		// path, /tmp's sticky bit stops another user removing our root, and the
+		// child's parent is our own 0700 directory, so no other writer has ever
+		// held a name to swap in. A PRE-EXISTING level is never chmod'ed, so the
+		// refusal below still fires on exactly the planted shape the guard is for.
+		// Re-stat rather than trusting chmod's status, the same postcondition
+		// entrypoint.sh's secure_tools_dir asserts.
+		if chmodErr := os.Chmod(dir, 0o700); chmodErr != nil {
+			return chmodErr
 		}
-		if perm := fi.Mode().Perm(); perm&0o022 != 0 {
-			return fmt.Errorf("%s is group/other-writable (%#o): another user could replace the mapping files under it", dir, perm)
+		if fi, err = os.Lstat(dir); err != nil {
+			return err
 		}
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s is group/other-writable (%#o): another user could replace the mapping files under it", dir, perm)
 	}
 	return nil
 }

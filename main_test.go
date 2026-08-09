@@ -2481,18 +2481,37 @@ func TestToolsStatus_watchConvergenceReturnsToUnknownOnAFailedRecount(t *testing
 	t.Parallel()
 	s := newToolsStatus()
 	var fail atomic.Bool
+	// Unbuffered: each FAILING recount blocks inside the fake counter until the
+	// test acknowledges it, and that ordering is what replaces the sleep this
+	// test used to carry. A sleep cannot do this job: under load the watcher may
+	// not process the poke in time, and the assertion then reads the
+	// pre-failure (7, true) state and fails spuriously.
+	entered := make(chan struct{})
 	go s.watchConvergence(t.Context(), func() (int, error) {
 		if fail.Load() {
+			entered <- struct{}{}
 			return 99, errors.New("inventory unavailable")
 		}
 		return 7, nil
 	})
 	waitForMissing(t, s, 7)
 
+	// watchConvergence is ONE sequential goroutine, so observing it enter the
+	// SECOND failing recount proves it already finished the first — including
+	// the unknown store this test is about, which happens after count() returns.
+	awaitFailingRecount := func() {
+		t.Helper()
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the convergence watcher never ran the failing recount, so the unknown branch was never exercised")
+		}
+	}
 	fail.Store(true)
 	s.requestRecount()
-	// Give the watcher room to process the poke and record the failure.
-	time.Sleep(200 * time.Millisecond)
+	awaitFailingRecount()
+	s.requestRecount()
+	awaitFailingRecount()
 	if n, ok := s.missingCount(); ok {
 		t.Errorf("missingCount() = (%d, %v) after a failed recount, want unknown (0, false)", n, ok)
 	}
@@ -2555,6 +2574,26 @@ func TestToolsStatus_observeJobIgnoresUncountedKindsForTheVerdictOnly(t *testing
 	case <-s.poke:
 	default:
 		t.Error("an uncounted but settled job did not request a convergence recount; the published count would assert a convergence the engine has not confirmed")
+	}
+}
+
+// A CANCELLED job is settled: toolbelt cancels RUNNING jobs, so one that already
+// changed the tree must provoke a recount even though cancellation is not a fault
+// and so must not move the verdict field.
+func TestToolsStatus_observeJobRecountsOnCancellation(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.recordBoot(toolsStateOK)
+	drainPoke(s)
+
+	s.observeJob(jobEvent(toolbelt.JobKindInstall, toolbelt.JobCancelled))
+	if got := s.get(); got != toolsStateOK {
+		t.Errorf("tools field = %q after a cancelled job, want %q (cancellation is not a fault)", got, toolsStateOK)
+	}
+	select {
+	case <-s.poke:
+	default:
+		t.Error("a cancelled job did not request a convergence recount; a job cancelled after it changed the tree would leave the published count asserting the pre-job state")
 	}
 }
 

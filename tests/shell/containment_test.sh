@@ -86,12 +86,13 @@ case "$out" in
 esac
 # 2a. mount's message is the only text in this line the script did not author, and
 # the stubs above print nothing, so without this case every sanitization rule is
-# unexercised. Both assertions discriminate (red-checked: each fails with its rule
-# removed). A lone trailing backslash escapes the closing quote, after which a
+# unexercised. All three assertions discriminate (red-checked: each fails with its
+# rule removed). A lone trailing backslash escapes the closing quote, after which a
 # logfmt reader swallows hint= -- the remedy this warn exists to name; a bare CR
-# splits or overwrites the record. An assertion that SYS_ADMIN is merely PRESENT is
-# deliberately not added: the substring survives a malformed field, so it cannot
-# fail for the reason it would claim.
+# splits or overwrites the record; an unescaped double quote closes the error field
+# early and lets mount's own text forge a logfmt key. An assertion that SYS_ADMIN is
+# merely PRESENT is deliberately not added: the substring survives a malformed field,
+# so it cannot fail for the reason it would claim.
 #
 # shellcheck disable=SC1003  # the trailing \\ is a literal backslash for printf to
 # emit, which is the malformed value under test -- not an attempt to escape a quote.
@@ -107,6 +108,15 @@ esac
 case "$out" in
   *$'\r'*) no "a carriage return must not reach the log record" "got: $out" ;;
   *) ok "a carriage return is replaced, not passed through" ;;
+esac
+# Negative on purpose: the property is that mount's quote does not SURVIVE into the
+# record, not that it becomes an apostrophe specifically, so a later change of
+# replacement character does not fail it spuriously. `"denied"` appears nowhere else
+# in the line (neither msg= nor hint= contains the word), so the match cannot be
+# satisfied by unrelated text.
+case "$out" in
+  *'"denied"'*) no "mount's own double quote must not reach the log record" "got: $out" ;;
+  *) ok "a double quote is neutralized, so it cannot close the error field early" ;;
 esac
 unset -f mount
 

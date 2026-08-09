@@ -1336,7 +1336,14 @@ func (s *toolsStatus) observeJob(j *toolbelt.Job) {
 	// coalesced, lock-free Inventory read at boot and per refresh interval, which
 	// is cheaper than a second kind policy to keep in step with this one.
 	switch j.State {
-	case toolbelt.JobDone, toolbelt.JobFailed:
+	case toolbelt.JobDone, toolbelt.JobFailed, toolbelt.JobCancelled:
+		// Cancelled is settled too: toolbelt cancels RUNNING jobs (the loopback
+		// tools API's CancelJob), so a job cancelled after it already changed the
+		// tree would otherwise leave the published count asserting the pre-job
+		// state until the next settled job or catalog refresh. A cancelled job
+		// that never ran changed nothing, and its poke is one coalesced no-op
+		// Inventory read — the same cost this comment already accepts for
+		// catalog-refresh transitions.
 		s.requestRecount()
 	}
 	if !toolsStatusCounts(j.Kind) || !s.booted.Load() {

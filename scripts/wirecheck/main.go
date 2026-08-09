@@ -16,7 +16,6 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -36,57 +35,35 @@ import (
 // the gate or the pin is at fault.
 const usageErrMsg = "ERROR wire-floor-gate-usage: the client wire revisions are unusable — pass -manifest <engine-pkg>/wire-compatibility.json, or -client-rev and -client-min-server as required positive integers (the extraction is broken — fix the gate, do not bump a pin)"
 
-// manifestSchemaVersion is the only wire-compatibility manifest schema this
-// gate knows how to read. The engine's manifest declares its own version
-// first precisely so a consumer refuses an unknown one instead of guessing at
-// a moved field: an unknown schema means THIS program is behind, which is a
-// broken gate (exit 2, do not move a pin), never a wire incompatibility.
-const manifestSchemaVersion = 1
-
-// wireManifest mirrors the engine's published wire-compatibility.json (a
-// package-root file listed in its npm `files` and exported as the
-// ./wire-compatibility.json subpath, so the vendored tarball carries it).
-// Only the fields this gate consumes are declared; incompatibleCloseCode and
-// generatedBy are the engine's own documentation of the pairing it refuses.
-type wireManifest struct {
-	SchemaVersion     int `json:"schemaVersion"`
-	WireCompatibility struct {
-		ProtocolVersion              int `json:"protocolVersion"`
-		MinimumServerProtocolVersion int `json:"minimumServerProtocolVersion"`
-	} `json:"wireCompatibility"`
-}
-
-// readManifest resolves the client half of the pairing from the engine
-// artifact's own manifest. Every failure returns the usage error's exit 2
-// rather than a compatibility verdict: an unreadable, malformed or
-// unknown-schema manifest says the gate cannot see the client's declaration,
-// which is a broken extraction and never a reason to move a pin. Reported with
-// the underlying cause, because "fix the gate" is only actionable when it names
-// what could not be read.
+// readManifest resolves the client half of the pairing from the engine artifact's
+// own manifest, via the engine's exported decoder (terminal.ReadWireManifest).
+//
+// The DECODING is the engine's: it publishes the format, so it owns read, parse,
+// schema check and the unusable-revisions check. This gate used to mirror that
+// schema in a local struct; all three family gates did, and two of them were
+// still scraping the TypeScript source with sed instead. The engine already kept
+// the same mirror in a conformance test, so exporting it moved the copy to the
+// producer's side rather than adding anything.
+//
+// The POLICY stays here, and it is the whole reason this wrapper exists: every
+// failure becomes the usage error's exit 2, never a compatibility verdict. An
+// unreadable, malformed or unknown-schema manifest says the gate cannot see the
+// client's declaration — a broken extraction, never a reason to move a pin.
+// terminal.ErrWireManifestSchema is called out by name because its remedy is the
+// opposite one (bump this gate, do not touch a pin), and a maintainer reading a
+// red build needs to be told which.
 func readManifest(path string, stderr io.Writer) (clientRev, clientMinServer int, ok bool) {
-	fail := func(format string, args ...any) (int, int, bool) {
-		fmt.Fprintf(stderr, "ERROR wire-floor-gate-usage: "+format+"\n", args...)
+	m, err := terminal.ReadWireManifest(path)
+	if err != nil {
+		if errors.Is(err, terminal.ErrWireManifestSchema) {
+			fmt.Fprintf(stderr, "ERROR wire-floor-gate-usage: %s: the manifest format moved ahead of this gate: %v\n", path, err)
+		} else {
+			fmt.Fprintf(stderr, "ERROR wire-floor-gate-usage: cannot read the engine's wire-compatibility manifest at %s: %v\n", path, err)
+		}
 		fmt.Fprintln(stderr, usageErrMsg)
 		return 0, 0, false
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- build-time gate; the path is the build's own argument
-	if err != nil {
-		return fail("cannot read the engine's wire-compatibility manifest: %v", err)
-	}
-	var m wireManifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return fail("cannot parse %s as the engine's wire-compatibility manifest: %v", path, err)
-	}
-	if m.SchemaVersion != manifestSchemaVersion {
-		return fail("%s declares schemaVersion %d, this gate reads %d (the manifest format moved ahead of the gate)",
-			path, m.SchemaVersion, manifestSchemaVersion)
-	}
-	rev, minServer := m.WireCompatibility.ProtocolVersion, m.WireCompatibility.MinimumServerProtocolVersion
-	if rev <= 0 || minServer <= 0 {
-		return fail("%s carries no usable wireCompatibility revisions (protocolVersion %d, minimumServerProtocolVersion %d)",
-			path, rev, minServer)
-	}
-	return rev, minServer, true
+	return m.ProtocolVersion, m.MinimumServerProtocolVersion, true
 }
 
 func main() {

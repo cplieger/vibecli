@@ -663,11 +663,16 @@ func TestReadManifest(t *testing.T) {
 	const good = `{"schemaVersion":1,"generatedBy":"web/src/wire-manifest.ts",` +
 		`"wireCompatibility":{"protocolVersion":4,"minimumServerProtocolVersion":3,"incompatibleCloseCode":4002}}`
 	cases := map[string]struct {
-		content         string // "" = do not create the file at all
-		wantOK          bool
-		wantRev         int
-		wantMinServer   int
-		wantStderrNames string // a fragment naming WHY the manifest is unusable
+		content       string // "" = do not create the file at all
+		wantOK        bool
+		wantRev       int
+		wantMinServer int
+		// A fragment naming WHY the manifest is unusable. The wording now comes
+		// from the engine's decoder (terminal.ReadWireManifest) rather than from
+		// this gate, since the engine owns the format; what this gate still owns —
+		// and what the second assertion below pins — is that every one of these
+		// carries the usage line telling the reader not to bump a pin.
+		wantStderrNames string
 	}{
 		"the engine's published shape": {
 			content: good, wantOK: true, wantRev: 4, wantMinServer: 3,
@@ -677,25 +682,25 @@ func TestReadManifest(t *testing.T) {
 		// behind and no pin should move.
 		"a newer schema is refused rather than guessed at": {
 			content:         `{"schemaVersion":2,"wireCompatibility":{"protocolVersion":9,"minimumServerProtocolVersion":9}}`,
-			wantStderrNames: "schemaVersion 2",
+			wantStderrNames: "manifest declares 2",
 		},
 		"a schemaVersion-less document is refused": {
 			content:         `{"wireCompatibility":{"protocolVersion":4,"minimumServerProtocolVersion":3}}`,
-			wantStderrNames: "schemaVersion 0",
+			wantStderrNames: "manifest declares 0",
 		},
 		// The silent-empty-capture failure the `${VAR:?}` guards existed for: a
 		// renamed or absent field must not read as revision 0 and reach the
 		// engine's comparator.
 		"a manifest with no usable revisions is refused": {
 			content:         `{"schemaVersion":1,"wireCompatibility":{}}`,
-			wantStderrNames: "no usable wireCompatibility revisions",
+			wantStderrNames: "no usable revisions",
 		},
 		"a non-JSON document is refused": {
 			content:         "export const WIRE_PROTOCOL_VERSION = 4;\n",
-			wantStderrNames: "cannot parse",
+			wantStderrNames: "parse wire-compatibility manifest",
 		},
 		"an absent manifest is refused": {
-			wantStderrNames: "cannot read",
+			wantStderrNames: "cannot read the engine's wire-compatibility manifest",
 		},
 	}
 	for name, tc := range cases {

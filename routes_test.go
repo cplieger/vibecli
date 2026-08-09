@@ -899,6 +899,17 @@ func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
 		// handleHealth's healthResponse to the pre-fix early-return shape leaves the
 		// whole suite green.
 		{"unready carries the informational tools state", unreadyDepsWithTools(), http.StatusServiceUnavailable, `{"status":"unready","reason":"starting up or shutting down","tools":"syncing"}`},
+		// The whole-tree convergence count is the SECOND tools question, and the
+		// disagreement is the point: the last repair succeeded (tools "ok") while
+		// one enabled tool is still missing. Before this field existed, "ok" was
+		// the only signal and read as whole-tree health.
+		{"a partial repair reports ok alongside an outstanding count", depsWithToolsMissing(true, 1), http.StatusOK, `{"status":"ok","tools":"ok","tools_missing":1}`},
+		// Zero MUST be emitted rather than dropped: it is the converged answer,
+		// and omitempty on a plain int would erase exactly the good news.
+		{"a converged tree reports zero rather than omitting it", depsWithToolsMissing(true, 0), http.StatusOK, `{"status":"ok","tools":"ok","tools_missing":0}`},
+		// Unknown is absent, so "not counted yet" can never be misread as
+		// converged.
+		{"an uncounted tree omits the field", depsWithToolsMissing(false, 0), http.StatusOK, `{"status":"ok","tools":"ok"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mux, _, _ := mustRegisterRoutes(t, tc.deps)
@@ -1014,6 +1025,15 @@ func staticCmd(argv ...string) func() []string {
 func unreadyDepsWithTools() *routeDeps {
 	d := newTestDeps(false)
 	d.toolsState = func() string { return "syncing" }
+	return d
+}
+
+// depsWithToolsMissing builds a ready runtime whose last job succeeded, with the
+// whole-tree convergence count either known (ok) or not yet taken.
+func depsWithToolsMissing(known bool, n int) *routeDeps {
+	d := newTestDeps(true)
+	d.toolsState = func() string { return "ok" }
+	d.toolsMissing = func() (int, bool) { return n, known }
 	return d
 }
 

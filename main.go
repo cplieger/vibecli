@@ -580,6 +580,7 @@ func run() error {
 		tools:           tools.engine,
 		toolsSyncing:    tools.syncing,
 		toolsState:      tools.state,
+		toolsMissing:    tools.missing,
 		containment:     startContainment(),
 	})
 
@@ -1028,6 +1029,18 @@ type toolsRuntime struct {
 	// syncing | ok | degraded. LIVE, not boot-only: after the boot
 	// verdict it tracks the tools engine's counted jobs (see toolsStatus).
 	state func() string
+	// missing is the WHOLE-TREE convergence signal, and it is deliberately a
+	// second question from state: state answers "did the last job succeed, or
+	// are we still booting", which is what keeps monitoring from flapping
+	// through a long first-boot install, while this answers "is the tree
+	// actually converged" — how many enabled manifest entries are still not
+	// installed. Reporting one of them as the other is what made state=ok
+	// readable as whole-tree health after a partial repair.
+	//
+	// ok is false until the first recount lands (and for an engine-less
+	// runtime), so a consumer can tell "nothing outstanding" from "not known
+	// yet" instead of reading a premature zero as convergence.
+	missing func() (n int, ok bool)
 }
 
 // The three documented values of /api/health's informational tools field. Each is
@@ -1105,6 +1118,16 @@ type toolsStatus struct {
 	// not block: the health handler and the session-create gate read it on
 	// request goroutines.
 	state atomic.Value // string: syncing | ok | degraded
+	// poke asks the convergence watcher for a recount. Buffered depth 1 and
+	// written with a NON-BLOCKING send, because every writer is either
+	// OnJobChanged (which runs under toolbelt's queue lock and must never
+	// block) or the boot finisher. Coalescing is the intent: several job
+	// transitions in a burst need one recount, not one each.
+	poke chan struct{}
+	// missing is the whole-tree convergence count: enabled manifest entries not
+	// installed. Negative means "not counted yet", which is a THIRD state a
+	// plain count cannot carry — a premature 0 would read as convergence.
+	missing atomic.Int64
 	// booted reports whether the boot verdict has been recorded, i.e.
 	// whether the live half of the reducer is armed. Set last by recordBoot
 	// so a job transition can never overtake the verdict.
@@ -1113,8 +1136,9 @@ type toolsStatus struct {
 
 // newToolsStatus returns a reducer parked in the pre-verdict boot state.
 func newToolsStatus() *toolsStatus {
-	s := &toolsStatus{}
+	s := &toolsStatus{poke: make(chan struct{}, 1)}
 	s.state.Store(toolsStateSyncing)
+	s.missing.Store(-1) // not counted yet, which is not the same as "none"
 	return s
 }
 
@@ -1122,6 +1146,91 @@ func newToolsStatus() *toolsStatus {
 func (s *toolsStatus) get() string {
 	v, _ := s.state.Load().(string)
 	return v
+}
+
+// missingCount reports the whole-tree convergence count, and whether one has
+// been taken at all.
+func (s *toolsStatus) missingCount() (int, bool) {
+	n := s.missing.Load()
+	if n < 0 {
+		return 0, false
+	}
+	return int(n), true
+}
+
+// requestRecount asks the watcher for a fresh convergence count without ever
+// blocking the caller.
+//
+// Non-blocking is not an optimisation, it is the whole reason this indirection
+// exists: the natural place to recount is OnJobChanged, but that fires under
+// toolbelt's job-queue lock and Engine.Inventory() takes the same lock through
+// InstallingSet(), so counting there deadlocks the engine. The callback pokes;
+// a goroutine that holds no lock does the counting.
+func (s *toolsStatus) requestRecount() {
+	select {
+	case s.poke <- struct{}{}:
+	default: // a recount is already pending, and it will see the newer state
+	}
+}
+
+// watchConvergence owns every convergence recount for the process, which is
+// what makes them serialized: one goroutine, so two counts can never interleave
+// and store each other's answer out of order.
+//
+// count is the engine-backed counter; it returns the number of enabled manifest
+// entries that are not installed. A failed count leaves the previous answer in
+// place rather than publishing a wrong one — the field says "not known yet"
+// only until the first success, and after that a stale count beats a fabricated
+// one.
+func (s *toolsStatus) watchConvergence(ctx context.Context, count func() (int, error)) {
+	recount := func() {
+		n, err := count()
+		if err != nil {
+			slog.Debug("tools: convergence recount failed", "error", err)
+			return
+		}
+		s.missing.Store(int64(n))
+	}
+	recount() // answer the question before the first job transition arrives
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.poke:
+			recount()
+		}
+	}
+}
+
+// countMissingTools reports how many ENABLED manifest entries are not installed.
+func countMissingTools(eng *toolbelt.Engine) func() (int, error) {
+	return func() (int, error) {
+		inv, err := eng.Inventory()
+		if err != nil {
+			return 0, err
+		}
+		return countMissingFromInventory(inv.Tools), nil
+	}
+}
+
+// countMissingFromInventory is the counting RULE, split from the engine call so
+// the policy below is testable without standing up a toolbelt tree.
+//
+// Disabled entries are excluded because in toolbelt v2 a disabled entry is a
+// TEMPLATE — recorded intent that is deliberately not installed — so counting
+// one as outstanding would make a freshly seeded volume report five missing
+// tools forever. An entry still installing DOES count: it is not on PATH yet,
+// which is what this number is about.
+func countMissingFromInventory(tools []toolbelt.ToolInfo) int {
+	n := 0
+	// Indexed rather than a value range: ToolInfo is 160 bytes, so copying one
+	// per entry is pure waste on a tree that can hold hundreds.
+	for i := range tools {
+		if !tools[i].Disabled && !tools[i].Installed {
+			n++
+		}
+	}
+	return n
 }
 
 // recordBoot stores the boot convergence pass's verdict and arms the live
@@ -1133,13 +1242,28 @@ func (s *toolsStatus) get() string {
 func (s *toolsStatus) recordBoot(v string) {
 	s.state.Store(v)
 	s.booted.Store(true)
+	// The boot pass is the largest single change to the tree, so recount as soon
+	// as its verdict is in rather than waiting for the next job transition.
+	s.requestRecount()
 }
 
 // observeJob is the Config.OnJobChanged reducer: it folds one job state
 // transition into the field. Fires from toolbelt's job worker under the queue
-// lock, so it does exactly one atomic store and never blocks.
+// lock, so it does exactly one atomic store, one non-blocking poke, and never
+// blocks.
 func (s *toolsStatus) observeJob(j *toolbelt.Job) {
-	if !s.booted.Load() || !toolsStatusCounts(j.Kind) {
+	if !toolsStatusCounts(j.Kind) {
+		return
+	}
+	// The convergence count is asked for on every settled counted job, INCLUDING
+	// before the boot verdict: it is a fact about the tree rather than a verdict
+	// about this process's boot, so there is nothing to arm and nothing a job
+	// transition could overtake.
+	switch j.State {
+	case toolbelt.JobDone, toolbelt.JobFailed:
+		s.requestRecount()
+	}
+	if !s.booted.Load() {
 		return
 	}
 	switch j.State {
@@ -1205,6 +1329,10 @@ func degradedRuntime() toolsRuntime {
 	return toolsRuntime{
 		syncing: func() bool { return false },
 		state:   func() string { return toolsStateDegraded },
+		// No engine, so there is no tree to count and nothing to report. Not
+		// zero: zero would claim convergence for a subsystem that failed to
+		// start.
+		missing: func() (int, bool) { return 0, false },
 	}
 }
 
@@ -1425,10 +1553,17 @@ func startTools(cfg baseTools) toolsRuntime {
 	if _, rerr := eng.RefreshCatalog(); rerr != nil {
 		slog.Warn("tools: boot catalog refresh not enqueued", "error", rerr)
 	}
+	// The convergence watcher is started here rather than beside the reducer, so
+	// it exists only for a runtime that actually has an engine to count. It runs
+	// for the process's lifetime: there is no shutdown ceremony because the
+	// engine outlives every request and Close() cancels its own work.
+	go status.watchConvergence(context.Background(), countMissingTools(eng))
+
 	return toolsRuntime{
 		engine:  eng,
 		syncing: func() bool { return status.get() == toolsStateSyncing },
 		state:   status.get,
+		missing: status.missingCount,
 	}
 }
 

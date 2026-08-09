@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -2362,4 +2363,217 @@ func TestWarnIfToolsBinUnreachable(t *testing.T) {
 			t.Errorf("log = %q carries no attr naming the unreachable bin dir %q; the nudge asks the reader to add a directory to PATH, so it must say which", records.Messages(), want)
 		}
 	})
+}
+
+// The whole-tree convergence signal is a SECOND question from the tools field,
+// and these tests pin the distinction that motivated adding it: the field
+// answers "did the last job succeed", the count answers "is the tree
+// converged", and a partial repair makes them disagree on purpose.
+
+func TestCountMissingFromInventory(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		tools []toolbelt.ToolInfo
+		want  int
+	}{
+		"no entries": {want: 0},
+		"all installed": {
+			tools: []toolbelt.ToolInfo{{Name: "gh", Installed: true}, {Name: "jq", Installed: true}},
+			want:  0,
+		},
+		"one enabled entry missing": {
+			tools: []toolbelt.ToolInfo{{Name: "gh", Installed: true}, {Name: "jq"}},
+			want:  1,
+		},
+		// A disabled entry is a TEMPLATE: recorded intent that is deliberately
+		// not installed. Counting one would make a freshly seeded volume report
+		// its five seeded templates as missing forever.
+		"disabled entries are not outstanding": {
+			tools: []toolbelt.ToolInfo{{Name: "gopls", Disabled: true}, {Name: "pyright", Disabled: true}},
+			want:  0,
+		},
+		"disabled and installed is still not outstanding": {
+			tools: []toolbelt.ToolInfo{{Name: "gopls", Disabled: true, Installed: true}},
+			want:  0,
+		},
+		// Not on PATH yet is exactly what the number is about, so an in-flight
+		// install counts rather than being excused.
+		"an installing entry still counts": {
+			tools: []toolbelt.ToolInfo{{Name: "jq", Installing: true}},
+			want:  1,
+		},
+		"mixed tree": {
+			tools: []toolbelt.ToolInfo{
+				{Name: "gh", Installed: true},
+				{Name: "jq"},
+				{Name: "rust-analyzer", Disabled: true},
+				{Name: "pyright", Installing: true},
+			},
+			want: 2,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := countMissingFromInventory(tc.tools); got != tc.want {
+				t.Errorf("countMissingFromInventory() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// "Not counted yet" is a third state a bare integer cannot carry, and conflating
+// it with zero would publish convergence for a tree nobody has looked at.
+func TestToolsStatus_missingCountIsUnknownBeforeTheFirstRecount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	if n, ok := s.missingCount(); ok {
+		t.Errorf("missingCount() = (%d, true) before any recount, want ok=false", n)
+	}
+	s.missing.Store(0)
+	if n, ok := s.missingCount(); !ok || n != 0 {
+		t.Errorf("missingCount() = (%d, %v) after a zero recount, want (0, true)", n, ok)
+	}
+}
+
+func TestToolsStatus_watchConvergenceRecountsOnPoke(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	counts := make(chan int, 8)
+	next := 3
+	go s.watchConvergence(t.Context(), func() (int, error) {
+		n := next
+		next--
+		counts <- n
+		return n, nil
+	})
+
+	// The watcher counts once at startup, without being asked: the question has
+	// an answer before the first job transition arrives.
+	select {
+	case <-counts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchConvergence never took an initial count")
+	}
+	waitForMissing(t, s, 3)
+
+	s.requestRecount()
+	waitForMissing(t, s, 2)
+}
+
+// A failed count must leave the previous answer standing rather than publish a
+// fabricated one; the field says "unknown" only until the first success.
+func TestToolsStatus_watchConvergenceKeepsTheLastGoodCount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	var fail atomic.Bool
+	go s.watchConvergence(t.Context(), func() (int, error) {
+		if fail.Load() {
+			return 99, errors.New("inventory unavailable")
+		}
+		return 7, nil
+	})
+	waitForMissing(t, s, 7)
+
+	fail.Store(true)
+	s.requestRecount()
+	// Give the watcher room to process the poke and discard it.
+	time.Sleep(200 * time.Millisecond)
+	if n, ok := s.missingCount(); !ok || n != 7 {
+		t.Errorf("missingCount() = (%d, %v) after a failed recount, want the last good (7, true)", n, ok)
+	}
+}
+
+// requestRecount is called from OnJobChanged, which runs under toolbelt's job
+// queue lock. If it could ever block, the engine would deadlock — Inventory()
+// takes that same lock through InstallingSet(), which is why the counting lives
+// in a goroutine at all.
+func TestToolsStatus_requestRecountNeverBlocks(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus() // no watcher: nothing is draining the channel
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 100 {
+			s.requestRecount()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("requestRecount blocked with no watcher draining; under the queue lock this deadlocks the engine")
+	}
+}
+
+// The count is a fact about the tree, not a verdict about this boot, so it is
+// requested even before the boot verdict is recorded — unlike the tools field,
+// whose live half stays disarmed until then.
+func TestToolsStatus_observeJobRequestsARecountBeforeBootWithoutChangingTheField(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.observeJob(jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone))
+
+	if got := s.get(); got != toolsStateSyncing {
+		t.Errorf("tools field = %q after a pre-verdict job, want %q (the live half must stay disarmed)", got, toolsStateSyncing)
+	}
+	select {
+	case <-s.poke:
+	default:
+		t.Error("no recount was requested for a settled pre-verdict job; the count would stay unknown until the next transition")
+	}
+}
+
+// An excluded job kind must not even provoke a recount: the kind policy is one
+// decision, applied to both halves.
+func TestToolsStatus_observeJobIgnoresUncountedKindsEntirely(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.recordBoot(toolsStateOK)
+	drainPoke(s)
+
+	s.observeJob(jobEvent(toolbelt.JobKindCatalogRefresh, toolbelt.JobFailed))
+	if got := s.get(); got != toolsStateOK {
+		t.Errorf("tools field = %q after an uncounted job, want %q", got, toolsStateOK)
+	}
+	select {
+	case <-s.poke:
+		t.Error("an uncounted job kind requested a convergence recount")
+	default:
+	}
+}
+
+// recordBoot recounts because the boot pass is the largest single change to the
+// tree; waiting for the next job transition would leave the count unknown on
+// every healthy boot, which is most of them.
+func TestToolsStatus_recordBootRequestsARecount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	drainPoke(s)
+	s.recordBoot(toolsStateOK)
+	select {
+	case <-s.poke:
+	default:
+		t.Error("recordBoot did not request a convergence recount")
+	}
+}
+
+func waitForMissing(t *testing.T, s *toolsStatus, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := s.missingCount(); ok && n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			n, ok := s.missingCount()
+			t.Fatalf("missingCount() = (%d, %v), want (%d, true)", n, ok, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func drainPoke(s *toolsStatus) {
+	select {
+	case <-s.poke:
+	default:
+	}
 }

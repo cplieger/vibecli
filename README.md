@@ -190,6 +190,19 @@ that failure changes nothing about your installed tools) and a failed
 `PATH`). kiro-cli's own readiness is a separate field — see the `status` and
 `reason` keys.
 
+**`tools_missing` is the second, independent tools question.** `tools` tells you
+whether the last install or reconcile succeeded (and whether the boot pass is
+still running); `tools_missing` tells you whether the tree is actually
+_converged_ — how many enabled entries are still not installed. They disagree on
+purpose: if a boot reconcile leaves two tools missing and you repair one through
+the loopback API, `tools` becomes `"ok"` (that repair genuinely did succeed)
+while `tools_missing` stays `1`. Read `tools` for "did the last thing I asked for
+work", and `tools_missing` for "is everything the manifest asks for present".
+Disabled entries are templates and never counted; an entry still installing does
+count, because it is not on `PATH` yet. The key is **absent** when the count is
+not known — no tools engine wired, or the first count has not landed — so a `0`
+always means converged and never "nobody has looked".
+
 **Add more tools by name.** Any catalog name works as a bare entry; the engine
 fills in the rest:
 

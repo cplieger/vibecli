@@ -75,10 +75,13 @@ type routeDeps struct {
 	// /api/tools behind the loopback gate; toolsSyncing gates session
 	// creation on the boot convergence pass; toolsState feeds the
 	// /api/health informational tools field ("" outside the container, which
-	// the omitempty tag drops).
+	// the omitempty tag drops); toolsMissing feeds the separate whole-tree
+	// convergence count beside it, and its second return distinguishes "none
+	// outstanding" from "not counted yet" (see healthBody).
 	tools        *toolbelt.Engine
 	toolsSyncing func() bool
 	toolsState   func() string
+	toolsMissing func() (int, bool)
 	// containment, when non-nil, puts each tab's kiro-cli process tree in its own
 	// cgroup so ending the session ends the tree, and reports the session's peak
 	// memory in the logs. Nil is the off-shape and the only shape outside the
@@ -460,10 +463,35 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 //
 // Tools is omitempty because it is INFORMATIONAL and absent when no tools engine
 // is wired (a bare `go run`), where an empty string would read as a state.
+//
+// ToolsMissing is the SECOND, independent tools question, and the pair is the
+// point: Tools answers "did the last install or reconcile succeed, or are we
+// still booting" — which is what keeps a long first-boot install from flapping
+// monitoring — while ToolsMissing answers "is the tree actually converged". They
+// disagree legitimately: repairing one of two missing tools through the loopback
+// tools API makes Tools "ok" (the repair DID succeed, exactly as README
+// documents) while ToolsMissing stays 1. Before this field existed that
+// disagreement had nowhere to live, so "ok" was readable as whole-tree health.
+//
+// A POINTER so the field is absent rather than 0 when the count is unknown — no
+// engine wired, or the first recount has not landed. Zero means converged, and
+// it must not be possible to read "not known yet" as that.
+//
+// FIELD ORDER IS THE WIRE CONTRACT, which is why fieldalignment is silenced here
+// rather than obeyed. encoding/json emits fields in DECLARATION order, so the
+// alignment-optimal layout (the pointer first) emits
+// {"tools_missing":…,"status":…} and breaks the key order this app shares with
+// web-terminal-server and subflux — the very divergence this struct exists to
+// remove. Attempted, and TestHealthEndpoint_envelopeMatchesTheLibrary caught it
+// byte-exactly. The trade is 8 bytes of padding on a value built once per health
+// request against a published envelope; the padding loses.
+//
+//nolint:govet // fieldalignment: declaration order is the JSON key order (above)
 type healthBody struct {
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
-	Tools  string `json:"tools,omitempty"`
+	Status       string `json:"status"`
+	Reason       string `json:"reason,omitempty"`
+	Tools        string `json:"tools,omitempty"`
+	ToolsMissing *int   `json:"tools_missing,omitempty"`
 }
 
 // handleHealth returns the /api/health readiness handler. It reflects, in
@@ -480,6 +508,11 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	healthResponse := func(status, reason string) healthBody {
 		body := healthBody{Status: status, Reason: reason}
 		body.Tools = deps.toolsState()
+		if deps.toolsMissing != nil {
+			if n, ok := deps.toolsMissing(); ok {
+				body.ToolsMissing = &n
+			}
+		}
 		return body
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {

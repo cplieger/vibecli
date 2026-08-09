@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -2575,5 +2576,110 @@ func drainPoke(s *toolsStatus) {
 	select {
 	case <-s.poke:
 	default:
+	}
+}
+
+// The stage field is the discriminator that replaced five named ERROR messages.
+// Consolidating them into one exit-site line removed the only thing a log query
+// or alert rule could key on, and three of the five names do not even survive as
+// substrings of the wrapped error. These tests pin the replacement: a stable
+// VALUE per startup stage, always present.
+
+func TestStageOf(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"nil error":                  {err: nil, want: stageUnknown},
+		"unattributed error":         {err: errors.New("boom"), want: stageUnknown},
+		"attributed":                 {err: atStage(stageListen, errors.New("boom")), want: stageListen},
+		"attributed then re-wrapped": {err: fmt.Errorf("outer: %w", atStage(stageServe, errors.New("boom"))), want: stageServe},
+		// The outermost attribution wins, which is what lets a caller re-attribute
+		// a failure it has reinterpreted.
+		"doubly attributed": {err: atStage(stageStatic, atStage(stageListen, errors.New("boom"))), want: stageStatic},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := stageOf(tc.err); got != tc.want {
+				t.Errorf("stageOf() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Attribution must not change what the operator reads: the wrapped text IS the
+// hint, and a stage wrapper that prefixed or reworded it would defeat the
+// consolidation it exists to make queryable.
+func TestAtStagePreservesTheMessageAndTheChain(t *testing.T) {
+	t.Parallel()
+	inner := errors.New("mount target is a file")
+	wrapped := fmt.Errorf("work directory /workspace is not a directory: %w", inner)
+	got := atStage(stageWorkDir, wrapped)
+
+	if got.Error() != wrapped.Error() {
+		t.Errorf("Error() = %q, want the wrapped text unchanged %q", got.Error(), wrapped.Error())
+	}
+	if !errors.Is(got, inner) {
+		t.Error("attribution broke the error chain; errors.Is no longer reaches the cause")
+	}
+}
+
+// A nil error must stay nil, so a call site can attribute unconditionally without
+// manufacturing a failure.
+func TestAtStageNilStaysNil(t *testing.T) {
+	t.Parallel()
+	if got := atStage(stageListen, nil); got != nil {
+		t.Errorf("atStage(_, nil) = %v, want nil", got)
+	}
+}
+
+// Every startup failure path must be attributed, or the field it exists for
+// reports unknown exactly when an operator needs it. checkWorkDir is the one
+// path a test can drive end to end without binding a port or embedding a broken
+// static tree.
+func TestCheckWorkDirAttributesItsStage(t *testing.T) {
+	t.Parallel()
+	t.Run("missing directory", func(t *testing.T) {
+		t.Parallel()
+		err := checkWorkDir(filepath.Join(t.TempDir(), "absent"))
+		if err == nil {
+			t.Fatal("checkWorkDir accepted an absent directory")
+		}
+		if got := stageOf(err); got != stageWorkDir {
+			t.Errorf("stage = %q, want %q", got, stageWorkDir)
+		}
+	})
+	t.Run("path is a file", func(t *testing.T) {
+		t.Parallel()
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if werr := os.WriteFile(file, []byte("x"), 0o600); werr != nil {
+			t.Fatalf("write fixture: %v", werr)
+		}
+		err := checkWorkDir(file)
+		if err == nil {
+			t.Fatal("checkWorkDir accepted a plain file")
+		}
+		if got := stageOf(err); got != stageWorkDir {
+			t.Errorf("stage = %q, want %q", got, stageWorkDir)
+		}
+	})
+}
+
+// The stage values are the log surface, so they are pinned as literals here:
+// renaming one is a breaking change to an operator's query and must fail a test
+// rather than pass silently.
+func TestStageValuesAreStable(t *testing.T) {
+	t.Parallel()
+	for got, want := range map[string]string{
+		stageWorkDir: "work_dir",
+		stageStatic:  "static",
+		stageListen:  "listen",
+		stageServe:   "serve",
+		stageUnknown: "unknown",
+	} {
+		if got != want {
+			t.Errorf("stage value = %q, want %q (an operator's log query keys on this literal)", got, want)
+		}
 	}
 }

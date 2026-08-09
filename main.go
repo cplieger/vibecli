@@ -372,9 +372,62 @@ func main() {
 		// Rendered once, here: the failure branches in run carry their operator
 		// hint inside the returned error rather than logging it themselves, so a
 		// startup failure produces exactly one ERROR line.
-		slog.Error("web-terminal-kiro exited with error", "error", err)
+		//
+		// stage is what a log query keys on. Consolidating five named ERROR
+		// messages into this one line removed the only discriminator an alert
+		// rule had, and three of those five names do not even survive as
+		// substrings of the wrapped error (an interpolated path interrupts two of
+		// them, and "listen failed" became "listen on <addr>"). A stable VALUE is
+		// strictly better than the prose names it replaces: prose is rewritten by
+		// any edit to the message, a stage token is not.
+		slog.Error("web-terminal-kiro exited with error", "stage", stageOf(err), "error", err)
 		os.Exit(1)
 	}
+}
+
+// The startup stages a failure can be attributed to. Values, not messages: these
+// are the strings an operator's log query or alert rule matches, so they are
+// enumerated here and changing one is a breaking change to the log surface.
+const (
+	stageWorkDir = "work_dir" // the /workspace mount is absent or not a directory
+	stageStatic  = "static"   // the embedded static tree is unusable
+	stageListen  = "listen"   // the listener could not bind
+	stageServe   = "serve"    // the HTTP server exited with an error
+	// stageUnknown is emitted for a failure nobody attributed, so the field is
+	// ALWAYS present. An absent field would make a query have to distinguish
+	// "no stage" from "no match", and a new failure path that forgets to attribute
+	// itself then shows up as an explicit unknown rather than as silence.
+	stageUnknown = "unknown"
+)
+
+// stageError attributes a startup failure to a stage without changing what the
+// error says. It carries no message of its own precisely so the wrapped text
+// stays the operator's hint, unchanged.
+type stageError struct {
+	err   error
+	stage string
+}
+
+func (e *stageError) Error() string { return e.err.Error() }
+
+func (e *stageError) Unwrap() error { return e.err }
+
+// atStage attributes err to a stage. A nil error stays nil so call sites can wrap
+// unconditionally.
+func atStage(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stageError{stage: stage, err: err}
+}
+
+// stageOf reports the stage a failure was attributed to, or stageUnknown.
+func stageOf(err error) string {
+	var se *stageError
+	if errors.As(err, &se) {
+		return se.stage
+	}
+	return stageUnknown
 }
 
 // setupLogging installs the slog handler this app's whole observability story
@@ -401,9 +454,9 @@ func checkWorkDir(workDir string) error {
 	fi, err := os.Stat(workDir)
 	switch {
 	case err != nil:
-		return fmt.Errorf("work directory %s is missing (bind-mount a host directory to /workspace in compose.yaml): %w", workDir, err)
+		return atStage(stageWorkDir, fmt.Errorf("work directory %s is missing (bind-mount a host directory to /workspace in compose.yaml): %w", workDir, err))
 	case !fi.IsDir():
-		return fmt.Errorf("work directory %s is not a directory: the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml", workDir)
+		return atStage(stageWorkDir, fmt.Errorf("work directory %s is not a directory: the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml", workDir))
 	}
 	return nil
 }
@@ -552,9 +605,9 @@ func run() error {
 	// that consumes both.
 	staticSrv, cspPolicy, err := buildStaticSurface(staticFS)
 	if err != nil {
-		return fmt.Errorf("the embedded static tree is unusable: %w"+
+		return atStage(stageStatic, fmt.Errorf("the embedded static tree is unusable: %w"+
 			" (this is a build defect, not a runtime setting: the embedded static/index.html must carry at least one inline <script> and exactly one inline <style> block;"+
-			" rebuild the image — go generate ./... plus the Dockerfile static build. The container will crash-loop under its restart policy until it is rebuilt.)", err)
+			" rebuild the image — go generate ./... plus the Dockerfile static build. The container will crash-loop under its restart policy until it is rebuilt.)", err))
 	}
 
 	// Collect the exit statuses of orphans re-parented onto this process. In the
@@ -592,7 +645,7 @@ func run() error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+		return atStage(stageListen, fmt.Errorf("listen on %s: %w", addr, err))
 	}
 
 	baseCtx, cancelBase := context.WithCancel(context.Background())
@@ -654,7 +707,7 @@ func run() error {
 		// do the same or a teardown would emit a false broken-install alert).
 		ready.Set(false)
 		mgr.Shutdown()
-		return fmt.Errorf("http server exited: %w", err)
+		return atStage(stageServe, fmt.Errorf("http server exited: %w", err))
 	}
 	return nil
 }

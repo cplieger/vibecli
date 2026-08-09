@@ -30,6 +30,8 @@ Neither of those covers DNS rebinding: a malicious page in your own browser can 
 
 The server logs a warning at startup when it binds a non-loopback address, and another when `KWEB_ALLOWED_HOSTS` is unset.
 
+A startup failure produces exactly one `ERROR` line, `web-terminal-kiro exited with error`, carrying the remedy in its `error` field and a `stage` field naming which step failed: `work_dir` (the `/workspace` mount is absent or is not a directory), `static` (the embedded UI is unusable — a build defect), `listen` (the port could not be bound), `serve` (the HTTP server exited), or `unknown`. Key log queries and alert rules on `stage`, not on the message text: the stage values are a stable contract, the prose is not.
+
 ## Run
 
 ```yaml

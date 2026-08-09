@@ -202,6 +202,19 @@ func writeToolsManifest(t *testing.T, configDir, manifest string) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatalf("create tools root: %v", err)
 	}
+	// MkdirAll's mode is a REQUEST, not a setting: it is masked by the umask
+	// and, on a filesystem carrying an inheritable group-write ACL, the
+	// directory is born group-writable whatever was asked for (measured on a
+	// ZFS nfs4acl dataset: 0770 from a 0o700 MkdirAll -- the same condition
+	// this app's own docs record for pinstall's install root, where
+	// "os.MkdirAll with dirMode = 0o755 cannot beat a ZFS inheritable ACL").
+	// toolbelt's VerifyRootIntegrity then refuses to construct the engine over
+	// a group-writable managed root, so every test below reaches the
+	// root-integrity refusal instead of the shape it means to exercise. Chmod
+	// is the only call that SETS the mode.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("make the tools root private: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(root, "tools.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
@@ -2461,9 +2474,10 @@ func TestToolsStatus_watchConvergenceRecountsOnPoke(t *testing.T) {
 	waitForMissing(t, s, 2)
 }
 
-// A failed count must leave the previous answer standing rather than publish a
-// fabricated one; the field says "unknown" only until the first success.
-func TestToolsStatus_watchConvergenceKeepsTheLastGoodCount(t *testing.T) {
+// A failed count must return the field to UNKNOWN rather than freeze the last
+// answer: tools_missing is absent when the count is not known, so a stale number
+// would assert a convergence the engine can no longer confirm.
+func TestToolsStatus_watchConvergenceReturnsToUnknownOnAFailedRecount(t *testing.T) {
 	t.Parallel()
 	s := newToolsStatus()
 	var fail atomic.Bool
@@ -2477,10 +2491,10 @@ func TestToolsStatus_watchConvergenceKeepsTheLastGoodCount(t *testing.T) {
 
 	fail.Store(true)
 	s.requestRecount()
-	// Give the watcher room to process the poke and discard it.
+	// Give the watcher room to process the poke and record the failure.
 	time.Sleep(200 * time.Millisecond)
-	if n, ok := s.missingCount(); !ok || n != 7 {
-		t.Errorf("missingCount() = (%d, %v) after a failed recount, want the last good (7, true)", n, ok)
+	if n, ok := s.missingCount(); ok {
+		t.Errorf("missingCount() = (%d, %v) after a failed recount, want unknown (0, false)", n, ok)
 	}
 }
 
@@ -2523,9 +2537,11 @@ func TestToolsStatus_observeJobRequestsARecountBeforeBootWithoutChangingTheField
 	}
 }
 
-// An excluded job kind must not even provoke a recount: the kind policy is one
-// decision, applied to both halves.
-func TestToolsStatus_observeJobIgnoresUncountedKindsEntirely(t *testing.T) {
+// An excluded job kind must not move the tools FIELD — the kind policy is the
+// state verdict's alone. It must still provoke a recount: the count is a fact
+// about the tree, and a disable, an uninstall or a half-finished update all
+// change which enabled entries are installed without meaning the boot failed.
+func TestToolsStatus_observeJobIgnoresUncountedKindsForTheVerdictOnly(t *testing.T) {
 	t.Parallel()
 	s := newToolsStatus()
 	s.recordBoot(toolsStateOK)
@@ -2537,8 +2553,8 @@ func TestToolsStatus_observeJobIgnoresUncountedKindsEntirely(t *testing.T) {
 	}
 	select {
 	case <-s.poke:
-		t.Error("an uncounted job kind requested a convergence recount")
 	default:
+		t.Error("an uncounted but settled job did not request a convergence recount; the published count would assert a convergence the engine has not confirmed")
 	}
 }
 

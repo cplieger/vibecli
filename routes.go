@@ -280,6 +280,21 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
 			return
 		}
+		// A context error can ONLY come from pinstall's cancellable WAIT for its
+		// operation slot: an admitted rescan runs detached (Rescan calls
+		// context.WithoutCancel once it holds the slot), so it can never surface
+		// the caller's own cancellation. So this is the abandoned-while-queued
+		// case -- nothing entered the library on this caller's behalf and no
+		// verdict was reached. Reporting it as "no usable version" would be a
+		// false broken-install record on the one endpoint an operator uses while
+		// the manager is ALREADY unready (EnsureWithRetry holds the same slot for
+		// a whole first-boot download), the same false-alert class the session
+		// fast-death hook gates away on every deploy.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Debug("kiro-cli rescan abandoned while queued behind an in-flight install or rescan",
+				"error", err)
+			return
+		}
 		// The manager has already logged the specific fault (and every path it
 		// took) at Warn or Error, so this reports the verdict rather than the
 		// error text: err can name a filesystem path, and this response is not
@@ -288,7 +303,15 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		if _, why := deps.kiroReady(); why != "" {
 			reason = why
 		}
-		slog.Warn("kiro-cli rescan found no usable version", "reason", reason, "error", err)
+		// pinstall.Rescan's ordinary failure is (false, nil): no candidate was selected
+		// and recording that verdict succeeded. A nil error attribute would put
+		// "error":null on that common path, making it indistinguishable from a rescan
+		// whose own state write failed -- the one case that needs a different remedy.
+		attrs := []any{"reason", reason}
+		if err != nil {
+			attrs = append(attrs, "error", err)
+		}
+		slog.Warn("kiro-cli rescan found no usable version", attrs...)
 		webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
 			kiroRescanBody{Status: "unready", Reason: reason})
 	}
@@ -482,10 +505,8 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	healthResponse := func(status, reason string) healthBody {
 		body := healthBody{Status: status, Reason: reason}
 		body.Tools = deps.toolsState()
-		if deps.toolsMissing != nil {
-			if n, ok := deps.toolsMissing(); ok {
-				body.ToolsMissing = &n
-			}
+		if n, ok := deps.toolsMissing(); ok {
+			body.ToolsMissing = &n
 		}
 		return body
 	}

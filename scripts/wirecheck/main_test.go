@@ -753,3 +753,120 @@ func TestReadManifest_readsTheVendoredEngineArtifact(t *testing.T) {
 			rev, minServer, code, stderr.String())
 	}
 }
+
+// TestGateProcessReadsTheManifestFlagTheDockerfilePasses pins the invocation the
+// image actually performs. TestGateProcessPropagatesExitCodes drives the gate
+// through -client-rev/-client-min-server, and the Dockerfile passes NEITHER: its
+// only invocation is
+// `-manifest static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json`.
+// So main's manifest branch -- reading the file, mapping its two declared
+// revisions onto (clientRev, clientMinServer), and exiting 2 when it cannot be
+// read -- is the shipped path and no test reaches it. TestReadManifest pins
+// readManifest's own returns in process; nothing pins that main wires them the
+// right way round. The compatible case is what makes that load-bearing: the
+// engine's own numbers are asymmetric (rev 4, min client 3), so a swapped
+// assignment turns a green build into a "TS client half is self-inconsistent"
+// exit 1, and the reverse swap could pass a pairing the runtime handshake
+// refuses with close 4002.
+func TestGateProcessReadsTheManifestFlagTheDockerfilePasses(t *testing.T) {
+	writeManifest := func(t *testing.T, rev, minServer int) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "wire-compatibility.json")
+		body := fmt.Sprintf(`{"schemaVersion":1,"generatedBy":"web/src/wire-manifest.ts",`+
+			`"wireCompatibility":{"protocolVersion":%d,"minimumServerProtocolVersion":%d,`+
+			`"incompatibleCloseCode":4002}}`, rev, minServer)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write manifest: %v", err)
+		}
+		return path
+	}
+
+	cases := map[string]struct {
+		// manifest builds the -manifest argument; the last case points at a path
+		// that was never written, the unreadable-extraction shape.
+		manifest func(*testing.T) string
+		wantCode int
+		wantOut  string
+	}{
+		"the vendored artifact's own declared pairing": {
+			manifest: func(t *testing.T) string {
+				return writeManifest(t, terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion)
+			},
+			wantCode: 0,
+			wantOut:  "wirecheck ok:",
+		},
+		"a client artifact whose floor the Go half is below": {
+			manifest: func(t *testing.T) string {
+				return writeManifest(t, terminal.WireProtocolVersion+2, terminal.WireProtocolVersion+2)
+			},
+			wantCode: 1,
+			wantOut:  "ERROR wire-floor-mismatch:",
+		},
+		"a manifest the gate cannot read": {
+			manifest: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "never-written.json")
+			},
+			wantCode: 2,
+			wantOut:  usageErrMsg,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// #nosec G204 -- os.Args[0] is this test binary; no external input.
+			cmd := exec.Command(os.Args[0], "-manifest="+tc.manifest(t))
+			cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if err != nil && !errors.As(err, &exitErr) {
+				t.Fatalf("run gate subprocess: %v (output %q)", err, out)
+			}
+			if got := cmd.ProcessState.ExitCode(); got != tc.wantCode {
+				t.Errorf("gate process exit = %d, want %d (output %q); -manifest is the ONLY form the Dockerfile passes, so this is the verdict the image build reads", got, tc.wantCode, out)
+			}
+			if !strings.Contains(string(out), tc.wantOut) {
+				t.Errorf("gate output = %q, want it to contain %q", out, tc.wantOut)
+			}
+		})
+	}
+}
+
+// TestGateHelpIsNotReportedAsABrokenGate pins the distinction main's
+// ContinueOnError FlagSet exists to make, and which both its own comment and
+// usageErrMsg's declare deliberate: -h is a successful help request (exit 0,
+// and NO broken-gate line), while an unparseable flag VALUE is the
+// broken-extraction shape (exit 2, and the line that says "fix the gate, do
+// not bump a pin"). Reverting to flag.ExitOnError with a flag.Usage override
+// -- the shape a simplification pass reaches for -- keeps every other test in
+// this package green while it either accuses the gate of being broken on a
+// plain -h or drops that remedy line from a red build, which is the one
+// misread the gate's whole design exists to prevent. The exit code alone does
+// not catch it (ExitOnError also exits 0 for ErrHelp), so the presence of the
+// line is the load-bearing assertion.
+func TestGateHelpIsNotReportedAsABrokenGate(t *testing.T) {
+	cases := map[string]struct {
+		arg          string
+		wantCode     int
+		wantUsageErr bool
+	}{
+		"a help request":            {arg: "-h", wantCode: 0, wantUsageErr: false},
+		"an unparseable flag value": {arg: "-client-rev=notanumber", wantCode: 2, wantUsageErr: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// #nosec G204 -- os.Args[0] is this test binary; no external input.
+			cmd := exec.Command(os.Args[0], tc.arg)
+			cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+			out, err := cmd.CombinedOutput()
+			var exitErr *exec.ExitError
+			if err != nil && !errors.As(err, &exitErr) {
+				t.Fatalf("run gate subprocess: %v (output %q)", err, out)
+			}
+			if got := cmd.ProcessState.ExitCode(); got != tc.wantCode {
+				t.Errorf("gate process exit for %q = %d, want %d (output %q)", tc.arg, got, tc.wantCode, out)
+			}
+			if got := strings.Contains(string(out), usageErrMsg); got != tc.wantUsageErr {
+				t.Errorf("gate output for %q contains the broken-gate line = %t, want %t (output %q); -h must not accuse the gate of being broken, and a parse error must say so", tc.arg, got, tc.wantUsageErr, out)
+			}
+		})
+	}
+}

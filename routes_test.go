@@ -972,6 +972,7 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 func withDefaultPolicies(d *routeDeps) *routeDeps {
 	d.toolsSyncing = func() bool { return false }
 	d.toolsState = func() string { return "" }
+	d.toolsMissing = func() (int, bool) { return 0, false }
 	d.kiroReady = func() (bool, string) { return true, "" }
 	d.sessionEnv = func() []string { return nil }
 	return d

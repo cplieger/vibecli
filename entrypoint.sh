@@ -72,6 +72,29 @@ fatal() {
   exit 1
 }
 
+# Make a value this script did not author safe inside a quoted logfmt field. Two
+# untrusted classes reach these log lines and they share one implementation so the rules
+# cannot drift: APT_PACKAGES tokens (env content) and names read off the /config bind
+# mount, which this script's threat model treats as writable by a foreign host user --
+# the same premise secure_tools_dir and the taint flag exist for. So the actor a warning
+# describes chooses the bytes inside the field that reports him: a file named
+# `x" level=info msg="tools tree clean` would otherwise close the field early and append
+# attacker-authored logfmt keys, losing the rest of the real message.
+#
+# Bound the RAW length first (one bad value must not dominate the line, and truncating
+# after the backslash doubling could split a `\\` pair and leave a trailing lone
+# backslash that escapes the closing quote), double logfmt's escape character, replace
+# non-printables, then neutralize the quote that would close the field. $2 is the INPUT
+# bound, defaulting to 200 (at most 2x that emitted).
+logfmt_value() {
+  local raw=$1 safe
+  safe=${raw:0:${2:-200}}
+  safe=${safe//\\/\\\\}
+  safe=${safe//[![:print:]]/?}
+  safe=${safe//\"/\'}
+  printf '%s' "$safe"
+}
+
 # Report a non-root run, because every downstream symptom of one blames something
 # else.
 #
@@ -126,13 +149,23 @@ warn_if_not_root
 # That leaves both the process group and the session, so neither a group-scoped
 # kill nor the PTY-close SIGHUP can reach it, and since it installs no stdin-EOF
 # exit path it can outlive the tab that spawned it holding hundreds of megabytes.
-# A cgroup is the only boundary it cannot leave. Measured on this image: 13
-# stranded processes holding 1.35 GB on a container with two tabs open.
+# Measured on this image: 13 stranded processes holding 1.35 GB on a container with
+# two tabs open.
+#
+# That LEAK is no longer what this buys, and the distinction decides whether an
+# operator should grant a capability. Engine v3.6.0 reaps a closed session's
+# surviving tree from an inherited environment marker with no host support at all
+# (terminal.StartZombieReaper in main.go, plus the engine's session reaping), so what
+# containment adds ON TOP is the per-session peak numbers (mem_peak_bytes,
+# tasks_peak) and a kill domain a scrubbed-environment descendant cannot escape.
+# Keep this paragraph in step with startContainment's doc comment in main.go: they
+# are the same tradeoff, told to the same operator, on the same boot.
 #
 # Docker mounts /sys/fs/cgroup read-only and offers no option to change that, so a
 # one-time remount is the established workaround (the same one runc documents for
-# running systemd in a container). It needs CAP_SYS_ADMIN, which the compose file
-# must add.
+# running systemd in a container). It needs CAP_SYS_ADMIN to OPT IN; neither the
+# public compose example nor the homelab compose grants it, which is why the refusal
+# path below is the ordinary one rather than the exception.
 #
 # WARN, never fatal, per this app's failure posture: without containment the
 # server still serves terminals exactly as it did before the feature existed, and
@@ -148,25 +181,15 @@ enable_session_containment() {
   if ! mount_err=$(mount -o remount,rw "$cg_root" 2>&1); then
     # Carry mount's own error into the warn: the hint below is only ONE of the ways
     # this remount fails, and the discarded text is the only discriminator between
-    # "add the capability" and "this host cannot do this at all". Sanitized inline
-    # (logfmt_value's own four rules, inlined below) rather than via logfmt_value,
-    # which is defined further down and bash resolves functions at call time --
-    # the same ordering trap the call-site comment below documents.
-    #
-    # Flatten mount's genuinely multi-line message into one record first (a space
-    # reads better here than the `?` the non-print rule below would leave), then
-    # logfmt_value's four rules in ITS order and for its stated reasons: bound the
-    # RAW value BEFORE escaping (truncating after the doubling could split a `\\`
-    # pair and leave a lone trailing backslash that escapes the closing quote),
-    # double logfmt's escape character, replace the remaining non-printables (a
-    # bare CR splits or overwrites the record for a log reader, and the LF flatten
-    # alone let it through), then neutralize the quote that would close the field.
-    mount_err=${mount_err//$'\n'/ }
-    mount_err=${mount_err:0:200}
-    mount_err=${mount_err//\\/\\\\}
-    mount_err=${mount_err//[![:print:]]/?}
-    mount_err=${mount_err//\"/\'}
-    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" error="%s" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' "$mount_err" >&2
+    # "add the capability" and "this host cannot do this at all". Sanitized through the
+    # SHARED logfmt_value (moved above this block for exactly this call), so the four
+    # rules have one implementation, which is what its own comment promises. Only the
+    # newline flatten stays here, and it is a presentation choice rather than a rule: a
+    # space reads better in this message than the `?` logfmt_value's non-print rule
+    # would leave, and flattening before the call preserves the original order (bound
+    # the RAW value, then escape).
+    mount_err=$(logfmt_value "${mount_err//$'\n'/ }")
+    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; per-session containment cannot engage, so per-session peak memory and task counts will not be reported. Closed-tab process trees are still reaped without it" error="%s" hint="OPTIONAL: add cap_add: [SYS_ADMIN] to the compose service to enable containment; the capability is dropped again immediately after this remount. Not granted by default, because marker-based session reaping in the engine closes the process leak without it" component=entrypoint\n' "$mount_err" >&2
     return 1
   fi
   # Report ONLY what the remount proved, and on stderr like every other line in this
@@ -591,29 +614,6 @@ warn_legacy_tool_metadata() {
   return 0
 }
 
-# Make a value this script did not author safe inside a quoted logfmt field. Two
-# untrusted classes reach these log lines and they share one implementation so the rules
-# cannot drift: APT_PACKAGES tokens (env content) and names read off the /config bind
-# mount, which this script's threat model treats as writable by a foreign host user --
-# the same premise secure_tools_dir and the taint flag exist for. So the actor a warning
-# describes chooses the bytes inside the field that reports him: a file named
-# `x" level=info msg="tools tree clean` would otherwise close the field early and append
-# attacker-authored logfmt keys, losing the rest of the real message.
-#
-# Bound the RAW length first (one bad value must not dominate the line, and truncating
-# after the backslash doubling could split a `\\` pair and leave a trailing lone
-# backslash that escapes the closing quote), double logfmt's escape character, replace
-# non-printables, then neutralize the quote that would close the field. $2 is the INPUT
-# bound, defaulting to 200 (at most 2x that emitted).
-logfmt_value() {
-  local raw=$1 safe
-  safe=${raw:0:${2:-200}}
-  safe=${safe//\\/\\\\}
-  safe=${safe//[![:print:]]/?}
-  safe=${safe//\"/\'}
-  printf '%s' "$safe"
-}
-
 # Warn about a rejected APT_PACKAGES token. The token is untrusted env content, so it
 # goes through the shared sanitizer above with a tighter 64 INPUT char bound (at most 128
 # emitted). Shared by both rejection paths (grammar and known-name) so the sanitizing
@@ -817,7 +817,21 @@ for version_entry in "$TOOLS/kiro-cli-versions"/* "$TOOLS/kiro-cli-versions"/*/*
   tools_tree_was_writable=1
   printf 'level=warn msg="an entry inside the kiro-cli install root is group/other-writable or its mode cannot be read; tightening it and treating every pre-existing version directory as untrusted so the manager reinstalls from the pinned SHA-verified archive" path="%s" mode=%s component=entrypoint\n' \
     "$(logfmt_value "$version_entry")" "${version_entry_mode:-unknown}" >&2
-  chmod go-w "$version_entry" 2>/dev/null || true
+  version_entry_chmod_rc=0
+  chmod go-w "$version_entry" 2>/dev/null || version_entry_chmod_rc=$?
+  # Trust the RESULT, not chmod's status -- the same postcondition secure_tools_dir
+  # and the $TOOLS/bin loop below assert, and for the same reason: a bind-mounted or
+  # foreign-semantics filesystem (a ZFS inheritable ACL is the case seen here) can
+  # acknowledge a chmod without applying it, so a zero status proves nothing. Without
+  # this the warn above CLAIMS a tightening and no line ever retracts it, and the
+  # identical claim repeats on every boot -- indistinguishable from a fresh
+  # occurrence. The taint is already armed above, so the manager reinstalls either
+  # way; what is missing is telling the operator their volume will not accept the fix.
+  version_entry_mode_after=$(stat -c '%a' "$version_entry" 2>/dev/null) || version_entry_mode_after=""
+  if [ -z "$version_entry_mode_after" ] || [ $((8#$version_entry_mode_after & 0022)) -ne 0 ]; then
+    printf 'level=warn msg="an entry inside the kiro-cli install root is STILL group/other-writable, or its mode cannot be verified, after tightening; the install manager reinstalls from the pinned archive regardless, but this path stays rewritable by any host user in its group until the volume permissions are fixed" path="%s" mode=%s was=%s chmod_rc=%d component=entrypoint\n' \
+      "$(logfmt_value "$version_entry")" "${version_entry_mode_after:-unknown}" "${version_entry_mode:-unknown}" "$version_entry_chmod_rc" >&2
+  fi
 done
 # The Dockerfile's ENV PATH puts ONE more /config-resident dir ahead of /usr/bin
 # for the server, its PTY sessions and the toolbelt engine: $TOOLS/go/bin, i.e.

@@ -26,6 +26,7 @@ set -u
 . "$(dirname -- "$0")/lib.sh"
 new_workdir >/dev/null
 
+load_function logfmt_value
 load_function enable_session_containment
 
 # --- 1. the success path: a writable tree reports the REMOUNT, nothing more -----

@@ -149,7 +149,12 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # fail-closing every image build on the gate below.
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
 ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.3
-# hadolint ignore=DL3062
+# No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
+# already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
+# (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
+# only silence DL3062 if the `@${...}` suffix were ever dropped, which is the one case on
+# this instruction worth failing the build for -- same reasoning as the wirecheck step
+# below.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
     : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
@@ -525,6 +530,6 @@ EXPOSE 9848
 # arise here.
 # hadolint ignore=DL3025
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20m \
-    CMD curl -sfS --max-time 4 "http://127.0.0.1:${KWEB_ADDR##*:}/api/health" || exit 1
+    CMD curl -sfS --max-time 4 "http://127.0.0.1:${KWEB_ADDR##*:}/api/health"
 
 ENTRYPOINT ["/opt/web-terminal-kiro/entrypoint.sh"]

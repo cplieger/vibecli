@@ -38,6 +38,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -157,8 +158,40 @@ func (s *sessionTitleSync) sessionEnv(tabID string) []string {
 // ensureStateDir creates the hook's drop directory. Called once at start: the hook
 // runs as a child of a tab and should not have to create it (a hook that fails is
 // silent by design, so a missing directory would be an invisible failure).
+//
+// Each level is created and then VERIFIED rather than left to os.MkdirAll, because
+// titleStateRoot is a compile-time constant inside a world-writable sticky
+// directory. MkdirAll cannot tell "I created this" from "something was already
+// here": it stats the path, FOLLOWS a symlink, finds a directory and returns nil.
+// Everything downstream follows that link too — os.ReadDir in pass(), os.Remove in
+// forget(), and readSmallFile's O_NOFOLLOW, which guards the final component and
+// never the directory it sits in — so a symlink planted at either level by a local
+// user who wins the boot race turns the stale-mapping reclaim into a delete loop
+// over the link's target, every titlePollInterval (CWE-59, CWE-377). Lstat is what
+// distinguishes the two cases. A group/other-writable level is refused for the same
+// reason: a directory somebody else can write is one they can swap the child into
+// at any time, so checking its type alone would be a check with a race under it.
+//
+// Fail closed, and cheap to fail: main warns and tabs degrade to the engine's
+// automatic name ladder, which is what every other failure on this path does.
 func (s *sessionTitleSync) ensureStateDir() error {
-	return os.MkdirAll(s.stateDir, 0o750)
+	// filepath.Dir is titleStateRoot: stateDir is always <root>/titleStateDirName.
+	for _, dir := range []string{filepath.Dir(s.stateDir), s.stateDir} {
+		if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if !fi.Mode().IsDir() {
+			return fmt.Errorf("%s is not a directory: a symlink or a plain file is planted at that path", dir)
+		}
+		if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+			return fmt.Errorf("%s is group/other-writable (%#o): another user could replace the mapping files under it", dir, perm)
+		}
+	}
+	return nil
 }
 
 // Run polls until ctx is cancelled. One goroutine for every tab, not one per tab:

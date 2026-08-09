@@ -1,9 +1,9 @@
 #!/bin/sh
 # Tell the web-terminal server which kiro-cli session belongs to this tab.
 #
-# Runs as a kiro-cli hook (SessionStart and UserPromptSubmit; see
-# entrypoint.sh's seed_session_title_hook). It is the only place the two
-# identities meet:
+# Runs as a kiro-cli hook (SessionStart and UserPromptSubmit; entrypoint.sh writes the
+# hook config that points at this path -- its `hooks_file` block, rewritten on every
+# boot). It is the only place the two identities meet:
 #
 #   KWEB_SESSION_ID     the tab's id, injected into this session's child
 #                       environment by the server's session factory and
@@ -51,9 +51,13 @@ case "$kiro_session" in
 esac
 
 # The tab id becomes a filename, so refuse anything that is not the server's own
-# id alphabet rather than letting it walk out of the state directory. The server
-# validates this again on read; both sides check because neither owns this file
-# exclusively.
+# id alphabet rather than letting it walk out of the state directory. This is the ONLY
+# alphabet check on the value: the server's readMapping and forget join the name they got
+# from os.ReadDir straight onto the state path (sessiontitle.go), because every id they
+# see is already a basename from that enumeration and the read path additionally requires
+# it to be live in the manager. Nothing downstream repeats this check, so do not drop it
+# as redundant -- the hook is the one writer that receives the id from an environment it
+# does not control.
 case "$KWEB_SESSION_ID" in
   *[!A-Za-z0-9_-]* | '') exit 0 ;;
 esac

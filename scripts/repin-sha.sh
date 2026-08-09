@@ -200,14 +200,17 @@ for dockerfile in "$@"; do
     # over it; copying the original first carries its mode across the replace,
     # which `cp -p` does portably where `chmod --reference` is GNU-only.
     #
-    # The staged name carries $$ so two runs cannot collide on it. A fixed
-    # `.repin.tmp` was the earlier shape and it is only safe while nothing else
-    # runs concurrently — an assumption a fleet-wide script should not make when
-    # the fix costs six characters. A leftover matches neither postUpgradeTasks
-    # fileFilter (Dockerfile, **/Dockerfile), so it can never be committed.
-    # shell.md, "Temp files and atomic writes".
-    staged="$dockerfile_target.repin.$$.tmp"
-    rm -f "$staged"
+    # mktemp, not a name built from $$: it creates the file with O_EXCL under an
+    # unpredictable name, so nothing can be sitting at the path when the copy opens
+    # it -- a $$-derived name is guessable and `rm -f` then `cp -p` reopens by path,
+    # which is a window a symlink planted there turns into a write through it. The
+    # rename still commits, and `cp -p` still carries the original's mode across the
+    # replace (verified: cp -p sets the source's mode on an existing destination),
+    # which is why mktemp's own 0600 does not leak into the committed file. A
+    # leftover matches neither postUpgradeTasks fileFilter (Dockerfile,
+    # **/Dockerfile), so it can never be committed. shell.md, "Temp files and atomic
+    # writes".
+    staged=$(mktemp "$dockerfile_target.repin.XXXXXX")
     cp -p "$dockerfile_target" "$staged"
     cat "$tmp/rewritten" >"$staged"
     mv -f "$staged" "$dockerfile_target"

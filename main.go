@@ -447,14 +447,24 @@ func setupLogging() {
 	}
 }
 
-// checkWorkDir refuses a work directory that is absent or is not a directory.
-// Both are compose-mount mistakes rather than runtime states, so each returned
-// error carries the remedy: main renders it as the process's single ERROR line.
+// checkWorkDir refuses a work directory in any of three distinct shapes:
+// absent, present but unstattable, or not a directory. They are deliberately
+// NOT collapsed — only an ABSENT directory is a missing-mount mistake, and the
+// other two would send the operator to add a mount that is already there — so
+// each returned error carries its own remedy: main renders it as the process's
+// single ERROR line.
 func checkWorkDir(workDir string) error {
 	fi, err := os.Stat(workDir)
 	switch {
-	case err != nil:
+	case errors.Is(err, fs.ErrNotExist):
 		return atStage(stageWorkDir, fmt.Errorf("work directory %s is missing (bind-mount a host directory to /workspace in compose.yaml): %w", workDir, err))
+	case err != nil:
+		// Present but unstattable: EACCES on a parent, ELOOP on a symlinked target,
+		// an EIO from the backing volume. The mount IS configured, so the
+		// missing-mount remedy above would send the operator to add one that is
+		// already there — the same collapse startTools refuses to make for its
+		// config dir, and this branch ends the process rather than degrading.
+		return atStage(stageWorkDir, fmt.Errorf("work directory %s could not be inspected: the mount exists but is unreadable to this process; check the bind source's permissions and its parent directories: %w", workDir, err))
 	case !fi.IsDir():
 		return atStage(stageWorkDir, fmt.Errorf("work directory %s is not a directory: the mount target is a file or device, not a directory; bind-mount a host DIRECTORY to /workspace in compose.yaml", workDir))
 	}
@@ -1150,8 +1160,8 @@ const (
 //
 // The two phases are ORDERED rather than racing, which is why `booted` exists.
 // The boot reconcile is itself a counted kind, and its terminal callback fires
-// (under toolbelt's queue lock) up to one Wait poll BEFORE startTools' finish
-// closure runs — so without the flag a converged boot would publish "ok", and
+// (under toolbelt's queue lock) up to one Wait poll BEFORE startTools calls
+// recordBoot — so without the flag a converged boot would publish "ok", and
 // with it lift the session-create gate derived from this same cell, before the
 // boot pass's own verdict was recorded. The boot verdict is therefore
 // authoritative until it is recorded, and the live reducer starts only after.
@@ -1174,7 +1184,7 @@ type toolsStatus struct {
 	// poke asks the convergence watcher for a recount. Buffered depth 1 and
 	// written with a NON-BLOCKING send, because every writer is either
 	// OnJobChanged (which runs under toolbelt's queue lock and must never
-	// block) or the boot finisher. Coalescing is the intent: several job
+	// block) or recordBoot. Coalescing is the intent: several job
 	// transitions in a burst need one recount, not one each.
 	poke chan struct{}
 	// missing is the whole-tree convergence count: enabled manifest entries not
@@ -1231,15 +1241,25 @@ func (s *toolsStatus) requestRecount() {
 // and store each other's answer out of order.
 //
 // count is the engine-backed counter; it returns the number of enabled manifest
-// entries that are not installed. A failed count leaves the previous answer in
-// place rather than publishing a wrong one — the field says "not known yet"
-// only until the first success, and after that a stale count beats a fabricated
-// one.
+// entries that are not installed. A failed count returns the field to UNKNOWN
+// (-1) rather than leaving the previous answer in place: the published contract
+// is that tools_missing is absent when the count is not known, so a stale count
+// would assert a convergence the engine can no longer confirm.
 func (s *toolsStatus) watchConvergence(ctx context.Context, count func() (int, error)) {
 	recount := func() {
 		n, err := count()
 		if err != nil {
-			slog.Debug("tools: convergence recount failed", "error", err)
+			// Return the field to UNKNOWN rather than freezing the last answer: the
+			// published contract is that tools_missing is absent when the count is
+			// not known, so that a number always means what it says (README, Tools).
+			// A frozen 0 asserts convergence the engine can no longer confirm.
+			// Warn, not Debug: Inventory's failure mode is an unreadable or
+			// unparseable manifest, which is persistent and operator-fixable, so
+			// Debug would keep the only record of it out of the shipped stream.
+			s.missing.Store(-1)
+			slog.Warn("tools: convergence recount failed; /api/health omits tools_missing until one succeeds",
+				"error", err,
+				"hint", "fix the manifest (schema v2 JSON); an unreadable manifest also fails the tools engine outright on the next restart")
 			return
 		}
 		s.missing.Store(int64(n))
@@ -1287,7 +1307,7 @@ func countMissingFromInventory(tools []toolbelt.ToolInfo) int {
 }
 
 // recordBoot stores the boot convergence pass's verdict and arms the live
-// half. Called once, from startTools' finish closure; storing a terminal
+// half. Called once, from startTools' boot-verdict switch; storing a terminal
 // verdict is also what lifts the session-create gate, since that gate reads
 // this same cell for the syncing state. The store order is load-bearing: state
 // first, then booted, so no job transition can land between them and be
@@ -1305,18 +1325,21 @@ func (s *toolsStatus) recordBoot(v string) {
 // lock, so it does exactly one atomic store, one non-blocking poke, and never
 // blocks.
 func (s *toolsStatus) observeJob(j *toolbelt.Job) {
-	if !toolsStatusCounts(j.Kind) {
-		return
-	}
-	// The convergence count is asked for on every settled counted job, INCLUDING
-	// before the boot verdict: it is a fact about the tree rather than a verdict
-	// about this process's boot, so there is nothing to arm and nothing a job
-	// transition could overtake.
+	// The convergence count is a fact about the TREE, so EVERY settled job asks for
+	// a recount — deliberately not filtered by toolsStatusCounts, which is the
+	// state VERDICT's policy. A disable flips Disabled in the manifest, an
+	// uninstall drops the entry, and an update that fails mid-install leaves a tool
+	// off PATH; none of those kinds counts toward degraded, and all three change
+	// which enabled entries are installed. Asked for before the boot verdict too:
+	// there is nothing to arm and nothing a job transition could overtake. A
+	// catalog-refresh transition pokes as well and is simply a no-op answer — one
+	// coalesced, lock-free Inventory read at boot and per refresh interval, which
+	// is cheaper than a second kind policy to keep in step with this one.
 	switch j.State {
 	case toolbelt.JobDone, toolbelt.JobFailed:
 		s.requestRecount()
 	}
-	if !s.booted.Load() {
+	if !toolsStatusCounts(j.Kind) || !s.booted.Load() {
 		return
 	}
 	switch j.State {
@@ -1334,6 +1357,11 @@ func (s *toolsStatus) observeJob(j *toolbelt.Job) {
 // enumerated rather than defaulted to "anything that failed" — the excluded
 // kinds are excluded for stated reasons, not by omission, and a job kind
 // toolbelt adds later counts only once someone decides it should.
+//
+// The exclusions govern the state VERDICT only, never the convergence recount:
+// observeJob pokes on every settled job whatever its kind, because a disable, an
+// uninstall or a half-finished update all change which enabled entries are
+// installed without meaning the boot was degraded.
 //
 // COUNTED — a failure means a tool the manifest says should be on PATH is not
 // there, which is the only thing this field claims:
@@ -1415,7 +1443,10 @@ func (t *toolsRuntime) close() {
 func warnIfToolsBinUnreachable(toolsDir string) {
 	binDir := filepath.Clean(filepath.Join(toolsDir, "bin"))
 	for entry := range strings.SplitSeq(os.Getenv("PATH"), string(os.PathListSeparator)) {
-		if entry != "" && filepath.Clean(entry) == binDir {
+		// No empty-entry carve-out: binDir is the Clean of a Join ending in
+		// "bin", so it can never be "." — the value Clean returns for both an
+		// empty element and ".", the two spellings of the child's cwd.
+		if filepath.Clean(entry) == binDir {
 			return
 		}
 	}
@@ -1484,6 +1515,11 @@ func startTools(cfg baseTools) toolsRuntime {
 		return toolsRuntime{
 			syncing: func() bool { return false },
 			state:   func() string { return "" },
+			// Total, like every other off-shape arm: there is no tree to count,
+			// and "not counted" is not convergence, so the health field stays
+			// ABSENT rather than reporting 0 (the reason degradedRuntime spells
+			// this out too).
+			missing: func() (int, bool) { return 0, false },
 		}
 	case statErr != nil:
 		slog.Error("tools engine failed to inspect config dir; continuing without it",
@@ -1562,7 +1598,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		return degradedRuntime()
 	}
 
-	// finish records the boot convergence verdict, which BOTH arms the live
+	// recordBoot records the boot convergence verdict, which BOTH arms the live
 	// reducer and lifts the session-create gate: the gate is derived from the
 	// reducer's one-way "syncing" state rather than kept in a second cell, so a
 	// request cannot observe tools=ok while session creation still refuses with
@@ -1572,18 +1608,14 @@ func startTools(cfg baseTools) toolsRuntime {
 	// update the informational field without ever re-closing session creation.
 	// Boot failure lifting the gate is deliberate (degraded-not-dead), and
 	// nothing may put it back.
-	finish := func(v string) {
-		status.recordBoot(v)
-	}
-
 	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
 	switch {
 	case rerr != nil:
 		slog.Warn("tools: boot reconcile not enqueued", "error", rerr)
-		finish(toolsStateDegraded)
+		status.recordBoot(toolsStateDegraded)
 		warnIfNoLSPEnabled(eng, manifestPath)
 	case job == nil: // empty manifest: nothing to converge
-		finish(toolsStateOK)
+		status.recordBoot(toolsStateOK)
 		warnIfNoLSPEnabled(eng, manifestPath)
 	default:
 		// No gate store: newToolsStatus already parks the reducer at "syncing",
@@ -1596,7 +1628,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		slog.Info("tools: boot convergence started; session creation is gated until it finishes",
 			"job", job.ID,
 			"hint", "POST /api/sessions answers 503 \"tools installing\" (Retry-After 5) and /api/health reports tools=syncing until this converges")
-		go awaitBootConvergence(eng, job.ID, finish, manifestPath)
+		go awaitBootConvergence(eng, job.ID, status.recordBoot, manifestPath)
 	}
 	// Boot catalog fetch, explicitly AFTER the reconcile enqueue: the
 	// engine's schedule deliberately has no fire-on-start (an immediate

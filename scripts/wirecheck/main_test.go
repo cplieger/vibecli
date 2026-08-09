@@ -334,7 +334,7 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		"an unrelated -manifest-ish flag": {"    " + build + ` && ` + bin + " -manifest-backup /tmp/x.json", false},
 		// The same two shapes on the explicit pair: both flags present as bare
 		// trailing words, and two unrelated flags that merely CONTAIN the names.
-		"the pair with no values":       {"    " + build + " && " + bin + " -client-rev -client-min-server", false},
+		"the pair with no values": {"    " + build + " && " + bin + " -client-rev -client-min-server", false},
 		// The same shape moved one word away from the end: both names are present
 		// and a field follows each, but -client-rev's "value" is the next FLAG, so
 		// the gate exits 2 without checking either floor.

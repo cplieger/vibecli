@@ -91,7 +91,13 @@ esac
 # splits or overwrites the record. An assertion that SYS_ADMIN is merely PRESENT is
 # deliberately not added: the substring survives a malformed field, so it cannot
 # fail for the reason it would claim.
-mount() { printf 'mount: /x: "denied" a\r\\' >&2; return 32; }
+#
+# shellcheck disable=SC1003  # the trailing \\ is a literal backslash for printf to
+# emit, which is the malformed value under test -- not an attempt to escape a quote.
+mount() {
+  printf 'mount: /x: "denied" a\r\\' >&2
+  return 32
+}
 out=$(enable_session_containment "$WORK/cg" 2>&1)
 case "$out" in
   *'\\" hint='*) ok "a backslash is doubled, so the error field closes and hint= survives" ;;

@@ -557,6 +557,15 @@ func run() error {
 			" rebuild the image — go generate ./... plus the Dockerfile static build. The container will crash-loop under its restart policy until it is rebuilt.)", err)
 	}
 
+	// Collect the exit statuses of orphans re-parented onto this process. In the
+	// container this binary IS pid 1, so every process whose own parent died —
+	// each language server, each git a session forked — lands here, and Go's
+	// os/exec waits only on the children it created itself. Measured on borgcube
+	// before this was wired: 17,323 zombies against 88 live processes, every one
+	// of them parented on this server. It costs a /proc walk every 30s and frees
+	// a pid slot per collection; it can never touch a live process.
+	defer terminal.StartZombieReaper(slog.Default(), 0)()
+
 	mgr := registerRoutes(mux, &routeDeps{
 		static:          staticSrv,
 		listenHint:      loopbackHint(addr),
@@ -1972,16 +1981,19 @@ const (
 // posture is explicit that a dev box must keep serving a terminal rather than
 // refuse to boot over disk hygiene.
 //
-// What is lost when it is nil, stated in the log so an operator can act on it: a
-// tab's kiro-cli tree can outlive the tab. The agent server calls setsid() and has
-// no stdin-EOF exit path, so no signal the engine can aim reaches it, and it
-// strands holding hundreds of megabytes.
+// What nil costs is now ONLY the per-session peak numbers (mem_peak_bytes,
+// tasks_peak), because the engine reaps a closed session's surviving tree from an
+// inherited environment marker with no host support at all. That is why this
+// container no longer asks for CAP_SYS_ADMIN: the leak the capability was granted
+// for is closed either way, and containment is a metrics-and-enforcement extra
+// rather than the only boundary. Measured on borgcube while containment was
+// silently off: 28 stranded session trees holding 16.2 GB.
 func startContainment() *terminal.Containment {
 	c, err := terminal.NewContainment(containCgroupRoot, containCgroupPrefix, slog.Default())
 	if err != nil {
-		slog.Warn("per-session process containment unavailable; a closed tab's kiro-cli tree may outlive it",
+		slog.Info("per-session cgroup containment unavailable; session trees are still reaped, but per-session peak memory and task counts will not be reported",
 			"error", err,
-			"hint", "containment needs a writable cgroup v2 root: the entrypoint remounts /sys/fs/cgroup rw with CAP_SYS_ADMIN (compose cap_add) and then drops the capability. Outside the container this warning is expected.")
+			"hint", "containment needs a writable cgroup v2 root, which needs CAP_SYS_ADMIN for a one-time remount. Not granted by default: the engine's marker-based reaping closes the process leak without it.")
 		return nil
 	}
 	return c

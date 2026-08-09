@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -118,6 +119,51 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 		s := newSessionTitleSync(root, t.TempDir())
 		if err := s.ensureStateDir(); err == nil {
 			t.Error("ensureStateDir accepted a pre-existing group-writable level; another user could swap the mapping files under it")
+		}
+	})
+}
+
+// TestEnableSessionTitlesGatesBothConsumersOnTheVerdict pins that ensureStateDir's
+// refusal is AUTHORITATIVE rather than merely logged. Both of the subsystem's sinks
+// hang off this one call, and a warn-only refusal left both pointed at the rejected
+// path: the hook still received KWEB_TITLE_STATE_DIR (so a directory another local
+// user can read discloses tab ids, which are /ws capability tokens) and the poller
+// still swept it with os.ReadDir + os.Remove. The nil-env half of the contract is
+// pinned downstream by TestChildEnvComposesBothOverlays, which asserts routeDeps
+// contributes nothing when sessionTitleEnv is nil.
+func TestEnableSessionTitlesGatesBothConsumersOnTheVerdict(t *testing.T) {
+	t.Run("a refused level yields no env and no poller", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatalf("plant the root: %v", err)
+		}
+		// Pre-existing and group-writable: somebody else's shape, which
+		// ensureStateDir refuses because its owner can swap the checked path.
+		if err := os.Chmod(root, 0o770); err != nil {
+			t.Fatalf("widen the planted root: %v", err)
+		}
+		env, poll := enableSessionTitles(newSessionTitleSync(root, t.TempDir()))
+		if env != nil {
+			t.Error("a refused state dir still produced a session title environment; the hook would write into the rejected path and every tab id in it is a /ws capability token")
+		}
+		if poll {
+			t.Error("a refused state dir still enabled the poller; its sweep is os.ReadDir + os.Remove over that path, which is the delete loop the verification exists to prevent")
+		}
+	})
+	t.Run("a verified level wires both", func(t *testing.T) {
+		s := newSessionTitleSync(filepath.Join(t.TempDir(), "state"), t.TempDir())
+		env, poll := enableSessionTitles(s)
+		if !poll {
+			t.Error("a verified state dir left the poller off; no tab would ever get its kiro-cli title")
+		}
+		if env == nil {
+			t.Fatal("a verified state dir produced no session title environment; no hook could pair a tab with its kiro session")
+		}
+		got := env("tab1")
+		for _, want := range []string{"KWEB_SESSION_ID=tab1", "KWEB_TITLE_STATE_DIR=" + s.stateDir} {
+			if !slices.Contains(got, want) {
+				t.Errorf("session title env = %v, want it to carry %q", got, want)
+			}
 		}
 	})
 }

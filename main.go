@@ -589,15 +589,13 @@ func run() error {
 	// Tab names come from kiro-cli's own session record. The state root is
 	// container-local on purpose: a mapping is only meaningful for a LIVE tab, and
 	// this app persists no session state (terminal state is the in-memory VT
-	// buffer), so nothing here should outlive the container. A failure to create
-	// the directory is a warn, not fatal — the hook then writes nothing, no tab
-	// gets a client title, and the engine's automatic ladder still names them.
+	// buffer), so nothing here should outlive the container. A refused directory is
+	// a warn, not fatal — and it is AUTHORITATIVE for both consumers: no tab gets
+	// KWEB_TITLE_STATE_DIR, the poller never starts, and the engine's automatic
+	// ladder names every tab (see enableSessionTitles for why a warn-only verdict
+	// left the refused path in use).
 	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
-	if err := titles.ensureStateDir(); err != nil {
-		slog.Warn("session title state dir could not be created; tabs will fall back to the automatic name ladder",
-			"dir", titles.stateDir, "error", err,
-			"hint", "kiro-cli session titles need this directory writable by the server and by the hook it seeds")
-	}
+	sessionTitleEnv, titleSyncEnabled := enableSessionTitles(titles)
 
 	// The subsystem teardown, named once and deferred once: both background
 	// owners, in the order the four hand-coordinated exit paths this replaced
@@ -634,7 +632,7 @@ func run() error {
 		listenHint:      loopbackHint(addr),
 		cmd:             kiro.cmd,
 		sessionEnv:      kiro.env,
-		sessionTitleEnv: titles.sessionEnv,
+		sessionTitleEnv: sessionTitleEnv,
 		workDir:         workDir,
 		ready:           &ready,
 		kiroReady:       kiro.ready,
@@ -687,8 +685,13 @@ func run() error {
 
 	// Poll kiro-cli session titles onto the engine's client title rung for as long
 	// as the server serves. Bound to baseCtx, which the pre-drain hook cancels, so
-	// this stops with the rest of the request-scoped work.
-	go titles.Run(baseCtx, mgr)
+	// this stops with the rest of the request-scoped work. Skipped entirely when the
+	// state directory was refused: the poller's sweep is os.ReadDir + os.Remove over
+	// that path, so running it against a rejected one is the delete loop the
+	// verification exists to prevent.
+	if titleSyncEnabled {
+		go titles.Run(baseCtx, mgr)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)

@@ -242,6 +242,31 @@ func ensureStateLevel(dir string) error {
 	return nil
 }
 
+// enableSessionTitles verifies the hook's drop directory and returns the wiring
+// that verdict authorizes: the per-session environment the session factory injects
+// into each tab's kiro-cli, and whether the poller may run at all. Both consumers
+// hang off the ONE verdict deliberately.
+//
+// ensureStateDir's whole job is to REFUSE a planted, foreign-owned or
+// group/other-writable state directory, and a refusal that only warned left both
+// sinks pointed at the refused path regardless: the hook still received
+// KWEB_TITLE_STATE_DIR and wrote a file per tab into it (so a directory some other
+// local user can read discloses tab ids, which are the /ws attach+resume capability
+// tokens), and pass()/forget() still followed it with os.ReadDir and os.Remove
+// every titlePollInterval — the delete loop over a planted link's target that
+// ensureStateDir's comment describes. The verdict is now authoritative, so a
+// refusal degrades exactly as documented: no injection, no poller, and every tab
+// keeps the engine's automatic name ladder.
+func enableSessionTitles(titles *sessionTitleSync) (func(tabID string) []string, bool) {
+	if err := titles.ensureStateDir(); err != nil {
+		slog.Warn("session title state dir refused; tabs keep the automatic name ladder and the title poller stays off",
+			"dir", titles.stateDir, "error", err,
+			"hint", "kiro-cli session titles need this directory owned by the server uid, not group/other-writable, and writable by the hook it seeds")
+		return nil, false
+	}
+	return titles.sessionEnv, true
+}
+
 // Run polls until ctx is cancelled. One goroutine for every tab, not one per tab:
 // the work is a directory listing plus a small read per mapped tab, so a single
 // ticker is both simpler and cheaper than a per-session watcher.

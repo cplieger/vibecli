@@ -261,47 +261,21 @@ type kiroRescanBody struct {
 // 503 with the manager's own reason when none is: the same verdict /api/health will
 // serve from the next probe, so a caller gets its answer without polling.
 func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
-	// One admission slot for the whole endpoint. pinstall serializes rescans on its
-	// own opMu, whose acquisition is NOT context-aware, so without this gate every
-	// concurrent POST parks a handler goroutine inside the library until its turn
-	// comes — and because the operation context is detached below, an abandoned
-	// caller's rescan still runs later. A loopback agent retrying in a loop can
-	// therefore queue an unbounded number of handlers, each of which executes a
-	// serialized rescan long after its client is gone. Admission is what waits here
-	// instead, and waiting here IS cancellable.
-	admit := make(chan struct{}, 1)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A rescan probes the candidate binary and reasserts the required
 		// settings, so it is not free; it is also not cacheable under any
 		// circumstances.
 		w.Header().Set("Cache-Control", "no-store")
-		select {
-		case admit <- struct{}{}:
-			defer func() { <-admit }()
-		case <-r.Context().Done():
-			// Still QUEUED when the caller went away: nothing has entered pinstall
-			// on its behalf, so dropping it costs nothing and is the whole point of
-			// gating here. The in-flight rescan it was waiting behind continues,
-			// and its result is what the next probe of /api/health reports.
-			slog.Debug("kiro-cli rescan abandoned while queued behind an in-flight rescan",
-				"error", r.Context().Err())
-			return
-		}
-		// The rescan MUTATES readiness, so it must not inherit the request's
-		// cancellation: pinstall's Rescan probes each candidate with
-		// exec.CommandContext, and a canceled context makes every probe fail
-		// instantly, which the manager records as "no usable version" and
-		// publishes as unready (recordUnavailable clears the active version and
-		// assertionsOK). A caller that presses Ctrl-C, or passes --max-time,
-		// would therefore knock a healthy server unready and 503 every new
-		// session until the next successful rescan or a container recreate.
-		// WithoutCancel keeps the request-scoped values the logs correlate on
-		// (request id) while detaching the lifetime; no deadline is added on
-		// purpose, because pinstall bounds every subprocess itself (probeTimeout
-		// / assertionTimeout) and an expiring deadline would reintroduce exactly
-		// the canceled-probe verdict this removes. Detachment applies only ONCE
-		// ADMITTED: a rescan that has started must finish on its own terms.
-		ok, err := deps.kiroRescan(context.WithoutCancel(r.Context()))
+		// The request context goes straight through. pinstall >= v1.1.0 owns both
+		// halves this handler used to hand-roll: WAITING for its operation slot
+		// honours this context (a queued caller that goes away is dropped, and
+		// nothing has entered the library on its behalf), while an ADMITTED rescan
+		// runs detached, so a Ctrl-C or --max-time cannot make every candidate
+		// probe fail and have the manager record "no usable version". The
+		// app-local admission channel and context.WithoutCancel wrapper that
+		// stood in for those are gone; vibekit, which had neither, gained them on
+		// the same bump.
+		ok, err := deps.kiroRescan(r.Context())
 		if ok {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
 			return
@@ -987,56 +961,28 @@ func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, st
 	}
 }
 
-// proxyProvenanceHeaders are the headers a request acquires by travelling
-// through a browser or a reverse proxy. The loopback gate's consumer is an
-// in-container CLI client, which sends none of them, so their presence is
-// positive evidence that this request did NOT originate inside the container
-// even when the socket peer and Host both canonicalize to loopback (a proxy
-// sharing the loopback interface with the server — host networking, a shared
-// network namespace — rewrites Host to its upstream address by default in
-// nginx and Apache, which satisfies webhttp.LoopbackRequest's Host leg).
-var proxyProvenanceHeaders = []string{
-	"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
-	"X-Real-Ip", "Sec-Fetch-Site", "Origin",
-}
-
-// proxiedOrigin reports whether h carries any evidence the request was
-// forwarded by a proxy or issued by a browser.
-func proxiedOrigin(h http.Header) bool {
-	for _, name := range proxyProvenanceHeaders {
-		if h.Get(name) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// loopbackOnly admits only requests whose SOCKET PEER *and* Host header are
-// both loopback, and which carry no proxy/browser provenance header. The
-// two-legged loopback test is webhttp.LoopbackRequest — the shared conjunction
-// the library exports, which reads only RemoteAddr and Host and fails closed on
-// either being unparseable; the provenance refusal stays THIS app's policy,
-// composed on top as an additional deny. Forwarded headers are never TRUSTED —
-// they can only refuse, never admit — and this gate is the guarded surface's
-// only boundary on an otherwise-unauthenticated port.
-// In-container consumers (kiro-cli's ! escape hitting curl localhost:9848) pass;
-// everything routed in from outside — LAN browsers, the reverse proxy — is
-// refused, as is a DNS-rebound page whose loopback socket peer carries an
-// attacker Host, and a same-loopback proxy that rewrites Host to its upstream
-// address (nginx's and Apache's defaults) and so satisfies both loopback legs.
+// loopbackOnly admits only requests whose SOCKET PEER and Host header are both
+// loopback and which carry no proxy/browser provenance header, and is now a thin
+// naming wrapper over webhttp.LoopbackOnly.
 //
-// hint is the deployment's own "localhost[:port]" (deps.listenHint): the 403 is
-// the whole of what a refused caller is told, so it must not name a port the
-// operator moved away from.
+// The whole decision moved into the library (webhttp >= v1.23.0): the two-legged
+// predicate, the seven-header provenance deny this app used to own, and the
+// reasoning for both. What stays here is only what is genuinely this app's — the
+// refusal wording, which names the guarded surface and the deployment's own
+// listen hint, because the 403 is the whole of what a refused caller is told and
+// must not name a port the operator moved away from.
+//
+// It moved because webhttp's own rule said when it should: bindclass.go names the
+// reopen conditions as "a second peer-gating consumer appears or the app/library
+// copies are ever found diverging", and both had happened — vibekit gates the
+// same way with NO provenance deny, on the hook that spawns processes. That gap
+// closes on its bump.
 func loopbackOnly(surface, hint string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !webhttp.LoopbackRequest(r) || proxiedOrigin(r.Header) {
-			webhttp.WriteError(w, r, http.StatusForbidden, "",
-				surface+" is loopback-only; call it from inside the container (curl "+hint+")")
-			return
-		}
-		next.ServeHTTP(w, r)
+	refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhttp.WriteError(w, r, http.StatusForbidden, "",
+			surface+" is loopback-only; call it from inside the container (curl "+hint+")")
 	})
+	return webhttp.LoopbackOnly(refuse)(next)
 }
 
 // sessionCostInterval is how often a contained session logs what it is currently

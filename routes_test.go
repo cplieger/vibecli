@@ -1666,94 +1666,49 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 	}
 }
 
-// TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall pins the
-// admission gate, which is not observable from a single request. pinstall
-// serializes rescans on an opMu whose acquisition ignores context, so before the
-// gate every concurrent POST parked a handler goroutine inside the library and —
-// because the operation context is deliberately detached from the request — still
-// ran its rescan after the caller was gone. A loopback agent retrying in a loop
-// (the documented consumer: kiro-cli's ! escape + curl) could queue an unbounded
-// number of them.
+// The two tests that used to sit here pinned this app's OWN admission gate and
+// its context.WithoutCancel wrapper: that an abandoned queued caller never
+// entered pinstall, and that an admitted rescan survived a client disconnect.
+// Both behaviours are now the LIBRARY's (pinstall >= v1.1.0 makes waiting for its
+// operation slot cancellable and runs an admitted rescan detached), and they are
+// pinned there by TestRescanQueuedCallerCanAbandon and
+// TestAdmittedRescanIgnoresCallerCancellation, which exercise the real manager.
+// These app-level versions drove a FAKE kiroRescan, so after the move they could
+// only ever assert that the fake had no gate — a test of the stub, not the app.
 //
-// The assertion is the rescan INVOCATION COUNT, not the response: the abandoned
-// caller has no reader left, so status codes prove nothing here, and a
-// count-blind test stays green with the gate deleted. Deterministic by
-// construction — the first request signals from inside the rescan and blocks
-// there, so the second request is provably queued rather than merely likely to be.
-func TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall(t *testing.T) {
-	var calls atomic.Int64
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	deps := newTestDeps(true)
-	deps.kiroRescan = func(context.Context) (bool, error) {
-		// Only the FIRST call holds the slot; a second call (which is the defect
-		// this pins) returns at once, so a broken gate fails the count assertion
-		// below instead of deadlocking the suite.
-		if calls.Add(1) == 1 {
-			close(entered)
-			<-release
-		}
-		return true, nil
-	}
-	h := handleKiroRescan(deps)
-
-	firstDone := make(chan struct{})
-	go func() {
-		defer close(firstDone)
-		req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
-		h(httptest.NewRecorder(), req)
-	}()
-	<-entered // the first rescan holds the only admission slot
-
-	// The second caller goes away while queued: exactly the abandoned-POST shape.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
-	h(httptest.NewRecorder(), req.WithContext(ctx))
-
-	if got := calls.Load(); got != 1 {
-		t.Errorf("kiroRescan calls after an abandoned queued request = %d, want 1 — an abandoned caller must not enter pinstall, or a retry loop queues unbounded serialized rescans", got)
-	}
-
-	close(release)
-	<-firstDone
-	if got := calls.Load(); got != 1 {
-		t.Errorf("kiroRescan calls after the in-flight rescan finished = %d, want 1", got)
-	}
-}
-
-// TestKiroRescan_AdmittedRescanSurvivesClientDisconnect is the other half of the
-// gate's contract, and the reason the cancellation check sits at ADMISSION only:
-// once a rescan is running, a caller that disconnects (Ctrl-C, --max-time) must
-// not abort it, because pinstall reads a canceled probe as "no usable version"
-// and publishes unready. The request context is canceled while the rescan is
-// executing; the rescan must still be allowed to complete.
-func TestKiroRescan_AdmittedRescanSurvivesClientDisconnect(t *testing.T) {
-	entered := make(chan struct{})
-	sawCancel := make(chan error, 1)
+// What is still this app's to get wrong is the one line below, and it is the
+// reason this test exists rather than nothing: the handler must hand the REQUEST
+// context to the manager unchanged. Re-detaching it here (the shape that was
+// correct before the bump) would defeat the library's cancellable wait, silently
+// restoring the unbounded-queue hazard the gate was written for.
+func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
+	seen := make(chan context.Context, 1)
 	deps := newTestDeps(true)
 	deps.kiroRescan = func(ctx context.Context) (bool, error) {
-		close(entered)
-		// Whatever the caller does now, the operation context must stay live.
-		<-sawCancel
-		return ctx.Err() == nil, nil
+		seen <- ctx
+		return true, nil
 	}
-	h := handleKiroRescan(deps)
+	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody).WithContext(ctx)
-	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h(rec, req)
-	}()
-	<-entered
-	cancel() // the client disconnects mid-rescan
-	sawCancel <- nil
-	<-done
+	req.RemoteAddr = "127.0.0.1:5555"
+	req.Host = "localhost:9848"
+	mux.ServeHTTP(httptest.NewRecorder(), req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d — an admitted rescan must run to completion on a detached context; a canceled probe would publish a false unready", rec.Code, http.StatusOK)
+	var got context.Context
+	select {
+	case got = <-seen:
+	default:
+		t.Fatal("the rescan hook was never called")
+	}
+
+	// Cancelling the REQUEST must be visible to the manager: that is what lets
+	// pinstall drop a caller still queued for its operation slot.
+	cancel()
+	select {
+	case <-got.Done():
+	default:
+		t.Error("cancelling the request did not reach the context handed to pinstall; the handler is detaching it itself, which defeats the library's cancellable wait and restores the unbounded-queue hazard")
 	}
 }

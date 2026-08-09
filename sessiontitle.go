@@ -326,8 +326,9 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 // the lookup. A session id lives under exactly one hash directory, so once the
 // record has been reached at all its contents are the answer -- a corrupt or
 // title-less record settles the lookup as "no title" rather than sending the scan
-// on to the remaining directories. Only an absent record is the ordinary miss that
-// keeps scanning. An empty returned title means "no usable title", which is why
+// on to the remaining directories. A record that could not be READ at all -- absent,
+// or unreadable for the abnormal reasons logged below -- is the miss that keeps
+// scanning. An empty returned title means "no usable title", which is why
 // readTitle derives its own ok from the string rather than from a third result.
 func (s *sessionTitleSync) titleFromRecord(hashDir, kiroID string) (string, bool) {
 	raw, err := readSmallFile(filepath.Join(s.sessionsRoot, hashDir, kiroID, "session.json"))

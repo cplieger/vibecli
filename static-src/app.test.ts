@@ -1093,7 +1093,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
     // Why this test exists: the watchdog's stand-down guards read index.html's
-    // REAL markup (role="status", no .fade, an empty #terminal) while
+    // REAL markup (no .fade on the overlay, an empty #terminal) while
     // appendPristineOverlay() re-creates that markup by hand. If the served
     // overlay ever drifts from the fixture -- a .fade already present, or
     // #terminal shipping a pre-JS child -- the watchdog silently never fires in
@@ -1106,8 +1106,11 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // shared served-document policy.
     const doc = parseServedDocument();
     const overlay = doc.getElementById("loading");
-    // The guards the watchdog keys on, read from the served file rather than
-    // from appendPristineOverlay()'s hand-built copy.
+    // The served overlay's shape the fixture must reproduce, read from the file
+    // rather than from appendPristineOverlay()'s hand-built copy. Of the
+    // assertions below only the absent .fade and the empty #terminal are
+    // watchdog guards; role and the bar pin the fixture's fidelity to the
+    // served markup.
     expect(overlay?.getAttribute("role")).toBe("status");
     expect(overlay?.querySelector(".wt-loading-bar")).not.toBeNull();
     expect(overlay?.querySelector(".wt-loading-bar")?.getAttribute("aria-hidden")).toBe("true");

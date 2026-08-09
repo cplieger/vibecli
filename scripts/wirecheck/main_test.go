@@ -167,7 +167,10 @@ func gateBuildOutput(segments []string) (string, int) {
 // exit 2 on every build for the same reason.
 //
 // Every flag is matched as an exact FIELD with a value after it, not as a
-// substring. A bare trailing `-manifest`, or an unrelated `-manifest-backup path`,
+// substring, and that following field must be a VALUE rather than the next flag:
+// `-client-rev -client-min-server "$X"` leaves -client-rev with no revision, so
+// the gate exits 2 and checks nothing while both names are present. A bare
+// trailing `-manifest`, or an unrelated `-manifest-backup path`,
 // each contain the text while leaving the gate with no parsable declaration, so it
 // exits 2 and checks no floor — the same never-reports-a-violation state the
 // half-pair cases above are rejected for. A substring test called both of those a
@@ -176,9 +179,14 @@ func gateBuildOutput(segments []string) (string, int) {
 // it: `-client-rev-backup a` contains the text and declares nothing.
 func gateFlagsPresent(seg string) bool {
 	fields := strings.Fields(seg)
+	// The field after the flag must be a VALUE, not another flag: `-client-rev
+	// -client-min-server "$X"` leaves -client-rev with no revision, so the gate
+	// exits 2 and checks no floor -- the same never-reports-a-violation state the
+	// bare and -foo-backup shapes are rejected for. No gate value legitimately
+	// starts with '-'.
 	hasValued := func(flag string) bool {
 		for i, field := range fields {
-			if field == flag && i+1 < len(fields) {
+			if field == flag && i+1 < len(fields) && !strings.HasPrefix(fields[i+1], "-") {
 				return true
 			}
 		}
@@ -327,8 +335,12 @@ func TestLineInvokesTheGate_rejectsInertForms(t *testing.T) {
 		// The same two shapes on the explicit pair: both flags present as bare
 		// trailing words, and two unrelated flags that merely CONTAIN the names.
 		"the pair with no values":       {"    " + build + " && " + bin + " -client-rev -client-min-server", false},
-		"an unrelated -client-rev flag": {"    " + build + ` && ` + bin + ` -client-rev-backup a -client-min-server-backup b`, false},
-		"prose mentioning the gate":     {"# public Go API inside scripts/wirecheck (no source scraping)", false},
+		// The same shape moved one word away from the end: both names are present
+		// and a field follows each, but -client-rev's "value" is the next FLAG, so
+		// the gate exits 2 without checking either floor.
+		"the pair with the first value missing": {"    " + build + ` && ` + bin + ` -client-rev -client-min-server "$CLIENT_MIN_SERVER"`, false},
+		"an unrelated -client-rev flag":         {"    " + build + ` && ` + bin + ` -client-rev-backup a -client-min-server-backup b`, false},
+		"prose mentioning the gate":             {"# public Go API inside scripts/wirecheck (no source scraping)", false},
 		// The gate must be BUILT and then RUN. `go run` still gates the pair but
 		// reports its own status 1 for the gate's exit 2, so the "fix the gate, do
 		// not bump a pin" signal is lost; TestDockerfileBuildsTheGateInsteadOfGoRun

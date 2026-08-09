@@ -225,6 +225,31 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	}
 }
 
+// TestSessionTitleKeepsTheHooksInFlightTemps pins the reclaim's POPULATION: the hook
+// writes each mapping through a dot-prefixed temp (".<tabID>.$$" in
+// hooks/session-title.sh) and renames it into place, so a temp caught mid-write by a
+// sweep has to survive. Without the dot skip the reclaim deletes it, the hook's mv then
+// fails, `|| rm -f` runs, and that prompt's re-point is lost with no record anywhere.
+// No other test in this file plants a dot-prefixed entry, so deleting the skip keeps the
+// whole suite green.
+func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
+	f := newTitleFixture(t)
+	tmp := filepath.Join(f.sync.stateDir, ".tab1.4242")
+	if err := os.WriteFile(tmp, []byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
+		t.Fatalf("plant an in-flight hook temp: %v", err)
+	}
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+
+	if _, err := os.Stat(tmp); err != nil {
+		t.Errorf("stat the hook's in-flight temp = %v, want it left in place: the reclaim must not race the hook's rename", err)
+	}
+	if len(set.calls) != 0 {
+		t.Errorf("pushed %v from a temp file, want nothing: a temp is not a tab mapping", set.calls)
+	}
+}
+
 // TestSessionTitleRejectsHostileIdentifiers is the security half for the one
 // identifier this package validates: the kiro session id read OUT of a mapping
 // file, which a hostile writer chooses freely and which becomes a path component
@@ -451,5 +476,49 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	f.sync.pass(set)
 	if want := "tab1=the second conversation"; len(set.calls) != 3 || set.calls[2] != want {
 		t.Errorf("after the new session gained a title pushed %v, want %q", set.calls, want)
+	}
+}
+
+// TestSessionTitleRepointWithATitleReplacesWithoutClearing pins the OTHER half of the
+// re-point branch, the one this cycle reshaped: when the new conversation already has a
+// usable title the tab is re-labelled in ONE store and never blanked in between (the
+// intermediate clear was removed from this arm), and the memo follows the new kiro
+// session even when the two titles are identical strings -- otherwise the memo keeps
+// pointing at the previous conversation forever.
+func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
+	f := newTitleFixture(t)
+	const first = "sess_11111111-2222-3333-4444-555555555555"
+	const second = "sess_99999999-8888-7777-6666-555555555555"
+	const third = "sess_44444444-3333-2222-1111-000000000000"
+	f.mapping("tab1", first)
+	f.session("hash0", first, titleJSON("the first conversation"))
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+
+	// The hook re-points the tab to a conversation that ALREADY has its title.
+	f.mapping("tab1", second)
+	f.session("hash0", second, titleJSON("the second conversation"))
+	f.sync.pass(set)
+
+	if len(set.calls) != 2 || set.calls[0] != "tab1=the first conversation" || set.calls[1] != "tab1=the second conversation" {
+		t.Fatalf("pushed %v, want the two titles and no blanking push between them: a usable title replaces the rung in one store", set.calls)
+	}
+	if got := f.sync.pushed["tab1"]; got.kiroID != second {
+		t.Fatalf("memo kiroID = %q, want %q", got.kiroID, second)
+	}
+
+	// A re-point whose new title happens to equal the old one still has to be pushed and
+	// memoized: the memo is keyed on the PAIR, so a title-only comparison would strand it
+	// on the previous session's id.
+	f.mapping("tab1", third)
+	f.session("hash0", third, titleJSON("the second conversation"))
+	f.sync.pass(set)
+
+	if len(set.calls) != 3 || set.calls[2] != "tab1=the second conversation" {
+		t.Errorf("pushed %v, want a third push: a re-point is a change even when the title text is unchanged", set.calls)
+	}
+	if got := f.sync.pushed["tab1"]; got.kiroID != third {
+		t.Errorf("memo kiroID = %q, want %q: the memo must follow the re-point", got.kiroID, third)
 	}
 }

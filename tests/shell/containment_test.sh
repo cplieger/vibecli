@@ -83,6 +83,24 @@ case "$out" in
   *SYS_ADMIN*) ok "the refusal warn names the capability to add" ;;
   *) no "the refusal warn names the capability" "got: $out" ;;
 esac
+# 2a. mount's message is the only text in this line the script did not author, and
+# the stubs above print nothing, so without this case every sanitization rule is
+# unexercised. Both assertions discriminate (red-checked: each fails with its rule
+# removed). A lone trailing backslash escapes the closing quote, after which a
+# logfmt reader swallows hint= -- the remedy this warn exists to name; a bare CR
+# splits or overwrites the record. An assertion that SYS_ADMIN is merely PRESENT is
+# deliberately not added: the substring survives a malformed field, so it cannot
+# fail for the reason it would claim.
+mount() { printf 'mount: /x: "denied" a\r\\' >&2; return 32; }
+out=$(enable_session_containment "$WORK/cg" 2>&1)
+case "$out" in
+  *'\\" hint='*) ok "a backslash is doubled, so the error field closes and hint= survives" ;;
+  *) no "a backslash is doubled before the field closes" "got: $out" ;;
+esac
+case "$out" in
+  *$'\r'*) no "a carriage return must not reach the log record" "got: $out" ;;
+  *) ok "a carriage return is replaced, not passed through" ;;
+esac
 unset -f mount
 
 # --- 2b. the function creates NOTHING inside the cgroup root --------------------

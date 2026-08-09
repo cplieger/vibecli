@@ -149,12 +149,24 @@ enable_session_containment() {
     # Carry mount's own error into the warn: the hint below is only ONE of the ways
     # this remount fails, and the discarded text is the only discriminator between
     # "add the capability" and "this host cannot do this at all". Sanitized inline
-    # (newline flatten, quote swap, length bound) rather than via logfmt_value,
+    # (logfmt_value's own four rules, inlined below) rather than via logfmt_value,
     # which is defined further down and bash resolves functions at call time --
     # the same ordering trap the call-site comment below documents.
+    #
+    # Flatten mount's genuinely multi-line message into one record first (a space
+    # reads better here than the `?` the non-print rule below would leave), then
+    # logfmt_value's four rules in ITS order and for its stated reasons: bound the
+    # RAW value BEFORE escaping (truncating after the doubling could split a `\\`
+    # pair and leave a lone trailing backslash that escapes the closing quote),
+    # double logfmt's escape character, replace the remaining non-printables (a
+    # bare CR splits or overwrites the record for a log reader, and the LF flatten
+    # alone let it through), then neutralize the quote that would close the field.
     mount_err=${mount_err//$'\n'/ }
+    mount_err=${mount_err:0:200}
+    mount_err=${mount_err//\\/\\\\}
+    mount_err=${mount_err//[![:print:]]/?}
     mount_err=${mount_err//\"/\'}
-    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" error="%s" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' "${mount_err:0:200}" >&2
+    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; a closed tab kiro-cli tree may outlive it" error="%s" hint="add cap_add: [SYS_ADMIN] to the compose service; the capability is dropped again immediately after this remount" component=entrypoint\n' "$mount_err" >&2
     return 1
   fi
   # Report ONLY what the remount proved, and on stderr like every other line in this

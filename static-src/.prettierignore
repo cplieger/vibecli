@@ -1,4 +1,3 @@
-.vitest-cache/
 coverage/
 
 # Stryker's sandbox + report output and the Kiro skill scratch trees. All are

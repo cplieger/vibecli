@@ -193,6 +193,16 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatalf("make the level: %v", err)
 	}
+	// os.Mkdir's mode is a REQUEST -- the same fact ensureStateLevel is built around
+	// -- so ASK for the bait mode rather than assuming it: an inheritable group-write
+	// ACL widens the created level to 0770 and the fixture stops being bait. Chmod is
+	// the call that SETS the mode and it is exact even on the dataset that widens the
+	// mkdir (measured: mkdir(0o700) -> 0770, chmod(0o700) -> 0700, and chown leaves
+	// the perm bits alone), so this is what keeps the ownership arm RUNNING there
+	// instead of skipping past it.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("tighten the level to the bait mode: %v", err)
+	}
 	if err := os.Chown(root, foreignUID, foreignGID); err != nil {
 		t.Skipf("cannot give a directory away here, so a foreign-owned level cannot be built: %v", err)
 	}
@@ -206,13 +216,13 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 		t.Fatalf("fixture is not a directory (mode %#o): os.Mkdir reported success, so this is a real anomaly rather than an environment limit", fi.Mode())
 	}
 	if perm := fi.Mode().Perm(); perm != 0o700 {
-		// Not a defect in the code under test: an inheritable group-write ACL widens
-		// a created mode (ensureStateLevel measures 0770 from a 0o700 mkdir on a ZFS
-		// nfs4acl dataset), and a widened level would be refused for its MODE, so the
-		// ownership arm this test exists for would never be the reason it failed.
-		// Skip like the Chown guard above rather than reporting the filesystem as a
-		// failure of the check.
-		t.Skipf("this filesystem stored mode %#o for a 0o700 mkdir, so a level that passes every check but the ownership one cannot be built here", perm)
+		// Not a defect in the code under test: the chmod above ASKED for the bait mode
+		// and this filesystem still would not store it, and a widened level would be
+		// refused for its MODE, so the ownership arm this test exists for would never
+		// be the reason it failed. Skip like the Chown guard above rather than
+		// reporting the filesystem as a failure of the check. A dataset that merely
+		// widens the mkdir does NOT land here -- the chmod covers that one.
+		t.Skipf("this filesystem stored mode %#o even after a chmod to 0o700, so a level that passes every check but the ownership one cannot be built here", perm)
 	}
 
 	if err := newSessionTitleSync(root, t.TempDir()).ensureStateDir(); err == nil {

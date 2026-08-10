@@ -399,13 +399,22 @@ func enforceLevelMode(dir string) (os.FileMode, error) {
 	defer func() { _ = f.Close() }()
 	stored, err := atomicfile.EnforceMode(f, 0o700)
 	if errors.Is(err, atomicfile.ErrModeNotStored) {
-		// The filesystem would not store the mode we asked for, which is the case
-		// this repair exists for rather than a reason to refuse: EnforceMode still
-		// reports the mode it read back, and ensureStateLevel's WRITE-bits check is
-		// the policy that decides whether it is acceptable (see the "WRITE bits
-		// only, deliberately" paragraph there). Refusing on exact inequality would
-		// tighten this path to 0o077, which that paragraph forbids, and would turn
-		// a mount that cannot store 0700 into tab titles silently off at every boot.
+		// The filesystem would not store the mode we asked for, which is a REPORT
+		// rather than a reason to refuse: EnforceMode still reports the mode it read
+		// back, and ensureStateLevel's WRITE-bits check is the policy that decides
+		// whether it is acceptable (see the "WRITE bits only, deliberately" paragraph
+		// there). Refusing on exact inequality would tighten this path to 0o077, which
+		// that paragraph forbids, and would turn a mount whose chmod cannot store 0700
+		// into tab titles silently off at every boot.
+		//
+		// A CHMOD that cannot store the mode is the case, and it is not the
+		// creation-widening one this repair exists for: EnforceMode fchmods before it
+		// fstats, and the fchmod is exact even on the dataset that widens the mkdir
+		// (measured on the ZFS nfs4acl dataset cited above: mkdir(0o700) -> 0770,
+		// chmod(0o700) -> 0700, so EnforceMode returns nil there), and /tmp -- where
+		// titleStateRoot lives -- is exact both ways. So no filesystem measured here
+		// reaches this branch; it is the fail-open side of a policy the paragraph below
+		// states, not a path with a witness.
 		return stored.Perm(), nil
 	}
 	if err != nil {
@@ -537,10 +546,12 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 	}
 	if mapped == 0 && len(live) > 0 {
 		// Tabs exist and not one of them has a kiro session mapping, so every one
-		// keeps the engine's automatic cwd ladder. state_entries is the
-		// discriminator: 0 means the hook never wrote (its config was replaced, its
-		// fixed session_id extraction no longer matches kiro-cli's payload, or hooks
-		// are not firing), non-zero means every name present belongs to no live tab.
+		// keeps the engine's automatic cwd ladder. state_entries is the discriminator
+		// and it counts what this sweep TREATED as a mapping: 0 means no mapping-shaped
+		// name was there at all -- either the hook never wrote (its config was replaced,
+		// its fixed session_id extraction no longer matches kiro-cli's payload, or hooks
+		// are not firing) or it wrote only the dot-prefixed temps an interrupted hook
+		// never renamed -- and non-zero means every name present belongs to no live tab.
 		// Debug, not Warn: a tab still at the device-flow sign-in legitimately has no
 		// kiro session until the user confirms the code in their own browser, so a
 		// default-level record would fire on ordinary first-boot sign-ins.

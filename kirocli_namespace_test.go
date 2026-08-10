@@ -32,7 +32,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/pathinside"
-	"github.com/cplieger/pinstall"
+	"github.com/cplieger/pinstall/v2"
 )
 
 // The pin these tests install, and the toolbelt tool name that collides with it.

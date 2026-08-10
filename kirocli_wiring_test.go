@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/pinstall"
+	"github.com/cplieger/pinstall/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
@@ -22,51 +22,6 @@ import (
 // loopback repair hook. The pinstall library's own suite covers the manager;
 // nothing there can see whether main.go and routes.go actually consume it, and
 // every property below was silently breakable before these tests existed.
-
-// TestSessionPathEnv_versionDirectoryLeads pins the precedence rule the whole
-// sidecar-resolution story rests on: the active version's directory comes FIRST,
-// ahead of everything the image put on PATH.
-//
-// It matters because $TOOLS/bin is co-owned by the toolbelt engine and
-// $TOOLS/go/bin is GOPATH/bin, so either can hold a stale kiro-cli-chat (a
-// restored backup volume, a stray `go install`). With the version directory
-// leading, `kiro-cli chat` finds its sidecar inside the same digest-verified
-// install whether it resolves a sibling of its own executable or a bare name on
-// PATH. Reverse the order and that becomes a silent mixed-dispatcher-set bug: the
-// main binary is the pinned one, the sidecar is not, and nothing reports it.
-func TestSessionPathEnv_versionDirectoryLeads(t *testing.T) {
-	t.Setenv("PATH", "/config/tools/bin:/config/tools/go/bin:/usr/bin")
-
-	if got := sessionPathEnv(""); got != nil {
-		t.Errorf("sessionPathEnv(\"\") = %v, want nil: with no active version there is nothing to prepend and the child must keep the server's own PATH", got)
-	}
-
-	got := sessionPathEnv("/config/tools/kiro-cli-versions/2.14.2")
-	want := "PATH=/config/tools/kiro-cli-versions/2.14.2:/config/tools/bin:/config/tools/go/bin:/usr/bin"
-	if len(got) != 1 || got[0] != want {
-		t.Fatalf("sessionPathEnv = %q, want [%q]", got, want)
-	}
-}
-
-// TestSessionPathEnv_emptyInheritedPATHDoesNotWidenTheSearchPath pins the
-// degenerate branch: with no inherited PATH the overlay is the version directory
-// ALONE. Appending an empty inherited value instead emits "PATH=<dir>:", and a
-// trailing separator is an EMPTY PATH element, which resolves to the child's
-// working directory -- KWEB_WORK_DIR, the user's own repo checkouts. A
-// kiro-cli-chat dropped in /workspace would then win bare-name resolution inside
-// the session, the opposite of what leading with the version directory is for.
-// TestSessionPathEnv_versionDirectoryLeads sets a non-empty PATH, so nothing else
-// in the suite reaches this branch.
-func TestSessionPathEnv_emptyInheritedPATHDoesNotWidenTheSearchPath(t *testing.T) {
-	t.Setenv("PATH", "")
-
-	versionDir := "/config/tools/kiro-cli-versions/2.14.2"
-	got := sessionPathEnv(versionDir)
-	want := "PATH=" + versionDir
-	if len(got) != 1 || got[0] != want {
-		t.Fatalf("sessionPathEnv(%q) with no inherited PATH = %q, want [%q]: an empty PATH element resolves to the child's cwd, which is the user's workspace", versionDir, got, want)
-	}
-}
 
 // TestSessionEnv_reachesSpawnedPTY proves the PATH overlay survives the whole
 // path from routeDeps to a live child process. The engine composes each child's
@@ -79,7 +34,13 @@ func TestSessionEnv_reachesSpawnedPTY(t *testing.T) {
 	versionDir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "path")
 	deps := newTestDeps(true)
-	deps.sessionEnv = func() []string { return sessionPathEnv(versionDir) }
+	// A literal overlay, not pinstall.Manager.PathEnv: the subject here is that
+	// whatever deps.sessionEnv returns reaches the child and wins over the engine's
+	// own entries. Composing it (lead with the version directory, append the
+	// inherited PATH only when there is one) is the library's rule and the library's
+	// tests own it -- production reads mgr.PathEnv, and this app no longer has a copy
+	// of that rule to pin.
+	deps.sessionEnv = func() []string { return []string{"PATH=" + versionDir} }
 	deps.cmd = staticCmd("/bin/sh", "-c", `printf '%s' "$PATH" > '`+marker+`'; exec cat`)
 	mustStartSession(t, deps)
 

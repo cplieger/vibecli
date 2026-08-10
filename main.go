@@ -34,8 +34,8 @@ import (
 	"time"
 
 	"github.com/cplieger/envx"
-	"github.com/cplieger/pinstall"
-	"github.com/cplieger/pinstall/kirocli"
+	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pinstall/v2/kirocli"
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/toolbelt/v2"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
@@ -764,6 +764,16 @@ const (
 	// co-owned by the toolbelt engine, which publishes bin/<tool> symlinks of its
 	// own — which is why the legacy sweep names its targets instead of scanning it.
 	kiroLinkDir = "bin"
+	// kiroNFSAdminUID is the administrator's NFS account, which the tools volume's
+	// NFSv4 ACL grants write access to every directory on the way to the install
+	// root. pinstall parses that list and refuses a tree a stranger can write; it
+	// cannot know this stranger already holds root on the host through sudo, so
+	// writing these files gains that account nothing. Declaring the identity keeps
+	// the check enforcing against every OTHER writer, which is what a blanket
+	// InstallWithoutCustody would give up — along with a digest-verified reinstall
+	// on every container start, because a sentinel in a tree it does not trust is
+	// not evidence.
+	kiroNFSAdminUID = 3000
 	// legacyStagePrefix prefixed the shell installer's staging trees directly under
 	// the tools dir. The managed staging trees live under the install root instead,
 	// so anything matching this is an orphan its EXIT trap missed on a SIGKILL. It
@@ -928,7 +938,7 @@ func startKiroCLI(cfg *baseKiro) kiroRuntime {
 	chatArgs := cfg.chatArgs
 	return kiroRuntime{
 		cmd: func() []string { return sessionCommand(mgr.Path(), chatArgs...) },
-		env: func() []string { return sessionPathEnv(mgr.PathEntry()) },
+		env: mgr.PathEnv,
 		// The library reports a typed reason; this is the ONE place it becomes the
 		// wording an operator reads, so every surface below serves the same text.
 		ready: func() (bool, string) {
@@ -982,6 +992,9 @@ func kiroInstallConfig(cfg *baseKiro) *pinstall.Config {
 		// vibekit deliberately leaves this UNSET — it has no hardening pass that
 		// could make the observation.
 		Untrusted: cfg.tainted,
+		// The one identity the tools volume's ACL grants write that this app can
+		// vouch for; see kiroNFSAdminUID.
+		TrustedUIDs: []int{kiroNFSAdminUID},
 	}
 }
 
@@ -1041,30 +1054,6 @@ func kiroLegacyPurge() *pinstall.Purge {
 		StagePrefix: legacyStagePrefix,
 		Marker:      legacyPurgeMarker,
 	}
-}
-
-// sessionPathEnv returns the per-session environment overlay that puts the active
-// kiro-cli version directory FIRST on PATH, or nil when no version is active.
-//
-// Leading is the point, not a detail. That directory holds only kiro-cli's own
-// dispatchers, so it shadows nothing else, while $TOOLS/bin is co-owned by the
-// toolbelt engine and $TOOLS/go/bin is GOPATH/bin, where a `go install` can land
-// anything -- including a stale kiro-cli-chat from a restored backup volume. With the
-// version directory first, `kiro-cli chat` resolves its sidecar out of the same
-// verified install whether it looks for a sibling of its own executable or for a bare
-// name on PATH.
-func sessionPathEnv(entry string) []string {
-	if entry == "" {
-		return nil
-	}
-	if inherited := os.Getenv("PATH"); inherited != "" {
-		return []string{"PATH=" + entry + string(os.PathListSeparator) + inherited}
-	}
-	// No inherited PATH: return the version directory ALONE. Appending an empty
-	// value would leave a trailing separator, and an empty PATH element resolves to
-	// the child's cwd (KWEB_WORK_DIR, the user's own checkouts), so the degenerate
-	// case would widen the search path instead of narrowing it.
-	return []string{"PATH=" + entry}
 }
 
 // configMountDir is the persistent bind mount every deployment gives this

@@ -858,13 +858,13 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 // webhttp.StaticHandler (which supplies the ETag/gzip mechanism; asset paths
 // arrive normalized, no leading slash):
 //   - fonts (vendor/fonts/**): public, 30 days, NOT immutable. The Monaspace
-//     .otf files are large (~2.4 MB each, ~9.4 MB total) and their glyphs are
-//     fixed for a given vendored web-terminal-ui version, so a long max-age
+//     .woff2 files are sizable (~1.3 MB each, ~5.1 MB total) and their glyphs
+//     are fixed for a given vendored web-terminal-ui version, so a long max-age
 //     keeps an ordinary navigation from re-requesting them at all. `immutable`
 //     is deliberately absent: the filenames are NOT content-addressed and this
 //     app cannot make them so (the four @font-face URLs come from the vendored
-//     UI's page.css, and Dockerfile's NERDFONT_VERSION step extracts the same
-//     fixed names), so the bytes DO change under one filename on a nerd-fonts
+//     UI's page.css, and Dockerfile's MONASPACE_VERSION step fetches the same
+//     fixed names), so the bytes DO change under one filename on a Monaspace
 //     bump. Without `immutable` a reload revalidates against the helper's
 //     content-hash ETag — a ~200-byte 304 when nothing changed, the new face
 //     when it did — which is the operator's and the user's only lever after a

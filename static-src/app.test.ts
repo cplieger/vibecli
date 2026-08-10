@@ -21,11 +21,19 @@ import {
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
 // assertions match against, so we verify app.ts passes the agent preset through.
-const { createTerminalMock, presetAgentTabbedMock } = vi.hoisted(() => ({
-  createTerminalMock: vi.fn(),
-  presetAgentTabbedMock: vi.fn(() => ["preset-features"]),
+const { createTerminalMock, presetAgentTabbedMock, localScrollbackStorageMock } = vi.hoisted(
+  () => ({
+    createTerminalMock: vi.fn(),
+    presetAgentTabbedMock: vi.fn(() => ["preset-features"]),
+    // A sentinel, so the assertions verify the app hands the library's own
+    // localStorage store through rather than inventing storage of its own.
+    localScrollbackStorageMock: vi.fn(() => ({ kind: "scrollback-store" })),
+  }),
+);
+vi.mock("@cplieger/web-terminal-ui", () => ({
+  createTerminal: createTerminalMock,
+  localScrollbackStorage: localScrollbackStorageMock,
 }));
-vi.mock("@cplieger/web-terminal-ui", () => ({ createTerminal: createTerminalMock }));
 vi.mock("@cplieger/web-terminal-ui/presets", () => ({
   presetAgentTabbed: presetAgentTabbedMock,
 }));
@@ -492,6 +500,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // app had to hand-build a recovery surface -- and the library never saw them.
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
       features: presetAgentTabbedMock,
+      persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
     });
     // Passing the function must NOT call it here.
@@ -500,6 +509,25 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the app adds no dialog, no inert, nothing.
     expect(root.hasAttribute("inert")).toBe(false);
     expect(root.children).toHaveLength(0);
+  });
+
+  it("persists each tab's scrollback through the library's own store", async () => {
+    // The point of the option, and the reason it is set here rather than left off:
+    // iOS discards this page's process routinely, the server keeps every session,
+    // and without a restored store the reload asks for the whole scrollback back
+    // over the wire — which is the line-by-line refill that made an ordinary tab
+    // eviction look like a crash.
+    //
+    // It must be the LIBRARY's store, called with no arguments. A hand-rolled one
+    // here would be a fourth copy of the same forty lines across the consumers,
+    // and the part that gets omitted in a copy is the orphan sweep, whose absence
+    // is invisible until the origin quota fills.
+    appendTerminalRoot();
+
+    await import("./app.js");
+
+    expect(localScrollbackStorageMock).toHaveBeenCalledTimes(1);
+    expect(localScrollbackStorageMock).toHaveBeenCalledWith();
   });
 
   it("passes the #loading element to createTerminal when it is present", async () => {
@@ -513,6 +541,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
       features: presetAgentTabbedMock,
+      persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
       loading,
     });

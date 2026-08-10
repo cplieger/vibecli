@@ -125,7 +125,9 @@ unset -f mount
 # makes, and it pins the reason that report is gone. An earlier fix here created an
 # `init` leaf and migrated the root's pids into it, to clear cgroup v2's
 # no-internal-process constraint before the server writes cgroup.subtree_control.
-# Read against the pinned engine (v3.4.3 terminal/containment_linux.go), that is
+# Read against the engine's terminal/containment_linux.go (unchanged in this respect
+# since containment landed, first tagged v3.4.0 -- do not re-anchor this to the current
+# go.mod pin, it moves on every Renovate bump), that is
 # both redundant and actively harmful: NewContainment's own vacateRoot (step 5)
 # already moves every pid into its "wt-server" leaf before delegating, and its
 # verifyOwnRoot (step 2, which runs FIRST) refuses the entire root the moment it

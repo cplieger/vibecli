@@ -403,8 +403,48 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	}
 }
 
+// TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted pins the arm the
+// handle reshape made necessary: entry names are TITLE HANDLES and handles live only
+// in this process's index, so a file left behind by a PREVIOUS server run in the same
+// container (/tmp is container-layer and survives a restart) resolves to no tab at all
+// -- a state the old tab-id key could not produce, because a stale tab id was simply
+// not live. Every other test in this file names its entries through the fixture's
+// handle helper, so all of them take the `known` path and this arm reports zero hits
+// in the coverage profile; dropping its forget call leaves the whole suite green while
+// every previous run's mappings stay on disk for the container's life, growing the
+// per-tick ReadDir, and every failure path here is Debug-only so nothing says so.
+func TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted(t *testing.T) {
+	f := newTitleFixture(t)
+	// A well-formed handle from a previous run: the right alphabet and length, just
+	// not in this process's index.
+	const stale = "0123456789abcdef0123456789abcdef"
+	stalePath := filepath.Join(f.sync.stateDir, stale)
+	if err := os.WriteFile(stalePath, []byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
+		t.Fatalf("plant a previous run's mapping: %v", err)
+	}
+	// A live tab whose own handle IS known, so the sweep is not trivially empty and
+	// an over-broad reclaim shows up as a missing push.
+	kiroID := "sess_22222222-3333-4444-5555-666666666666"
+	f.mapping("tab1", kiroID)
+	f.session("hash0", kiroID, titleJSON("a real title"))
+	own := filepath.Join(f.sync.stateDir, f.handle("tab1"))
+
+	set := &fakeSetter{live: []string{"tab1"}}
+	f.sync.pass(set)
+
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Errorf("a mapping named for a handle this process never minted survives (stat err = %v); every previous run's files would stay on disk for the container's life, growing the per-tick ReadDir", err)
+	}
+	if _, err := os.Stat(own); err != nil {
+		t.Errorf("stat the live tab's own mapping = %v, want the unknown-handle reclaim to leave it alone", err)
+	}
+	if len(set.calls) != 1 {
+		t.Errorf("pushes = %v, want exactly the live tab's title: an unknown handle resolves to no tab, so nothing may be pushed for it", set.calls)
+	}
+}
+
 // TestSessionTitleKeepsTheHooksInFlightTemps pins the reclaim's POPULATION: the hook
-// writes each mapping through a dot-prefixed temp (".<tabID>.$$" in
+// writes each mapping through a dot-prefixed temp (".<handle>.$$" in
 // hooks/session-title.sh) and renames it into place, so a temp caught mid-write by a
 // sweep has to survive. Without the dot skip the reclaim deletes it, the hook's mv then
 // fails, `|| rm -f` runs, and that prompt's re-point is lost with no record anywhere.
@@ -431,9 +471,10 @@ func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
 // TestSessionTitleRejectsHostileIdentifiers is the security half for the one
 // identifier this package validates: the kiro session id read OUT of a mapping
 // file, which a hostile writer chooses freely and which becomes a path component
-// under the kiro session store. The tab id needs no predicate — every production
-// value is an os.ReadDir basename of the state dir, so it is one path component
-// by construction — so only the kiro id is gated at the Go boundary, and that
+// under the kiro session store. The mapping file's NAME needs no predicate — since
+// the handle reshape it is a title handle, every production value is an os.ReadDir
+// basename of the state dir, and pass() resolves it through tabForHandle before
+// anything reads it — so only the kiro id is gated at the Go boundary, and that
 // gate is checked here independently of the hook's own.
 func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 	t.Run("kiro id must look like a kiro session id", func(t *testing.T) {
@@ -633,8 +674,10 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 		t.Errorf("mapping file is named %q, want the title handle %q: a filename in this directory must not be a capability token", name, handle)
 	}
 
-	// 3. Every log attribute, across the three records the sync path emits about a
-	// mapping: the adopted title, an unusable mapping, and the reclaim.
+	// 3. Every log attribute. The sync path emits TWO records about a mapping -- the
+	// adopted title and an unusable mapping -- and the reclaim emits none, because
+	// forget logs only when os.Remove fails. The third pass below is therefore here to
+	// prove the reclaim adds no record naming the tab id, not to observe one.
 	var logged strings.Builder
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))

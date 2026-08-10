@@ -83,17 +83,28 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Nerd Font. kiro-cli's diff UI uses nerd-font private-use-area
 # glyphs (line markers, file-type icons). System monospace fonts
 # don't carry these, so they render as tofu (black squares) in
-# the terminal display. Bundling one Mono-width Nerd Font + serving
-# it via @font-face fixes that. The four MonaspiceNe Nerd Font Mono
-# faces grow the web-terminal-kiro binary via go:embed and ship gzipped
-# over the wire.
-# renovate: datasource=github-releases depName=ryanoasis/nerd-fonts
-ARG NERDFONT_VERSION=v3.5.0
-# sha256 of Monaspace.tar.xz for this tag. GitHub release assets are MUTABLE (a
-# retag can swap the bytes under a fixed tag), so this gate is the real
-# integrity anchor here.
-# repin: dep=ryanoasis/nerd-fonts url=https://github.com/ryanoasis/nerd-fonts/releases/download/{version}/Monaspace.tar.xz
-ARG NERDFONT_SHA256=bc34fd1998deee7105573e4604ca3fc3d568c1549fc6035c53981eba4160c0dc
+# the terminal display. Bundling one cell-width-icon Nerd Font +
+# serving it via @font-face fixes that. The four Monaspace Neon NF
+# WOFF2 faces come from GitHub's own Monaspace repo, which publishes
+# official nerd-fonts-patched webfonts (the nerd-fonts release repo is
+# OTF-only); WOFF2 halves the served bytes (~5.1 MB vs ~10.9 MB), and
+# the swap was gated on a metrics check: outlines and every PUA icon
+# advance are identical to the previously bundled MonaspiceNe NFM OTFs
+# (icons stay exactly one cell). The faces grow the web-terminal-kiro
+# binary via go:embed and ship pre-compressed over the wire.
+# renovate: datasource=github-releases depName=githubnext/monaspace
+ARG MONASPACE_VERSION=v1.400
+# sha256 per face for this tag. Raw files at a git tag are as mutable as
+# GitHub release assets (a force-pushed tag swaps the bytes under a fixed
+# ref), so these gates are the real integrity anchor here.
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Regular.woff2
+ARG MONASPACE_REGULAR_SHA256=8063ea45b6997c658035a4d876f996ecfa306c88fd0541d35d533fb1f9400c84
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Bold.woff2
+ARG MONASPACE_BOLD_SHA256=45f56dceff8e569d61b6e3168fe208432e7bf0bc3e56e41b4d754cc575a063bd
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Italic.woff2
+ARG MONASPACE_ITALIC_SHA256=3d77eb9a5ec9e32c5ac7ea49c4325e5d6c8e5fefda7317527de905130a88f3cf
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-BoldItalic.woff2
+ARG MONASPACE_BOLDITALIC_SHA256=5dffc9465be18eb63263671f1f3ba266ede49043cb6b3edcd65ea993c909b3aa
 
 WORKDIR /build
 COPY go.mod go.sum ./
@@ -166,17 +177,16 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
     go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
-# Fetch Nerd Font for the monospace terminal display.
+# Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
 RUN mkdir -p static/vendor/fonts && \
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/mona.tar.xz \
-      "https://github.com/ryanoasis/nerd-fonts/releases/download/${NERDFONT_VERSION}/Monaspace.tar.xz" && \
-    printf '%s  /tmp/mona.tar.xz\n' "$NERDFONT_SHA256" | sha256sum -c - && \
-    tar -xJ -C static/vendor/fonts -f /tmp/mona.tar.xz \
-        MonaspiceNeNerdFontMono-Regular.otf \
-        MonaspiceNeNerdFontMono-Bold.otf \
-        MonaspiceNeNerdFontMono-Italic.otf \
-        MonaspiceNeNerdFontMono-BoldItalic.otf && \
-    rm /tmp/mona.tar.xz
+    for face in Regular Bold Italic BoldItalic; do \
+      curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL \
+        -o "static/vendor/fonts/MonaspaceNeonNF-${face}.woff2" \
+        "https://raw.githubusercontent.com/githubnext/monaspace/${MONASPACE_VERSION}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-${face}.woff2"; \
+    done && \
+    printf '%s  static/vendor/fonts/MonaspaceNeonNF-Regular.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-Bold.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-Italic.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-BoldItalic.woff2\n' \
+      "$MONASPACE_REGULAR_SHA256" "$MONASPACE_BOLD_SHA256" "$MONASPACE_ITALIC_SHA256" "$MONASPACE_BOLDITALIC_SHA256" \
+      | sha256sum -c -
 
 # Fetch the engine + UI TypeScript from the npm registry. Both publish TS
 # source only (no precompiled JS) — same pattern as @cplieger/reactive,

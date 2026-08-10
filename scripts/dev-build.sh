@@ -130,8 +130,8 @@ wirecheck_bin="$(mktemp)"
 # The gate's whole purpose is to EXIT non-zero (1 on a floor violation, 2 on a broken
 # extraction), and under set -euo pipefail either exit -- like a failing go build --
 # skips the rm below, leaking a multi-megabyte binary per failing run. Trap it, then
-# disarm: the later mona_tmp trap REPLACES this one, so leaving it armed would point
-# that trap's predecessor at a stale path.
+# disarm once the binary is removed: EXIT traps do not stack (a later step arming its
+# own would silently replace this one), so no step may leave one armed past its use.
 trap 'rm -f "$wirecheck_bin"' EXIT
 go build -o "$wirecheck_bin" ./scripts/wirecheck
 "$wirecheck_bin" -manifest "$ENGINE_PKG/wire-compatibility.json"
@@ -164,40 +164,54 @@ bash scripts/vendor-tsc.sh "$TSC" ui "$UI_PKG/src" \
 # page's own importmap rather than restating it here.
 sh scripts/assert-emit.sh
 
-printf '[5/6] fonts (Monaspace Nerd Font, cached) + CSS bundle (from UI package)\n'
-# Single source of truth: the Dockerfile's Renovate-managed NERDFONT_* ARGs.
-# Stop at whitespace or a `#` trailer: the repo's other manually-bumped sha
-# pins (GO_SHA256_*, TOOL_CATALOG_SHA256) carry a `# <name> <version>`
-# Renovate anchor, and swallowing one here would feed garbage to sha256sum.
-FONT_VER="$(sed -n 's/^ARG NERDFONT_VERSION=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
-FONT_SHA256="$(sed -n 's/^ARG NERDFONT_SHA256=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
-: "${FONT_VER:?failed to parse NERDFONT_VERSION from Dockerfile}"
-: "${FONT_SHA256:?failed to parse NERDFONT_SHA256 from Dockerfile}"
-# Key the cache dir by version AND integrity pin so a NERDFONT_VERSION bump —
-# or a same-version NERDFONT_SHA256 correction — misses the cache instead of
-# silently reusing stale fonts (old cache dirs are tiny and rare enough to
-# leave behind). A .complete marker inside the keyed dir gates reuse: it is
-# written only after every face extracted non-empty, so a tar interrupted
-# mid-face (which can leave all four pathnames present, the last truncated)
-# self-heals with a full retry on the next build instead of embedding a
-# corrupt face.
-FONT_CACHE="${HOME}/.cache/web-terminal-kiro-fonts/${FONT_VER}-${FONT_SHA256}"
-FONT_CACHE_MARKER="$FONT_CACHE/.complete"
-# Same single-source-of-truth rule as the NERDFONT_* pins above: the face set is the
-# Dockerfile's tar member list. Hardcoding it here drifts SILENTLY (extracting the old
-# four faces still succeeds), so the dev binary would embed a different font set than the
-# image and only show it as tofu at runtime.
-# Match ANY .otf tar member rather than one family: pinning the family here is the
-# hardcoding this block exists to avoid, and it fails asymmetrically -- a wholesale
-# rename trips the guard below, but renaming SOME faces silently yields a shorter
-# list that passes it. Every .otf token in the Dockerfile is a member of this one
-# tar list, so no family prefix is needed to disambiguate.
-mapfile -t fonts < <(sed -n \
-  's/^[[:space:]]*\([A-Za-z0-9][A-Za-z0-9.-]*\.otf\).*/\1/p' Dockerfile)
+printf '[5/6] fonts (Monaspace Neon NF webfonts, cached) + CSS bundle (from UI package)\n'
+# Single source of truth: the Dockerfile's Renovate-managed MONASPACE_* ARGs
+# and its fetch layer. Stop at whitespace or a `#` trailer: the repo's other
+# manually-bumped sha pins (GO_SHA256_*, TOOL_CATALOG_SHA256) carry a
+# `# <name> <version>` Renovate anchor, and swallowing one here would feed
+# garbage to sha256sum.
+FONT_VER="$(sed -n 's/^ARG MONASPACE_VERSION=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
+: "${FONT_VER:?failed to parse MONASPACE_VERSION from Dockerfile}"
+# Face set: every vendored .woff2 filename the Dockerfile names (family-free
+# match, same anti-drift rule as the old tar member list — a face renamed or
+# dropped in the image must change this list in lockstep, or the dev binary
+# would embed a different font set than the image and only show it as tofu at
+# runtime).
+mapfile -t fonts < <(grep -oE 'static/vendor/fonts/[A-Za-z0-9.-]+\.woff2' Dockerfile | sed 's|.*/||' | sort -u)
 [ "${#fonts[@]}" -gt 0 ] || {
   printf 'error: failed to parse the Monaspace face list from Dockerfile\n' >&2
   exit 1
 }
+# Fetch base: the repin marker's URL template (the same literal Renovate's
+# postUpgradeTask reads), {version} substituted — so the URL too is
+# single-sourced in the Dockerfile.
+FONT_URL_TMPL="$(sed -n 's|^# repin: dep=githubnext/monaspace url=\(.*\)/[^/]*$|\1|p' Dockerfile | head -n1)"
+: "${FONT_URL_TMPL:?failed to parse the monaspace repin URL from Dockerfile}"
+FONT_BASE_URL="${FONT_URL_TMPL//\{version\}/$FONT_VER}"
+# Per-face pins, keyed by the face token in the filename
+# (MonaspaceNeonNF-<Face>.woff2 -> ARG MONASPACE_<FACE>_SHA256). The cache dir
+# is keyed by version AND a digest of all four pins so a MONASPACE_VERSION
+# bump — or a same-version sha correction — misses the cache instead of
+# silently reusing stale fonts. A .complete marker inside the keyed dir gates
+# reuse: it is written only after every face downloaded AND verified, so an
+# interrupted fetch self-heals with a full retry on the next build instead of
+# embedding a corrupt face.
+declare -A font_sha
+combined=""
+for font in "${fonts[@]}"; do
+  face="${font##*-}"
+  face="${face%.woff2}"
+  arg_name="MONASPACE_$(printf '%s' "$face" | tr '[:lower:]' '[:upper:]')_SHA256"
+  sha="$(sed -n "s/^ARG ${arg_name}=\([^[:space:]#]*\).*/\1/p" Dockerfile)"
+  [ -n "$sha" ] || {
+    printf 'error: failed to parse %s from Dockerfile\n' "$arg_name" >&2
+    exit 1
+  }
+  font_sha["$font"]="$sha"
+  combined="${combined}${sha}"
+done
+FONT_CACHE="${HOME}/.cache/web-terminal-kiro-fonts/${FONT_VER}-$(printf '%s' "$combined" | sha256sum | cut -c1-16)"
+FONT_CACHE_MARKER="$FONT_CACHE/.complete"
 mkdir -p "$FONT_CACHE"
 need_fonts=0
 [ -f "$FONT_CACHE_MARKER" ] || need_fonts=1
@@ -205,19 +219,14 @@ for font in "${fonts[@]}"; do
   [ -s "$FONT_CACHE/$font" ] || need_fonts=1
 done
 if [ "$need_fonts" = 1 ]; then
-  printf '  downloading Monaspace %s...\n' "$FONT_VER"
+  printf '  downloading Monaspace Neon NF %s...\n' "$FONT_VER"
   rm -f "$FONT_CACHE_MARKER"
-  mona_tmp="$(mktemp)"
-  trap 'rm -f "$mona_tmp"' EXIT
-  curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL \
-    "https://github.com/ryanoasis/nerd-fonts/releases/download/${FONT_VER}/Monaspace.tar.xz" \
-    -o "$mona_tmp"
-  printf '%s  %s\n' "$FONT_SHA256" "$mona_tmp" | sha256sum -c -
-  tar -xJ -C "$FONT_CACHE" -f "$mona_tmp" "${fonts[@]}"
-  rm -f "$mona_tmp"
   for font in "${fonts[@]}"; do
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL \
+      "${FONT_BASE_URL}/${font}" -o "$FONT_CACHE/$font"
+    printf '%s  %s\n' "${font_sha[$font]}" "$FONT_CACHE/$font" | sha256sum -c -
     [ -s "$FONT_CACHE/$font" ] || {
-      printf 'error: extracted font is missing or empty: %s\n' "$FONT_CACHE/$font" >&2
+      printf 'error: downloaded font is missing or empty: %s\n' "$FONT_CACHE/$font" >&2
       exit 1
     }
   done

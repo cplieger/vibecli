@@ -696,7 +696,7 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 //
 // This is a COMPOSITION test, and it exists because the composition is the part
 // that breaks. Tab names come from kiro-cli's own session record, and the whole
-// chain rests on one thing this app must do per session: inject KWEB_SESSION_ID
+// chain rests on one thing this app must do per session: inject KWEB_TITLE_HANDLE
 // into the child environment so a kiro-cli hook can report which kiro session the
 // tab is running (sessiontitle.go). Nothing else can supply that pairing. Drop the
 // option and every tab silently falls back to the engine's automatic cwd rung and
@@ -717,7 +717,7 @@ func TestSessionFactoryRequestsTheTitleEnv(t *testing.T) {
 		cmd:     staticCmd("/bin/cat"),
 		sessionTitleEnv: func(id string) []string {
 			gotIDs = append(gotIDs, id)
-			return []string{"KWEB_SESSION_ID=" + id}
+			return []string{"KWEB_TITLE_HANDLE=" + id}
 		},
 	})
 	_, _, _, id := mustStartSession(t, deps)
@@ -735,10 +735,10 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 	t.Run("both overlays present", func(t *testing.T) {
 		d := &routeDeps{
 			sessionEnv:      func() []string { return []string{"PATH=/pinned:/usr/bin"} },
-			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
+			sessionTitleEnv: func(id string) []string { return []string{"KWEB_TITLE_HANDLE=" + id} },
 		}
 		got := d.childEnv("tab7")
-		want := []string{"PATH=/pinned:/usr/bin", "KWEB_SESSION_ID=tab7"}
+		want := []string{"PATH=/pinned:/usr/bin", "KWEB_TITLE_HANDLE=tab7"}
 		if !slices.Equal(got, want) {
 			t.Errorf("childEnv = %v, want %v", got, want)
 		}
@@ -756,14 +756,14 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 		base[0] = "PATH=/pinned"
 		d := &routeDeps{
 			sessionEnv:      func() []string { return base },
-			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
+			sessionTitleEnv: func(id string) []string { return []string{"KWEB_TITLE_HANDLE=" + id} },
 		}
 		a := d.childEnv("tabA")
 		b := d.childEnv("tabB")
-		if a[1] != "KWEB_SESSION_ID=tabA" {
+		if a[1] != "KWEB_TITLE_HANDLE=tabA" {
 			t.Errorf("first overlay = %v, want it unchanged by the second", a)
 		}
-		if b[1] != "KWEB_SESSION_ID=tabB" {
+		if b[1] != "KWEB_TITLE_HANDLE=tabB" {
 			t.Errorf("second overlay = %v", b)
 		}
 	})

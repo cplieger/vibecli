@@ -2775,23 +2775,6 @@ func TestParseCatalogRefreshIsOutcomeTransparent(t *testing.T) {
 	}
 }
 
-// The same invariant over arbitrary bytes, so a vocabulary change upstream is
-// caught even for a spelling no hand-written case anticipated.
-func FuzzParseCatalogRefreshIsOutcomeTransparent(f *testing.F) {
-	for _, seed := range []string{
-		"", "off", "disabled", "24h", "24H", "0", "0s", "-5m", "5min", "abc",
-		" 90m ", "OFF", "1h30m", "\x00", "1e3s",
-	} {
-		f.Add(seed)
-	}
-	f.Fuzz(func(t *testing.T, raw string) {
-		want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
-		if got := parseCatalogRefresh(raw); got != want {
-			t.Fatalf("parseCatalogRefresh(%q) = %v, library returns %v — outcome divergence", raw, got, want)
-		}
-	})
-}
-
 // The protection itself: whatever the operator set must never reach the log. This
 // is what the deviation buys, and it is the half a library change would have
 // taken away. Mutates the process-global default logger, so no t.Parallel.

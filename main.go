@@ -591,9 +591,9 @@ func run() error {
 	// this app persists no session state (terminal state is the in-memory VT
 	// buffer), so nothing here should outlive the container. A refused directory is
 	// a warn, not fatal — and it is AUTHORITATIVE for both consumers: no tab gets
-	// KWEB_TITLE_STATE_DIR, the poller never starts, and the engine's automatic
-	// ladder names every tab (see enableSessionTitles for why a warn-only verdict
-	// left the refused path in use).
+	// KWEB_TITLE_HANDLE or KWEB_TITLE_STATE_DIR, the poller never starts, and the
+	// engine's automatic ladder names every tab (see enableSessionTitles for why a
+	// warn-only verdict left the refused path in use).
 	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
 	sessionTitleEnv, titleSyncEnabled := enableSessionTitles(titles)
 
@@ -640,6 +640,18 @@ func run() error {
 	// SESSION reaping is a different engine mechanism and stays on by default: it
 	// ends a closed session's still-ALIVE descendants from an inherited environment
 	// marker, needs no capability, and is unaffected by which process is pid 1.
+	//
+	// Because reaping is the init's job, its ABSENCE is detectable here in one
+	// comparison: with `init: true` tini is pid 1 and this server is not; without
+	// it the entrypoint's exec chain makes this server pid 1, where os/exec
+	// collects only its own children and every re-parented orphan stays a zombie
+	// for the container's lifetime (measured: 17,323 zombies, 32.6 GB). Warn, not
+	// fatal, per this app's failure posture: the container still serves and the
+	// fix is one compose line.
+	if os.Getpid() == 1 {
+		slog.Warn("running as PID 1 with no init: orphaned session processes will accumulate as zombies for the container's lifetime",
+			"hint", "add `init: true` to the compose service (or run with `docker run --init`) so an init at PID 1 reaps orphans; the shipped compose.yaml marks it required")
+	}
 
 	mgr := registerRoutes(mux, &routeDeps{
 		static:          staticSrv,

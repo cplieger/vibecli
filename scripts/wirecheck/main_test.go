@@ -803,3 +803,29 @@ func TestGateHelpIsNotReportedAsABrokenGate(t *testing.T) {
 		})
 	}
 }
+
+// TestGateRequiresTheManifestFlag pins the requirement main's own comment claims
+// needs no separate check: -manifest is REQUIRED, so a bare invocation must exit
+// 2 with the broken-gate line, never 0. Today that holds only because an absent
+// flag reaches terminal.ReadWireManifest as "" and fails to open; a defaulted
+// flag path or an early exit on the empty value would silently un-require it,
+// and no other test invokes the gate process without the flag.
+func TestGateRequiresTheManifestFlag(t *testing.T) {
+	// #nosec G204 -- os.Args[0] is this test binary; no external input.
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		t.Fatalf("run gate subprocess: %v (output %q)", err, out)
+	}
+	if got := cmd.ProcessState.ExitCode(); got != 2 {
+		t.Errorf("gate process with no flags exit = %d, want 2 (output %q); an invocation with no client-side declaration checks no floor and must say the gate is broken", got, out)
+	}
+	if !strings.Contains(string(out), usageErrMsg) {
+		t.Errorf("gate output = %q, want the broken-gate usage line so the reader is told not to bump a pin", out)
+	}
+	if !strings.Contains(string(out), "cannot read the engine's wire-compatibility manifest") {
+		t.Errorf("gate output = %q, want it to name what could not be read", out)
+	}
+}

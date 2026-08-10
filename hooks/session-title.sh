@@ -5,10 +5,18 @@
 # hook config that points at this path -- its `hooks_file` block, rewritten on every
 # boot). It is the only place the two identities meet:
 #
-#   KWEB_SESSION_ID     the tab's id, injected into this session's child
-#                       environment by the server's session factory and
-#                       inherited by every descendant including this hook
+#   KWEB_TITLE_HANDLE   the tab's TITLE HANDLE, minted by the server and injected
+#                       into this session's child environment by its session
+#                       factory, inherited by every descendant including this hook
 #   session_id          kiro-cli's own session id, handed to a hook on stdin
+#
+# The handle is NOT the tab id, and that is deliberate: a tab id is the credential
+# /ws attaches and resumes a session with, so naming this file after one put a live
+# capability token in a directory neither the server nor kiro-cli owns. A handle is
+# 128 bits of crypto-random hex that authenticates nothing, so leaking it discloses
+# nothing, while staying just as hard to guess as a session id -- which is what keeps
+# a local writer from naming a mapping file for a tab it does not own. The server
+# joins the handle back to its tab in memory; see sessionEnv in sessiontitle.go.
 #
 # The server cannot learn the pairing any other way: kiro-cli does not accept a
 # session id from its environment (KIRO_SESSION_ID is a variable it EXPORTS to
@@ -26,8 +34,8 @@
 set -u
 
 # Nothing to do outside a web-terminal session (the operator running kiro-cli
-# from `docker exec` gets no injected id, and a global hook fires there too).
-[ -n "${KWEB_SESSION_ID:-}" ] || exit 0
+# from `docker exec` gets no injected handle, and a global hook fires there too).
+[ -n "${KWEB_TITLE_HANDLE:-}" ] || exit 0
 [ -n "${KWEB_TITLE_STATE_DIR:-}" ] || exit 0
 
 # Read the hook payload and pull out kiro's session id. Deliberately a fixed
@@ -50,24 +58,24 @@ case "$kiro_session" in
   *) exit 0 ;;
 esac
 
-# The tab id becomes a filename, so refuse anything that is not the server's own
-# id alphabet rather than letting it walk out of the state directory. This is the ONLY
-# alphabet check on the value: the server's readMapping and forget join the name they got
-# from os.ReadDir straight onto the state path (sessiontitle.go), because every id they
-# see is already a basename from that enumeration and the read path additionally requires
-# it to be live in the manager. Nothing downstream repeats this check, so do not drop it
-# as redundant -- the hook is the one writer that receives the id from an environment it
-# does not control.
-case "$KWEB_SESSION_ID" in
-  *[!A-Za-z0-9_-]* | '') exit 0 ;;
+# The handle becomes a filename, so refuse anything that is not the server's own
+# handle alphabet rather than letting it walk out of the state directory. This is the
+# ONLY alphabet check on the value: the server's readMapping and forget join the name
+# they got from os.ReadDir straight onto the state path (sessiontitle.go), because
+# every name they see is already a basename from that enumeration and the read path
+# additionally requires it to resolve to a tab the manager still lists. Nothing
+# downstream repeats this check, so do not drop it as redundant -- the hook is the one
+# writer that receives the value from an environment it does not control.
+case "$KWEB_TITLE_HANDLE" in
+  *[!A-Za-z0-9_-]*) exit 0 ;;
 esac
 
 mkdir -p "$KWEB_TITLE_STATE_DIR" 2>/dev/null || exit 0
 
 # Write via a temp file and rename so the server never reads a half-written
 # mapping. The temp name carries $$ so two tabs starting together cannot collide.
-tmp="$KWEB_TITLE_STATE_DIR/.$KWEB_SESSION_ID.$$"
+tmp="$KWEB_TITLE_STATE_DIR/.$KWEB_TITLE_HANDLE.$$"
 printf '%s\n' "$kiro_session" >"$tmp" 2>/dev/null || exit 0
-mv -f "$tmp" "$KWEB_TITLE_STATE_DIR/$KWEB_SESSION_ID" 2>/dev/null || rm -f "$tmp"
+mv -f "$tmp" "$KWEB_TITLE_STATE_DIR/$KWEB_TITLE_HANDLE" 2>/dev/null || rm -f "$tmp"
 
 exit 0

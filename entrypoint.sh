@@ -191,7 +191,7 @@ enable_session_containment() {
     # would leave, and flattening before the call preserves the original order (bound
     # the RAW value, then escape).
     mount_err=$(logfmt_value "${mount_err//$'\n'/ }")
-    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; per-session containment cannot engage, so per-session peak memory and task counts will not be reported. Closed-tab process trees are still reaped without it" error="%s" hint="OPTIONAL: add cap_add: [SYS_ADMIN] to the compose service to enable containment; the capability is dropped again immediately after this remount. Not granted by default, because marker-based session reaping in the engine closes the process leak without it" component=entrypoint\n' "$mount_err" >&2
+    printf 'level=warn msg="cannot remount /sys/fs/cgroup rw; per-session containment cannot engage, so per-session peak memory and task counts will not be reported. Closed-tab process trees are still reaped without it" error="%s" hint="OPTIONAL: add cap_add: [SYS_ADMIN] to the compose service to enable containment; the server and every terminal session drop the capability immediately after this remount. The grant is not fully transient: the container init at PID 1 keeps it for the container lifetime (inert -- it executes nothing and cannot be ptraced without SYS_PTRACE), docker exec processes receive it, and the widened seccomp profile persists. Not granted by default, because marker-based session reaping in the engine closes the process leak without it" component=entrypoint\n' "$mount_err" >&2
     return 1
   fi
   # Report ONLY what the remount proved, and on stderr like every other line in this
@@ -209,8 +209,9 @@ enable_session_containment() {
   # out of the root into its "wt-server" leaf before delegate() writes
   # cgroup.subtree_control. That does NOT explain the borgcube measurement, and the
   # reason is worth recording rather than assuming: image v2.7.7 pinned engine v3.4.2,
-  # whose terminal/containment_linux.go is byte-identical to the v3.4.3 pinned here
-  # (containment landed in one engine commit, first tagged v3.4.0, vacate included), so
+  # which already carried the vacate (containment landed in one engine commit, first
+  # tagged v3.4.0, vacate included -- do not re-anchor this to the current go.mod pin;
+  # it moves on every Renovate bump), so
   # that EBUSY occurred WITH the vacate running. Its cause is still open; do not read
   # this block as having closed it. What is settled is only that the fix does not
   # belong here. A leaf created HERE cannot be named acceptably: step 2, verifyOwnRoot,
@@ -233,6 +234,10 @@ enable_session_containment() {
 # plus an APT_PACKAGES install on every start, and holding the broadest capability
 # there is across network-fetched package installation to buy a single mount call
 # would be a bad trade. Re-executing here reduces the window to that one call.
+# The window is per-process, not per-container: the container init at PID 1 (compose
+# init: true) is this script's parent and keeps the granted capability for the
+# container's life, as does any docker exec -- the drop protects the processes that
+# execute terminal input, which is the server and every PTY session.
 #
 # This block must stay BELOW enable_session_containment's definition: bash resolves
 # a function at call time, so a call placed above the definition does not fail
@@ -1252,7 +1257,7 @@ fi
 # Seed the kiro-cli hook that reports which kiro session each tab is running.
 #
 # This is the mapping half of the tab-title feature (sessiontitle.go). The server
-# injects KWEB_SESSION_ID + KWEB_TITLE_STATE_DIR into each PTY session, and this hook
+# injects KWEB_TITLE_HANDLE + KWEB_TITLE_STATE_DIR into each PTY session, and this hook
 # — a descendant of that session, handed kiro's own session_id on stdin — writes the
 # pair where the server reads it. Without it every tab falls back to the engine's
 # automatic cwd/process name ladder, which is a degraded label rather than a failure.
@@ -1260,7 +1265,7 @@ fi
 # Rewritten on EVERY boot rather than created-if-missing, so an image upgrade updates
 # the hook and a deleted or edited file self-heals. Global hooks (~/.kiro/hooks) load
 # in every workspace, which is what makes this reach a session whatever directory it
-# starts in; the script itself no-ops when KWEB_SESSION_ID is absent, so an operator
+# starts in; the script itself no-ops when KWEB_TITLE_HANDLE is absent, so an operator
 # running kiro-cli from `docker exec` is unaffected.
 #
 # Symlink handling follows the theme block above for the same reason: this writes a

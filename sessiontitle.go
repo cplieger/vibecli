@@ -22,12 +22,19 @@ package main
 // kiro-cli does not accept a session id from its environment (KIRO_SESSION_ID is a
 // variable it EXPORTS to hook processes, not one it reads), and nothing in the
 // process tree or the session file names the tab. So the mapping is established the
-// one way kiro offers authoritatively: a hook. This app injects KWEB_SESSION_ID
-// into each tab's child environment, and a kiro-cli hook — which inherits that
-// environment and is handed kiro's own session_id on stdin — writes the pair into a
-// state directory this app watches. A hook re-affirms it on every prompt, so a
-// session switch inside one tab (/chat, /tangent) re-points the mapping instead of
-// stranding it.
+// one way kiro offers authoritatively: a hook. This app mints a per-tab TITLE
+// HANDLE and injects it as KWEB_TITLE_HANDLE into each tab's child environment, and
+// a kiro-cli hook — which inherits that environment and is handed kiro's own
+// session_id on stdin — writes the pair into a state directory this app watches. A
+// hook re-affirms it on every prompt, so a session switch inside one tab (/chat,
+// /tangent) re-points the mapping instead of stranding it.
+//
+// The join key is that handle and NOT the tab id, which is the one thing in this
+// file worth understanding before changing it: a tab id IS the /ws capability token
+// the engine attaches and resumes with, so keying on it wrote a live credential into
+// a filename under a directory this app does not own and into every diagnostic about
+// the feature. sessionEnv says why the handle keeps the session id's unguessability
+// while carrying none of its authority.
 //
 // Deliberately NOT read from the log or the process tree. The KAS log does name its
 // session, but it names every OTHER session the tab ever touched too (a resume, a
@@ -36,6 +43,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +53,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -55,7 +65,8 @@ import (
 
 const (
 	// titleStateDirName is the directory under the app's state root where hooks
-	// drop one file per tab, named for the tab and containing kiro's session id.
+	// drop one file per tab, named for that tab's TITLE HANDLE (not its id) and
+	// containing kiro's session id.
 	titleStateDirName = "session-titles"
 
 	// titlePollInterval is how often each mapped tab's session.json is re-read. A
@@ -108,20 +119,47 @@ type pushedTitle struct {
 // has no client title, and the engine's automatic ladder still names it — the
 // feature degrades to the old cwd label rather than to a blank one.
 type sessionTitleSync struct {
-	// Field order is load-bearing for govet fieldalignment: the map goes first so
-	// the pointer-bearing prefix ends as early as possible. Re-check the linter
-	// when adding a field.
+	// Field order is load-bearing for govet fieldalignment: the maps go first so
+	// the pointer-bearing prefix ends as early as possible, and the pointer-free
+	// mutex goes last. Re-check the linter when adding a field.
 	//
-	// pushed remembers the kiro session and title last pushed per tab. Keeping
-	// the mapping identity lets syncOne clear the old conversation's title when a
-	// hook re-points the tab before the new session has a usable title.
-	pushed   map[string]pushedTitle
-	stateDir string
+	// pushed remembers the kiro session and title last pushed per tab, keyed by
+	// TAB ID. Keeping the mapping identity lets syncOne clear the old
+	// conversation's title when a hook re-points the tab before the new session
+	// has a usable title. Touched only by the poller goroutine, so it needs no
+	// lock; the two handle maps below do, because sessionEnv mints from whichever
+	// goroutine is creating a session.
+	pushed map[string]pushedTitle
+	// handleByTab and tabByHandle are the same per-tab title handle indexed both
+	// ways: sessionEnv needs tab -> handle to tell the hook what to report under,
+	// and the poller needs handle -> tab to turn a mapping FILENAME back into the
+	// session it may push a title to. Both entries are dropped together when a
+	// mapping is reclaimed, so a long-lived container does not accumulate handles
+	// for tabs that closed hours ago. Guarded by mu.
+	//
+	// One residue is accepted rather than swept: a tab whose hook never ran (the
+	// operator removed the hook config, or the tab closed before its first prompt)
+	// produces no mapping file, so nothing reclaims its two entries and they are
+	// held for the container's life -- tens of bytes per tab ever opened. Do NOT
+	// "fix" that by sweeping the index against pass()'s liveness snapshot: the
+	// handle is minted while the session factory builds the child environment,
+	// which is BEFORE the manager lists the session, so a tick landing in that
+	// window would drop a live tab's handle while the hook keeps writing under it
+	// -- and since the hook holds the handle in its environment for the tab's whole
+	// life, the server could never re-learn it and that tab would never be named
+	// again. A permanent per-tab failure is worse than a bounded retention.
+	handleByTab map[string]string
+	tabByHandle map[string]string
+	stateDir    string
 	// sessionsRoot is kiro-cli's session store ($HOME/.kiro/sessions). Sessions
 	// live one level down under a per-workspace hash directory, so a session id
 	// is resolved by scanning that one level rather than by recomputing the hash
 	// (which is kiro's private business).
 	sessionsRoot string
+	// mu guards handleByTab and tabByHandle only. sessionEnv runs on the
+	// goroutine creating a session and the poller runs on its own ticker, so the
+	// handle index is the one piece of this type's state two goroutines touch.
+	mu sync.Mutex
 }
 
 // newSessionTitleSync builds the syncer. stateRoot is the app's writable state
@@ -143,17 +181,98 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 		stateDir:     filepath.Join(stateRoot, titleStateDirName),
 		sessionsRoot: filepath.Join(home, ".kiro", "sessions"),
 		pushed:       make(map[string]pushedTitle),
+		handleByTab:  make(map[string]string),
+		tabByHandle:  make(map[string]string),
 	}
 }
 
 // sessionEnv returns the two variables one tab's kiro-cli process needs so a hook
 // can report its kiro session id. This is the whole mechanism on the child's side:
-// the tab id it should report under, and where to write it.
+// the TITLE HANDLE it should report under, and where to write it.
+//
+// The handle is minted here instead of shipping the tab id, and that substitution is
+// the whole point of this shape. A tab id IS a capability: it is the credential /ws
+// attaches and resumes a session with, which is why the engine refuses to log one
+// whole and why this app already keeps it out of the access log
+// (WithTemplatePathsUnder) and out of heuristic caches (sessionNoStore). Shipping it
+// to a hook made a live capability token the filename of a file in a directory this
+// app does not own, and the identifier in every diagnostic about the feature — the
+// one egress that policy never reached.
+//
+// A handle is 128 bits of crypto-random hex with no relation to the session id and no
+// authentication meaning anywhere in this app or the engine: leaking one discloses
+// nothing and cannot be replayed against /ws. It is unguessable ON PURPOSE even so,
+// and that is not belt-and-braces — it is what keeps forgery resistance exactly where
+// it was, because a local writer still cannot name a mapping file for a tab whose
+// handle it does not know. So do NOT "simplify" this to a counter or a tab index: that
+// keeps the confidentiality win and throws the integrity one away.
+//
+// A mint failure degrades like every other failure on this path: no variables, so the
+// hook no-ops (it needs both) and the tab keeps the engine's automatic name ladder.
 func (s *sessionTitleSync) sessionEnv(tabID string) []string {
+	handle, err := s.titleHandle(tabID)
+	if err != nil {
+		slog.Warn("session title: could not mint a title handle; this tab keeps the automatic name ladder",
+			"error", err)
+		return nil
+	}
 	return []string{
-		"KWEB_SESSION_ID=" + tabID,
+		"KWEB_TITLE_HANDLE=" + handle,
 		"KWEB_TITLE_STATE_DIR=" + s.stateDir,
 	}
+}
+
+// titleHandle returns this tab's title handle, minting one the first time the tab
+// needs it. Reusing an existing handle keeps the invariant the poller relies on --
+// one live mapping file per tab -- so a second call for the same tab cannot strand a
+// file under an abandoned name.
+func (s *sessionTitleSync) titleHandle(tabID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if handle, ok := s.handleByTab[tabID]; ok {
+		return handle, nil
+	}
+	handle, err := newTitleHandle()
+	if err != nil {
+		return "", err
+	}
+	s.handleByTab[tabID] = handle
+	s.tabByHandle[handle] = tabID
+	return handle, nil
+}
+
+// tabForHandle resolves a mapping FILENAME back to the tab it belongs to. A handle
+// this process never minted -- a file left behind by a previous server run, or one a
+// local writer invented -- names no tab, and the caller then treats it exactly as an
+// unknown tab id was treated when the file was named for the tab: reclaimed.
+func (s *sessionTitleSync) tabForHandle(handle string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tabID, ok := s.tabByHandle[handle]
+	return tabID, ok
+}
+
+// dropHandle forgets one handle and its tab, both directions at once. Called from
+// forget, which is the single place a mapping stops being live.
+func (s *sessionTitleSync) dropHandle(handle string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if tabID, ok := s.tabByHandle[handle]; ok {
+		delete(s.handleByTab, tabID)
+		delete(s.tabByHandle, handle)
+	}
+}
+
+// newTitleHandle mints one tab's title handle: 128 bits of crypto-random hex, the
+// same shape as the engine's own newSessionID and for the same unguessability
+// reason, but carrying none of its meaning -- it authenticates nothing and no
+// request ever presents it. See sessionEnv for why the strength is kept anyway.
+func newTitleHandle() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // ensureStateDir creates the hook's drop directory. Called once at start: the hook
@@ -236,6 +355,16 @@ func ensureStateLevel(dir string) error {
 			return err
 		}
 	}
+	// WRITE bits only, deliberately, and this is the place a future reader will
+	// want to tighten to 0o077. Do not: listing this directory yields TITLE
+	// HANDLES, and a handle authenticates nothing and cannot be replayed against
+	// /ws (sessionEnv), so read access here discloses no secret and a wider mask
+	// would protect nothing. It WAS a disclosure while the entry names were
+	// session ids, and minting a handle is what removed it rather than a sixth
+	// permission check. What survives is the INTEGRITY half, which is exactly what
+	// this check is: a directory somebody else can write is one they can swap the
+	// child into after the check returns, turning the titlePollInterval reclaim
+	// sweep into a delete loop over a planted link's target.
 	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
 		return fmt.Errorf("%s is group/other-writable (%#o): another user could replace the mapping files under it", dir, perm)
 	}
@@ -250,13 +379,18 @@ func ensureStateLevel(dir string) error {
 // ensureStateDir's whole job is to REFUSE a planted, foreign-owned or
 // group/other-writable state directory, and a refusal that only warned left both
 // sinks pointed at the refused path regardless: the hook still received
-// KWEB_TITLE_STATE_DIR and wrote a file per tab into it (so a directory some other
-// local user can read discloses tab ids, which are the /ws attach+resume capability
-// tokens), and pass()/forget() still followed it with os.ReadDir and os.Remove
-// every titlePollInterval — the delete loop over a planted link's target that
-// ensureStateDir's comment describes. The verdict is now authoritative, so a
-// refusal degrades exactly as documented: no injection, no poller, and every tab
-// keeps the engine's automatic name ladder.
+// KWEB_TITLE_STATE_DIR and wrote a file per tab into it (under a name whose owner
+// can swap the directory out from under the next read), and pass()/forget() still
+// followed it with os.ReadDir and os.Remove every titlePollInterval — the delete
+// loop over a planted link's target that ensureStateDir's comment describes. The
+// verdict is now authoritative, so a refusal degrades exactly as documented: no
+// injection, no poller, and every tab keeps the engine's automatic name ladder.
+//
+// The refusal stands on INTEGRITY alone. It used to carry a confidentiality reason
+// too — the entry names were tab ids, i.e. /ws attach+resume capability tokens, so a
+// readable directory disclosed live credentials — and that reason is gone because
+// the names are title handles now (see sessionEnv). The integrity reason is
+// unaffected by that change and is sufficient on its own.
 func enableSessionTitles(titles *sessionTitleSync) (func(tabID string) []string, bool) {
 	if err := titles.ensureStateDir(); err != nil {
 		slog.Warn("session title state dir refused; tabs keep the automatic name ladder and the title poller stays off",
@@ -306,30 +440,42 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 			continue
 		}
 		if strings.HasPrefix(e.Name(), ".") {
-			// The hook's in-flight write temps (".<tabID>.$$", renamed into place by
+			// The hook's in-flight write temps (".<handle>.$$", renamed into place by
 			// hooks/session-title.sh) share this directory. They are never a live tab's
 			// name, so the reclaim below would delete one mid-write and silently drop
 			// that prompt's mapping update. A dot prefix is the hook's documented temp
-			// shape and no engine session id starts with a dot, so skipping costs nothing.
+			// shape and no title handle starts with a dot, so skipping costs nothing.
 			continue
 		}
-		if _, ok := live[e.Name()]; !ok {
+		// The entry name is a TITLE HANDLE, so the tab it belongs to is resolved in
+		// memory before anything is judged against it. An unknown handle names no
+		// tab -- a file left by a previous server run (handles live only in this
+		// process), or one a local writer invented -- and is reclaimed on the spot,
+		// which is what an unknown tab id got when the file was named for the tab.
+		tabID, known := s.tabForHandle(e.Name())
+		if !known {
+			s.forget(e.Name())
+			continue
+		}
+		if _, ok := live[tabID]; !ok {
 			// The tab is gone. Reclaim now rather than waiting for a title change
 			// that will never come: syncOne's memo short-circuits before the
 			// SetSessionTitle-false probe, so an ordinary close (stable title)
 			// used to keep its mapping file, its pushed entry and its per-tick
 			// I/O for the container's life.
-			delete(s.pushed, e.Name())
+			delete(s.pushed, tabID)
 			s.forget(e.Name())
 			continue
 		}
-		s.syncOne(mgr, e.Name())
+		s.syncOne(mgr, e.Name(), tabID)
 	}
 }
 
-// syncOne maps one tab to its kiro session and pushes that session's title.
-func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
-	kiroID, ok := s.readMapping(tabID)
+// syncOne maps one tab to its kiro session and pushes that session's title. handle
+// is the mapping file's name; tabID is what pass() resolved it to and the only one
+// of the two the engine understands.
+func (s *sessionTitleSync) syncOne(mgr titleSetter, handle, tabID string) {
+	kiroID, ok := s.readMapping(handle)
 	if !ok {
 		return
 	}
@@ -346,7 +492,7 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 		// title. Only this arm needs a clear: a usable title REPLACES the rung in
 		// one store below, so the old title is never observable in between.
 		if !mgr.SetSessionTitle(tabID, "") {
-			s.forget(tabID)
+			s.forget(handle)
 		}
 		delete(s.pushed, tabID)
 		return
@@ -359,34 +505,37 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, tabID string) {
 	// snapshot time, so this arm is the within-sweep race backstop only.
 	if !mgr.SetSessionTitle(tabID, title) {
 		delete(s.pushed, tabID)
-		s.forget(tabID)
+		s.forget(handle)
 		return
 	}
 	s.pushed[tabID] = pushedTitle{kiroID: kiroID, title: title}
-	// The tab id is the /ws attach+resume capability token and the title is
-	// kiro-cli's verbatim copy of the user's first message, so this record carries
-	// the truncated id and the title's LENGTH -- the same treatment main.go:1905,
-	// routes.go:360 and newStatusClassifier's fingerprint already give their
-	// respective values. kiro_session is kiro-cli's own internal id, not a
-	// network capability, so it stays whole.
+	// The title is kiro-cli's verbatim copy of the user's first message, so this
+	// record carries its LENGTH rather than its text -- the same treatment
+	// main.go:1905, routes.go:360 and newStatusClassifier's fingerprint already
+	// give their respective values. The tab id is deliberately ABSENT: it is the
+	// /ws attach+resume capability token, and the title handle names this mapping
+	// for an operator reading the log without disclosing one (see sessionEnv). Do
+	// not add the session id back beside the handle -- truncated or otherwise --
+	// or the whole point of keying on a handle is lost. kiro_session is kiro-cli's
+	// own internal id, not a network capability, so it stays whole.
 	slog.Debug("session title: adopted kiro session title",
-		"session", terminal.LogID(tabID), "kiro_session", kiroID,
+		"title_handle", handle, "kiro_session", kiroID,
 		"title_runes", utf8.RuneCountInString(title))
 }
 
-// readMapping reads the tab -> kiro-session-id file the hook wrote. The value is
+// readMapping reads the handle -> kiro-session-id file the hook wrote. The value is
 // validated as a kiro session id rather than trusted: it is interpolated into a
 // filesystem path below, and the file is written by a shell hook this app does not
 // execute itself.
-func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
-	raw, err := readSmallFile(filepath.Join(s.stateDir, tabID))
+func (s *sessionTitleSync) readMapping(handle string) (string, bool) {
+	raw, err := readSmallFile(filepath.Join(s.stateDir, handle))
 	if err != nil {
 		// pass() just enumerated this entry, so any failure here is abnormal --
 		// EACCES, a refused symlink/FIFO (OpenRegular), an oversized file -- not
 		// absence. Same ErrNotExist carve-out as the directory-level reads.
 		if !errors.Is(err, fs.ErrNotExist) {
 			slog.Debug("session title: mapping file unreadable",
-				"session", terminal.LogID(tabID), "error", err)
+				"title_handle", handle, "error", err)
 		}
 		return "", false
 	}
@@ -394,7 +543,7 @@ func (s *sessionTitleSync) readMapping(tabID string) (string, bool) {
 	if !validKiroSessionID(id) {
 		if id != "" {
 			slog.Debug("session title: mapping file holds no usable session id",
-				"session", terminal.LogID(tabID))
+				"title_handle", handle)
 		}
 		return "", false
 	}
@@ -473,13 +622,16 @@ func (s *sessionTitleSync) titleFromRecord(hashDir, kiroID string) (string, bool
 	return title, true
 }
 
-// forget removes a mapping whose tab no longer exists. tabID is one path
-// component by construction: every caller takes it from an os.ReadDir entry of
-// stateDir, whose Name is a single basename and never "." or "..".
-func (s *sessionTitleSync) forget(tabID string) {
-	if err := os.Remove(filepath.Join(s.stateDir, tabID)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+// forget removes a mapping whose tab no longer exists and drops that tab's handle
+// from the in-memory index, so a long-lived container accumulates neither files nor
+// handles for tabs that closed hours ago. handle is one path component by
+// construction: every caller takes it from an os.ReadDir entry of stateDir, whose
+// Name is a single basename and never "." or "..".
+func (s *sessionTitleSync) forget(handle string) {
+	s.dropHandle(handle)
+	if err := os.Remove(filepath.Join(s.stateDir, handle)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Debug("session title: could not drop a stale mapping",
-			"session", terminal.LogID(tabID), "error", err)
+			"title_handle", handle, "error", err)
 	}
 }
 

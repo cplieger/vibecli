@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/hex"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,7 +50,12 @@ type titleFixture struct {
 
 func newTitleFixture(t *testing.T) *titleFixture {
 	t.Helper()
-	root, home := t.TempDir(), t.TempDir()
+	// The state root is a CHILD of the temp dir, so both levels are created --
+	// and mode-tightened -- by ensureStateDir itself: a filesystem whose
+	// inheritable ACL widens fresh directories (the ZFS nfs4acl case the
+	// production comment measures) then cannot make the fixture's own root read
+	// as a pre-existing widened level and refuse every test in this file.
+	root, home := filepath.Join(t.TempDir(), "state"), t.TempDir()
 	s := newSessionTitleSync(root, home)
 	if err := s.ensureStateDir(); err != nil {
 		t.Fatalf("ensureStateDir: %v", err)
@@ -56,13 +63,34 @@ func newTitleFixture(t *testing.T) *titleFixture {
 	return &titleFixture{t: t, sync: s, home: home}
 }
 
-// mapping plants what the hook writes: a file named for the tab holding kiro's id.
+// mapping plants what the hook writes: a file named for the tab's TITLE HANDLE,
+// holding kiro's id. The handle comes from the real minting path, so a test joins
+// the two identities the same way the poller does rather than fabricating a filename
+// production would never produce.
 func (f *titleFixture) mapping(tabID, kiroID string) {
 	f.t.Helper()
-	path := filepath.Join(f.sync.stateDir, tabID)
+	path := filepath.Join(f.sync.stateDir, f.handle(tabID))
 	if err := os.WriteFile(path, []byte(kiroID+"\n"), 0o600); err != nil {
 		f.t.Fatalf("write mapping %s: %v", tabID, err)
 	}
+}
+
+// handle mints (or returns) one tab's title handle, which is what a test must use to
+// name anything in the state directory: the mapping file is named for the handle and
+// never for the tab, because a tab id is the /ws capability token.
+func (f *titleFixture) handle(tabID string) string {
+	f.t.Helper()
+	return titleHandleFor(f.t, f.sync, tabID)
+}
+
+// titleHandleFor is the fixture-free form, for the tests that build a syncer directly.
+func titleHandleFor(t *testing.T, s *sessionTitleSync, tabID string) string {
+	t.Helper()
+	handle, err := s.titleHandle(tabID)
+	if err != nil {
+		t.Fatalf("mint a title handle for %s: %v", tabID, err)
+	}
+	return handle
 }
 
 // session plants a kiro session record under a per-workspace hash directory, which
@@ -91,7 +119,9 @@ func quote(s string) string {
 // accepted (a filesystem with an inheritable group-write ACL widens os.Mkdir's
 // requested mode, and refusing our own directory would disable tab titles for the
 // container's life), while a level that was ALREADY group/other-writable is refused
-// -- that one is somebody else's shape and is the hostile case the check is for.
+// -- that refusal is pinned through the gate by
+// TestEnableSessionTitlesGatesBothConsumersOnTheVerdict, which plants the same
+// widened shape and asserts the verdict withholds both consumers.
 func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 	t.Run("a level we created is tightened, not refused", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "state")
@@ -107,19 +137,6 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 			if perm := fi.Mode().Perm(); perm != 0o700 {
 				t.Errorf("%s mode = %#o, want 0700: a level we created must be tightened to what was asked for", dir, perm)
 			}
-		}
-	})
-	t.Run("a pre-existing group-writable level is refused", func(t *testing.T) {
-		root := filepath.Join(t.TempDir(), "state")
-		if err := os.Mkdir(root, 0o700); err != nil {
-			t.Fatalf("plant the root: %v", err)
-		}
-		if err := os.Chmod(root, 0o770); err != nil {
-			t.Fatalf("widen the planted root: %v", err)
-		}
-		s := newSessionTitleSync(root, t.TempDir())
-		if err := s.ensureStateDir(); err == nil {
-			t.Error("ensureStateDir accepted a pre-existing group-writable level; another user could swap the mapping files under it")
 		}
 	})
 	t.Run("a level created off-mode is tightened to 0700", func(t *testing.T) {
@@ -149,6 +166,46 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 			if perm := fi.Mode().Perm(); perm != 0o700 {
 				t.Errorf("%s mode = %#o, want 0700: a level we created off-mode must be tightened", dir, perm)
 			}
+		}
+	})
+}
+
+// TestEnsureStateDirRefusesAPlantedPath pins the planted-path arm of the custody
+// check -- the CWE-59 shape ensureStateDir's comment is mostly about -- and with
+// it the load-bearing syscall choice: each level must be inspected with Lstat,
+// never Stat. Swapping the two compiles and changes no other test's outcome (the
+// widened- and created-level cases never involve a link), while silently
+// re-opening the planted-symlink delete loop: Stat follows the link to a
+// directory this process owns at mode 0700, every remaining check passes, and
+// pass()/forget() then ReadDir and Remove through the link every tick. The
+// symlink subtest fails under exactly that swap; the plain-file subtest covers
+// the other planted shape at the other level.
+func TestEnsureStateDirRefusesAPlantedPath(t *testing.T) {
+	t.Run("a symlink planted at the state root is refused, not followed", func(t *testing.T) {
+		target := t.TempDir()
+		if err := os.Chmod(target, 0o700); err != nil {
+			t.Fatalf("chmod target: %v", err)
+		}
+		root := filepath.Join(t.TempDir(), "state")
+		if err := os.Symlink(target, root); err != nil {
+			t.Fatalf("plant the symlink: %v", err)
+		}
+		s := newSessionTitleSync(root, t.TempDir())
+		if err := s.ensureStateDir(); err == nil {
+			t.Error("ensureStateDir accepted a symlink planted at the state root; pass() and forget() would then ReadDir and Remove through it every tick (the CWE-59 delete loop its own comment describes)")
+		}
+	})
+	t.Run("a plain file planted at the drop directory is refused", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatalf("make the root: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(root, titleStateDirName), []byte("x"), 0o600); err != nil {
+			t.Fatalf("plant the file: %v", err)
+		}
+		s := newSessionTitleSync(root, t.TempDir())
+		if err := s.ensureStateDir(); err == nil {
+			t.Error("ensureStateDir accepted a plain file planted at the drop directory")
 		}
 	})
 }
@@ -190,7 +247,7 @@ func TestEnableSessionTitlesGatesBothConsumersOnTheVerdict(t *testing.T) {
 			t.Fatal("a verified state dir produced no session title environment; no hook could pair a tab with its kiro session")
 		}
 		got := env("tab1")
-		for _, want := range []string{"KWEB_SESSION_ID=tab1", "KWEB_TITLE_STATE_DIR=" + s.stateDir} {
+		for _, want := range []string{"KWEB_TITLE_HANDLE=" + titleHandleFor(t, s, "tab1"), "KWEB_TITLE_STATE_DIR=" + s.stateDir} {
 			if !slices.Contains(got, want) {
 				t.Errorf("session title env = %v, want it to carry %q", got, want)
 			}
@@ -288,6 +345,10 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	id := "sess_11111111-2222-3333-4444-555555555555"
 	f.mapping("gonetab", id)
 	f.session("hash0", id, titleJSON("a real title"))
+	// Capture the handle BEFORE the sweep: forget drops it from the index, so
+	// asking afterwards would mint a fresh one and stat a name that was never
+	// written -- an assertion that passes however broken the reclaim is.
+	mappingPath := filepath.Join(f.sync.stateDir, f.handle("gonetab"))
 
 	// The tab is still in the manager's list at snapshot time and disappears at the
 	// push, which is the within-sweep race this arm exists for -- not the ordinary
@@ -295,7 +356,7 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	set := &fakeSetter{missing: map[string]bool{"gonetab": true}, live: []string{"gonetab"}}
 	f.sync.pass(set)
 
-	if _, err := os.Stat(filepath.Join(f.sync.stateDir, "gonetab")); !os.IsNotExist(err) {
+	if _, err := os.Stat(mappingPath); !os.IsNotExist(err) {
 		t.Errorf("mapping for a closed tab still present (stat err = %v), want it removed", err)
 	}
 }
@@ -314,6 +375,9 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	id := "sess_11111111-2222-3333-4444-555555555555"
 	f.mapping("closedtab", id)
 	f.session("hash0", id, titleJSON("a real title"))
+	// Captured before the reclaim: the handle leaves the index with the mapping, so
+	// resolving it afterwards would mint a new one and stat a path nothing wrote.
+	mappingPath := filepath.Join(f.sync.stateDir, f.handle("closedtab"))
 
 	// First sweep with the tab live: the title is pushed and memoized, which is the
 	// state that used to hide the dead tab from the reclaim.
@@ -328,7 +392,7 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	set.live = nil
 	f.sync.pass(set)
 
-	if _, err := os.Stat(filepath.Join(f.sync.stateDir, "closedtab")); !os.IsNotExist(err) {
+	if _, err := os.Stat(mappingPath); !os.IsNotExist(err) {
 		t.Errorf("mapping for a tab the manager no longer lists is still present (stat err = %v), want it reclaimed", err)
 	}
 	if len(set.calls) != 1 {
@@ -348,7 +412,7 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 // whole suite green.
 func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
 	f := newTitleFixture(t)
-	tmp := filepath.Join(f.sync.stateDir, ".tab1.4242")
+	tmp := filepath.Join(f.sync.stateDir, "."+f.handle("tab1")+".4242")
 	if err := os.WriteFile(tmp, []byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
 		t.Fatalf("plant an in-flight hook temp: %v", err)
 	}
@@ -401,7 +465,7 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 // (atomicfile.ErrFileTooLarge) rather than truncated, and nothing is pushed.
 func TestSessionTitleBoundsFileReads(t *testing.T) {
 	f := newTitleFixture(t)
-	huge := filepath.Join(f.sync.stateDir, "tab1")
+	huge := filepath.Join(f.sync.stateDir, f.handle("tab1"))
 	if err := os.WriteFile(huge, []byte(strings.Repeat("a", maxTitleFileBytes*3)), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -418,13 +482,15 @@ func TestSessionTitleBoundsFileReads(t *testing.T) {
 // TestSessionTitleEnvNamesWhatTheHookReads is the contract between the Go side and
 // the shell hook: the hook reads exactly these two variable names, so a rename here
 // silently stops every tab from being named. hooks/session-title.sh is the other
-// half and this asserts they agree.
+// half and this asserts they agree. The handle VALUE is the subject of
+// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey; this leg pins the names, and
+// that the value shipped under the handle name is the one the syncer will join on.
 func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 	f := newTitleFixture(t)
 	env := f.sync.sessionEnv("tab42")
 
 	want := map[string]string{
-		"KWEB_SESSION_ID":      "tab42",
+		"KWEB_TITLE_HANDLE":    f.handle("tab42"),
 		"KWEB_TITLE_STATE_DIR": f.sync.stateDir,
 	}
 	got := make(map[string]string, len(env))
@@ -453,6 +519,12 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 			t.Errorf("hooks/session-title.sh does not mention %s; the hook and the server disagree on the variable name, so no tab would ever be named", k)
 		}
 	}
+	// The retired name must not linger anywhere in the hook: it used to carry the
+	// tab id, so a leftover reference would either be dead or -- worse -- a second
+	// writer naming files after a /ws capability token again.
+	if strings.Contains(string(script), "KWEB_SESSION_ID") {
+		t.Error("hooks/session-title.sh still references KWEB_SESSION_ID; the tab id is the /ws capability token and no longer travels to the hook")
+	}
 }
 
 // TestSessionTitleHookWriteFormatReachesThePoller is the OTHER half of the
@@ -460,11 +532,11 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 // variable NAMES, this one pins the FILE FORMAT by running the shipped script and
 // letting the real poller consume what it wrote. Nothing else executes
 // hooks/session-title.sh — every other test fabricates the mapping file itself, so
-// without this leg the agreement that the file is named for the tab id and holds a
-// bare `sess_...` line is asserted only against the consumer's own idea of it. Both
-// sides fail SILENTLY by construction (the hook exits 0 on every failure path
-// because a non-zero exit can block the user's prompt, and the poller says nothing
-// when the name or location is wrong), so a drift would surface only as tabs
+// without this leg the agreement that the file is named for the tab's TITLE HANDLE
+// and holds a bare `sess_...` line is asserted only against the consumer's own idea
+// of it. Both sides fail SILENTLY by construction (the hook exits 0 on every failure
+// path because a non-zero exit can block the user's prompt, and the poller says
+// nothing when the name or location is wrong), so a drift would surface only as tabs
 // quietly reverting to the engine's automatic cwd label.
 func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	sh, err := exec.LookPath("/bin/sh")
@@ -476,14 +548,21 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 
 	f := newTitleFixture(t)
 	// Run the REAL hook the image ships, in the environment the session factory
-	// injects, with the payload kiro-cli hands a hook on stdin.
+	// injects -- built by the real sessionEnv, so the handle the hook names the file
+	// after is the one the poller will look for -- with the payload kiro-cli hands a
+	// hook on stdin.
 	cmd := exec.Command(sh, "hooks/session-title.sh")
-	cmd.Env = append(os.Environ(),
-		"KWEB_SESSION_ID=tab42",
-		"KWEB_TITLE_STATE_DIR="+f.sync.stateDir)
+	cmd.Env = append(os.Environ(), f.sync.sessionEnv("tab42")...)
 	cmd.Stdin = strings.NewReader(`{"session_id":"` + kiroID + `"}`)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("hook: %v (output %q)", err, out)
+	}
+
+	// The hook chose the filename from its environment; assert it chose the handle,
+	// because a poller that scans by handle and a hook that writes by anything else
+	// agree on nothing and say nothing about it.
+	if _, err := os.Stat(filepath.Join(f.sync.stateDir, f.handle("tab42"))); err != nil {
+		t.Fatalf("stat the mapping the hook wrote = %v, want it named for the tab's title handle", err)
 	}
 
 	// Seed the kiro session record the poller resolves, then assert the pairing
@@ -494,6 +573,92 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	f.sync.pass(set)
 	if len(set.calls) != 1 || set.calls[0] != "tab42="+title {
 		t.Errorf("the hook's mapping did not reach the poller: got %v, want [%q]", set.calls, "tab42="+title)
+	}
+}
+
+// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey pins the invariant the whole
+// handle mechanism exists for, in all three places this feature writes an
+// identifier: the hook's environment, the mapping FILENAME (a directory under
+// world-writable /tmp that neither this app nor kiro-cli owns), and every log
+// attribute. A tab id is the /ws attach+resume capability token -- the credential
+// the engine attaches and resumes with -- so none of the three may carry it, whole
+// or truncated.
+//
+// Every other test in this file names state-directory entries through the fixture's
+// handle helper, so re-keying the mapping on the tab id (the shape this replaced)
+// leaves the entire suite green while a live credential is written to disk under a
+// name any local reader can list, and logged again on every adopted title.
+//
+// slog.Default is process-global, so this test must not call t.Parallel.
+func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
+	// Shaped like the engine's own newSessionID (128-bit crypto-random hex), which
+	// is what makes a substring search for it meaningful.
+	const tabID = "3f7a1c9e5b2d4086af13e7c05d9b2846"
+	const kiroID = "sess_11111111-2222-3333-4444-555555555555"
+
+	f := newTitleFixture(t)
+
+	// 1. The child environment. sessionEnv mints on first use, so ask it first and
+	// resolve the handle afterwards.
+	env := f.sync.sessionEnv(tabID)
+	handle := f.handle(tabID)
+	for _, kv := range env {
+		if strings.Contains(kv, tabID) {
+			t.Errorf("child env entry %q carries the tab id; that value is the /ws attach+resume capability token", kv)
+		}
+	}
+	if !slices.Contains(env, "KWEB_TITLE_HANDLE="+handle) {
+		t.Fatalf("child env = %v, want it to carry KWEB_TITLE_HANDLE=%s", env, handle)
+	}
+	if handle == tabID {
+		t.Fatal("the title handle IS the tab id; minting exists precisely so it is not")
+	}
+	// 128 bits of hex, the engine's own shape: unguessable on purpose even though
+	// the handle authenticates nothing, so forgery resistance is unchanged.
+	if raw, err := hex.DecodeString(handle); err != nil || len(raw) != 16 {
+		t.Errorf("handle %q decoded to %d bytes (err %v), want 16 bytes of hex", handle, len(raw), err)
+	}
+
+	// 2. The mapping filename.
+	f.mapping(tabID, kiroID)
+	f.session("hash0", kiroID, titleJSON("Kopia audit: landed"))
+	entries, err := os.ReadDir(f.sync.stateDir)
+	if err != nil {
+		t.Fatalf("read the state dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("state dir holds %d entries, want exactly the one mapping", len(entries))
+	}
+	if name := entries[0].Name(); name != handle {
+		t.Errorf("mapping file is named %q, want the title handle %q: a filename in this directory must not be a capability token", name, handle)
+	}
+
+	// 3. Every log attribute, across the three records the sync path emits about a
+	// mapping: the adopted title, an unusable mapping, and the reclaim.
+	var logged strings.Builder
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	set := &fakeSetter{live: []string{tabID}}
+	f.sync.pass(set)
+	f.mapping(tabID, "not-a-session-id")
+	f.sync.pass(set)
+	set.live = nil
+	f.sync.pass(set)
+
+	out := logged.String()
+	if strings.Contains(out, tabID) {
+		t.Errorf("the tab id reached a log attribute whole; output was:\n%s", out)
+	}
+	// The truncating form too: `terminal.LogID(tabID)` is what a reviewer re-adding
+	// a "session" attribute would reach for, and 8 hex characters of a capability
+	// token is still 8 characters of one.
+	if truncated := terminal.LogID(tabID); strings.Contains(out, truncated) {
+		t.Errorf("the tab id reached a log attribute as %q; the handle is the diagnostic identifier for this feature, output was:\n%s", truncated, out)
+	}
+	if !strings.Contains(out, handle) {
+		t.Errorf("no log record named the title handle, so a mapping is undiagnosable; output was:\n%s", out)
 	}
 }
 

@@ -114,11 +114,11 @@ type routeDeps struct {
 	// own environment, which is what the root's off-shape constructors return.
 	sessionEnv func() []string
 	// sessionTitleEnv returns the per-session variables a kiro-cli hook needs to
-	// report which kiro session this tab is running: the tab's own id and the
-	// state directory to write the pairing into. Takes the session id because it
-	// is the one part of the child environment that differs per tab. A nil
-	// function (the root's off-shape constructors) leaves tabs on the engine's
-	// automatic name ladder.
+	// report which kiro session this tab is running: the tab's TITLE HANDLE (a
+	// minted value, deliberately not the session id — see sessiontitle.go's
+	// sessionEnv) and the state directory to write the pairing into. Takes the
+	// session id because the handle is derived per tab. A nil function (the root's
+	// off-shape constructors) leaves tabs on the engine's automatic name ladder.
 	sessionTitleEnv func(id string) []string
 	workDir         string
 	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized

@@ -120,7 +120,19 @@ type routeDeps struct {
 	// session id because the handle is derived per tab. A nil function (the root's
 	// off-shape constructors) leaves tabs on the engine's automatic name ladder.
 	sessionTitleEnv func(id string) []string
-	workDir         string
+	// scrollback is the operator's retained-history depth from
+	// terminal.ScrollbackEnvVar, or nil when they set nothing — in which case the
+	// option is OMITTED and the engine's own default applies. The engine owns
+	// both the variable's name and the sizing decision, because this app,
+	// web-terminal-server and vibekit share the knob and a number copied into
+	// each is three numbers that drift.
+	//
+	// A POINTER, so that "unset" is the ZERO VALUE. An int sentinel cannot be:
+	// 0 is a legal depth meaning "retain nothing", so a routeDeps built by hand
+	// — every test here does — would have silently disabled scrollback, which is
+	// exactly how this was caught.
+	scrollback *int
+	workDir    string
 	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
 	// OSC 9 notification's full text is logged at Debug. Default false — the
 	// text is arbitrary child output that may carry a token or device code, so
@@ -377,8 +389,13 @@ func (d *routeDeps) childEnv(id string) []string {
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// Scrollback 5000 covers a /chat transcript restore on reconnect (matches
-	// the client store's retained-line cap). WithKeepUnfocused pins the process
+	// Retained-history depth is NOT set here: the engine's own default applies,
+	// and an operator overrides it per deployment with terminal.ScrollbackEnvVar
+	// (read in main.go). This app used to pass its own number, which made the
+	// sizing decision in three places across the family; the engine documents it
+	// once at terminal.DefaultScrollbackCapacity.
+	//
+	// WithKeepUnfocused pins the process
 	// to the DEC 1004 "unfocused" state so kiro-cli keeps emitting its
 	// focus-gated OSC 9 notifications (which drive the classifier) even though no
 	// browser tab claims focus; web-terminal-server deliberately does NOT use
@@ -407,9 +424,8 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 		// marker instead (WithCommandLogValue), the same way main.go's own
 		// startup line logs only chat_args_count.
 		sessionLogger := slog.Default().With("session", safeID)
-		return terminal.NewHandler(deps.cmd(),
+		opts := []terminal.Option{
 			terminal.WithWorkDir(deps.workDir),
-			terminal.WithScrollbackCapacity(5000),
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
@@ -471,7 +487,14 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 						"hint", "check /api/health and the kiro-cli install under /config/tools/kiro-cli-versions")
 				}
 			}),
-		)
+		}
+		// Retained-history depth is OMITTED unless the operator set it, so the
+		// engine's default applies and a change to it reaches this app without a
+		// rebuild of its intent.
+		if deps.scrollback != nil {
+			opts = append(opts, terminal.WithScrollbackCapacity(*deps.scrollback))
+		}
+		return terminal.NewHandler(deps.cmd(), opts...)
 	}
 }
 

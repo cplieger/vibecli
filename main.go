@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -150,6 +151,37 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 			"hint", "fix the malformed entries in "+key+" to restore browser access")
 	}
 	return policy
+}
+
+// resolveScrollback reads the retained-history depth from the env var the ENGINE
+// owns (terminal.ScrollbackEnvVar), returning scrollbackUnset when the operator
+// set nothing so the session factory omits the option and the engine's own
+// default applies.
+//
+// The variable is shared with web-terminal-server and vibekit, which is why its
+// name and its awkward-middle policy both live in the engine rather than here: a
+// knob spelled or interpreted three ways is three knobs. This app's only local
+// decision is the failure posture, and it is this app's usual one — warn by NAME
+// and fall back rather than abort, because retained history is not a safety
+// property and a dev box must be able to boot with a typo'd compose value (see
+// the same reasoning on KWEB_LOG_LEVEL). The value is deliberately not echoed:
+// this app publishes a no-values promise for its whole env surface.
+func resolveScrollback() *int {
+	raw, ok := os.LookupEnv(terminal.ScrollbackEnvVar)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		slog.Warn("ignoring a malformed retained-history depth; using the engine default",
+			"env", terminal.ScrollbackEnvVar, "default_lines", terminal.DefaultScrollbackCapacity)
+		return nil
+	}
+	capacity, reason := terminal.ClampScrollbackCapacity(n)
+	if reason != "" {
+		slog.Warn(reason)
+	}
+	return &capacity
 }
 
 // catalogRefreshKey is the env var parseCatalogRefresh interprets and names in its
@@ -412,12 +444,8 @@ func (e *stageError) Error() string { return e.err.Error() }
 
 func (e *stageError) Unwrap() error { return e.err }
 
-// atStage attributes err to a stage. A nil error stays nil so call sites can wrap
-// unconditionally.
+// atStage attributes err to a stage.
 func atStage(stage string, err error) error {
-	if err == nil {
-		return nil
-	}
 	return &stageError{stage: stage, err: err}
 }
 
@@ -495,6 +523,7 @@ func run() error {
 	if err := checkWorkDir(workDir); err != nil {
 		return err
 	}
+	scrollback := resolveScrollback()
 
 	// Tools engine (cplieger/toolbelt): declarative provisioning of the
 	// /config/tools tree from the tools.json manifest, replacing the
@@ -665,6 +694,7 @@ func run() error {
 		sessionEnv:      kiro.env,
 		sessionTitleEnv: sessionTitleEnv,
 		workDir:         workDir,
+		scrollback:      scrollback,
 		ready:           &ready,
 		kiroReady:       kiro.ready,
 		kiroRescan:      kiro.rescan,

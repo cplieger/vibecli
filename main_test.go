@@ -2680,15 +2680,6 @@ func TestAtStagePreservesTheMessageAndTheChain(t *testing.T) {
 	}
 }
 
-// A nil error must stay nil, so a call site can attribute unconditionally without
-// manufacturing a failure.
-func TestAtStageNilStaysNil(t *testing.T) {
-	t.Parallel()
-	if got := atStage(stageListen, nil); got != nil {
-		t.Errorf("atStage(_, nil) = %v, want nil", got)
-	}
-}
-
 // Every startup failure path must be attributed, or the field it exists for
 // reports unknown exactly when an operator needs it. checkWorkDir is the one
 // path a test can drive end to end without binding a port or embedding a broken

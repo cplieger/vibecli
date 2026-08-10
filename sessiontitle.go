@@ -194,7 +194,9 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 // the whole point of this shape. A tab id IS a capability: it is the credential /ws
 // attaches and resumes a session with, which is why the engine refuses to log one
 // whole and why this app already keeps it out of the access log
-// (WithTemplatePathsUnder) and out of heuristic caches (sessionNoStore). Shipping it
+// (WithTemplatePathsUnder) and out of heuristic caches (the engine's
+// terminal.MountSessionRoutes applies its own withNoStore to the session REST
+// handler). Shipping it
 // to a hook made a live capability token the filename of a file in a directory this
 // app does not own, and the identifier in every diagnostic about the feature — the
 // one egress that policy never reached.
@@ -334,24 +336,27 @@ func ensureStateLevel(dir string) error {
 	if int(stat.Uid) != os.Geteuid() {
 		return fmt.Errorf("%s is owned by uid %d, want server uid %d: its owner could replace the checked path", dir, stat.Uid, os.Geteuid())
 	}
-	if created && fi.Mode().Perm() != 0o700 {
+	perm := fi.Mode().Perm()
+	if created && perm != 0o700 {
 		// os.Mkdir's mode is a REQUEST. A filesystem carrying an inheritable
 		// group-write ACL widens what we just created whatever was asked for
 		// (measured on a ZFS nfs4acl dataset: 0770 from a 0o700 mkdir, and a child
 		// of an already-0700 parent is 0770 too, so tightening the parent does not
 		// cover it), and the check below would then refuse this process's OWN
 		// directory with nothing retrying. Chmod is the only call that SETS the
-		// mode. Safe here and only here: os.Mkdir reported that we created this
-		// path, /tmp's sticky bit stops another user removing our root, and the
-		// child's parent is our own 0700 directory, so no other writer has ever
-		// held a name to swap in. A PRE-EXISTING level is never chmod'ed, so the
-		// refusal below still fires on exactly the planted shape the guard is for.
-		// Re-stat rather than trusting chmod's status, the same postcondition
-		// entrypoint.sh's secure_tools_dir asserts.
-		if chmodErr := os.Chmod(dir, 0o700); chmodErr != nil {
-			return chmodErr
-		}
-		if fi, err = os.Lstat(dir); err != nil {
+		// mode, and only a re-stat turns "I asked for 0700" into "it is 0700" —
+		// the same postcondition entrypoint.sh's secure_tools_dir asserts.
+		//
+		// atomicfile.EnforceMode owns that sequence now, and owns it on an open
+		// HANDLE: fchmod then fstat on one descriptor, which no rename can
+		// redirect, where the chmod-path-then-lstat-path this replaces could
+		// chmod one directory and certify another. Repairing is safe here and only
+		// here: os.Mkdir reported that we created this path, /tmp's sticky bit
+		// stops another user removing our root, and the child's parent is our own
+		// 0700 directory, so no other writer has ever held a name to swap in. A
+		// PRE-EXISTING level is never repaired, so the refusal below still fires
+		// on exactly the planted shape the guard is for.
+		if perm, err = enforceLevelMode(dir); err != nil {
 			return err
 		}
 	}
@@ -365,16 +370,45 @@ func ensureStateLevel(dir string) error {
 	// this check is: a directory somebody else can write is one they can swap the
 	// child into after the check returns, turning the titlePollInterval reclaim
 	// sweep into a delete loop over a planted link's target.
-	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+	if perm&0o022 != 0 {
 		return fmt.Errorf("%s is group/other-writable (%#o): another user could replace the mapping files under it", dir, perm)
 	}
 	return nil
 }
 
+// enforceLevelMode repairs the mode of a level this process just created and
+// proves the repair took, returning the permission bits the filesystem actually
+// stored. atomicfile.EnforceMode is the postcondition: fchmod then fstat on ONE
+// descriptor, so no rename between the two calls can make it certify a
+// directory other than the one it changed.
+//
+// O_NOFOLLOW is what makes opening by name safe here. The path was just created
+// by os.Mkdir, so a symlink at the final component means someone replaced it in
+// the interval; refusing to follow turns that race into an error instead of a
+// chmod applied to the link's target. O_DIRECTORY refuses a plain file for the
+// same reason, and both together mean the descriptor EnforceMode acts on is a
+// directory this process made.
+func enforceLevelMode(dir string) (os.FileMode, error) {
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	stored, err := atomicfile.EnforceMode(f, 0o700)
+	if err != nil {
+		return 0, err
+	}
+	return stored.Perm(), nil
+}
+
 // enableSessionTitles verifies the hook's drop directory and returns the wiring
 // that verdict authorizes: the per-session environment the session factory injects
-// into each tab's kiro-cli, and whether the poller may run at all. Both consumers
-// hang off the ONE verdict deliberately.
+// into each tab's kiro-cli, or nil when the directory was refused. Nil IS the
+// verdict, and both consumers read that one value -- the session factory skips the
+// injection (routes.go childEnv already treats nil as this function's off-shape)
+// and the composition root skips the poller. One value rather than a value plus a
+// bool, so "inject but do not poll" -- hooks writing mapping files nothing reads or
+// reclaims -- cannot be expressed at all.
 //
 // ensureStateDir's whole job is to REFUSE a planted, foreign-owned or
 // group/other-writable state directory, and a refusal that only warned left both
@@ -391,14 +425,14 @@ func ensureStateLevel(dir string) error {
 // readable directory disclosed live credentials — and that reason is gone because
 // the names are title handles now (see sessionEnv). The integrity reason is
 // unaffected by that change and is sufficient on its own.
-func enableSessionTitles(titles *sessionTitleSync) (func(tabID string) []string, bool) {
+func enableSessionTitles(titles *sessionTitleSync) func(tabID string) []string {
 	if err := titles.ensureStateDir(); err != nil {
 		slog.Warn("session title state dir refused; tabs keep the automatic name ladder and the title poller stays off",
 			"dir", titles.stateDir, "error", err,
 			"hint", "kiro-cli session titles need this directory owned by the server uid, not group/other-writable, and writable by the hook it seeds")
-		return nil, false
+		return nil
 	}
-	return titles.sessionEnv, true
+	return titles.sessionEnv
 }
 
 // Run polls until ctx is cancelled. One goroutine for every tab, not one per tab:
@@ -422,11 +456,16 @@ func (s *sessionTitleSync) Run(ctx context.Context, mgr titleSetter) {
 func (s *sessionTitleSync) pass(mgr titleSetter) {
 	entries, err := os.ReadDir(s.stateDir)
 	if err != nil {
-		// A missing directory is the normal pre-first-hook state, not an error
-		// worth logging every tick.
-		if !errors.Is(err, fs.ErrNotExist) {
-			slog.Debug("session title: state dir unreadable", "dir", s.stateDir, "error", err)
-		}
+		// No ErrNotExist carve-out. The poller runs ONLY on enableSessionTitles'
+		// true verdict, which ensureStateDir has already satisfied, so the
+		// pre-first-hook state the carve-out was written for cannot reach this
+		// goroutine. Within its lifetime an absent directory means something
+		// REMOVED it -- titleStateRoot is under /tmp, writable by every terminal
+		// session in this container -- after which this sweep no-ops forever and
+		// nothing here re-creates it. That was the one arm on this path with no
+		// record at any level.
+		slog.Debug("session title: state dir unreadable; no tab can be mapped until it is back",
+			"dir", s.stateDir, "error", err)
 		return
 	}
 	// One liveness snapshot per sweep rather than per entry: the manager takes its
@@ -435,6 +474,10 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 	for _, info := range mgr.List() {
 		live[info.ID] = struct{}{}
 	}
+	// How many live tabs this sweep actually resolved a mapping for. Zero while
+	// tabs exist is the whole feature being dead, which is what the record below
+	// exists to say.
+	mapped := 0
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -467,7 +510,21 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 			s.forget(e.Name())
 			continue
 		}
+		mapped++
 		s.syncOne(mgr, e.Name(), tabID)
+	}
+	if mapped == 0 && len(live) > 0 {
+		// Tabs exist and not one of them has a kiro session mapping, so every one
+		// keeps the engine's automatic cwd ladder. state_entries is the
+		// discriminator: 0 means the hook never wrote (its config was replaced, its
+		// fixed session_id extraction no longer matches kiro-cli's payload, or hooks
+		// are not firing), non-zero means every name present belongs to no live tab.
+		// Debug, not Warn: a tab still at the device-flow sign-in legitimately has no
+		// kiro session until the user confirms the code in their own browser, so a
+		// default-level record would fire on ordinary first-boot sign-ins.
+		slog.Debug("session title: no live tab has a kiro session mapping; every tab keeps the automatic name ladder",
+			"live_tabs", len(live), "state_entries", len(entries), "dir", s.stateDir,
+			"hint", "kiro-cli's SessionStart/UserPromptSubmit hooks write these files; check $HOME/.kiro/hooks/web-terminal-session-title.json and hooks/session-title.sh. A tab still at the device-flow sign-in has no kiro session yet, so this is expected until chat starts.")
 	}
 }
 
@@ -510,9 +567,10 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, handle, tabID string) {
 	}
 	s.pushed[tabID] = pushedTitle{kiroID: kiroID, title: title}
 	// The title is kiro-cli's verbatim copy of the user's first message, so this
-	// record carries its LENGTH rather than its text -- the same treatment
-	// main.go:1905, routes.go:360 and newStatusClassifier's fingerprint already
-	// give their respective values. The tab id is deliberately ABSENT: it is the
+	// record carries its LENGTH rather than its text -- the same treatment run's
+	// chat_args_count line, newSessionFactory's WithCommandLogValue redaction and
+	// newStatusClassifier's fingerprint already give their respective values. The
+	// tab id is deliberately ABSENT: it is the
 	// /ws attach+resume capability token, and the title handle names this mapping
 	// for an operator reading the log without disclosing one (see sessionEnv). Do
 	// not add the session id back beside the handle -- truncated or otherwise --

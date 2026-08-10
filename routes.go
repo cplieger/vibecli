@@ -249,17 +249,28 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) *terminal.SessionManage
 }
 
 // kiroRescanBody is the repair hook's response envelope, matching healthBody's key
-// order and vocabulary (status first, then the reason) so an operator reads the same
-// shape from both surfaces.
+// order (status first, then the reason) so an operator reads the same shape from
+// both surfaces. The status VOCABULARY is only partly shared: "ok" and "unready"
+// mean what they mean on /api/health, while "abandoned" is this hook's own and
+// /api/health never serves it -- only a rescan can fail to reach a verdict at all.
 type kiroRescanBody struct {
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
 }
 
+// reasonRescanAbandoned is the repair hook's 503 reason when the request was
+// abandoned before pinstall reached any verdict. It is deliberately NOT one of
+// main.go's kiroReasonText strings: those NAME the install manager's readiness
+// state, and this response reaches no verdict about the install at all -- it
+// reports only that the request was not serviced.
+const reasonRescanAbandoned = "kiro-cli rescan not performed: request abandoned before any verdict"
+
 // handleKiroRescan re-derives the active kiro-cli version from what is on disk right
 // now and reports the resulting readiness. 200 when a version is active afterwards,
 // 503 with the manager's own reason when none is: the same verdict /api/health will
-// serve from the next probe, so a caller gets its answer without polling.
+// serve from the next probe, so a caller gets its answer without polling. A request
+// abandoned before any verdict was reached also answers 503, under its own
+// "abandoned" status rather than a readiness verdict about the install.
 func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A rescan probes the candidate binary and reasserts the required
@@ -280,19 +291,37 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
 			return
 		}
-		// A context error can ONLY come from pinstall's cancellable WAIT for its
-		// operation slot: an admitted rescan runs detached (Rescan calls
-		// context.WithoutCancel once it holds the slot), so it can never surface
-		// the caller's own cancellation. So this is the abandoned-while-queued
-		// case -- nothing entered the library on this caller's behalf and no
+		// A context error means the request was ABANDONED before pinstall reached
+		// any verdict, and there are TWO sources of it, not one. The caller's own
+		// cancellation while queued for pinstall's operation slot is the obvious
+		// one (an ADMITTED rescan runs detached -- Rescan calls
+		// context.WithoutCancel once it holds the slot -- so it can never surface
+		// the caller's cancellation). The second is this server's own shutdown:
+		// the pre-drain hook cancels baseCtx, which is the BaseContext of EVERY
+		// request, so a rescan still queued behind a first-boot install holding
+		// that slot is abandoned with a live client on the other end.
+		//
+		// Either way nothing entered the library on this caller's behalf and no
 		// verdict was reached. Reporting it as "no usable version" would be a
 		// false broken-install record on the one endpoint an operator uses while
 		// the manager is ALREADY unready (EnsureWithRetry holds the same slot for
 		// a whole first-boot download), the same false-alert class the session
-		// fast-death hook gates away on every deploy.
+		// fast-death hook gates away on every deploy. So this answers 503 under its
+		// own "abandoned" status, with a reason naming it -- the request was not
+		// serviced -- and says nothing about the install. "unready" is wrong here
+		// even as a hedge: it IS a weak verdict, and it is not provably true, since
+		// a rescan queued behind another rescan can be abandoned on a manager that
+		// is perfectly ready. A distinct status carries that discrimination in the
+		// field a consumer switches on, instead of resting it all on the reason
+		// string. Writing nothing (the shape this replaced) left
+		// net/http to synthesize an implicit 200 with an empty body, so an
+		// operator's `curl -sfS -X POST` exited 0, reporting success for a repair
+		// that never ran.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			slog.Debug("kiro-cli rescan abandoned while queued behind an in-flight install or rescan",
+			slog.Debug("kiro-cli rescan abandoned before a verdict was reached",
 				"error", err)
+			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
+				kiroRescanBody{Status: "abandoned", Reason: reasonRescanAbandoned})
 			return
 		}
 		// The manager has already logged the specific fault (and every path it
@@ -384,16 +413,17 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
-			// Put the active kiro-cli version's own directory first on the
-			// child's PATH. The engine appends WithEnv LAST when it composes
-			// os.Environ() plus its TERM identity, so this PATH wins — which is
-			// what makes `kiro-cli chat` dispatch its sidecar out of the same
-			// digest-verified install rather than out of a stale $TOOLS/bin copy
-			// left by a restored backup volume. A nil result (no version active,
-			// or no manager) leaves the server's own environment untouched.
-			// The version-directory PATH overlay, plus the two variables that
-			// let a kiro-cli hook report which kiro session this tab is running
-			// (sessionTitleEnv). Tab names come from kiro-cli's own session
+			// The active kiro-cli version's own directory first on the child's
+			// PATH, plus the two variables that let a kiro-cli hook report which
+			// kiro session this tab is running (childEnv composes both). The
+			// engine appends WithEnv LAST when it composes os.Environ() plus its
+			// TERM identity, so this PATH wins — which is what makes `kiro-cli
+			// chat` dispatch its sidecar out of the same digest-verified install
+			// rather than out of a stale $TOOLS/bin copy left by a restored
+			// backup volume. With no version active (or no manager) the PATH
+			// entry is simply absent; childEnv still carries the title variables,
+			// and an empty result leaves the server's own environment untouched.
+			// Tab names come from kiro-cli's own session
 			// record, so the engine's input-stream deriver (WithInputTitle) is
 			// deliberately NOT requested here: reconstructing a submitted line
 			// from raw bytes means modelling the agent shell's composer, and

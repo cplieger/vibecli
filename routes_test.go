@@ -1671,17 +1671,28 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 }
 
 // TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached pins the two non-ok
-// outcomes, neither of which any other test reaches. pinstall's ORDINARY refusal
-// is (false, nil) -- no candidate selected, and recording that verdict succeeded
-// -- which must answer 503 with the manager's own reason. A context error can
-// ONLY be the caller's own abandonment while queued for pinstall's operation slot
-// (Rescan detaches with context.WithoutCancel once admitted, and a probe or
+// outcomes, neither of which any other test reaches, and the property that
+// separates them: BOTH answer 503, and only the one that reached a verdict speaks
+// about the install. pinstall's ORDINARY refusal is (false, nil) -- no candidate
+// selected, and recording that verdict succeeded -- which answers the manager's
+// own reason. A context error means the request was ABANDONED before any verdict
+// (the caller's own cancellation while queued for pinstall's operation slot, or
+// this server's shutdown pre-drain cancelling the BaseContext every request is
+// built on; an ADMITTED rescan detaches with context.WithoutCancel, and a probe or
 // assertion that times out surfaces as *exec.ExitError, not as a context error),
-// so it must answer nothing at all: recording it as "no usable version" would be
-// a false broken-install report on the one endpoint an operator uses while the
-// manager is already unready. Without this the branch reads as redundant with the
-// 503 below it, and deleting it keeps the whole suite green while turning a failed
-// repair into a silent 200.
+// so it answers under its own "abandoned" status and does NOT report "no usable
+// version" -- that would be a false broken-install verdict on the one endpoint an
+// operator uses while the manager is already unready. "unready" is not a safe
+// hedge either: it is itself a weak verdict, and an abandoned rescan says nothing
+// about readiness (a caller queued behind another rescan can be dropped on a
+// manager that is ready), so the status field carries the discrimination rather
+// than the reason string alone.
+//
+// The empty wantBody this case used to carry was a defect, not a contract: writing
+// nothing let net/http synthesize an implicit 200, so an operator's
+// `curl -sfS -X POST .../api/kiro-cli/rescan` exited 0 -- reporting success for a
+// repair that never ran. Both assertions below are load-bearing against a
+// regression to that shape.
 func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
 	for name, tc := range map[string]struct {
 		rescanErr error
@@ -1693,10 +1704,10 @@ func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
 			wantCode:  http.StatusServiceUnavailable,
 			wantBody:  `{"status":"unready","reason":"kiro-cli unavailable"}`,
 		},
-		"an abandoned queued caller reports nothing": {
+		"an abandoned caller reports the abandonment, never a verdict": {
 			rescanErr: context.Canceled,
-			wantCode:  http.StatusOK,
-			wantBody:  "",
+			wantCode:  http.StatusServiceUnavailable,
+			wantBody:  `{"status":"abandoned","reason":"kiro-cli rescan not performed: request abandoned before any verdict"}`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

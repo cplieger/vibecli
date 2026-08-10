@@ -3,7 +3,7 @@ module github.com/cplieger/web-terminal-kiro
 go 1.26.5
 
 require (
-	github.com/cplieger/atomicfile/v2 v2.7.0
+	github.com/cplieger/atomicfile/v2 v2.9.0
 	github.com/cplieger/pathinside v1.0.0
 	github.com/cplieger/pinstall v1.1.0
 	github.com/cplieger/runesafe v1.4.0
@@ -25,7 +25,7 @@ require (
 )
 
 require (
-	github.com/coder/websocket v1.8.15
+	github.com/coder/websocket v1.8.15 // indirect
 	github.com/cplieger/envx v1.5.1
 	github.com/creack/pty v1.1.24 // indirect
 )

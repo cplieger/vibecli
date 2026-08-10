@@ -170,6 +170,47 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 	})
 }
 
+// TestEnsureStateDirRefusesAForeignOwnedLevel pins the ownership arm of the custody
+// check, which ensureStateLevel's own comment says nothing else covers: a level at
+// mode 0700 that is a real directory passes the type check, the created check and
+// the group/other-writable check, so OWNERSHIP is the only thing standing between a
+// level another local user controls and pass()/forget() sweeping it with os.ReadDir
+// and os.Remove every titlePollInterval. Deleting the two Uid lines compiles and
+// leaves the rest of this suite green, because every other level any test builds is
+// owned by the test process.
+//
+// The foreign owner is the point rather than the mode: its holder can rename the
+// checked path or replace it with a symlink AFTER the verdict, which is the
+// post-check window the mode test cannot see.
+//
+// Requires the privilege to give a directory away, which this app has by design
+// (the image runs as root) and an unprivileged CI runner does not, so the test
+// skips there rather than failing for the environment.
+func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
+	const foreignUID, foreignGID = 65534, 65534 // nobody:nogroup, present on the Debian base
+
+	root := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("make the level: %v", err)
+	}
+	if err := os.Chown(root, foreignUID, foreignGID); err != nil {
+		t.Skipf("cannot give a directory away here, so a foreign-owned level cannot be built: %v", err)
+	}
+	// Everything except ownership is exactly what the check wants, so this fixture
+	// is only bait if the mode really is 0700 and the path really is a directory.
+	fi, err := os.Lstat(root)
+	if err != nil {
+		t.Fatalf("lstat the level: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 || !fi.Mode().IsDir() {
+		t.Fatalf("fixture is not bait: mode %#o dir=%v, want a 0700 directory that passes every check but the ownership one", perm, fi.Mode().IsDir())
+	}
+
+	if err := newSessionTitleSync(root, t.TempDir()).ensureStateDir(); err == nil {
+		t.Errorf("ensureStateDir accepted a level owned by uid %d; its owner can replace the checked path after the verdict, and pass()/forget() then ReadDir and Remove through whatever is there every tick", foreignUID)
+	}
+}
+
 // TestEnsureStateDirRefusesAPlantedPath pins the planted-path arm of the custody
 // check -- the CWE-59 shape ensureStateDir's comment is mostly about -- and with
 // it the load-bearing syscall choice: each level must be inspected with Lstat,
@@ -210,6 +251,83 @@ func TestEnsureStateDirRefusesAPlantedPath(t *testing.T) {
 	})
 }
 
+// TestEnforceLevelModeRefusesToRepairThroughAPlantedPath pins the two open flags
+// that make repairing a level by NAME safe, neither of which any other test
+// reaches: O_NOFOLLOW, so a symlink swapped in after os.Mkdir reported success is
+// refused instead of having the mode of its TARGET rewritten to 0700, and
+// O_DIRECTORY, so a plain file under the same name is refused rather than
+// fchmod'ed. Dropping either flag compiles and changes no other test's outcome --
+// every level the suite creates is a real directory this process just made -- while
+// handing a local user who wins the boot race a chmod on a path of their choosing,
+// the CWE-59 window ensureStateLevel's own comment says the handle-based sequence
+// closes.
+//
+// Each planted case asserts the victim's mode is UNCHANGED, not merely that an
+// error came back: an implementation that followed the name and then reported some
+// later failure would still have performed the write the refusal exists to prevent,
+// and the mode is the only observable that separates the two. The errno is
+// deliberately not asserted -- the kernel returns ENOTDIR for a symlink under
+// O_DIRECTORY|O_NOFOLLOW but ELOOP without O_DIRECTORY, and both are refusals, so
+// pinning one would fail a still-safe implementation.
+func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
+	t.Run("a symlink is refused and its target is not chmod'ed", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "victim")
+		if err := os.Mkdir(target, 0o750); err != nil {
+			t.Fatalf("make the victim directory: %v", err)
+		}
+		link := filepath.Join(t.TempDir(), "level")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("plant the symlink: %v", err)
+		}
+		if _, err := enforceLevelMode(link); err == nil {
+			t.Error("enforceLevelMode followed a symlink planted at the level; O_NOFOLLOW is what turns that boot race into an error instead of a chmod on a path the attacker chose")
+		}
+		fi, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat the victim: %v", err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o750 {
+			t.Errorf("the symlink target's mode = %#o, want it untouched at 0750: the repair was applied through the link", perm)
+		}
+	})
+	t.Run("a plain file is refused and not chmod'ed", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "level")
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatalf("plant the file: %v", err)
+		}
+		if _, err := enforceLevelMode(file); err == nil {
+			t.Error("enforceLevelMode accepted a plain file as a level; O_DIRECTORY is what refuses it")
+		}
+		fi, err := os.Lstat(file)
+		if err != nil {
+			t.Fatalf("lstat the planted file: %v", err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o644 {
+			t.Errorf("the planted file's mode = %#o, want it untouched at 0644", perm)
+		}
+	})
+	t.Run("a directory this process made is repaired and the stored mode reported", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "level")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("make the level: %v", err)
+		}
+		stored, err := enforceLevelMode(dir)
+		if err != nil {
+			t.Fatalf("enforceLevelMode over our own directory: %v", err)
+		}
+		if stored != 0o700 {
+			t.Errorf("reported stored mode = %#o, want 0700: ensureStateLevel's group/other-writable check reads this value, not a fresh stat", stored)
+		}
+		fi, err := os.Lstat(dir)
+		if err != nil {
+			t.Fatalf("lstat the level: %v", err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o700 {
+			t.Errorf("on-disk mode = %#o, want 0700: the repair did not take", perm)
+		}
+	})
+}
+
 // TestEnableSessionTitlesGatesBothConsumersOnTheVerdict pins that ensureStateDir's
 // refusal is AUTHORITATIVE rather than merely logged. Both of the subsystem's sinks
 // hang off this one call, and a warn-only refusal left both pointed at the rejected
@@ -229,22 +347,16 @@ func TestEnableSessionTitlesGatesBothConsumersOnTheVerdict(t *testing.T) {
 		if err := os.Chmod(root, 0o770); err != nil {
 			t.Fatalf("widen the planted root: %v", err)
 		}
-		env, poll := enableSessionTitles(newSessionTitleSync(root, t.TempDir()))
+		env := enableSessionTitles(newSessionTitleSync(root, t.TempDir()))
 		if env != nil {
-			t.Error("a refused state dir still produced a session title environment; the hook would write into the rejected path and every tab id in it is a /ws capability token")
-		}
-		if poll {
-			t.Error("a refused state dir still enabled the poller; its sweep is os.ReadDir + os.Remove over that path, which is the delete loop the verification exists to prevent")
+			t.Error("a refused state dir still produced a session title environment; the hook would write into the rejected path, and a non-nil verdict is also what starts the poller whose os.ReadDir + os.Remove sweep is the delete loop the verification exists to prevent")
 		}
 	})
 	t.Run("a verified level wires both", func(t *testing.T) {
 		s := newSessionTitleSync(filepath.Join(t.TempDir(), "state"), t.TempDir())
-		env, poll := enableSessionTitles(s)
-		if !poll {
-			t.Error("a verified state dir left the poller off; no tab would ever get its kiro-cli title")
-		}
+		env := enableSessionTitles(s)
 		if env == nil {
-			t.Fatal("a verified state dir produced no session title environment; no hook could pair a tab with its kiro session")
+			t.Fatal("a verified state dir produced no session title environment: no hook could pair a tab with its kiro session, and the poller -- gated on this same value -- would never run")
 		}
 		got := env("tab1")
 		for _, want := range []string{"KWEB_TITLE_HANDLE=" + titleHandleFor(t, s, "tab1"), "KWEB_TITLE_STATE_DIR=" + s.stateDir} {

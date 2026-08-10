@@ -501,13 +501,18 @@ func run() error {
 	// retired setup-tools.sh. Constructed only when the config dir
 	// exists (the container's /config bind mount); bare `go run` and
 	// tests outside the container run without a tools surface.
+	// ONE read for the ONE tools root, handed to both co-owners below: the toolbelt
+	// engine (its ConfigDir and ToolsDir) and the kiro-cli install manager (its
+	// install Root). entrypoint.sh exports the path it created and hardened, and a
+	// SECOND derivation is what previously split toolbelt's manifest from the tree it
+	// describes (the deleted config-dir knob), so the value is resolved here rather
+	// than at each consumer. Empty outside the container, where startTools falls back
+	// to <configDir>/tools.
+	kiroToolsDir := envx.String("KIRO_CLI_TOOLS_DIR", "")
+
 	tools := startTools(baseTools{
-		configDir: configMountDir,
-		// The SAME env var startKiroCLI reads below, so the tools tree has one
-		// source of truth: entrypoint.sh exports the path it created and
-		// hardened, and both co-owners write to that one. Empty outside the
-		// container, where startTools falls back to <configDir>/tools.
-		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
+		configDir:   configMountDir,
+		toolsDir:    kiroToolsDir,
 		catalogPath: envx.String("TOOL_CATALOG_PATH", "/app/tool-catalog.json"),
 		// Runtime catalog refresh: the baked catalog above is only the
 		// first-boot/offline fallback; the engine fetches the published
@@ -578,7 +583,7 @@ func run() error {
 		version:     envx.String("KIRO_CLI_VERSION", ""),
 		sha256:      envx.String("KIRO_CLI_SHA256", ""),
 		sha256ARM64: envx.String("KIRO_CLI_SHA256_ARM64", ""),
-		toolsDir:    envx.String("KIRO_CLI_TOOLS_DIR", ""),
+		toolsDir:    kiroToolsDir,
 		tainted:     tainted,
 		chatArgs:    chatArgs,
 	})
@@ -595,7 +600,7 @@ func run() error {
 	// engine's automatic ladder names every tab (see enableSessionTitles for why a
 	// warn-only verdict left the refused path in use).
 	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
-	sessionTitleEnv, titleSyncEnabled := enableSessionTitles(titles)
+	sessionTitleEnv := enableSessionTitles(titles)
 
 	// The subsystem teardown, named once and deferred once: both background
 	// owners, in the order the four hand-coordinated exit paths this replaced
@@ -715,7 +720,7 @@ func run() error {
 	// state directory was refused: the poller's sweep is os.ReadDir + os.Remove over
 	// that path, so running it against a rejected one is the delete loop the
 	// verification exists to prevent.
-	if titleSyncEnabled {
+	if sessionTitleEnv != nil {
 		go titles.Run(baseCtx, mgr)
 	}
 

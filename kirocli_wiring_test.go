@@ -537,7 +537,27 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 		sha256ARM64: strings.Repeat("b", 64),
 		toolsDir:    fixture.tools,
 	})
-	t.Cleanup(rt.stop)
+	// stop() CANCELS the bind-first install goroutine; it does not JOIN it, and the
+	// tail of an in-flight Ensure -- the state record and the convenience symlink --
+	// is not context-guarded. A cancel alone therefore leaves that goroutine still
+	// writing into the tools tree while t.TempDir's RemoveAll walks it, and the
+	// removal fails with "directory not empty" AFTER every assertion below has
+	// already passed. That is what made this test flaky under load, and it is the
+	// only way it has been observed to fail (measured: 4 failures in 240 runs with
+	// the machine loaded, all four the cleanup, none the readiness poll below).
+	//
+	// Rescan takes the manager's own operation semaphore, so it cannot return until
+	// the in-flight Ensure has released it, and after a cancel no further attempt is
+	// ever started (EnsureWithRetry breaks on ctx.Err() and an Ensure that has not
+	// yet acquired the slot returns at once). Joining on it is what orders the
+	// cleanup instead of leaving it to the scheduler. Cleanups run LIFO, so this one
+	// runs before the TempDir removal newNSEnv registered.
+	t.Cleanup(func() {
+		rt.stop()
+		if rt.rescan != nil {
+			_, _ = rt.rescan(context.Background())
+		}
+	})
 	if rt.ready == nil {
 		t.Fatal("the managed runtime wired no readiness gate, so no reason reaches any surface")
 	}

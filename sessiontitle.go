@@ -380,7 +380,10 @@ func ensureStateLevel(dir string) error {
 // proves the repair took, returning the permission bits the filesystem actually
 // stored. atomicfile.EnforceMode is the postcondition: fchmod then fstat on ONE
 // descriptor, so no rename between the two calls can make it certify a
-// directory other than the one it changed.
+// directory other than the one it changed. A filesystem that will not store 0700
+// exactly is REPORTED rather than refused: ensureStateLevel's write-bits check
+// owns that verdict, so a widening that adds only read or execute bits stays
+// acceptable exactly as it was before the postcondition moved onto a handle.
 //
 // O_NOFOLLOW is what makes opening by name safe here. The path was just created
 // by os.Mkdir, so a symlink at the final component means someone replaced it in
@@ -395,6 +398,16 @@ func enforceLevelMode(dir string) (os.FileMode, error) {
 	}
 	defer func() { _ = f.Close() }()
 	stored, err := atomicfile.EnforceMode(f, 0o700)
+	if errors.Is(err, atomicfile.ErrModeNotStored) {
+		// The filesystem would not store the mode we asked for, which is the case
+		// this repair exists for rather than a reason to refuse: EnforceMode still
+		// reports the mode it read back, and ensureStateLevel's WRITE-bits check is
+		// the policy that decides whether it is acceptable (see the "WRITE bits
+		// only, deliberately" paragraph there). Refusing on exact inequality would
+		// tighten this path to 0o077, which that paragraph forbids, and would turn
+		// a mount that cannot store 0700 into tab titles silently off at every boot.
+		return stored.Perm(), nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -478,6 +491,14 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 	// tabs exist is the whole feature being dead, which is what the record below
 	// exists to say.
 	mapped := 0
+	// How many entries this sweep actually TREATED as mappings: the same population
+	// the loop below judges, which is what makes it the discriminator the zero-mapping
+	// record claims it is. len(entries) is the raw ReadDir snapshot and counts the two
+	// shapes the sweep never considers a mapping -- a subdirectory, and the hook's
+	// dot-prefixed write temp, which an interrupted hook leaves behind indefinitely --
+	// so reporting it says "names are present, none of them belong to a live tab" for
+	// a directory holding nothing but one stale temp.
+	mappingEntries := 0
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -490,6 +511,7 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 			// shape and no title handle starts with a dot, so skipping costs nothing.
 			continue
 		}
+		mappingEntries++
 		// The entry name is a TITLE HANDLE, so the tab it belongs to is resolved in
 		// memory before anything is judged against it. An unknown handle names no
 		// tab -- a file left by a previous server run (handles live only in this
@@ -523,7 +545,7 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 		// kiro session until the user confirms the code in their own browser, so a
 		// default-level record would fire on ordinary first-boot sign-ins.
 		slog.Debug("session title: no live tab has a kiro session mapping; every tab keeps the automatic name ladder",
-			"live_tabs", len(live), "state_entries", len(entries), "dir", s.stateDir,
+			"live_tabs", len(live), "state_entries", mappingEntries, "dir", s.stateDir,
 			"hint", "kiro-cli's SessionStart/UserPromptSubmit hooks write these files; check $HOME/.kiro/hooks/web-terminal-session-title.json and hooks/session-title.sh. A tab still at the device-flow sign-in has no kiro session yet, so this is expected until chat starts.")
 	}
 }

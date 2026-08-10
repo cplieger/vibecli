@@ -202,8 +202,17 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lstat the level: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o700 || !fi.Mode().IsDir() {
-		t.Fatalf("fixture is not bait: mode %#o dir=%v, want a 0700 directory that passes every check but the ownership one", perm, fi.Mode().IsDir())
+	if !fi.Mode().IsDir() {
+		t.Fatalf("fixture is not a directory (mode %#o): os.Mkdir reported success, so this is a real anomaly rather than an environment limit", fi.Mode())
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		// Not a defect in the code under test: an inheritable group-write ACL widens
+		// a created mode (ensureStateLevel measures 0770 from a 0o700 mkdir on a ZFS
+		// nfs4acl dataset), and a widened level would be refused for its MODE, so the
+		// ownership arm this test exists for would never be the reason it failed.
+		// Skip like the Chown guard above rather than reporting the filesystem as a
+		// failure of the check.
+		t.Skipf("this filesystem stored mode %#o for a 0o700 mkdir, so a level that passes every check but the ownership one cannot be built here", perm)
 	}
 
 	if err := newSessionTitleSync(root, t.TempDir()).ensureStateDir(); err == nil {
@@ -275,6 +284,17 @@ func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 		if err := os.Mkdir(target, 0o750); err != nil {
 			t.Fatalf("make the victim directory: %v", err)
 		}
+		// The mode the filesystem STORED, not the one os.Mkdir asked for: an
+		// inheritable group-write ACL widens a created mode (the case
+		// ensureStateLevel's own comment measures, 0770 from a 0o700 mkdir on a ZFS
+		// nfs4acl dataset), and the property under test is that the victim is
+		// UNCHANGED -- a comparison against whatever it started as, never against
+		// the literal, or the refusal that WORKED is reported as a repair through
+		// the link.
+		before, err := os.Lstat(target)
+		if err != nil {
+			t.Fatalf("lstat the victim before the refusal: %v", err)
+		}
 		link := filepath.Join(t.TempDir(), "level")
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatalf("plant the symlink: %v", err)
@@ -286,14 +306,19 @@ func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("lstat the victim: %v", err)
 		}
-		if perm := fi.Mode().Perm(); perm != 0o750 {
-			t.Errorf("the symlink target's mode = %#o, want it untouched at 0750: the repair was applied through the link", perm)
+		if perm := fi.Mode().Perm(); perm != before.Mode().Perm() {
+			t.Errorf("the symlink target's mode = %#o, want it untouched at %#o: the repair was applied through the link", perm, before.Mode().Perm())
 		}
 	})
 	t.Run("a plain file is refused and not chmod'ed", func(t *testing.T) {
 		file := filepath.Join(t.TempDir(), "level")
 		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 			t.Fatalf("plant the file: %v", err)
+		}
+		// Same reason as the symlink case: the stored mode is the baseline.
+		before, err := os.Lstat(file)
+		if err != nil {
+			t.Fatalf("lstat the planted file before the refusal: %v", err)
 		}
 		if _, err := enforceLevelMode(file); err == nil {
 			t.Error("enforceLevelMode accepted a plain file as a level; O_DIRECTORY is what refuses it")
@@ -302,8 +327,8 @@ func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("lstat the planted file: %v", err)
 		}
-		if perm := fi.Mode().Perm(); perm != 0o644 {
-			t.Errorf("the planted file's mode = %#o, want it untouched at 0644", perm)
+		if perm := fi.Mode().Perm(); perm != before.Mode().Perm() {
+			t.Errorf("the planted file's mode = %#o, want it untouched at %#o", perm, before.Mode().Perm())
 		}
 	})
 	t.Run("a directory this process made is repaired and the stored mode reported", func(t *testing.T) {

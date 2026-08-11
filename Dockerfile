@@ -88,9 +88,19 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # WOFF2 faces come from GitHub's own Monaspace repo, which publishes
 # official nerd-fonts-patched webfonts (the nerd-fonts release repo is
 # OTF-only); WOFF2 halves the served bytes (~5.1 MB vs ~10.9 MB), and
-# the swap was gated on a metrics check: outlines and every PUA icon
-# advance are identical to the previously bundled MonaspiceNe NFM OTFs
-# (icons stay exactly one cell). The faces grow the web-terminal-kiro
+# the swap was gated on a metrics check that covered HORIZONTAL metrics
+# only: outlines and every PUA icon advance are identical to the
+# previously bundled MonaspiceNe NFM OTFs (icons stay exactly one cell).
+# The VERTICAL metrics are NOT identical, and that gap shipped a visible
+# regression in v2.8.0 — these faces declare 0.945em ascent + 0.200em
+# descent where the patched OTFs carried 0.995em + 0.250em, which is
+# shorter than the terminal's 17px cell, so every row of application
+# background gained a 1px unpainted stripe. web-terminal-ui's page.css
+# now restores the OTF pair with ascent-override/descent-override and
+# pins it against the cell height in its own test suite; a Monaspace
+# bump that changes those tables again needs that override re-measured,
+# not just these sha pins refreshed.
+# The faces grow the web-terminal-kiro
 # binary via go:embed and ship pre-compressed over the wire.
 # renovate: datasource=github-releases depName=githubnext/monaspace
 ARG MONASPACE_VERSION=v1.400

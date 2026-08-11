@@ -28,7 +28,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -363,10 +362,12 @@ func parseToolsTainted() bool {
 // A malformed entry is DROPPED and the usable ones are kept, the warn-and-drop
 // posture WT_ALLOWED_HOSTS and WT_TRUSTED_PROXIES already use: one typo in a list
 // must not fail the boot, and dropping is the fail-closed direction here, because
-// a uid that never lands leaves the check enforcing against it. Non-numeric text
-// is rejected, and so are two numeric shapes: 0, because the library trusts root
-// unconditionally and naming it grants nothing, and any negative value, which is
-// not an identity.
+// a uid that never lands leaves the check enforcing against it. Which entries are
+// refused, and why a blank between separators is not one of them, is
+// pinstall.ParseIdentities' contract: the rule follows from what the library's own
+// field means, so it lives beside that field rather than in a copy here. This app
+// keeps the two things that ARE its own — the variable's name, and every word an
+// operator reads about it.
 //
 // The warning names the KEY and a COUNT only, never an entry, for the reason
 // parseTrustedProxies, parseAllowedHosts, parseToolsTainted, parseLogOSCText and
@@ -374,10 +375,8 @@ func parseToolsTainted() bool {
 // can put a credential on any variable (`WT_TRUSTED_INSTALL_UIDS:
 // ${SOME_TOKEN}`), and echoing it would leave a durable, queryable copy in the
 // log store (CWE-532). The hint is a FIXED string for the same reason — it must
-// not grow an input-derived tail.
-//
-// The result is deduplicated and keeps first-seen order, so what reaches the
-// library is a set rather than a transcript of the operator's typing.
+// not grow an input-derived tail. The library returns a count rather than the
+// refused text precisely so this promise cannot be broken by accident.
 //
 // Carries the WT_ family prefix, like every other operator knob this app reads
 // and like the engine's own WT_SCROLLBACK: the knob is not specific to this app.
@@ -386,39 +385,10 @@ func parseToolsTainted() bool {
 // knobs. A shared spelling is also the one a shared README can document.
 func parseTrustedInstallUIDs() []int {
 	const key = "WT_TRUSTED_INSTALL_UIDS"
-	raw := strings.TrimSpace(envx.String(key, ""))
-	if raw == "" {
-		return nil
-	}
-	var (
-		uids    []int
-		seen    = make(map[int]bool)
-		invalid int
-	)
-	for field := range strings.SplitSeq(raw, ",") {
-		entry := strings.TrimSpace(field)
-		if entry == "" {
-			// A doubled or trailing separator, skipped like webhttp.ParseCIDRs and
-			// ParseHostList skip a blank: it declares no identity, so it is neither
-			// a grant nor a mistake worth a diagnostic.
-			continue
-		}
-		uid, convErr := strconv.Atoi(entry)
-		if convErr != nil || uid <= 0 {
-			// convErr is never logged: strconv's error wraps the rejected value
-			// (*strconv.NumError), which is exactly what must not reach a record.
-			invalid++
-			continue
-		}
-		if seen[uid] {
-			continue
-		}
-		seen[uid] = true
-		uids = append(uids, uid)
-	}
-	if invalid > 0 {
+	uids, rejected := pinstall.ParseIdentities(envx.String(key, ""))
+	if rejected > 0 {
 		slog.Warn("dropping unusable "+key+" entries; the kiro-cli install keeps enforcing custody against those identities",
-			"invalid_count", invalid,
+			"invalid_count", rejected,
 			"hint", "each entry is a single numeric uid greater than 0 (e.g. 1000,1001); root is trusted already, and every identity listed must be at least as privileged as this server")
 	}
 	return uids

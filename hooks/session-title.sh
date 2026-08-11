@@ -40,12 +40,15 @@ set -u
 
 # Read the hook payload and pull out kiro's session id. Deliberately a fixed
 # extraction rather than a JSON parser, and NOT for want of one: jq is baked into
-# this image (the Dockerfile's runtime apt list) and this script only ever runs
-# inside it, from the hook config entrypoint.sh seeds at an absolute in-image
-# path. The reason is the failure mode. The payload is machine-written by
-# kiro-cli, and a shape change here must yield an empty match, which the guard
-# below turns into a silent no-op (the tab keeps the server's automatic name)
-# rather than a wrong mapping -- a tab label is never worth a broken prompt.
+# this image (the Dockerfile's runtime apt list), and in production this script
+# runs only inside it, from the hook config entrypoint.sh seeds at an absolute
+# in-image path. It does run in one other place -- sessiontitle_test.go executes
+# it under the host's /bin/sh to pin the mapping-file format -- so a parser would
+# add a jq prerequisite to `go test`, not to the image. The reason is the failure
+# mode. The payload is machine-written by kiro-cli, and a shape change here must
+# yield an empty match, which the guard below turns into a silent no-op (the tab
+# keeps the server's automatic name) rather than a wrong mapping -- a tab label
+# is never worth a broken prompt.
 # Switching to a parser is therefore a behaviour change to weigh, not a
 # portability upgrade: it selects a named field instead of a byte match.
 # Stream stdin straight through the extraction. Two reasons not to buffer it first: this

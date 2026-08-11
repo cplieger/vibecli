@@ -390,18 +390,17 @@ func (d *routeDeps) childEnv(id string) []string {
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	// Retained-history depth carries no app-owned number any more. The option is
-	// appended at the BOTTOM of this factory, and only when the operator set
-	// terminal.ScrollbackEnvVar (main.go's resolveScrollback reads it); with
-	// nothing set the option is omitted and the engine's own
-	// terminal.DefaultScrollbackCapacity applies. This app used to pass its own
-	// constant, which made the sizing decision in three places across the family;
-	// the engine documents it once.
+	// appended at the BOTTOM of this factory only when resolveScrollback returns
+	// a valid operator override; unset, blank, or malformed values omit the
+	// option, so the engine's own terminal.DefaultScrollbackCapacity applies.
+	// This app used to pass its own constant, which made the sizing decision in
+	// three places across the family; the engine documents it once.
 	//
 	// WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
-	// kiro-cli keeps emitting its
-	// focus-gated OSC 9 notifications (which drive the classifier) even though no
-	// browser tab claims focus; web-terminal-server deliberately does NOT use
-	// this, since a generic shell/editor wants real focus reporting.
+	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive
+	// the classifier) even though no browser tab claims focus;
+	// web-terminal-server deliberately does NOT use this, since a generic
+	// shell/editor wants real focus reporting.
 	//
 	// No TERM_PROGRAM override here: the engine advertises TERM_PROGRAM=
 	// iTerm.app (>= 3.6.6), which puts kiro-cli in its OSC 9;4 progress allowlist

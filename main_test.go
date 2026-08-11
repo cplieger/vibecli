@@ -2895,6 +2895,7 @@ func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 	cases := []struct {
 		name      string
 		raw       string
+		absent    bool // the variable is not in the environment at all
 		wantDebug bool // the installed handler admits Debug
 		wantInfo  bool // ... and Info
 		wantWarn  bool // the unparseable-level warning was emitted
@@ -2903,7 +2904,8 @@ func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 		// and "info" appear in this warning's own hint by design.
 		rawMustStayOut bool
 	}{
-		{name: "unset installs the info default", raw: "", wantInfo: true},
+		{name: "absent installs the info default", absent: true, wantInfo: true},
+		{name: "blank installs the info default", raw: "", wantInfo: true},
 		{name: "debug installs debug", raw: "debug", wantDebug: true, wantInfo: true},
 		{name: "error installs error", raw: "error"},
 		{name: "case and padding are the library's tolerance, not a local one", raw: " DEBUG ", wantDebug: true, wantInfo: true},
@@ -2918,7 +2920,15 @@ func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// t.Setenv first either way: it records the pre-test value and
+			// restores it at cleanup, so the Unsetenv below is safe (the shape
+			// TestResolveScrollback uses for its absent case).
 			t.Setenv("KWEB_LOG_LEVEL", tc.raw)
+			if tc.absent {
+				if err := os.Unsetenv("KWEB_LOG_LEVEL"); err != nil {
+					t.Fatalf("Unsetenv(KWEB_LOG_LEVEL): %v", err)
+				}
+			}
 
 			out := setupLoggingStderr(t)
 

@@ -159,7 +159,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
 # fail-closing every image build on the gate below.
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.3
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.8
 # No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
 # already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
 # (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
@@ -217,11 +217,11 @@ ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.7.0
 # digest, so the version and the digest come from different sources: Renovate bumps
 # the version and the repin postUpgradeTask recomputes this line in the same commit.
 # repin: dep=@cplieger/web-terminal-engine url=https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=f74e030522ff3c2de6bc64ffbc1b5098beb9a9c7f808550b589b3d7f823d0caf
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=5212bb39529b2662720c6c9078082280e550f59a648e636d5494f23245e39983
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
 ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.3.0
 # repin: dep=@cplieger/web-terminal-ui url=https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=b8ad87efc28c1dc2596ef2a1230aab4c36d16af2ea8c7d4b07d02aebb7621bdc
+ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=2393a545c0ea9330f1a8a80890a5a9077842d3e9336bf2eb7924addf8fb10d02
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is

@@ -11,7 +11,7 @@ services:
 
     ports:
       # Root shell with no built-in auth; loopback alone does not stop DNS rebinding.
-      # See README "It is a remote shell" for proxy, bind, and KWEB_ALLOWED_HOSTS setup.
+      # See README "It is a remote shell" for proxy, bind, and WT_ALLOWED_HOSTS setup.
       - "9848:9848"
 
     volumes:

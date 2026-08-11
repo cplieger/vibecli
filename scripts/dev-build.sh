@@ -4,7 +4,7 @@
 # sibling ../web-terminal-engine (engine) and ../web-terminal-ui (UI) checkouts
 # instead of the published Go module / npm packages — the way to try unpublished
 # engine/UI changes against the real app. Run the binary directly
-# (KWEB_WORK_DIR=... ./web-terminal-kiro-dev-bin; see CONTRIBUTING "Local dev setup").
+# (WT_WORKDIR=... ./web-terminal-kiro-dev-bin; see CONTRIBUTING "Local dev setup").
 #
 # Not for CI or release. go.work and web-terminal-kiro-dev-bin are gitignored.
 # Override the sibling checkouts with ENGINE_DIR=... / UI_DIR=...

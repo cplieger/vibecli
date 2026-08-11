@@ -60,7 +60,7 @@ type routeDeps struct {
 	static http.Handler
 	ready  *webhttp.Ready
 	// listenHint is "localhost[:port]" for THIS deployment, derived from the
-	// address the server actually listens on (KWEB_ADDR). The loopback surfaces'
+	// address the server actually listens on (WT_ADDR). The loopback surfaces'
 	// refusals quote it so the remedy they name works on a server that did not
 	// keep the default port. Empty (a test building routeDeps by hand) yields
 	// today's message minus the address, so no consumer is required to set it.
@@ -133,7 +133,7 @@ type routeDeps struct {
 	// exactly how this was caught.
 	scrollback *int
 	workDir    string
-	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
+	// logOSCText is the WT_LOG_OSC_TEXT opt-in: when true, an unrecognized
 	// OSC 9 notification's full text is logged at Debug. Default false — the
 	// text is arbitrary child output that may carry a token or device code, so
 	// the log otherwise carries only a content-free fingerprint (see
@@ -621,7 +621,7 @@ const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab sta
 // Deliberately does NOT contain unrecognizedNotifyMsg as a substring: these are two
 // different events and a log search (or a test) matching on one must not also match
 // the other.
-const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set KWEB_LOG_LEVEL=debug)"
+const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set WT_LOG_LEVEL=debug)"
 
 // recognizedNotifyMsg is the POSITIVE half of the classifier trace. Without it
 // the classifier is observable only when it fails to match, so a debug session
@@ -654,8 +654,8 @@ const unrecognizedNotifyCapRearm = 6 * time.Hour
 // unrecognizedNotifyHint is the operator-facing next step both Warn arms carry:
 // what to re-verify after a kiro-cli bump, and the two levers that surface the
 // notification's actual TEXT (raising the level alone is no longer enough —
-// KWEB_LOG_OSC_TEXT is the deliberate confidentiality opt-in).
-const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_OSC_TEXT=true with KWEB_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
+// WT_LOG_OSC_TEXT is the deliberate confidentiality opt-in).
+const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set WT_LOG_OSC_TEXT=true with WT_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
 
 // notifyFingerprintHexDigits bounds the fingerprint written in place of the
 // notification text. 16 hex digits (64 bits of HMAC-SHA-256) is far more than
@@ -696,7 +696,7 @@ const notifyFingerprintKeyBytes = 32
 // lifetime is the classifier INSTANCE (one per process in production), so
 // fingerprints correlate across the Warn and Debug records of one run and
 // deliberately do NOT correlate across restarts; recovering the text itself is
-// a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus KWEB_LOG_LEVEL=debug),
+// a deliberate two-lever opt-in (WT_LOG_OSC_TEXT plus WT_LOG_LEVEL=debug),
 // not a side effect of raising the log level.
 type notifyFingerprinter struct {
 	key []byte
@@ -788,7 +788,7 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // with its own bounded warn latch: the first occurrence of each DISTINCT
 // unrecognized notification is promoted to Warn (up to unrecognizedNotifyCap),
 // so a kiro-cli notification-wording drift is visible in the DEFAULT (info) log
-// stream instead of only under KWEB_LOG_LEVEL=debug, while the Debug trace still
+// stream instead of only under WT_LOG_LEVEL=debug, while the Debug trace still
 // records every occurrence — a build that legitimately emits some other
 // notification cannot flood the shipped stream.
 //
@@ -825,7 +825,7 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
 //
-// logText is the KWEB_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
+// logText is the WT_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
 // whether an UNRECOGNIZED notification's TEXT may be logged at all. Off, every
 // unrecognized-arm record is content-free metadata (see notifyFingerprinter);
 // on, the Debug arm — and only the Debug arm — carries the full sanitized text,
@@ -852,7 +852,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			// silently stop latching. The first occurrence of each DISTINCT message
 			// warns (visible at the default info level, up to unrecognizedNotifyCap
 			// distinct strings); the Debug line records every occurrence, so
-			// KWEB_LOG_LEVEL=debug is what shows the full set after a version bump.
+			// WT_LOG_LEVEL=debug is what shows the full set after a version bump.
 			//
 			// Neither record carries the notification TEXT by default, and the Warn
 			// never does. The text is arbitrary child output: the engine's
@@ -867,7 +867,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			// the distinct wordings apart and correlate repeats within this
 			// process, carrying none of the content and offering no offline
 			// guessing oracle. Recovering the text is the explicit
-			// KWEB_LOG_OSC_TEXT opt-in below, at Debug only.
+			// WT_LOG_OSC_TEXT opt-in below, at Debug only.
 			//
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
@@ -891,7 +891,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 						"distinct_limit", unrecognizedNotifyCap,
 						"hint", unrecognizedNotifyHint)...)
 			}
-			// ONE Debug record either way; the KWEB_LOG_OSC_TEXT opt-in only ADDS
+			// ONE Debug record either way; the WT_LOG_OSC_TEXT opt-in only ADDS
 			// the text. Whoever set BOTH it and the debug level accepted (and was
 			// warned at startup) that terminal notification text may contain
 			// secrets. The metadata rides along rather than being replaced: the

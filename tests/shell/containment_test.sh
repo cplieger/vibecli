@@ -232,14 +232,14 @@ printf '%s' "$tail_block" | grep -Eq 'level=warn.*not held' \
 # It re-runs this same script, so the marker is the only thing between one drop and
 # an infinite exec loop. Assert it is set BEFORE the exec, and exported (the child
 # is a fresh process, so an unexported marker would not survive).
-marker_line=$(grep -n 'KWEB_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+marker_line=$(grep -n 'WT_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 [ -n "$marker_line" ] && [ "$marker_line" -lt "$exec_line" ] \
   && ok "the loop marker is set before the exec" \
   || no "the loop marker is set before the exec" "marker at ${marker_line:-none}, exec at $exec_line"
-grep -Eq 'export KWEB_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" \
+grep -Eq 'export WT_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" \
   && ok "the loop marker is exported so the re-exec sees it" \
   || no "the loop marker is exported" "an unexported marker cannot survive exec, so boot would loop"
-grep -Eq '\$\{KWEB_CONTAINMENT_CAPS_DROPPED:-\}" != "1"' "$ENTRYPOINT" \
+grep -Eq '\$\{WT_CONTAINMENT_CAPS_DROPPED:-\}" != "1"' "$ENTRYPOINT" \
   && ok "the guard tests the marker" \
   || no "the guard tests the marker" "no marker test found"
 

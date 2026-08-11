@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -61,7 +62,7 @@ import (
 var staticFS embed.FS
 
 // parseTrustedProxies reads a comma-separated list of CIDRs / bare IPs from the
-// TRUSTED_PROXIES env var into the trusted-proxy set the access log's client-IP
+// WT_TRUSTED_PROXIES env var into the trusted-proxy set the access log's client-IP
 // resolver consults (webhttp.WithClientIP -> ClientIP). It delegates the
 // CIDR/bare-IP parsing to the shared webhttp.ParseCIDRs helper, which trims
 // whitespace, skips blanks, treats a bare IP as a single host (/32 or /128), and
@@ -79,14 +80,14 @@ var staticFS embed.FS
 // reverse proxy, set the var to the proxy's CIDR(s) so the access log records
 // the real client.
 func parseTrustedProxies() []*net.IPNet {
-	const key = "TRUSTED_PROXIES"
+	const key = "WT_TRUSTED_PROXIES"
 	v := envx.String(key, "")
 	if v == "" {
 		return nil
 	}
 	nets, invalid := webhttp.ParseCIDRs(strings.Split(v, ","))
 	if len(invalid) > 0 {
-		// Count-only, like the KWEB_LOG_LEVEL and KIRO_CLI_CHAT_ARGS
+		// Count-only, like the WT_LOG_LEVEL and KIRO_CLI_CHAT_ARGS
 		// treatment: a compose expansion mistake could put a credential in an
 		// entry, so the rejected raw values never reach the log.
 		slog.Warn("ignoring malformed "+key+" entries; using the valid proxy set",
@@ -112,7 +113,7 @@ func parseTrustedProxies() []*net.IPNet {
 	return nets
 }
 
-// parseAllowedHosts reads the comma-separated KWEB_ALLOWED_HOSTS list of exact
+// parseAllowedHosts reads the comma-separated WT_ALLOWED_HOSTS list of exact
 // hostnames / IPs this server answers for into a webhttp.HostPolicy — the
 // shared exact-match Host allowlist that closes the DNS-rebinding hole
 // same-origin checks alone leave open (a rebinding attack makes Origin and
@@ -121,7 +122,7 @@ func parseTrustedProxies() []*net.IPNet {
 // (webhttp.CanonicalHost canonicalization, X-Forwarded-Host ignored, the
 // loopback peer+Host carve-out that keeps the baked Docker healthcheck and
 // in-container tools clients working under any allowlist); this parser owns
-// the app policy: the carve-out is enabled, the 403 names KWEB_ALLOWED_HOSTS,
+// the app policy: the carve-out is enabled, the 403 names WT_ALLOWED_HOSTS,
 // and malformed entries are logged (count-only, like parseTrustedProxies) and
 // dropped per ParseHostList's drop-and-report contract.
 //
@@ -133,17 +134,17 @@ func parseTrustedProxies() []*net.IPNet {
 // closed rather than silently unprotected — warned here by name, since every
 // browser request would otherwise 403 with no hint why.
 func parseAllowedHosts() *webhttp.HostPolicy {
-	const key = "KWEB_ALLOWED_HOSTS"
+	const key = "WT_ALLOWED_HOSTS"
 	policy, invalid := webhttp.ParseHostList(strings.Split(envx.String(key, ""), ","),
 		webhttp.WithLoopbackExempt(),
 		webhttp.WithHostAllowlistError("",
-			"host not allowed; add it to KWEB_ALLOWED_HOSTS to serve this hostname"))
+			"host not allowed; add it to WT_ALLOWED_HOSTS to serve this hostname"))
 	if len(invalid) > 0 {
 		// Count-only, like parseTrustedProxies: the rejected raw values could
 		// carry a misplaced credential, so only their count is logged.
 		slog.Warn("dropping malformed "+key+" entries; they cannot match any browser-sent Host",
 			"invalid_count", len(invalid),
-			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,192.168.1.5,webterm.example.com; a lone port like :9848 belongs in KWEB_ADDR")
+			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,192.168.1.5,webterm.example.com; a lone port like :9848 belongs in WT_ADDR")
 	}
 	if policy.Active() && policy.Size() == 0 {
 		slog.Warn(key+" has no usable entries; rejecting every non-loopback request (fail closed)",
@@ -163,7 +164,7 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 // decision is the failure posture, and it is this app's usual one — warn by NAME
 // and fall back rather than abort, because retained history is not a safety
 // property and a dev box must be able to boot with a typo'd compose value (see
-// the same reasoning on KWEB_LOG_LEVEL). The value is deliberately not echoed:
+// the same reasoning on WT_LOG_LEVEL). The value is deliberately not echoed:
 // this app publishes a no-values promise for its whole env surface.
 func resolveScrollback() *int {
 	// envx.IntStrict is the read the engine's ScrollbackEnvVar doc names, and the
@@ -197,8 +198,8 @@ const catalogRefreshKey = "TOOL_CATALOG_REFRESH"
 // canonical parser — but only for values that parser ACCEPTS. toolbelt calls
 // scheduler.ParseInterval without scheduler.WithRedactedValue, so its fallback
 // warning echoes the RAW value (scheduler warnFallback), and a compose expansion
-// mistake could put a credential on this key — the same reason KWEB_LOG_LEVEL is
-// read as a string and KWEB_LOG_OSC_TEXT goes through envx.BoolStrict. A value the
+// mistake could put a credential on this key — the same reason WT_LOG_LEVEL is
+// read as a string and WT_LOG_OSC_TEXT goes through envx.BoolStrict. A value the
 // library would reject is warned about HERE by name only and replaced with "" so
 // the library applies its documented default silently. Accepted values are passed
 // through untouched, so the default, the "off"/"disabled"/"0" disable words and
@@ -224,22 +225,22 @@ func parseCatalogRefresh(raw string) time.Duration {
 	return toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
 }
 
-// parseLogOSCText reads the KWEB_LOG_OSC_TEXT knob (default false) and emits the
+// parseLogOSCText reads the WT_LOG_OSC_TEXT knob (default false) and emits the
 // startup warnings that go with it, returning whether notification TEXT may be
 // logged.
 //
-// KWEB_LOG_OSC_TEXT is the confidentiality opt-in for terminal notification
+// WT_LOG_OSC_TEXT is the confidentiality opt-in for terminal notification
 // TEXT. An unrecognized OSC 9 notification is arbitrary child output — any
 // program run in the terminal can emit `ESC ] 9 ; <text>` — and it can carry a
 // token or a device code, so by default the classifier logs only a content-free
 // fingerprint plus a rune count (see newStatusClassifier). Turning this on adds
 // the full text to the Debug record, which is why it warns at startup rather
-// than logging silently: raising KWEB_LOG_LEVEL alone must not widen what
+// than logging silently: raising WT_LOG_LEVEL alone must not widen what
 // content reaches the log store.
 //
 // Read with envx.BoolStrict, NOT envx.Bool, and that choice is the
 // confidentiality property rather than a style preference: a compose expansion
-// mistake can put a secret on this key (`KWEB_LOG_OSC_TEXT: ${SOME_TOKEN}`), and
+// mistake can put a secret on this key (`WT_LOG_OSC_TEXT: ${SOME_TOKEN}`), and
 // envx.Bool's malformed path emits a Warn carrying the RAW value — a durable,
 // queryable copy of that secret in the log store (CWE-532). BoolStrict shares
 // ONE parser with Bool, so the accepted vocabulary (true/1/yes/on,
@@ -248,7 +249,7 @@ func parseCatalogRefresh(raw string) time.Duration {
 // the error it returns names only the key and the accepted spellings, never the
 // value. Do NOT "simplify" this to envx.Bool — the two differ only in who owns
 // the diagnostic, and Bool's diagnostic is the leak. The same reasoning keeps
-// KWEB_LOG_LEVEL a string read and TOOL_CATALOG_REFRESH behind
+// WT_LOG_LEVEL a string read and TOOL_CATALOG_REFRESH behind
 // parseCatalogRefresh.
 //
 // This function owns all the policy around that read, and every part of it is
@@ -260,7 +261,7 @@ func parseCatalogRefresh(raw string) time.Duration {
 // function — the one main calls — to assert the malformed path emits one Warn
 // with no copy of the raw value anywhere in it.
 func parseLogOSCText() bool {
-	const key = "KWEB_LOG_OSC_TEXT"
+	const key = "WT_LOG_OSC_TEXT"
 	// The ok result is unused on purpose: the fallback is false and BoolStrict
 	// returns false when the key is unset, so "unset" and "set to false" need no
 	// distinguishing here.
@@ -343,6 +344,86 @@ func parseToolsTainted() bool {
 	}
 }
 
+// parseTrustedInstallUIDs decodes WT_TRUSTED_INSTALL_UIDS, a comma-separated
+// list of numeric uids, into the identities pinstall may find with write access
+// to the kiro-cli installation tree without treating custody as broken
+// (pinstall.Config.TrustedUIDs).
+//
+// It is EMPTY BY DEFAULT, and the default is the point: unset or blank grants
+// nothing, so the library's custody check applies in full and refuses an install
+// root some other identity can write. Setting the variable is an ASSERTION about
+// the deployment, and the library's field doc states the contract it has to meet
+// — every uid listed is already at least as privileged as this server process,
+// so its write access to the tree gains that identity nothing. An identity that
+// is NOT (the unprivileged account another service runs as) can escalate through
+// a binary this app installs and then executes, so naming it defeats the check
+// rather than tuning it. Only the operator can answer this: nothing in the image
+// can know which identities a given volume's ownership, mode or ACL grants.
+//
+// A malformed entry is DROPPED and the usable ones are kept, the warn-and-drop
+// posture WT_ALLOWED_HOSTS and WT_TRUSTED_PROXIES already use: one typo in a list
+// must not fail the boot, and dropping is the fail-closed direction here, because
+// a uid that never lands leaves the check enforcing against it. Non-numeric text
+// is rejected, and so are two numeric shapes: 0, because the library trusts root
+// unconditionally and naming it grants nothing, and any negative value, which is
+// not an identity.
+//
+// The warning names the KEY and a COUNT only, never an entry, for the reason
+// parseTrustedProxies, parseAllowedHosts, parseToolsTainted, parseLogOSCText and
+// parseCatalogRefresh all log by name or count: a compose interpolation mistake
+// can put a credential on any variable (`WT_TRUSTED_INSTALL_UIDS:
+// ${SOME_TOKEN}`), and echoing it would leave a durable, queryable copy in the
+// log store (CWE-532). The hint is a FIXED string for the same reason — it must
+// not grow an input-derived tail.
+//
+// The result is deduplicated and keeps first-seen order, so what reaches the
+// library is a set rather than a transcript of the operator's typing.
+//
+// Carries the WT_ family prefix, like every other operator knob this app reads
+// and like the engine's own WT_SCROLLBACK: the knob is not specific to this app.
+// Every app that installs kiro-cli through pinstall faces the same custody
+// question about the same volume, and a knob spelled one way per app is several
+// knobs. A shared spelling is also the one a shared README can document.
+func parseTrustedInstallUIDs() []int {
+	const key = "WT_TRUSTED_INSTALL_UIDS"
+	raw := strings.TrimSpace(envx.String(key, ""))
+	if raw == "" {
+		return nil
+	}
+	var (
+		uids    []int
+		seen    = make(map[int]bool)
+		invalid int
+	)
+	for field := range strings.SplitSeq(raw, ",") {
+		entry := strings.TrimSpace(field)
+		if entry == "" {
+			// A doubled or trailing separator, skipped like webhttp.ParseCIDRs and
+			// ParseHostList skip a blank: it declares no identity, so it is neither
+			// a grant nor a mistake worth a diagnostic.
+			continue
+		}
+		uid, convErr := strconv.Atoi(entry)
+		if convErr != nil || uid <= 0 {
+			// convErr is never logged: strconv's error wraps the rejected value
+			// (*strconv.NumError), which is exactly what must not reach a record.
+			invalid++
+			continue
+		}
+		if seen[uid] {
+			continue
+		}
+		seen[uid] = true
+		uids = append(uids, uid)
+	}
+	if invalid > 0 {
+		slog.Warn("dropping unusable "+key+" entries; the kiro-cli install keeps enforcing custody against those identities",
+			"invalid_count", invalid,
+			"hint", "each entry is a single numeric uid greater than 0 (e.g. 1000,1001); root is trusted already, and every identity listed must be at least as privileged as this server")
+	}
+	return uids
+}
+
 // sessionCommand builds the per-session PTY command: `kiro-cli chat` behind a
 // sign-in guard. When no identity is present (`whoami` exits non-zero, verified
 // against the pinned build: 0 logged in, 1 not), the guard first runs
@@ -387,7 +468,7 @@ exec "$0" chat "$@"`
 
 // loopbackHint renders the address an in-container caller uses to reach this
 // server, for the loopback surfaces' refusal messages (routeDeps.listenHint).
-// Derived from the listen address (KWEB_ADDR) so a deployment that moved the port
+// Derived from the listen address (WT_ADDR) so a deployment that moved the port
 // is not told to curl the default one — the 403 is the whole of what a refused
 // caller is told. A port-less or malformed addr degrades to the bare host rather
 // than to a broken URL.
@@ -464,16 +545,16 @@ func stageOf(err error) string {
 // setupLogging installs the slog handler this app's whole observability story
 // rests on. Parse the level BEFORE Setup so the handler installs at the
 // configured level; warn AFTER Setup so the warning emits through the configured
-// handler (the slogx contract). KWEB_LOG_LEVEL=debug surfaces the diagnostic
+// handler (the slogx contract). WT_LOG_LEVEL=debug surfaces the diagnostic
 // lines that are invisible at the default info — e.g. the newStatusClassifier
 // trace for a kiro-cli notification-wording drift.
 func setupLogging() {
-	logLevel, ok := slogx.ParseLevel(envx.String("KWEB_LOG_LEVEL", ""), slog.LevelInfo)
+	logLevel, ok := slogx.ParseLevel(envx.String("WT_LOG_LEVEL", ""), slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: logLevel})
 	if !ok {
 		// Field-name-only: a compose expansion mistake could put a secret in
 		// the value, so the raw string never reaches the log.
-		slog.Warn("unparseable KWEB_LOG_LEVEL; using the info default",
+		slog.Warn("unparseable WT_LOG_LEVEL; using the info default",
 			"hint", "use debug, info, warn, or error")
 	}
 }
@@ -511,7 +592,7 @@ func checkWorkDir(workDir string) error {
 func run() error {
 	setupLogging()
 
-	addr := envx.String("KWEB_ADDR", ":9848")
+	addr := envx.String("WT_ADDR", ":9848")
 	// Warn for any bind reachable beyond loopback (wildcards, routable IPs,
 	// hostnames — webhttp.ClassifyBind's exposure vocabulary): a client that
 	// can reach this port gets an UNAUTHENTICATED kiro-cli PTY. The
@@ -522,7 +603,7 @@ func run() error {
 			"addr", addr,
 			"hint", "any client that can reach this port gets a kiro-cli PTY with filesystem access to /workspace and the /config home (auth tokens, ssh keys, gitconfig)")
 	}
-	workDir := envx.String("KWEB_WORK_DIR", "/workspace")
+	workDir := envx.String("WT_WORKDIR", "/workspace")
 	if err := checkWorkDir(workDir); err != nil {
 		return err
 	}
@@ -557,13 +638,13 @@ func run() error {
 		refreshInterval: parseCatalogRefresh(envx.String(catalogRefreshKey, "")),
 	})
 
-	// TRUSTED_PROXIES names the reverse proxies (CIDRs or bare IPs) whose
+	// WT_TRUSTED_PROXIES names the reverse proxies (CIDRs or bare IPs) whose
 	// X-Forwarded-For the access log may trust to recover the real client IP.
 	// Unset/empty ⇒ nil ⇒ trust nothing ⇒ log the unspoofable socket peer (the
 	// spoof-safe default for a directly-exposed deployment). See parseTrustedProxies.
 	trustedProxies := parseTrustedProxies()
 
-	// KWEB_ALLOWED_HOSTS names the exact hostnames/IPs this server answers
+	// WT_ALLOWED_HOSTS names the exact hostnames/IPs this server answers
 	// for; anything else is rejected before the terminal routes (see
 	// parseAllowedHosts for the DNS-rebinding rationale). Unset ⇒ inactive
 	// policy ⇒ permissive (backward compatible), but that leaves rebinding
@@ -572,11 +653,11 @@ func run() error {
 	// it. Warn.
 	hostPolicy := parseAllowedHosts()
 	if !hostPolicy.Active() {
-		slog.Warn("KWEB_ALLOWED_HOSTS is unset or blank; any Host header is accepted, leaving DNS rebinding open even on loopback/private binds",
-			"hint", "set KWEB_ALLOWED_HOSTS to the exact hostnames/IPs you browse to (e.g. localhost,192.168.1.5,webterm.example.com)")
+		slog.Warn("WT_ALLOWED_HOSTS is unset or blank; any Host header is accepted, leaving DNS rebinding open even on loopback/private binds",
+			"hint", "set WT_ALLOWED_HOSTS to the exact hostnames/IPs you browse to (e.g. localhost,192.168.1.5,webterm.example.com)")
 	}
 
-	// KWEB_LOG_OSC_TEXT (default false) is the confidentiality opt-in for
+	// WT_LOG_OSC_TEXT (default false) is the confidentiality opt-in for
 	// terminal notification TEXT; the knob's rationale, its fail-closed
 	// direction and its startup warnings are all in parseLogOSCText.
 	logOSCText := parseLogOSCText()
@@ -588,7 +669,7 @@ func run() error {
 	// string splicing.
 	chatArgs := strings.Fields(envx.String("KIRO_CLI_CHAT_ARGS", ""))
 	if len(chatArgs) > 0 {
-		// Field-count-only, like the KWEB_LOG_LEVEL warning above: a compose
+		// Field-count-only, like the WT_LOG_LEVEL warning above: a compose
 		// expansion mistake or a value-bearing flag could put a secret in the
 		// args, so the raw values never reach the log.
 		slog.Info("appending extra kiro-cli chat flags", "chat_args_count", len(chatArgs))
@@ -609,15 +690,19 @@ func run() error {
 	// KIRO_CLI_TOOLS_TAINTED is the entrypoint's tools-tree-was-writable
 	// observation; the two-value vocabulary that may arm it, the
 	// treat-anything-else-as-unset outcome and the by-name-only warning are all
-	// parseToolsTainted's.
+	// parseToolsTainted's. WT_TRUSTED_INSTALL_UIDS is the operator's own
+	// declaration of which identities may write the installation tree without
+	// breaking custody, empty by default so the library's check applies in full;
+	// see parseTrustedInstallUIDs.
 	tainted := parseToolsTainted()
 	kiro := startKiroCLI(&baseKiro{
-		version:     envx.String("KIRO_CLI_VERSION", ""),
-		sha256:      envx.String("KIRO_CLI_SHA256", ""),
-		sha256ARM64: envx.String("KIRO_CLI_SHA256_ARM64", ""),
-		toolsDir:    kiroToolsDir,
-		tainted:     tainted,
-		chatArgs:    chatArgs,
+		version:            envx.String("KIRO_CLI_VERSION", ""),
+		sha256:             envx.String("KIRO_CLI_SHA256", ""),
+		sha256ARM64:        envx.String("KIRO_CLI_SHA256_ARM64", ""),
+		toolsDir:           kiroToolsDir,
+		tainted:            tainted,
+		chatArgs:           chatArgs,
+		trustedInstallUIDs: parseTrustedInstallUIDs(),
 	})
 
 	mux := http.NewServeMux()
@@ -628,7 +713,7 @@ func run() error {
 	// this app persists no session state (terminal state is the in-memory VT
 	// buffer), so nothing here should outlive the container. A refused directory is
 	// a warn, not fatal — and it is AUTHORITATIVE for both consumers: no tab gets
-	// KWEB_TITLE_HANDLE or KWEB_TITLE_STATE_DIR, the poller never starts, and the
+	// WT_TITLE_HANDLE or WT_TITLE_STATE_DIR, the poller never starts, and the
 	// engine's automatic ladder names every tab (see enableSessionTitles for why a
 	// warn-only verdict left the refused path in use).
 	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
@@ -797,16 +882,6 @@ const (
 	// co-owned by the toolbelt engine, which publishes bin/<tool> symlinks of its
 	// own — which is why the legacy sweep names its targets instead of scanning it.
 	kiroLinkDir = "bin"
-	// kiroNFSAdminUID is the administrator's NFS account, which the tools volume's
-	// NFSv4 ACL grants write access to every directory on the way to the install
-	// root. pinstall parses that list and refuses a tree a stranger can write; it
-	// cannot know this stranger already holds root on the host through sudo, so
-	// writing these files gains that account nothing. Declaring the identity keeps
-	// the check enforcing against every OTHER writer, which is what a blanket
-	// InstallWithoutCustody would give up — along with a digest-verified reinstall
-	// on every container start, because a sentinel in a tree it does not trust is
-	// not evidence.
-	kiroNFSAdminUID = 3000
 	// legacyStagePrefix prefixed the shell installer's staging trees directly under
 	// the tools dir. The managed staging trees live under the install root instead,
 	// so anything matching this is an orphan its EXIT trap missed on a SIGKILL. It
@@ -823,13 +898,18 @@ const (
 
 // baseKiro carries startKiroCLI's inputs: the three Renovate-pinned literals the
 // entrypoint exports, the tools tree they install into, the taint observation only
-// the entrypoint can make, and this deployment's extra chat flags.
+// the entrypoint can make, this deployment's extra chat flags, and the operator's
+// install-custody trust list.
 type baseKiro struct {
 	version     string
 	sha256      string
 	sha256ARM64 string
 	toolsDir    string
 	chatArgs    []string
+	// trustedInstallUIDs are the operator-declared identities whose write access
+	// to the installation tree does not break custody. Empty by default; see
+	// parseTrustedInstallUIDs.
+	trustedInstallUIDs []int
 	// tainted carries the entrypoint's tools-tree-was-writable observation.
 	tainted bool
 }
@@ -1025,9 +1105,12 @@ func kiroInstallConfig(cfg *baseKiro) *pinstall.Config {
 		// vibekit deliberately leaves this UNSET — it has no hardening pass that
 		// could make the observation.
 		Untrusted: cfg.tainted,
-		// The one identity the tools volume's ACL grants write that this app can
-		// vouch for; see kiroNFSAdminUID.
-		TrustedUIDs: []int{kiroNFSAdminUID},
+		// The identities an operator has declared may write the installation tree
+		// without breaking custody (WT_TRUSTED_INSTALL_UIDS), empty by default so
+		// the library's check applies in full. Setting it asserts what the library's
+		// own field doc requires: each identity is already at least as privileged as
+		// this process, so its write access to the tree gains it nothing.
+		TrustedUIDs: cfg.trustedInstallUIDs,
 	}
 }
 
@@ -1787,7 +1870,7 @@ func manifestPathFor(toolsRoot string) string {
 // ConfigDir and ToolsDir), telling an operator to edit a file that no longer
 // exists. A restated path drifts; a threaded one cannot, and it stays correct
 // for an out-of-container run whose root is a temp dir. The hint text itself
-// stays FIXED for the reason the TRUSTED_PROXIES hints are fixed: an
+// stays FIXED for the reason the WT_TRUSTED_PROXIES hints are fixed: an
 // operator-facing hint must not grow an input-derived tail (CWE-532).
 func warnIfNoLSPEnabled(e *toolbelt.Engine, manifestPath string) {
 	inv, err := e.Inventory()
@@ -1985,7 +2068,7 @@ func canonicalPathGuard(next http.Handler) http.Handler {
 //     does, since it never becomes a stream), ProbeLogLevel for /api/health, the
 //     WithTemplatePathsUnder redaction that keeps a live session id out of
 //     the token-bearing /api/sessions/ subtree's lines, and WithClientIP over
-//     the TRUSTED_PROXIES set (see parseTrustedProxies for the trust-nothing
+//     the WT_TRUSTED_PROXIES set (see parseTrustedProxies for the trust-nothing
 //     default). The request id is minted, echoed and threaded even on the
 //     skipped stream paths.
 //   - Recoverer — turns a downstream panic into a logged 500 (inside the logger
@@ -2008,7 +2091,7 @@ func canonicalPathGuard(next http.Handler) http.Handler {
 //     'none' — web-terminal-kiro is never embedded in a frame. Placed outside
 //     CrossOriginProtection so even a rejected cross-origin request still
 //     carries the headers.
-//   - hostPolicy.Middleware — the KWEB_ALLOWED_HOSTS exact-host check
+//   - hostPolicy.Middleware — the WT_ALLOWED_HOSTS exact-host check
 //     (webhttp.HostPolicy; see parseAllowedHosts for the DNS-rebinding
 //     rationale). Placed before CrossOriginProtection because rebinding makes
 //     Origin and Host agree, so the origin check alone cannot reject it; kept
@@ -2077,7 +2160,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// WithSkipUpgrades solved: webhttp exports Allows for this, and it is
 			// the app's own gate rather than a re-implementation of a library's
 			// internals. Allows is nil- and inactive-safe (it returns true), so an
-			// unset KWEB_ALLOWED_HOSTS keeps today's behavior exactly.
+			// unset WT_ALLOWED_HOSTS keeps today's behavior exactly.
 			// The GET conjunct is the same reasoning as the hostPolicy one, one
 			// layer further in. A skip predicate is evaluated BEFORE the chain
 			// runs, so it deletes the record whatever status the request ends
@@ -2113,7 +2196,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// /api/health is probed every 30s (Docker HEALTHCHECK curl +
 			// Gatus); the fleet-standard ProbeLogLevel keeps healthy probes
 			// at Debug (out of the shipped stream, visible under
-			// KWEB_LOG_LEVEL=debug) while a FAILING probe — the readiness
+			// WT_LOG_LEVEL=debug) while a FAILING probe — the readiness
 			// 503 when kiro-cli is broken — surfaces at Warn/Error with its
 			// status and request id. The streams above stay fully skipped:
 			// one open-to-close line per WebSocket/SSE would be misleading

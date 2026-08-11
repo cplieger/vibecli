@@ -23,7 +23,7 @@ package main
 // variable it EXPORTS to hook processes, not one it reads), and nothing in the
 // process tree or the session file names the tab. So the mapping is established the
 // one way kiro offers authoritatively: a hook. This app mints a per-tab TITLE
-// HANDLE and injects it as KWEB_TITLE_HANDLE into each tab's child environment, and
+// HANDLE and injects it as WT_TITLE_HANDLE into each tab's child environment, and
 // a kiro-cli hook — which inherits that environment and is handed kiro's own
 // session_id on stdin — writes the pair into a state directory this app watches. A
 // hook re-affirms it on every prompt, so a session switch inside one tab (/chat,
@@ -219,8 +219,8 @@ func (s *sessionTitleSync) sessionEnv(tabID string) []string {
 		return nil
 	}
 	return []string{
-		"KWEB_TITLE_HANDLE=" + handle,
-		"KWEB_TITLE_STATE_DIR=" + s.stateDir,
+		"WT_TITLE_HANDLE=" + handle,
+		"WT_TITLE_STATE_DIR=" + s.stateDir,
 	}
 }
 
@@ -435,7 +435,7 @@ func enforceLevelMode(dir string) (os.FileMode, error) {
 // ensureStateDir's whole job is to REFUSE a planted, foreign-owned or
 // group/other-writable state directory, and a refusal that only warned left both
 // sinks pointed at the refused path regardless: the hook still received
-// KWEB_TITLE_STATE_DIR and wrote a file per tab into it (under a name whose owner
+// WT_TITLE_STATE_DIR and wrote a file per tab into it (under a name whose owner
 // can swap the directory out from under the next read), and pass()/forget() still
 // followed it with os.ReadDir and os.Remove every titlePollInterval — the delete
 // loop over a planted link's target that ensureStateDir's comment describes. The

@@ -5,7 +5,7 @@
 # hook config that points at this path -- its `hooks_file` block, rewritten on every
 # boot). It is the only place the two identities meet:
 #
-#   KWEB_TITLE_HANDLE   the tab's TITLE HANDLE, minted by the server and injected
+#   WT_TITLE_HANDLE   the tab's TITLE HANDLE, minted by the server and injected
 #                       into this session's child environment by its session
 #                       factory, inherited by every descendant including this hook
 #   session_id          kiro-cli's own session id, handed to a hook on stdin
@@ -35,8 +35,8 @@ set -u
 
 # Nothing to do outside a web-terminal session (the operator running kiro-cli
 # from `docker exec` gets no injected handle, and a global hook fires there too).
-[ -n "${KWEB_TITLE_HANDLE:-}" ] || exit 0
-[ -n "${KWEB_TITLE_STATE_DIR:-}" ] || exit 0
+[ -n "${WT_TITLE_HANDLE:-}" ] || exit 0
+[ -n "${WT_TITLE_STATE_DIR:-}" ] || exit 0
 
 # Read the hook payload and pull out kiro's session id. Deliberately a fixed
 # extraction rather than a JSON parser, and NOT for want of one: jq is baked into
@@ -74,16 +74,16 @@ esac
 # additionally requires it to resolve to a tab the manager still lists. Nothing
 # downstream repeats this check, so do not drop it as redundant -- the hook is the one
 # writer that receives the value from an environment it does not control.
-case "$KWEB_TITLE_HANDLE" in
+case "$WT_TITLE_HANDLE" in
   *[!A-Za-z0-9_-]*) exit 0 ;;
 esac
 
-mkdir -p "$KWEB_TITLE_STATE_DIR" 2>/dev/null || exit 0
+mkdir -p "$WT_TITLE_STATE_DIR" 2>/dev/null || exit 0
 
 # Write via a temp file and rename so the server never reads a half-written
 # mapping. The temp name carries $$ so two tabs starting together cannot collide.
-tmp="$KWEB_TITLE_STATE_DIR/.$KWEB_TITLE_HANDLE.$$"
+tmp="$WT_TITLE_STATE_DIR/.$WT_TITLE_HANDLE.$$"
 printf '%s\n' "$kiro_session" >"$tmp" 2>/dev/null || exit 0
-mv -f "$tmp" "$KWEB_TITLE_STATE_DIR/$KWEB_TITLE_HANDLE" 2>/dev/null || rm -f "$tmp"
+mv -f "$tmp" "$WT_TITLE_STATE_DIR/$WT_TITLE_HANDLE" 2>/dev/null || rm -f "$tmp"
 
 exit 0

@@ -36,7 +36,7 @@ set -u
 # session, and to any agent running in one -- including the engine's own npm and uv, which
 # is why /api/health reported tools "degraded" while the tools themselves were installed
 # and fine, and why a failed install left a dangling bin/ symlink behind. Deriving from
-# KWEB_SESSION_PATH when it is already set makes the capture idempotent across any number
+# WT_SESSION_PATH when it is already set makes the capture idempotent across any number
 # of re-execs. It is not an operator knob and is unset again before the final exec; a
 # deployment that wants a different PATH sets PATH itself, which compose can already do.
 #
@@ -46,8 +46,8 @@ set -u
 # prevent. Moving the save/narrow pair BELOW the containment block would resolve that
 # block's own `mount`, `setpriv` and `awk` through /config/tools/bin for the same reason.
 # Both are pinned by tests/shell/session_path_test.sh.
-SESSION_PATH="${KWEB_SESSION_PATH:-$PATH}"
-export KWEB_SESSION_PATH="$SESSION_PATH"
+SESSION_PATH="${WT_SESSION_PATH:-$PATH}"
+export WT_SESSION_PATH="$SESSION_PATH"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 TOOLS="/config/tools"
@@ -252,9 +252,9 @@ enable_session_containment() {
 # ships in util-linux, which Debian marks Essential, so it cannot be missing; the
 # guard is there so a hand-built image without it degrades to a warning rather than
 # a container that cannot boot.
-if [ "${KWEB_CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
+if [ "${WT_CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
   enable_session_containment || true
-  export KWEB_CONTAINMENT_CAPS_DROPPED=1
+  export WT_CONTAINMENT_CAPS_DROPPED=1
   # PRE-FLIGHT the drop before committing to it, because this is an `exec`: a
   # setpriv that fails here does not degrade, it ends the container. Two ways it
   # can fail on an image this one does not control -- setpriv absent from a
@@ -1267,7 +1267,7 @@ fi
 # Seed the kiro-cli hook that reports which kiro session each tab is running.
 #
 # This is the mapping half of the tab-title feature (sessiontitle.go). The server
-# injects KWEB_TITLE_HANDLE + KWEB_TITLE_STATE_DIR into each PTY session, and this hook
+# injects WT_TITLE_HANDLE + WT_TITLE_STATE_DIR into each PTY session, and this hook
 # — a descendant of that session, handed kiro's own session_id on stdin — writes the
 # pair where the server reads it. Without it every tab falls back to the engine's
 # automatic cwd/process name ladder, which is a degraded label rather than a failure.
@@ -1275,7 +1275,7 @@ fi
 # Rewritten on EVERY boot rather than created-if-missing, so an image upgrade updates
 # the hook and a deleted or edited file self-heals. Global hooks (~/.kiro/hooks) load
 # in every workspace, which is what makes this reach a session whatever directory it
-# starts in; the script itself no-ops when KWEB_TITLE_HANDLE is absent, so an operator
+# starts in; the script itself no-ops when WT_TITLE_HANDLE is absent, so an operator
 # running kiro-cli from `docker exec` is unaffected.
 #
 # Symlink handling follows the theme block above for the same reason: this writes a
@@ -1313,12 +1313,12 @@ fi
 # noise an operator could mistake for a knob.
 PATH="$SESSION_PATH"
 export PATH
-unset KWEB_SESSION_PATH
+unset WT_SESSION_PATH
 # Same reason as the PATH carry above, and the same lifetime: this is the setpriv
 # re-exec marker, meaningful only until that exec has happened. Nothing past this
 # point re-execs this script and no Go code reads it, so leaving it exported would
 # advertise an internal control-flow flag to the server and every terminal session
 # as though it were a supported knob.
-unset KWEB_CONTAINMENT_CAPS_DROPPED
+unset WT_CONTAINMENT_CAPS_DROPPED
 printf 'level=info msg="entrypoint complete; starting the web server" component=entrypoint\n' >&2
 exec /app/web-terminal-kiro

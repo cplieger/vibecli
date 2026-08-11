@@ -366,7 +366,7 @@ func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 // TestEnableSessionTitlesGatesBothConsumersOnTheVerdict pins that ensureStateDir's
 // refusal is AUTHORITATIVE rather than merely logged. Both of the subsystem's sinks
 // hang off this one call, and a warn-only refusal left both pointed at the rejected
-// path: the hook still received KWEB_TITLE_STATE_DIR (so a directory another local
+// path: the hook still received WT_TITLE_STATE_DIR (so a directory another local
 // user can read discloses tab ids, which are /ws capability tokens) and the poller
 // still swept it with os.ReadDir + os.Remove. The nil-env half of the contract is
 // pinned downstream by TestChildEnvComposesBothOverlays, which asserts routeDeps
@@ -394,7 +394,7 @@ func TestEnableSessionTitlesGatesBothConsumersOnTheVerdict(t *testing.T) {
 			t.Fatal("a verified state dir produced no session title environment: no hook could pair a tab with its kiro session, and the poller -- gated on this same value -- would never run")
 		}
 		got := env("tab1")
-		for _, want := range []string{"KWEB_TITLE_HANDLE=" + titleHandleFor(t, s, "tab1"), "KWEB_TITLE_STATE_DIR=" + s.stateDir} {
+		for _, want := range []string{"WT_TITLE_HANDLE=" + titleHandleFor(t, s, "tab1"), "WT_TITLE_STATE_DIR=" + s.stateDir} {
 			if !slices.Contains(got, want) {
 				t.Errorf("session title env = %v, want it to carry %q", got, want)
 			}
@@ -678,8 +678,8 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 	env := f.sync.sessionEnv("tab42")
 
 	want := map[string]string{
-		"KWEB_TITLE_HANDLE":    f.handle("tab42"),
-		"KWEB_TITLE_STATE_DIR": f.sync.stateDir,
+		"WT_TITLE_HANDLE":    f.handle("tab42"),
+		"WT_TITLE_STATE_DIR": f.sync.stateDir,
 	}
 	got := make(map[string]string, len(env))
 	for _, kv := range env {
@@ -710,8 +710,8 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 	// The retired name must not linger anywhere in the hook: it used to carry the
 	// tab id, so a leftover reference would either be dead or -- worse -- a second
 	// writer naming files after a /ws capability token again.
-	if strings.Contains(string(script), "KWEB_SESSION_ID") {
-		t.Error("hooks/session-title.sh still references KWEB_SESSION_ID; the tab id is the /ws capability token and no longer travels to the hook")
+	if strings.Contains(string(script), "WT_SESSION_ID") {
+		t.Error("hooks/session-title.sh still references WT_SESSION_ID; the tab id is the /ws capability token and no longer travels to the hook")
 	}
 }
 
@@ -795,8 +795,8 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 			t.Errorf("child env entry %q carries the tab id; that value is the /ws attach+resume capability token", kv)
 		}
 	}
-	if !slices.Contains(env, "KWEB_TITLE_HANDLE="+handle) {
-		t.Fatalf("child env = %v, want it to carry KWEB_TITLE_HANDLE=%s", env, handle)
+	if !slices.Contains(env, "WT_TITLE_HANDLE="+handle) {
+		t.Fatalf("child env = %v, want it to carry WT_TITLE_HANDLE=%s", env, handle)
 	}
 	if handle == tabID {
 		t.Fatal("the title handle IS the tab id; minting exists precisely so it is not")

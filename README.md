@@ -26,9 +26,22 @@ A browser tab here is an interactive shell with access to your files under `/wor
 - put it behind an authenticating reverse proxy (Caddy forward-auth, oauth2-proxy, Authentik, …), and/or
 - keep the published port on loopback or a private network.
 
-Neither of those covers DNS rebinding: a malicious page in your own browser can point its own hostname at `127.0.0.1` (or your LAN IP) and drive even a loopback-bound terminal, because the request then arrives from your own machine with a matching `Origin`. Also set [`KWEB_ALLOWED_HOSTS`](#configuration-reference) to the exact hostnames you reach it by — the `Host` allowlist is the check that rejects a rebound request.
+Neither of those covers DNS rebinding: a malicious page in your own browser can point its own hostname at `127.0.0.1` (or your LAN IP) and drive even a loopback-bound terminal, because the request then arrives from your own machine with a matching `Origin`. Also set [`WT_ALLOWED_HOSTS`](#configuration-reference) to the exact hostnames you reach it by — the `Host` allowlist is the check that rejects a rebound request.
 
-The server logs a warning at startup when it binds a non-loopback address, and another when `KWEB_ALLOWED_HOSTS` is unset.
+The server logs a warning at startup when it binds a non-loopback address, and another when `WT_ALLOWED_HOSTS` is unset.
+
+### Stored scrollback
+
+Each tab's newest 200 lines are kept in your browser's `localStorage`, so returning to a page your phone discarded does not pull every tab's history back over the wire. Worth knowing, since terminal output is not always something you want on disk:
+
+- It is readable from that browser without reaching this server, and it outlives the tab. An entry is deleted when you close its terminal, and otherwise after seven days.
+- Nothing is sent anywhere. The server neither receives nor reads these snapshots.
+- Restored output is checked against the running server on the first reconnect and cleared if it came from a previous run, so a container restart never leaves last run's history on screen. If that session is already gone, the restore is discarded outright rather than shown behind a “Session ended” banner.
+- On a shared or borrowed device, use a private window, which keeps no storage at all.
+
+No permission prompt is involved — browsers ask nothing for `localStorage` — and a browser that blocks site data simply restores nothing and replays over the wire as before.
+
+The sibling [`web-terminal-server`](https://github.com/cplieger/web-terminal-server) does the same by default but carries a `WT_PERSIST_SCROLLBACK=false` switch, because the command it runs is its operator's choice. Here the command is kiro-cli and the deployment is your own dev box, so there is no knob.
 
 A startup failure produces exactly one `ERROR` line, `web-terminal-kiro exited with error`, carrying the remedy in its `error` field and a `stage` field naming which step failed: `work_dir` (the `/workspace` mount is absent or is not a directory), `static` (the embedded UI is unusable — a build defect), `listen` (the port could not be bound), `serve` (the HTTP server exited), or `unknown`. Key log queries and alert rules on `stage`, not on the message text: the stage values are a stable contract, the prose is not.
 
@@ -40,6 +53,7 @@ services:
   web-terminal-kiro:
     image: ghcr.io/cplieger/web-terminal-kiro:latest
     container_name: web-terminal-kiro
+    init: true                  # required: reaps orphaned processes, see below
     ports:
       - "9848:9848"
     volumes:
@@ -50,6 +64,8 @@ services:
 
 Open <http://localhost:9848>. On first launch, kiro-cli walks you through sign-in with a device-code flow: it prints a URL and a one-time code, so you open the URL in any browser (your phone works), enter the code, and you're in. Every browser tab is a fresh session.
 
+`init: true` is required, not cosmetic. An agent session forks language servers, `git` processes and node runtimes whose own parent exits, which re-parents them onto PID 1, and the server waits only for the children it started itself. Without an init the server _is_ PID 1 and those orphans accumulate as zombies for the container's life — measured at 17,323 of them against 88 live processes before this was fixed. Docker's `init: true` runs a tiny reaper as PID 1 instead, which owns no child anyone else is waiting on. The server logs a warning at startup if it finds itself running as PID 1, so a deployment that omits this does not fail silently.
+
 Web Terminal for Kiro runs as root so `git`, `gh`, and SSH work; don't add a `user:` line, and expect files under the mounts to be root-owned on the host.
 
 ## Configuration reference
@@ -58,17 +74,19 @@ The image ships working defaults; most setups only pick a port and a volume.
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `KWEB_ADDR` | Listen address (`host:port`). Leave the host part empty (or use `0.0.0.0`) so the bind still covers loopback: the image's healthcheck probes `127.0.0.1` on the port taken from this value, so pinning the bind to a single non-loopback interface reports the container `unhealthy` even while it serves normally. Restrict reachability with the published port (`127.0.0.1:9848:9848`) or a reverse proxy instead. | `:9848` |
-| `KWEB_LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
-| `KWEB_LOG_OSC_TEXT` | Log the text of terminal notifications the server does not recognize (needs `KWEB_LOG_LEVEL=debug` to be visible). Off by default: any program running in the terminal can emit that text, so it may contain a token, a device code, or a tokenised URL, and logs are usually kept longer and searched more widely than terminal scrollback. Off, the log still records a per-wording fingerprint and a length, which is enough to tell that kiro-cli changed its wording and how many distinct ones appeared. Turn it on only for an active diagnostic session; it warns at startup while set. | `false` |
-| `KWEB_WORK_DIR` | Directory each terminal session starts in (must exist). | `/workspace` |
+| `WT_ADDR` | Listen address (`host:port`). Leave the host part empty (or use `0.0.0.0`) so the bind still covers loopback: the image's healthcheck probes `127.0.0.1` on the port taken from this value, so pinning the bind to a single non-loopback interface reports the container `unhealthy` even while it serves normally. Restrict reachability with the published port (`127.0.0.1:9848:9848`) or a reverse proxy instead. | `:9848` |
+| `WT_LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
+| `WT_LOG_OSC_TEXT` | Log the text of terminal notifications the server does not recognize (needs `WT_LOG_LEVEL=debug` to be visible). Off by default: any program running in the terminal can emit that text, so it may contain a token, a device code, or a tokenised URL, and logs are usually kept longer and searched more widely than terminal scrollback. Off, the log still records a per-wording fingerprint and a length, which is enough to tell that kiro-cli changed its wording and how many distinct ones appeared. Turn it on only for an active diagnostic session; it warns at startup while set. | `false` |
+| `WT_WORKDIR` | Directory each terminal session starts in (must exist). | `/workspace` |
+| `WT_SCROLLBACK` | Lines of history the server retains per terminal — how far back you can scroll, and what a reconnect replays. Held in memory and grown as history is produced, so a large value costs nothing until a session reaches it: to say "never truncate", set a number no session will hit. `0` keeps nothing beyond the live screen. Values between `1` and `5000` are raised to `5000` with a warning, because below that the server stops offering demand-paged history and the browser falls back to holding its whole buffer — asking for less server history would cost your phone more. This is the terminal engine's own variable, shared verbatim with every app built on it. | `100000` |
 | `KIRO_CLI_CHAT_ARGS` | Extra launch flags appended to every session's `kiro-cli chat` command, whitespace-separated (for example `--effort high` or `--v3`). Handy for opting into kiro-cli features ahead of the image's defaults. Flag values never reach the logs — the startup line records only a flag count. | _(unset)_ |
 | `TOOL_CATALOG_REFRESH` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. | `24h` |
 | `TOOL_CATALOG_URL` | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact |
 | `TOOL_CATALOG_PATH` | Image-baked tool catalog used at first boot and when offline, until a successfully fetched catalog replaces it. | `/app/tool-catalog.json` |
 | `APT_PACKAGES` | OS packages `apt-get install`ed at every container start, whitespace-separated (for example `"gcc python3 libc6-dev"`). apt state lives in the ephemeral container layer, not `/config`, so it is re-applied on each start. Plain package names only, checked twice. A token that is not shaped like a bare Debian package name (a `pkg=version` pin, `pkg:arch`, `pkg/release`, or a trailing `-`) is skipped with a warning in the container log. A token that is shaped like one but is not an actual package in the index is skipped too: without that check, `apt-get` retries an unmatched token containing `.`, `?` or `*` as a pattern across every package name, so a typo like `python3.` would install hundreds of packages instead of failing. A pure virtual package (`awk`) is skipped as well and needs a concrete provider (`mawk`). An install failure warns without blocking startup. | _(unset)_ |
-| `TRUSTED_PROXIES` | Reverse-proxy CIDRs / bare IPs whose `X-Forwarded-For` the access log trusts to resolve `client_ip`. See [Behind a reverse proxy](#behind-a-reverse-proxy). | _(unset)_ |
-| `KWEB_ALLOWED_HOSTS` | Comma-separated exact hostnames/IPs the server answers for (e.g. `localhost,192.168.1.5,webterm.example.com`); any other `Host` header is rejected. This blocks DNS rebinding, which can reach even a loopback- or LAN-bound terminal through your own browser, so set it for any long-running deployment; unset accepts every `Host` and logs a startup warning. Requests that are loopback on both ends (a loopback client address _and_ a loopback `Host`, e.g. `127.0.0.1:9848` or `localhost:9848`) are always admitted, so the healthcheck and in-container tools clients keep working; addressing the container by any other name still needs that name in the list. | _(unset)_ |
+| `WT_TRUSTED_PROXIES` | Reverse-proxy CIDRs / bare IPs whose `X-Forwarded-For` the access log trusts to resolve `client_ip`. See [Behind a reverse proxy](#behind-a-reverse-proxy). | _(unset)_ |
+| `WT_ALLOWED_HOSTS` | Comma-separated exact hostnames/IPs the server answers for (e.g. `localhost,192.168.1.5,webterm.example.com`); any other `Host` header is rejected. This blocks DNS rebinding, which can reach even a loopback- or LAN-bound terminal through your own browser, so set it for any long-running deployment; unset accepts every `Host` and logs a startup warning. Requests that are loopback on both ends (a loopback client address _and_ a loopback `Host`, e.g. `127.0.0.1:9848` or `localhost:9848`) are always admitted, so the healthcheck and in-container tools clients keep working; addressing the container by any other name still needs that name in the list. | _(unset)_ |
+| `WT_TRUSTED_INSTALL_UIDS` | Comma-separated numeric uids that may have write access to the kiro-cli install tree under `/config/tools` without the server treating the install as compromised. Before installing, the server checks who can write each directory on the way to that tree and refuses when another identity can, because what lands there is later run as root. Unset (the default) makes no exception, and that is the right setting for almost every deployment: the full check applies. Set it only when the check refuses a volume you know is safe — a shared mount whose permissions grant an account you control. Each uid you list is an assertion that the account is already at least as privileged as this server, so its write access gains it nothing; listing an unprivileged account hands that account a way in instead, and defeats the check. An entry that is not a whole number above `0` is skipped with a warning that names the variable and how many entries were dropped, never their content. Carries the `WT_` family prefix like the rest of this server's settings because it is not specific to this app: every app that installs kiro-cli the same way answers the same question. | _(unset)_ |
 
 - **Port:** `9848` (HTTP + WebSocket).
 - **Volumes:** `/config` persists kiro-cli auth/tokens, installed tools, settings, and `~/.ssh` + git config; `/workspace` is your repositories / working directory.
@@ -86,7 +104,7 @@ Everything kiro-cli stores lives under `/config` and survives container recreati
 
 Web Terminal for Kiro has no built-in authentication, so the cleanest way to expose it is to let a reverse proxy terminate TLS and require a login: HTTP Basic auth at minimum, forward auth (Authentik, oauth2-proxy, Caddy forward-auth) for real single sign-on. The proxy needs no special handling beyond passing WebSocket upgrades through, which mainstream proxies do by default. Pair it with a published port bound to loopback (`127.0.0.1:9848:9848`) so the only route in is through the proxy.
 
-Behind a proxy, also set `TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (e.g. `TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the access log then resolves the real client from a trusted `X-Forwarded-For` instead of logging the proxy as the peer. Unset (the default), the log records the direct socket peer and ignores `X-Forwarded-For`, so the logged IP cannot be spoofed; that is the right choice when the terminal is directly exposed. Only a request whose socket peer is inside the set has its `X-Forwarded-For` trusted, and a malformed entry is logged and skipped rather than aborting startup.
+Behind a proxy, also set `WT_TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (e.g. `WT_TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the access log then resolves the real client from a trusted `X-Forwarded-For` instead of logging the proxy as the peer. Unset (the default), the log records the direct socket peer and ignores `X-Forwarded-For`, so the logged IP cannot be spoofed; that is the right choice when the terminal is directly exposed. Only a request whose socket peer is inside the set has its `X-Forwarded-For` trusted, and a malformed entry is logged and skipped rather than aborting startup.
 
 One thing to configure on the proxy: the terminal WebSocket URL carries the session id as a query parameter (`/ws?session=<id>`), and that id is a capability token — anything that can reach the port and replay it attaches to that live session, and sessions have no idle timeout, so it stays valid until the tab is closed or the container restarts. This server never logs it (the access log records the request path only, and the `/api/sessions/` subtree is logged as its route template), but a proxy in front usually logs the full request URI by default (Caddy's `uri` field, nginx's `$request`). Drop or redact the query string for `/ws` in the proxy's access log before shipping it anywhere.
 
@@ -115,6 +133,7 @@ Everything below works on a phone as well as a desktop.
 
 - Auto-reconnect with screen + scrollback replay after laptop sleep, network drops, or proxy timeouts.
 - Input sent during an outage is re-delivered on reconnect (no lost or duplicated output), and a restarted server is detected and cleanly resynced.
+- **Fast recovery when your phone drops the page.** iOS reclaims a backgrounded tab's memory routinely, which re-runs the page when you come back. The sessions themselves are untouched — they live on the server — but the browser used to return holding nothing and pull every tab's history back over the wire, which you saw as the scrollback filling in line by line. Each tab's recent output is now kept on the device, so returning asks only for what was printed while you were away. See [Stored scrollback](#stored-scrollback) for what that keeps and where.
 
 ## Works with the whole kiro-cli TUI
 

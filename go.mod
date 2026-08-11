@@ -8,7 +8,7 @@ require (
 	github.com/cplieger/runesafe v1.4.0
 	github.com/cplieger/slogx v1.6.0
 	github.com/cplieger/toolbelt/v2 v2.4.3
-	github.com/cplieger/web-terminal-engine/v3 v3.6.0
+	github.com/cplieger/web-terminal-engine/v3 v3.7.0
 	github.com/cplieger/webhttp v1.23.0
 )
 

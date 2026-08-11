@@ -451,6 +451,20 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 			// conversation goes; see sessiontitle.go for the mapping and why it
 			// needs a hook.
 			terminal.WithEnv(deps.childEnv(id)),
+			// Keep every colour kiro-cli paints legible on this app's near-black
+			// terminal. kiro-cli colours a markdown link with SGR 34, i.e.
+			// palette SLOT 4, which is all a terminal program can express: it
+			// cannot know what RGB slot 4 resolves to here, and its own chrome
+			// uses truecolor precisely because it CAN control that. Under the
+			// engine's earlier VGA palette slot 4 was #0000aa, 1.58:1 against
+			// black, so every link and every bare URL rendered unreadable. The
+			// palette that replaced it clears 4.5:1 in 13 of 16 slots; this floor
+			// covers the other three, an application's own OSC 4 overrides, and
+			// the dark corners of the 256-colour cube. 4.5 is the WCAG AA floor
+			// for body text and VS Code's default for its integrated terminal.
+			// Backgrounds and default foregrounds are never touched, so
+			// static-src/app.ts's theme keeps full control of --bg and --text.
+			terminal.WithMinimumContrast(4.5),
 			// Per-session process containment. Closing a tab (or the process
 			// dying) must end the whole tree, and for this app it otherwise does
 			// not: `kiro-cli chat` runs kiro-cli -> kiro-cli-chat -> the TUI ->

@@ -389,14 +389,16 @@ func (d *routeDeps) childEnv(id string) []string {
 // operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
 // surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// Retained-history depth is NOT set here: the engine's own default applies,
-	// and an operator overrides it per deployment with terminal.ScrollbackEnvVar
-	// (read in main.go). This app used to pass its own number, which made the
-	// sizing decision in three places across the family; the engine documents it
-	// once at terminal.DefaultScrollbackCapacity.
+	// Retained-history depth carries no app-owned number any more. The option is
+	// appended at the BOTTOM of this factory, and only when the operator set
+	// terminal.ScrollbackEnvVar (main.go's resolveScrollback reads it); with
+	// nothing set the option is omitted and the engine's own
+	// terminal.DefaultScrollbackCapacity applies. This app used to pass its own
+	// constant, which made the sizing decision in three places across the family;
+	// the engine documents it once.
 	//
-	// WithKeepUnfocused pins the process
-	// to the DEC 1004 "unfocused" state so kiro-cli keeps emitting its
+	// WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
+	// kiro-cli keeps emitting its
 	// focus-gated OSC 9 notifications (which drive the classifier) even though no
 	// browser tab claims focus; web-terminal-server deliberately does NOT use
 	// this, since a generic shell/editor wants real focus reporting.
@@ -488,9 +490,6 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 				}
 			}),
 		}
-		// Retained-history depth is OMITTED unless the operator set it, so the
-		// engine's default applies and a change to it reaches this app without a
-		// rebuild of its intent.
 		if deps.scrollback != nil {
 			opts = append(opts, terminal.WithScrollbackCapacity(*deps.scrollback))
 		}
@@ -775,7 +774,10 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 	// time leaves a LATER kiro-cli rewording -- the drift this Warn exists to catch
 	// -- with no default-level record at all. The set still never grows past the
 	// cap, and log volume is still bounded (one line per window).
-	if !s.lastCapWarn.IsZero() && time.Since(s.lastCapWarn) < unrecognizedNotifyCapRearm {
+	// The zero value needs no carve-out: time.Since saturates to the maximum
+	// Duration for it, so this comparison is already false and the FIRST
+	// turned-away message announces.
+	if time.Since(s.lastCapWarn) < unrecognizedNotifyCapRearm {
 		return false, false
 	}
 	s.lastCapWarn = time.Now()

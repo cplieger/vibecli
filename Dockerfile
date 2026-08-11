@@ -178,15 +178,29 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
 # Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
-RUN mkdir -p static/vendor/fonts && \
+#
+# Each face is verified in the SAME loop iteration that downloads it, so the
+# downloaded set and the verified set are one list by construction: a face added
+# to the loop with no matching sha ARG dies on the `*)` arm instead of shipping
+# unverified. `set -e` is what makes the per-iteration check bite -- a for-loop's
+# status is only its LAST iteration's, so a failure inside an earlier one used to
+# be swallowed. These gates are the only integrity anchor here (the source is a
+# git tag, which a force-push can rewrite under a fixed ref), and the face list is
+# also read by scripts/dev-build.sh from the `# repin:` markers above.
+RUN set -e; mkdir -p static/vendor/fonts; \
     for face in Regular Bold Italic BoldItalic; do \
+      case "$face" in \
+        Regular) face_sha="$MONASPACE_REGULAR_SHA256" ;; \
+        Bold) face_sha="$MONASPACE_BOLD_SHA256" ;; \
+        Italic) face_sha="$MONASPACE_ITALIC_SHA256" ;; \
+        BoldItalic) face_sha="$MONASPACE_BOLDITALIC_SHA256" ;; \
+        *) echo "ERROR font-sha-missing: no sha256 ARG for Monaspace face $face" >&2; exit 1 ;; \
+      esac; \
       curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL \
         -o "static/vendor/fonts/MonaspaceNeonNF-${face}.woff2" \
         "https://raw.githubusercontent.com/githubnext/monaspace/${MONASPACE_VERSION}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-${face}.woff2"; \
-    done && \
-    printf '%s  static/vendor/fonts/MonaspaceNeonNF-Regular.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-Bold.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-Italic.woff2\n%s  static/vendor/fonts/MonaspaceNeonNF-BoldItalic.woff2\n' \
-      "$MONASPACE_REGULAR_SHA256" "$MONASPACE_BOLD_SHA256" "$MONASPACE_ITALIC_SHA256" "$MONASPACE_BOLDITALIC_SHA256" \
-      | sha256sum -c -
+      printf '%s  static/vendor/fonts/MonaspaceNeonNF-%s.woff2\n' "$face_sha" "$face" | sha256sum -c -; \
+    done
 
 # Fetch the engine + UI TypeScript from the npm registry. Both publish TS
 # source only (no precompiled JS) — same pattern as @cplieger/reactive,
@@ -362,7 +376,12 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # interactive user needs:
 #   - bash: the entrypoint interpreter (entrypoint.sh is a bash
 #     script; Debian's /bin/sh is dash)
-#   - ca-certificates + curl + unzip: kiro-cli installer + HTTPS trust
+#   - ca-certificates + curl: HTTPS trust, the baked HEALTHCHECK probe, and the
+#     archive/catalog fetches the server and the toolbelt engine make
+#   - unzip: `.zip` extraction for tools the toolbelt engine installs at runtime
+#     (toolbelt extract.go shells out to it), the same reason xz-utils is here.
+#     NOT the kiro-cli install -- the pinstall library unpacks that archive with
+#     Go's archive/zip, so this package looks droppable and is not.
 #   - git: source control from inside the terminal (gh is NOT baked; it
 #     is opt-in via /config/tools/tools.json)
 #   - openssh-client: git over ssh (and gh over ssh once gh is enabled)

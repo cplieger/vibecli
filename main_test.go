@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -2821,4 +2822,125 @@ func TestParseCatalogRefreshStillWarnsByName(t *testing.T) {
 		}
 	}
 	t.Errorf("no warning named %s for an unusable value; the operator gets no diagnostic at all", catalogRefreshKey)
+}
+
+// setupLoggingStderr runs setupLogging with os.Stderr replaced by a pipe and
+// returns everything the handler it INSTALLED wrote while doing so. Nothing
+// cheaper works: setupLogging's own slogx.Setup replaces the default logger, so
+// capture.Default's handler is gone before the warning is emitted, and
+// slogx.NewHandler reads os.Stderr at construction — which is exactly why the
+// swap has to happen before the call and is enough to observe it.
+//
+// Both globals are restored on cleanup, so a later test sees the process it
+// started with.
+func setupLoggingStderr(t *testing.T) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	prevStderr, prevLogger := os.Stderr, slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = prevStderr
+		slog.SetDefault(prevLogger)
+		_ = r.Close()
+	})
+	os.Stderr = w
+
+	setupLogging()
+
+	// Close the write end so ReadAll terminates. The record is one short line and
+	// a pipe buffers far more, so the write above never blocked on this read.
+	if err := w.Close(); err != nil {
+		t.Fatalf("close the pipe writer: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read the captured stderr: %v", err)
+	}
+	return string(out)
+}
+
+// TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly pins the one env read
+// that had no test at all, and it is the read that decides which of this app's
+// other diagnostics an operator can see. Two properties, each a silent
+// regression:
+//
+//   - the parsed level actually reaches the INSTALLED handler, and an
+//     unparseable value falls back to info rather than to debug. Nothing
+//     asserted this, so reversing the default, or moving slogx.Setup above
+//     ParseLevel (the doc comment says the order is the slogx contract, and the
+//     zero Options.Level is info, so the swap compiles and pins every deployment
+//     at info), silently decides for every deployment which lines exist —
+//     including the classifyStatus trace this app's own steering names as the
+//     KWEB_LOG_LEVEL=debug diagnosis path for stuck tab-status dots;
+//   - the unparseable warning names the KEY and carries no copy of the VALUE.
+//     That is the app's house rule, stated in the function's own comment and
+//     applied at TRUSTED_PROXIES, KIRO_CLI_CHAT_ARGS, KWEB_LOG_OSC_TEXT and
+//     TOOL_CATALOG_REFRESH — the last two each with a test saying so. This key
+//     was the only one where the claim was unchecked, and a compose
+//     interpolation mistake is what puts a credential on it (CWE-532).
+//
+// Assertions name the specific record rather than counting all records: a PTY
+// session left running by an earlier test can still be writing to the default
+// logger, and a total count would make this test fail for someone else's line.
+//
+// Serial (no t.Parallel): it replaces the process-global default logger and
+// os.Stderr, and t.Setenv forbids parallel anyway.
+func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
+	const (
+		token   = "s3cr3t-token-abc123"
+		warnMsg = "unparseable KWEB_LOG_LEVEL"
+	)
+	cases := []struct {
+		name      string
+		raw       string
+		wantDebug bool // the installed handler admits Debug
+		wantInfo  bool // ... and Info
+		wantWarn  bool // the unparseable-level warning was emitted
+		// rawMustStayOut asks for the confidentiality assertion, and is set only
+		// for values distinctive enough that finding one PROVES a leak: "debug"
+		// and "info" appear in this warning's own hint by design.
+		rawMustStayOut bool
+	}{
+		{name: "unset installs the info default", raw: "", wantInfo: true},
+		{name: "debug installs debug", raw: "debug", wantDebug: true, wantInfo: true},
+		{name: "error installs error", raw: "error"},
+		{name: "case and padding are the library's tolerance, not a local one", raw: " DEBUG ", wantDebug: true, wantInfo: true},
+		{
+			name: "an unparseable level falls back to info and warns by name",
+			raw:  "verbose", wantInfo: true, wantWarn: true, rawMustStayOut: true,
+		},
+		{
+			name: "a token-shaped value cannot reach the log",
+			raw:  token, wantInfo: true, wantWarn: true, rawMustStayOut: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("KWEB_LOG_LEVEL", tc.raw)
+
+			out := setupLoggingStderr(t)
+
+			ctx := t.Context()
+			if got := slog.Default().Enabled(ctx, slog.LevelDebug); got != tc.wantDebug {
+				t.Errorf("with KWEB_LOG_LEVEL=%q the installed handler admits Debug = %v, want %v", tc.raw, got, tc.wantDebug)
+			}
+			if got := slog.Default().Enabled(ctx, slog.LevelInfo); got != tc.wantInfo {
+				t.Errorf("with KWEB_LOG_LEVEL=%q the installed handler admits Info = %v, want %v", tc.raw, got, tc.wantInfo)
+			}
+			// Error is always admitted; asserting it makes "the handler is a real
+			// leveled handler" explicit rather than assumed by the two above.
+			if !slog.Default().Enabled(ctx, slog.LevelError) {
+				t.Errorf("with KWEB_LOG_LEVEL=%q the installed handler drops Error records", tc.raw)
+			}
+			if got := strings.Count(out, warnMsg); (got > 0) != tc.wantWarn {
+				t.Errorf("stderr = %q, want the %q warning present = %v", out, warnMsg, tc.wantWarn)
+			}
+			if tc.rawMustStayOut && strings.Contains(out, tc.raw) {
+				t.Errorf("stderr = %q carries the raw KWEB_LOG_LEVEL value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only",
+					out)
+			}
+		})
+	}
 }

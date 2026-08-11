@@ -28,7 +28,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -167,14 +166,18 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 // the same reasoning on KWEB_LOG_LEVEL). The value is deliberately not echoed:
 // this app publishes a no-values promise for its whole env surface.
 func resolveScrollback() *int {
-	raw, ok := os.LookupEnv(terminal.ScrollbackEnvVar)
-	if !ok || strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	// envx.IntStrict is the read the engine's ScrollbackEnvVar doc names, and the
+	// same three states parseLogOSCText's BoolStrict returns: unset or blank
+	// (ok=false, no error), malformed (an error), or a value. The error is
+	// deliberately NOT logged — it wraps *strconv.NumError, which carries the
+	// rejected value, and this app warns by name only.
+	n, ok, err := envx.IntStrict(terminal.ScrollbackEnvVar)
 	if err != nil {
 		slog.Warn("ignoring a malformed retained-history depth; using the engine default",
 			"env", terminal.ScrollbackEnvVar, "default_lines", terminal.DefaultScrollbackCapacity)
+		return nil
+	}
+	if !ok {
 		return nil
 	}
 	capacity, reason := terminal.ClampScrollbackCapacity(n)
@@ -2082,10 +2085,21 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// rejects an UNSAFE cross-origin request with a 403 that WriteError
 			// logs nowhere. Only a GET can become the stream this skip exists to
 			// suppress (SSE is a GET, and the safe methods are the ones the
-			// origin gate always admits), so restricting the skip to GET keeps
-			// every reachable refusal on this path logged: the cross-origin 403,
-			// the engine's 503 at the subscriber cap, its 500 for an
-			// unflushable writer. The trade is that a non-GET request that IS
+			// origin gate always admits), so restricting the skip to GET keeps the
+			// one refusal a GET can never produce: the cross-origin 403, since
+			// CrossOriginProtection admits every safe method. It does NOT keep the
+			// engine's own refusals, and that is accepted rather than overlooked:
+			// the 503 at the subscriber cap and the 500 for an unflushable writer
+			// both arrive on a GET with an allowed Host, so this predicate deletes
+			// their access record too. The cap rejection is still recorded by the
+			// engine ("terminal: status subscriber rejected (at cap)"), carrying the
+			// cap but no client_ip and no request_id -- visible, not attributable --
+			// and the 500 is unreachable here, because a skipped request is not
+			// wrapped at all and webhttp's StatusRecorder implements Unwrap, so
+			// supportsFlush always succeeds. Do not close the attribution gap with
+			// an app-side subscribe record: anyone who can reach this endpoint
+			// already gets an unauthenticated PTY, so there is no privilege the
+			// attribution would protect. The trade is that a non-GET request that IS
 			// admitted (curl -X POST with no Origin -- the engine's
 			// EventsHandler does not check the method) now emits one
 			// close-time line with a session-length duration; a misleading line

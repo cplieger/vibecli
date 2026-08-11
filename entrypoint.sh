@@ -1216,9 +1216,19 @@ if [ -n "${APT_PACKAGES:-}" ]; then
       fi
     fi
   fi
-  # Reclaim the indexes whenever this block refreshed them, whether or not anything
-  # was ultimately installed (every token may have been skipped).
-  if [ "${apt_update_rc:-1}" -eq 0 ]; then
+  # Reclaim the indexes whenever this block refreshed them -- ATTEMPTED, not succeeded --
+  # whether or not anything was ultimately installed (every token may have been skipped).
+  # A partial refresh returns non-zero with the files written, which is the state the
+  # known-name gate above is designed around, so keying on rc=0 kept ~21 MB of Debian
+  # indexes (measured on trixie, main only) in the CONTAINER LAYER on exactly those boots:
+  # invisible on the /config volume, surviving every docker start, and cleared only by a
+  # recreate or a later boot whose update happened to return 0. The image deletes these at
+  # build time for the same reason. Retaining them buys nothing -- the gate reads only an
+  # index refreshed in THIS boot, never a pre-existing one.
+  #
+  # An UNSET apt_update_rc is the one case that must not delete: update never ran, because
+  # every APT_PACKAGES token failed the grammar.
+  if [ -n "${apt_update_rc:-}" ]; then
     rm -rf /var/lib/apt/lists/*
   fi
 fi

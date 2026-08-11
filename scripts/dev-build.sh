@@ -172,12 +172,13 @@ printf '[5/6] fonts (Monaspace Neon NF webfonts, cached) + CSS bundle (from UI p
 # garbage to sha256sum.
 FONT_VER="$(sed -n 's/^ARG MONASPACE_VERSION=\([^[:space:]#]*\).*/\1/p' Dockerfile)"
 : "${FONT_VER:?failed to parse MONASPACE_VERSION from Dockerfile}"
-# Face set: every vendored .woff2 filename the Dockerfile names (family-free
-# match, same anti-drift rule as the old tar member list — a face renamed or
-# dropped in the image must change this list in lockstep, or the dev binary
-# would embed a different font set than the image and only show it as tofu at
-# runtime).
-mapfile -t fonts < <(grep -oE 'static/vendor/fonts/[A-Za-z0-9.-]+\.woff2' Dockerfile | sed 's|.*/||' | sort -u)
+# Face set: read from the Dockerfile's own `# repin:` markers, one per face —
+# the same lines the FONT_URL_TMPL parse below keys on, and the same lines
+# Renovate's postUpgradeTask rewrites. Keying on the markers rather than on a
+# literal path inside a RUN is what makes this list unable to drift from the
+# pins: a face with no marker has no sha256 ARG at all, so it could never be
+# verified, and the image build refuses it.
+mapfile -t fonts < <(sed -n 's|^# repin: dep=githubnext/monaspace url=.*/\([^/]*\.woff2\)$|\1|p' Dockerfile | sort -u)
 [ "${#fonts[@]}" -gt 0 ] || {
   printf 'error: failed to parse the Monaspace face list from Dockerfile\n' >&2
   exit 1

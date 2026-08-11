@@ -275,4 +275,4 @@ This project was built with AI-assisted tooling using [Claude](https://claude.co
 
 ## License
 
-GPL-3.0. See [LICENSE](LICENSE).
+MPL-2.0. See [LICENSE](LICENSE).

@@ -3,14 +3,16 @@ import { expect, test } from "@playwright/test";
 
 // Boot verification against the served page. What each test defends:
 //
-//   1. Every importmap specifier resolves. This is the failure class the suite
-//      exists for: a vendor copy the Docker build forgot, or a subpath the
-//      library renamed, leaves tsc green and the browser dead.
-//   2. No uncaught exception or console error during module evaluation.
-//   3. The loading overlay clears and the terminal shell actually mounts, so a
+//   1. No uncaught exception or console error during module evaluation.
+//   2. The loading overlay clears and the terminal shell actually mounts, so a
 //      boot that stalls behind the spinner fails here rather than in a user's
 //      browser.
-//   4. The page is accessible at the axe-core WCAG-A/AA rule level.
+//   3. The page is accessible at the axe-core WCAG-A/AA rule level.
+//
+// What every test here has in common is the BROWSER: module evaluation, mounting,
+// rendering. The served importmap's targets are not re-probed by request, because
+// tests/image-smoke.conf already reads the built image's importmap and fails
+// unless every target returns successfully with a non-empty body.
 //
 // Deliberately NOT here: sending keystrokes, asserting terminal output, or
 // exercising a session. Those need an authenticated kiro-cli.
@@ -20,41 +22,6 @@ import { expect, test } from "@playwright/test";
 // the app's bind-first boot: static assets and the shell are reachable regardless.
 
 test.describe("served page boots", () => {
-  test("every importmap specifier resolves to a real module", async ({ page, baseURL }) => {
-    // Read the importmap the SERVER served rather than the one in the repo, so a
-    // build that shipped a different index.html is caught too.
-    const res = await page.request.get(`${baseURL}/`);
-    expect(res.ok(), "index.html must be served").toBeTruthy();
-    const html = await res.text();
-
-    const match = /<script type="importmap">([\s\S]*?)<\/script>/.exec(html);
-    const importmapJSON = match?.[1];
-    expect(importmapJSON, "the served page must carry an importmap").toBeDefined();
-    if (importmapJSON === undefined) {
-      return; // unreachable after the expect; narrows the type for tsc
-    }
-
-    const imports = JSON.parse(importmapJSON).imports as Record<string, string>;
-    const specifiers = Object.keys(imports);
-    expect(specifiers.length, "importmap must not be empty").toBeGreaterThan(0);
-
-    for (const [specifier, target] of Object.entries(imports)) {
-      const url = new URL(target, baseURL!).toString();
-      const probe = await page.request.get(url);
-      expect(
-        probe.status(),
-        `importmap entry "${specifier}" -> ${target} must be served; a missing ` +
-          `vendor tree aborts module loading in the browser while tsc and the ` +
-          `Docker build both stay green`,
-      ).toBe(200);
-      const body = await probe.text();
-      expect(
-        body.length,
-        `importmap entry "${specifier}" resolved to an empty body`,
-      ).toBeGreaterThan(0);
-    }
-  });
-
   test("boots with no console errors and no uncaught exceptions", async ({ page }) => {
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];
@@ -81,8 +48,23 @@ test.describe("served page boots", () => {
     });
 
     await page.goto("/", { waitUntil: "load" });
-    // Give module evaluation and the first frame a moment to surface errors.
-    await page.waitForTimeout(1500);
+    // Wait for a DETERMINISTIC boot outcome rather than a fixed delay: either the
+    // library rendered into #terminal, or the watchdog raised its fatal dialog.
+    // This wait IS the test's verdict -- every assertion below only reads what the
+    // listeners captured before it returned -- so a fixed 1500ms reports "no
+    // console errors" about a boot that had not finished on any machine slower
+    // than the author's, green for the exact failure class this suite exists for.
+    const terminal = page.locator("#terminal");
+    const bootFatal = page.locator('#loading[role="alertdialog"]');
+    await expect
+      .poll(
+        async () => (await terminal.innerHTML()).trim() !== "" || (await bootFatal.count()) > 0,
+        {
+          message: "boot must reach either a mounted shell or the watchdog's fatal dialog",
+          timeout: 15_000,
+        },
+      )
+      .toBe(true);
 
     expect(pageErrors, "uncaught exceptions during boot").toEqual([]);
     expect(failedRequests, "static resources that failed to load").toEqual([]);
@@ -112,6 +94,27 @@ test.describe("served page boots", () => {
         `the bootstrap watchdog reported a fatal: ${(await fatal.innerText()).trim()}`,
       );
     }
+
+    // ...and the overlay came down, which is the half this test's name promises and
+    // nothing asserted. #loading is opaque at z-index 200, so a shell that mounted
+    // UNDER a spinner nobody dismissed satisfies the mount poll above while the user
+    // stares at an animating bar -- the stuck-loading failure this app has hit twice.
+    // The kernel adds "fade" on the first frame and removes the element on
+    // transitionend, so either state is a pass. Asserted on the class rather than
+    // Playwright visibility, because a faded overlay is opacity:0: still visible to
+    // Playwright, already invisible and inert to the user.
+    const overlay = page.locator("#loading");
+    await expect
+      .poll(
+        async () =>
+          (await overlay.count()) === 0 ||
+          ((await overlay.getAttribute("class")) ?? "").includes("fade"),
+        {
+          message: "the loading overlay must be dismissed once the first frame renders",
+          timeout: 15_000,
+        },
+      )
+      .toBe(true);
   });
 
   // Runtime accessibility. html-validate's :a11y preset already gates the static
@@ -139,7 +142,11 @@ test.describe("served page boots", () => {
 
   test("has no NEW axe-core accessibility violations", async ({ page }) => {
     await page.goto("/", { waitUntil: "load" });
-    await page.waitForTimeout(1500);
+    // Audit the RENDERED shell, not the pre-boot page. This scan is the only check
+    // on the library's rendered tree, and after a fixed 1500ms on a loaded machine
+    // it can still be looking at the loading overlay -- which has no violations, so
+    // the audit passes having examined nothing it was written for.
+    await expect(page.locator("#terminal > *").first()).toBeAttached({ timeout: 15_000 });
 
     const results = await new AxeBuilder({ page })
       .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])

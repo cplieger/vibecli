@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -199,6 +202,19 @@ func writeToolsManifest(t *testing.T, configDir, manifest string) {
 	root := filepath.Join(configDir, "tools")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatalf("create tools root: %v", err)
+	}
+	// MkdirAll's mode is a REQUEST, not a setting: it is masked by the umask
+	// and, on a filesystem carrying an inheritable group-write ACL, the
+	// directory is born group-writable whatever was asked for (measured on a
+	// ZFS nfs4acl dataset: 0770 from a 0o700 MkdirAll -- the same condition
+	// this app's own docs record for pinstall's install root, where
+	// "os.MkdirAll with dirMode = 0o755 cannot beat a ZFS inheritable ACL").
+	// toolbelt's VerifyRootIntegrity then refuses to construct the engine over
+	// a group-writable managed root, so every test below reaches the
+	// root-integrity refusal instead of the shape it means to exercise. Chmod
+	// is the only call that SETS the mode.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("make the tools root private: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "tools.json"), []byte(manifest), 0o644); err != nil {
 		t.Fatalf("write manifest: %v", err)
@@ -545,7 +561,7 @@ func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
 	}
 }
 
-// TestHostAllowlist pins the KWEB_ALLOWED_HOSTS anti-DNS-rebinding gate
+// TestHostAllowlist pins the WT_ALLOWED_HOSTS anti-DNS-rebinding gate
 // through the real middleware stack (buildHandler): a rebinding attack makes
 // an attacker-controlled hostname resolve to this server, so Origin and Host
 // AGREE and CrossOriginProtection alone admits both session creation and the
@@ -576,7 +592,7 @@ func TestHostAllowlist(t *testing.T) {
 		return rec.Code
 	}
 
-	t.Setenv("KWEB_ALLOWED_HOSTS", "localhost, 192.168.1.5, ::1, Webterm.Example.COM.")
+	t.Setenv("WT_ALLOWED_HOSTS", "localhost, 192.168.1.5, ::1, Webterm.Example.COM.")
 	h := buildHandler(mux, nil, "default-src 'self'", parseAllowedHosts())
 
 	cases := []struct {
@@ -637,7 +653,7 @@ func TestHostAllowlist(t *testing.T) {
 	t.Run("unset allowlist stays permissive", func(t *testing.T) {
 		open := buildHandler(mux, nil, "default-src 'self'", nil)
 		if got := do(open, "GET", "http://anything.example:9848/ws", "", ""); got != http.StatusOK {
-			t.Errorf("GET /ws with nil allowlist = %d, want %d (unset KWEB_ALLOWED_HOSTS must stay backward compatible)", got, http.StatusOK)
+			t.Errorf("GET /ws with nil allowlist = %d, want %d (unset WT_ALLOWED_HOSTS must stay backward compatible)", got, http.StatusOK)
 		}
 	})
 }
@@ -657,7 +673,7 @@ func TestHostAllowlist_loopbackCarveOut(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	t.Setenv("KWEB_ALLOWED_HOSTS", "webterm.example.com") // deliberately no loopback entry
+	t.Setenv("WT_ALLOWED_HOSTS", "webterm.example.com") // deliberately no loopback entry
 	h := buildHandler(mux, nil, "default-src 'self'", parseAllowedHosts())
 
 	do := func(url, remoteAddr string) int {
@@ -720,13 +736,13 @@ func TestHostAllowlist_loopbackCarveOut(t *testing.T) {
 }
 
 // TestHostAllowlist_blankConfigurationStaysPermissive drives a configured but
-// blank KWEB_ALLOWED_HOSTS (only commas and whitespace) through the real
+// blank WT_ALLOWED_HOSTS (only commas and whitespace) through the real
 // parseAllowedHosts into the middleware: blank entries never engage the gate
 // (webhttp.ParseHostList leaves the policy INACTIVE), so the documented
 // permissive state must hold. Accidentally treating a blank entry as
 // non-blank would turn a blank configuration into a deny-all outage.
 func TestHostAllowlist_blankConfigurationStaysPermissive(t *testing.T) {
-	t.Setenv("KWEB_ALLOWED_HOSTS", "  ,  , ")
+	t.Setenv("WT_ALLOWED_HOSTS", "  ,  , ")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -739,7 +755,7 @@ func TestHostAllowlist_blankConfigurationStaysPermissive(t *testing.T) {
 	)
 
 	if rec.Code != http.StatusNoContent {
-		t.Errorf("blank KWEB_ALLOWED_HOSTS: GET /probe status = %d, want %d", rec.Code, http.StatusNoContent)
+		t.Errorf("blank WT_ALLOWED_HOSTS: GET /probe status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 }
 
@@ -892,7 +908,7 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 	})
 }
 
-// TestParseAllowedHosts unit-tests the KWEB_ALLOWED_HOSTS parser directly,
+// TestParseAllowedHosts unit-tests the WT_ALLOWED_HOSTS parser directly,
 // covering the branches TestHostAllowlist's middleware-level driving cannot
 // reach: an unset/empty var must yield an INACTIVE policy (the permissive
 // backward-compatible default main keys its rebinding warning on), and a
@@ -914,19 +930,19 @@ func TestParseAllowedHosts(t *testing.T) {
 	}
 
 	t.Run("unset env yields an inactive policy (any Host accepted)", func(t *testing.T) {
-		t.Setenv("KWEB_ALLOWED_HOSTS", "")
+		t.Setenv("WT_ALLOWED_HOSTS", "")
 		policy := parseAllowedHosts()
 		if policy.Active() {
-			t.Error("parseAllowedHosts() is active for an unset/empty KWEB_ALLOWED_HOSTS; want the permissive backward-compatible default")
+			t.Error("parseAllowedHosts() is active for an unset/empty WT_ALLOWED_HOSTS; want the permissive backward-compatible default")
 		}
 		if !allows(t, policy, "anything.example:9848", "") {
-			t.Error("inactive policy rejected a request; unset KWEB_ALLOWED_HOSTS must accept every Host")
+			t.Error("inactive policy rejected a request; unset WT_ALLOWED_HOSTS must accept every Host")
 		}
 	})
 
 	t.Run("URL-shaped entry warns and is dropped", func(t *testing.T) {
 		records := capture.Default(t)
-		t.Setenv("KWEB_ALLOWED_HOSTS", "http://webterm.example.com, localhost")
+		t.Setenv("WT_ALLOWED_HOSTS", "http://webterm.example.com, localhost")
 		policy := parseAllowedHosts()
 
 		if got := records.CountLevel(slog.LevelWarn, "dropping malformed"); got != 1 {
@@ -952,7 +968,7 @@ func TestParseAllowedHosts(t *testing.T) {
 
 // TestParseAllowedHosts_allInvalidFailsClosed pins the all-invalid branch
 // TestParseAllowedHosts's other cases never reach: a var whose entries are a
-// lone ":9848" (a pasted KWEB_ADDR value) and a URL-shaped credential paste
+// lone ":9848" (a pasted WT_ADDR value) and a URL-shaped credential paste
 // canonicalizes to an empty host set no browser-sent Host can ever match, so
 // the parser must Warn twice — the dropped-entry count, then the resulting
 // deny-all state — and yield an ACTIVE EMPTY policy: every non-loopback
@@ -964,7 +980,7 @@ func TestParseAllowedHosts(t *testing.T) {
 func TestParseAllowedHosts_allInvalidFailsClosed(t *testing.T) {
 	records := capture.Default(t)
 	const secretEntry = "hunter2-sekret-token"
-	t.Setenv("KWEB_ALLOWED_HOSTS", ":9848,https://user:"+secretEntry+"@proxy.internal")
+	t.Setenv("WT_ALLOWED_HOSTS", ":9848,https://user:"+secretEntry+"@proxy.internal")
 
 	policy := parseAllowedHosts()
 
@@ -990,7 +1006,7 @@ func TestParseAllowedHosts_allInvalidFailsClosed(t *testing.T) {
 		t.Errorf("warn attr invalid_count = %d, want 2 (both malformed entries counted)", invalidCount)
 	}
 	if logContains(records, secretEntry) {
-		t.Errorf("log carries rejected raw entry containing %q; malformed KWEB_ALLOWED_HOSTS values may hold credentials and must never be logged", secretEntry)
+		t.Errorf("log carries rejected raw entry containing %q; malformed WT_ALLOWED_HOSTS values may hold credentials and must never be logged", secretEntry)
 	}
 	if !policy.Active() {
 		t.Fatal("policy is inactive despite a non-blank configuration; an all-invalid list must fail closed, not fall open")
@@ -1132,11 +1148,6 @@ func TestToolsStatus_reducerTransitions(t *testing.T) {
 			boot: noBoot,
 			jobs: []*toolbelt.Job{jobEvent(toolbelt.JobKindInstall, toolbelt.JobFailed)},
 			want: toolsStateSyncing,
-		},
-		"nil job is ignored": {
-			boot: toolsStateOK,
-			jobs: []*toolbelt.Job{nil},
-			want: toolsStateOK,
 		},
 		"boot failure then a successful install heals": {
 			boot: toolsStateDegraded,
@@ -1396,7 +1407,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 
 	// A failed catalog refresh must NOT degrade: keep-last-good makes it
 	// routine, and the boot refresh runs before the publisher is reachable.
-	// The URL is empty here (no KWEB_TOOL_CATALOG_URL), so the fetch fails.
+	// The URL is empty here (no TOOL_CATALOG_URL), so the fetch fails.
 	runJob("catalog refresh", rt.engine.RefreshCatalog, toolbelt.JobFailed)
 	assertStage("after a failed catalog refresh", toolsStateOK)
 
@@ -1490,8 +1501,8 @@ func TestToolsStatus_callbackAndHealthReadAreRaceClean(t *testing.T) {
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	const token = "s3cr3t-token-abc123"
-	const onMsg = "KWEB_LOG_OSC_TEXT is on"
-	const badMsg = "unparseable KWEB_LOG_OSC_TEXT"
+	const onMsg = "WT_LOG_OSC_TEXT is on"
+	const badMsg = "unparseable WT_LOG_OSC_TEXT"
 	cases := map[string]struct {
 		raw       string
 		wantValue bool
@@ -1545,7 +1556,7 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			records := capture.Default(t)
-			t.Setenv("KWEB_LOG_OSC_TEXT", tc.raw)
+			t.Setenv("WT_LOG_OSC_TEXT", tc.raw)
 
 			if got := parseLogOSCText(); got != tc.wantValue {
 				t.Errorf("parseLogOSCText() with %q = %v, want %v", tc.raw, got, tc.wantValue)
@@ -1557,7 +1568,7 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 				t.Errorf("log = %q, want a Warn containing %q", records.Messages(), tc.wantMsg)
 			}
 			if tc.rawMustStayOut && logContains(records, tc.raw) {
-				t.Errorf("log = %q carries the raw KWEB_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why the read is envx.BoolStrict and not envx.Bool, whose malformed Warn carries the value)",
+				t.Errorf("log = %q carries the raw WT_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why the read is envx.BoolStrict and not envx.Bool, whose malformed Warn carries the value)",
 					records.Messages())
 			}
 		})
@@ -1565,7 +1576,7 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 }
 
 // The KIRO_CLI_TOOLS_TAINTED warning, duplicated verbatim from parseToolsTainted
-// (main.go) for the reason the TRUSTED_PROXIES hints above it are duplicated: this
+// (main.go) for the reason the WT_TRUSTED_PROXIES hints above it are duplicated: this
 // record is the only thing an operator sees about a rejected value, the value
 // itself can be a compose-interpolated credential (CWE-532), so message and hint
 // must stay FIXED strings that cannot grow an input-derived tail. A deliberate
@@ -1681,12 +1692,135 @@ func TestParseToolsTainted(t *testing.T) {
 	}
 }
 
+// The WT_TRUSTED_INSTALL_UIDS warning, duplicated verbatim from
+// parseTrustedInstallUIDs (main.go). Duplicating the prose is the point, as it is
+// for the WT_TRUSTED_PROXIES hints: this record is the ONLY thing an operator sees
+// about a dropped entry, and an entry can be a compose-interpolated credential
+// (CWE-532), so both strings must stay FIXED and cannot grow an input-derived
+// tail. A deliberate rewording updates both sides; anything else is the
+// regression these pins exist to fail.
+const (
+	trustedUIDsBadMsg  = "dropping unusable WT_TRUSTED_INSTALL_UIDS entries; the kiro-cli install keeps enforcing custody against those identities"
+	trustedUIDsBadHint = "each entry is a single numeric uid greater than 0 (e.g. 1000,1001); root is trusted already, and every identity listed must be at least as privileged as this server"
+)
+
+// TestParseTrustedInstallUIDs pins the whole WT_TRUSTED_INSTALL_UIDS contract:
+// the EMPTY default (no trust grant, so pinstall's custody check applies in
+// full), the drop-the-unusable-keep-the-rest posture, the two numeric shapes that
+// are rejected as well as non-numeric text (0 is root, which the library trusts
+// anyway; a negative is not an identity), deduplication, first-seen order, and
+// the by-name-and-count-only warning.
+//
+// Order is asserted exactly rather than as a set, because it is the property that
+// makes the value handed to the library reproducible for an operator reading the
+// list back.
+//
+// Two forms of the confidentiality assertion, for the reason
+// TestParseToolsTainted uses both: a needle sweep proves a specific value stayed
+// out, and assertAttrSchema pins the record's EXACT attr set so a value reaching
+// the log under any name, in any shape, fails even where a needle would be
+// vacuous (the fixed hint necessarily contains "1000", "1001" and "0").
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestParseTrustedInstallUIDs(t *testing.T) {
+	const key = "WT_TRUSTED_INSTALL_UIDS"
+	const token = "s3cr3t-token-abc123"
+	cases := map[string]struct {
+		raw   string
+		unset bool
+		want  []int
+		// wantInvalid is the dropped-entry count the warning must report; 0 means
+		// no warning at all is expected.
+		wantInvalid int
+		// rawMustStayOut asks for the needle form of the confidentiality
+		// assertion, and is set only where finding the value in the log would PROVE
+		// a leak. It is off for the numeric cases, whose digits appear in the fixed
+		// hint's own examples.
+		rawMustStayOut bool
+	}{
+		// The default, in all three spellings of "the operator declared nothing":
+		// no grant, and silence — the strict custody check is the expected
+		// behaviour here, not a degraded one worth reporting.
+		"unset grants nothing":            {unset: true},
+		"empty grants nothing":            {raw: ""},
+		"whitespace only grants nothing":  {raw: "   \t "},
+		"a lone separator grants nothing": {raw: ","},
+
+		// The usable shapes.
+		"one uid":                       {raw: "1000", want: []int{1000}},
+		"several uids":                  {raw: "1000,1001,1002", want: []int{1000, 1001, 1002}},
+		"surrounding whitespace trims":  {raw: " 1000 ,\t1001 ", want: []int{1000, 1001}},
+		"blank entries are skipped":     {raw: "1000,,1001,", want: []int{1000, 1001}},
+		"a duplicate collapses":         {raw: "1000,1000,1001,1000", want: []int{1000, 1001}},
+		"first-seen order is preserved": {raw: "1002,1000,1001", want: []int{1002, 1000, 1001}},
+
+		// The rejected shapes, each dropped with one by-name warning rather than
+		// failing the boot.
+		"a non-numeric entry is dropped": {raw: "notauid", wantInvalid: 1, rawMustStayOut: true},
+		"zero is dropped":                {raw: "0", wantInvalid: 1},
+		"a negative uid is dropped":      {raw: "-1000", wantInvalid: 1},
+		"a float is dropped":             {raw: "1000.5", wantInvalid: 1, rawMustStayOut: true},
+
+		// The shape that motivates naming the key only: a compose interpolation
+		// mistake (WT_TRUSTED_INSTALL_UIDS: ${SOME_TOKEN}) puts a credential here.
+		"a token-shaped value is dropped": {raw: token, wantInvalid: 1, rawMustStayOut: true},
+
+		// Mixed: the usable entries survive, and every dropped one is counted.
+		"valid entries survive alongside invalid ones": {
+			raw: "1000,notauid,0,-5,1001", want: []int{1000, 1001}, wantInvalid: 3, rawMustStayOut: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			records := capture.Default(t)
+			// t.Setenv first even for the unset case: it registers the restore of
+			// whatever the ambient environment held, and the Unsetenv then makes
+			// the key genuinely absent for this subtest rather than empty.
+			t.Setenv(key, tc.raw)
+			if tc.unset {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatalf("unset %s: %v", key, err)
+				}
+			}
+
+			got := parseTrustedInstallUIDs()
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("parseTrustedInstallUIDs() with %s=%q (unset=%v) = %v, want %v", key, tc.raw, tc.unset, got, tc.want)
+			}
+			wantWarns := 0
+			if tc.wantInvalid > 0 {
+				wantWarns = 1
+			}
+			if n := records.CountLevel(slog.LevelWarn, ""); n != wantWarns {
+				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), wantWarns, n)
+			}
+			if wantWarns == 0 {
+				return
+			}
+			// Exact message, not a substring: a regression that appends the
+			// rejected entries to the sentence keeps every substring match green.
+			if n := records.CountExact(trustedUIDsBadMsg); n != 1 {
+				t.Errorf("log = %q, want exactly one Warn whose message is exactly %q (got %d); the message must be a fixed string with no input-derived tail",
+					records.Messages(), trustedUIDsBadMsg, n)
+			}
+			assertAttrSchema(t, records, slog.LevelWarn, trustedUIDsBadMsg, map[string]attrCheck{
+				"invalid_count": wantInt(tc.wantInvalid),
+				"hint":          wantString(trustedUIDsBadHint),
+			})
+			if tc.rawMustStayOut && logContains(records, tc.raw) {
+				t.Errorf("log = %q carries the raw %s value; a compose interpolation mistake can put a credential on this key, so a dropped entry must be warned about by NAME and COUNT only",
+					records.Messages(), key)
+			}
+		})
+	}
+}
+
 // TestParseCatalogRefresh_warnsByNameOnly pins that no supplied
 // TOOL_CATALOG_REFRESH value reaches a log record, and that every value toolbelt
 // ACCEPTS still gets toolbelt's answer. The wrapper exists only because
 // toolbelt's parser calls scheduler.ParseInterval WITHOUT
 // scheduler.WithRedactedValue, so its own fallback warning echoes the raw string
-// — the CWE-532 shape the KWEB_LOG_OSC_TEXT remedy closed on a knob of exactly
+// — the CWE-532 shape the WT_LOG_OSC_TEXT remedy closed on a knob of exactly
 // this kind. Dropping the wrapper (calling toolbelt.ParseCatalogRefresh
 // directly) leaves every other test green.
 // Serial: capture.Default mutates the process-global default logger.
@@ -1954,7 +2088,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 // Serial: capture.Default mutates the process-global default logger.
 func TestAccessLogKeepsStreamPathRefusals(t *testing.T) {
 	rec := capture.Default(t)
-	t.Setenv("KWEB_ALLOWED_HOSTS", "webterm.example.com")
+	t.Setenv("WT_ALLOWED_HOSTS", "webterm.example.com")
 
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -2367,4 +2501,579 @@ func TestWarnIfToolsBinUnreachable(t *testing.T) {
 			t.Errorf("log = %q carries no attr naming the unreachable bin dir %q; the nudge asks the reader to add a directory to PATH, so it must say which", records.Messages(), want)
 		}
 	})
+}
+
+// The whole-tree convergence signal is a SECOND question from the tools field,
+// and these tests pin the distinction that motivated adding it: the field
+// answers "did the last job succeed", the count answers "is the tree
+// converged", and a partial repair makes them disagree on purpose.
+
+func TestCountMissingFromInventory(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		tools []toolbelt.ToolInfo
+		want  int
+	}{
+		"no entries": {want: 0},
+		"all installed": {
+			tools: []toolbelt.ToolInfo{{Name: "gh", Installed: true}, {Name: "jq", Installed: true}},
+			want:  0,
+		},
+		"one enabled entry missing": {
+			tools: []toolbelt.ToolInfo{{Name: "gh", Installed: true}, {Name: "jq"}},
+			want:  1,
+		},
+		// A disabled entry is a TEMPLATE: recorded intent that is deliberately
+		// not installed. Counting one would make a freshly seeded volume report
+		// its five seeded templates as missing forever.
+		"disabled entries are not outstanding": {
+			tools: []toolbelt.ToolInfo{{Name: "gopls", Disabled: true}, {Name: "pyright", Disabled: true}},
+			want:  0,
+		},
+		"disabled and installed is still not outstanding": {
+			tools: []toolbelt.ToolInfo{{Name: "gopls", Disabled: true, Installed: true}},
+			want:  0,
+		},
+		// Not on PATH yet is exactly what the number is about, so an in-flight
+		// install counts rather than being excused.
+		"an installing entry still counts": {
+			tools: []toolbelt.ToolInfo{{Name: "jq", Installing: true}},
+			want:  1,
+		},
+		"mixed tree": {
+			tools: []toolbelt.ToolInfo{
+				{Name: "gh", Installed: true},
+				{Name: "jq"},
+				{Name: "rust-analyzer", Disabled: true},
+				{Name: "pyright", Installing: true},
+			},
+			want: 2,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := countMissingFromInventory(tc.tools); got != tc.want {
+				t.Errorf("countMissingFromInventory() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// "Not counted yet" is a third state a bare integer cannot carry, and conflating
+// it with zero would publish convergence for a tree nobody has looked at.
+func TestToolsStatus_missingCountIsUnknownBeforeTheFirstRecount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	if n, ok := s.missingCount(); ok {
+		t.Errorf("missingCount() = (%d, true) before any recount, want ok=false", n)
+	}
+	s.missing.Store(0)
+	if n, ok := s.missingCount(); !ok || n != 0 {
+		t.Errorf("missingCount() = (%d, %v) after a zero recount, want (0, true)", n, ok)
+	}
+}
+
+func TestToolsStatus_watchConvergenceRecountsOnPoke(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	counts := make(chan int, 8)
+	next := 3
+	go s.watchConvergence(t.Context(), func() (int, error) {
+		n := next
+		next--
+		counts <- n
+		return n, nil
+	})
+
+	// The watcher counts once at startup, without being asked: the question has
+	// an answer before the first job transition arrives.
+	select {
+	case <-counts:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchConvergence never took an initial count")
+	}
+	waitForMissing(t, s, 3)
+
+	s.requestRecount()
+	waitForMissing(t, s, 2)
+}
+
+// A failed count must return the field to UNKNOWN rather than freeze the last
+// answer: tools_missing is absent when the count is not known, so a stale number
+// would assert a convergence the engine can no longer confirm.
+func TestToolsStatus_watchConvergenceReturnsToUnknownOnAFailedRecount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	var fail atomic.Bool
+	// Unbuffered: each FAILING recount blocks inside the fake counter until the
+	// test acknowledges it, and that ordering is what replaces the sleep this
+	// test used to carry. A sleep cannot do this job: under load the watcher may
+	// not process the poke in time, and the assertion then reads the
+	// pre-failure (7, true) state and fails spuriously.
+	entered := make(chan struct{})
+	go s.watchConvergence(t.Context(), func() (int, error) {
+		if fail.Load() {
+			entered <- struct{}{}
+			return 99, errors.New("inventory unavailable")
+		}
+		return 7, nil
+	})
+	waitForMissing(t, s, 7)
+
+	// watchConvergence is ONE sequential goroutine, so observing it enter the
+	// SECOND failing recount proves it already finished the first — including
+	// the unknown store this test is about, which happens after count() returns.
+	awaitFailingRecount := func() {
+		t.Helper()
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the convergence watcher never ran the failing recount, so the unknown branch was never exercised")
+		}
+	}
+	fail.Store(true)
+	s.requestRecount()
+	awaitFailingRecount()
+	s.requestRecount()
+	awaitFailingRecount()
+	if n, ok := s.missingCount(); ok {
+		t.Errorf("missingCount() = (%d, %v) after a failed recount, want unknown (0, false)", n, ok)
+	}
+}
+
+// requestRecount is called from OnJobChanged, which runs under toolbelt's job
+// queue lock. If it could ever block, the engine would deadlock — Inventory()
+// takes that same lock through InstallingSet(), which is why the counting lives
+// in a goroutine at all.
+func TestToolsStatus_requestRecountNeverBlocks(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus() // no watcher: nothing is draining the channel
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 100 {
+			s.requestRecount()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("requestRecount blocked with no watcher draining; under the queue lock this deadlocks the engine")
+	}
+}
+
+// The count is a fact about the tree, not a verdict about this boot, so it is
+// requested even before the boot verdict is recorded — unlike the tools field,
+// whose live half stays disarmed until then.
+func TestToolsStatus_observeJobRequestsARecountBeforeBootWithoutChangingTheField(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.observeJob(jobEvent(toolbelt.JobKindInstall, toolbelt.JobDone))
+
+	if got := s.get(); got != toolsStateSyncing {
+		t.Errorf("tools field = %q after a pre-verdict job, want %q (the live half must stay disarmed)", got, toolsStateSyncing)
+	}
+	select {
+	case <-s.poke:
+	default:
+		t.Error("no recount was requested for a settled pre-verdict job; the count would stay unknown until the next transition")
+	}
+}
+
+// An excluded job kind must not move the tools FIELD — the kind policy is the
+// state verdict's alone. It must still provoke a recount: the count is a fact
+// about the tree, and a disable, an uninstall or a half-finished update all
+// change which enabled entries are installed without meaning the boot failed.
+func TestToolsStatus_observeJobIgnoresUncountedKindsForTheVerdictOnly(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.recordBoot(toolsStateOK)
+	drainPoke(s)
+
+	s.observeJob(jobEvent(toolbelt.JobKindCatalogRefresh, toolbelt.JobFailed))
+	if got := s.get(); got != toolsStateOK {
+		t.Errorf("tools field = %q after an uncounted job, want %q", got, toolsStateOK)
+	}
+	select {
+	case <-s.poke:
+	default:
+		t.Error("an uncounted but settled job did not request a convergence recount; the published count would assert a convergence the engine has not confirmed")
+	}
+}
+
+// A CANCELLED job is settled: toolbelt cancels RUNNING jobs, so one that already
+// changed the tree must provoke a recount even though cancellation is not a fault
+// and so must not move the verdict field.
+func TestToolsStatus_observeJobRecountsOnCancellation(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	s.recordBoot(toolsStateOK)
+	drainPoke(s)
+
+	s.observeJob(jobEvent(toolbelt.JobKindInstall, toolbelt.JobCancelled))
+	if got := s.get(); got != toolsStateOK {
+		t.Errorf("tools field = %q after a cancelled job, want %q (cancellation is not a fault)", got, toolsStateOK)
+	}
+	select {
+	case <-s.poke:
+	default:
+		t.Error("a cancelled job did not request a convergence recount; a job cancelled after it changed the tree would leave the published count asserting the pre-job state")
+	}
+}
+
+// recordBoot recounts because the boot pass is the largest single change to the
+// tree; waiting for the next job transition would leave the count unknown on
+// every healthy boot, which is most of them.
+func TestToolsStatus_recordBootRequestsARecount(t *testing.T) {
+	t.Parallel()
+	s := newToolsStatus()
+	drainPoke(s)
+	s.recordBoot(toolsStateOK)
+	select {
+	case <-s.poke:
+	default:
+		t.Error("recordBoot did not request a convergence recount")
+	}
+}
+
+func waitForMissing(t *testing.T, s *toolsStatus, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, ok := s.missingCount(); ok && n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			n, ok := s.missingCount()
+			t.Fatalf("missingCount() = (%d, %v), want (%d, true)", n, ok, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func drainPoke(s *toolsStatus) {
+	select {
+	case <-s.poke:
+	default:
+	}
+}
+
+// The stage field is the discriminator that replaced five named ERROR messages.
+// Consolidating them into one exit-site line removed the only thing a log query
+// or alert rule could key on, and three of the five names do not even survive as
+// substrings of the wrapped error. These tests pin the replacement: a stable
+// VALUE per startup stage, always present.
+
+func TestStageOf(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		err  error
+		want string
+	}{
+		"nil error":                  {err: nil, want: stageUnknown},
+		"unattributed error":         {err: errors.New("boom"), want: stageUnknown},
+		"attributed":                 {err: atStage(stageListen, errors.New("boom")), want: stageListen},
+		"attributed then re-wrapped": {err: fmt.Errorf("outer: %w", atStage(stageServe, errors.New("boom"))), want: stageServe},
+		// The outermost attribution wins, which is what lets a caller re-attribute
+		// a failure it has reinterpreted.
+		"doubly attributed": {err: atStage(stageStatic, atStage(stageListen, errors.New("boom"))), want: stageStatic},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := stageOf(tc.err); got != tc.want {
+				t.Errorf("stageOf() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Attribution must not change what the operator reads: the wrapped text IS the
+// hint, and a stage wrapper that prefixed or reworded it would defeat the
+// consolidation it exists to make queryable.
+func TestAtStagePreservesTheMessageAndTheChain(t *testing.T) {
+	t.Parallel()
+	inner := errors.New("mount target is a file")
+	wrapped := fmt.Errorf("work directory /workspace is not a directory: %w", inner)
+	got := atStage(stageWorkDir, wrapped)
+
+	if got.Error() != wrapped.Error() {
+		t.Errorf("Error() = %q, want the wrapped text unchanged %q", got.Error(), wrapped.Error())
+	}
+	if !errors.Is(got, inner) {
+		t.Error("attribution broke the error chain; errors.Is no longer reaches the cause")
+	}
+}
+
+// Every startup failure path must be attributed, or the field it exists for
+// reports unknown exactly when an operator needs it. checkWorkDir is the one
+// path a test can drive end to end without binding a port or embedding a broken
+// static tree.
+func TestCheckWorkDirAttributesItsStage(t *testing.T) {
+	t.Parallel()
+	t.Run("missing directory", func(t *testing.T) {
+		t.Parallel()
+		err := checkWorkDir(filepath.Join(t.TempDir(), "absent"))
+		if err == nil {
+			t.Fatal("checkWorkDir accepted an absent directory")
+		}
+		if got := stageOf(err); got != stageWorkDir {
+			t.Errorf("stage = %q, want %q", got, stageWorkDir)
+		}
+	})
+	t.Run("path is a file", func(t *testing.T) {
+		t.Parallel()
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if werr := os.WriteFile(file, []byte("x"), 0o600); werr != nil {
+			t.Fatalf("write fixture: %v", werr)
+		}
+		err := checkWorkDir(file)
+		if err == nil {
+			t.Fatal("checkWorkDir accepted a plain file")
+		}
+		if got := stageOf(err); got != stageWorkDir {
+			t.Errorf("stage = %q, want %q", got, stageWorkDir)
+		}
+	})
+}
+
+// The stage values are the log surface, so they are pinned as literals here:
+// renaming one is a breaking change to an operator's query and must fail a test
+// rather than pass silently.
+func TestStageValuesAreStable(t *testing.T) {
+	t.Parallel()
+	for got, want := range map[string]string{
+		stageWorkDir: "work_dir",
+		stageStatic:  "static",
+		stageListen:  "listen",
+		stageServe:   "serve",
+		stageUnknown: "unknown",
+	} {
+		if got != want {
+			t.Errorf("stage value = %q, want %q (an operator's log query keys on this literal)", got, want)
+		}
+	}
+}
+
+// parseCatalogRefresh is deliberately STRICTER than the fleet's config-echo
+// policy: envx states that config values are not secrets and its own tolerant
+// warnings include the raw value, scheduler's steering doc says plain *_INTERVAL
+// env reads should not redact, and 9 apps echo raw config values today. This app
+// does not, because its compose file is the operator's whole config surface, it
+// serves an unauthenticated root shell, and its README publishes a no-values
+// promise. See "Settled review decisions".
+//
+// The cost of that deviation is the only thing worth guarding: the pre-parse
+// duplicates scheduler's accept vocabulary, and nothing keeps the two in step.
+// These tests derive the expected behaviour from the REAL library rather than
+// from a copy of its rules, so a scheduler or toolbelt release that adds a
+// sentinel fails here on the Renovate bump PR instead of silently changing what
+// this app accepts.
+
+// The invariant that makes the pre-parse safe to keep: it is OUTCOME-TRANSPARENT.
+// It may change what is LOGGED and must never change what is RETURNED. Any
+// divergence means the local vocabulary has drifted from the library's and this
+// app is now rejecting (or accepting) something the library does not.
+func TestParseCatalogRefreshIsOutcomeTransparent(t *testing.T) {
+	for _, raw := range []string{
+		"", " ", "off", "OFF", "disabled", "Disabled", "off ", " disabled ",
+		"0", "0s", "24h", "90m", "1h30m", "24H", "1H30M", // case-sensitive units
+		"-5m", "5", "5min", "abc", "24 h", "1e3s", "0x10s",
+		"9999999h", "-0", "+24h", ".5h", "1.5h",
+	} {
+		t.Run("value="+raw, func(t *testing.T) {
+			want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+			if got := parseCatalogRefresh(raw); got != want {
+				t.Errorf("parseCatalogRefresh(%q) = %v, library returns %v — the local pre-parse changed the OUTCOME, so its accept vocabulary has drifted from scheduler's",
+					raw, got, want)
+			}
+		})
+	}
+}
+
+// The protection itself: whatever the operator set must never reach the log. This
+// is what the deviation buys, and it is the half a library change would have
+// taken away. Mutates the process-global default logger, so no t.Parallel.
+func TestParseCatalogRefreshNeverLogsTheValue(t *testing.T) {
+	// Values chosen to look like a misrouted credential rather than a duration,
+	// which is the case the deviation exists for: a compose expansion mistake
+	// putting ${SOME_TOKEN} on this key.
+	for _, secret := range []string{
+		"hunter2-not-a-duration",
+		"ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+		"postgres://user:pa55w0rd@db:5432/app",
+	} {
+		t.Run(secret[:8], func(t *testing.T) {
+			records := capture.Default(t)
+			if got := parseCatalogRefresh(secret); got == 0 {
+				t.Fatalf("parseCatalogRefresh(%q) = 0; an unusable value must fall back to a positive cadence", secret)
+			}
+			for _, r := range records.Records() {
+				if strings.Contains(r.Message, secret) {
+					t.Errorf("the rejected value reached a log MESSAGE: %q", r.Message)
+				}
+				r.Attrs(func(a slog.Attr) bool {
+					if strings.Contains(a.Value.String(), secret) {
+						t.Errorf("the rejected value reached log attr %q = %q", a.Key, a.Value)
+					}
+					return true
+				})
+			}
+		})
+	}
+}
+
+// The by-name-only warning must still FIRE, or the redaction has been achieved by
+// saying nothing at all — which would leave an operator with a silently ignored
+// setting.
+func TestParseCatalogRefreshStillWarnsByName(t *testing.T) {
+	records := capture.Default(t)
+	parseCatalogRefresh("definitely-not-a-duration")
+
+	for _, r := range records.Records() {
+		if strings.Contains(r.Message, catalogRefreshKey) {
+			return
+		}
+		found := false
+		r.Attrs(func(a slog.Attr) bool {
+			if strings.Contains(a.Value.String(), catalogRefreshKey) {
+				found = true
+			}
+			return true
+		})
+		if found {
+			return
+		}
+	}
+	t.Errorf("no warning named %s for an unusable value; the operator gets no diagnostic at all", catalogRefreshKey)
+}
+
+// setupLoggingStderr runs setupLogging with os.Stderr replaced by a pipe and
+// returns everything the handler it INSTALLED wrote while doing so. Nothing
+// cheaper works: setupLogging's own slogx.Setup replaces the default logger, so
+// capture.Default's handler is gone before the warning is emitted, and
+// slogx.NewHandler reads os.Stderr at construction — which is exactly why the
+// swap has to happen before the call and is enough to observe it.
+//
+// Both globals are restored on cleanup, so a later test sees the process it
+// started with.
+func setupLoggingStderr(t *testing.T) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	prevStderr, prevLogger := os.Stderr, slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = prevStderr
+		slog.SetDefault(prevLogger)
+		_ = r.Close()
+	})
+	os.Stderr = w
+
+	setupLogging()
+
+	// Close the write end so ReadAll terminates. The record is one short line and
+	// a pipe buffers far more, so the write above never blocked on this read.
+	if err := w.Close(); err != nil {
+		t.Fatalf("close the pipe writer: %v", err)
+	}
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read the captured stderr: %v", err)
+	}
+	return string(out)
+}
+
+// TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly pins the one env read
+// that had no test at all, and it is the read that decides which of this app's
+// other diagnostics an operator can see. Two properties, each a silent
+// regression:
+//
+//   - the parsed level actually reaches the INSTALLED handler, and an
+//     unparseable value falls back to info rather than to debug. Nothing
+//     asserted this, so reversing the default, or moving slogx.Setup above
+//     ParseLevel (the doc comment says the order is the slogx contract, and the
+//     zero Options.Level is info, so the swap compiles and pins every deployment
+//     at info), silently decides for every deployment which lines exist —
+//     including the classifyStatus trace this app's own steering names as the
+//     WT_LOG_LEVEL=debug diagnosis path for stuck tab-status dots;
+//   - the unparseable warning names the KEY and carries no copy of the VALUE.
+//     That is the app's house rule, stated in the function's own comment and
+//     applied at WT_TRUSTED_PROXIES, KIRO_CLI_CHAT_ARGS, WT_LOG_OSC_TEXT and
+//     TOOL_CATALOG_REFRESH — the last two each with a test saying so. This key
+//     was the only one where the claim was unchecked, and a compose
+//     interpolation mistake is what puts a credential on it (CWE-532).
+//
+// Assertions name the specific record rather than counting all records: a PTY
+// session left running by an earlier test can still be writing to the default
+// logger, and a total count would make this test fail for someone else's line.
+//
+// Serial (no t.Parallel): it replaces the process-global default logger and
+// os.Stderr, and t.Setenv forbids parallel anyway.
+func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
+	const (
+		token   = "s3cr3t-token-abc123"
+		warnMsg = "unparseable WT_LOG_LEVEL"
+	)
+	cases := []struct {
+		name      string
+		raw       string
+		absent    bool // the variable is not in the environment at all
+		wantDebug bool // the installed handler admits Debug
+		wantInfo  bool // ... and Info
+		wantWarn  bool // the unparseable-level warning was emitted
+		// rawMustStayOut asks for the confidentiality assertion, and is set only
+		// for values distinctive enough that finding one PROVES a leak: "debug"
+		// and "info" appear in this warning's own hint by design.
+		rawMustStayOut bool
+	}{
+		{name: "absent installs the info default", absent: true, wantInfo: true},
+		{name: "blank installs the info default", raw: "", wantInfo: true},
+		{name: "debug installs debug", raw: "debug", wantDebug: true, wantInfo: true},
+		{name: "error installs error", raw: "error"},
+		{name: "case and padding are the library's tolerance, not a local one", raw: " DEBUG ", wantDebug: true, wantInfo: true},
+		{
+			name: "an unparseable level falls back to info and warns by name",
+			raw:  "verbose", wantInfo: true, wantWarn: true, rawMustStayOut: true,
+		},
+		{
+			name: "a token-shaped value cannot reach the log",
+			raw:  token, wantInfo: true, wantWarn: true, rawMustStayOut: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// t.Setenv first either way: it records the pre-test value and
+			// restores it at cleanup, so the Unsetenv below is safe (the shape
+			// TestResolveScrollback uses for its absent case).
+			t.Setenv("WT_LOG_LEVEL", tc.raw)
+			if tc.absent {
+				if err := os.Unsetenv("WT_LOG_LEVEL"); err != nil {
+					t.Fatalf("Unsetenv(WT_LOG_LEVEL): %v", err)
+				}
+			}
+
+			out := setupLoggingStderr(t)
+
+			ctx := t.Context()
+			if got := slog.Default().Enabled(ctx, slog.LevelDebug); got != tc.wantDebug {
+				t.Errorf("with WT_LOG_LEVEL=%q the installed handler admits Debug = %v, want %v", tc.raw, got, tc.wantDebug)
+			}
+			if got := slog.Default().Enabled(ctx, slog.LevelInfo); got != tc.wantInfo {
+				t.Errorf("with WT_LOG_LEVEL=%q the installed handler admits Info = %v, want %v", tc.raw, got, tc.wantInfo)
+			}
+			// Error is always admitted; asserting it makes "the handler is a real
+			// leveled handler" explicit rather than assumed by the two above.
+			if !slog.Default().Enabled(ctx, slog.LevelError) {
+				t.Errorf("with WT_LOG_LEVEL=%q the installed handler drops Error records", tc.raw)
+			}
+			if got := strings.Count(out, warnMsg); (got > 0) != tc.wantWarn {
+				t.Errorf("stderr = %q, want the %q warning present = %v", out, warnMsg, tc.wantWarn)
+			}
+			if tc.rawMustStayOut && strings.Contains(out, tc.raw) {
+				t.Errorf("stderr = %q carries the raw WT_LOG_LEVEL value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only",
+					out)
+			}
+		})
+	}
 }

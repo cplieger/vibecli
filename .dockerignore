@@ -36,6 +36,6 @@ web-terminal-kiro-dev-bin
 # .stryker-tmp/ alone reaches tens of MB on a checkout that ran the mutation
 # suite, and any vitest/coverage/report write would cache-bust `COPY . ./`.
 **/.stryker-tmp/
-**/.vitest-cache/
 static-src/coverage/
 static-src/reports/
+static-src/test-results/

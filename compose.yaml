@@ -4,10 +4,14 @@ services:
     image: ghcr.io/cplieger/web-terminal-kiro:latest
     container_name: web-terminal-kiro
     restart: unless-stopped
+    # Required, not optional: tini reaps orphaned children. An agent session forks language servers,
+    # gits and node runtimes whose own parent exits, re-parenting them onto PID 1, and the server
+    # waits only for the children it spawned itself — at PID 1 it would accumulate them as zombies.
+    init: true
 
     ports:
       # Root shell with no built-in auth; loopback alone does not stop DNS rebinding.
-      # See README "It is a remote shell" for proxy, bind, and KWEB_ALLOWED_HOSTS setup.
+      # See README "It is a remote shell" for proxy, bind, and WT_ALLOWED_HOSTS setup.
       - "9848:9848"
 
     volumes:

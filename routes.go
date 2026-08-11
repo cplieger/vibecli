@@ -29,10 +29,13 @@ import (
 // that keys on the same path cannot drift apart across files.
 const (
 	// apiPrefix is the JSON API surface's shared prefix. It names the app's own
-	// API mounts below; it is no longer a middleware scope — the /api/-wide
-	// no-store wrapper is gone now that each route owner (toolbelt's httpapi,
-	// handleHealth, handleKiroRescan) sets the header itself. See
-	// main.go's sessionNoStore for what remains and why.
+	// API mounts below; it is no longer a middleware scope, and no app middleware
+	// sets the header any more. Every route owner covers itself: toolbelt's
+	// httpapi upstream of its own mux, handleHealth and handleKiroRescan at the
+	// top of the handler, and the engine's session surface through
+	// terminal.MountSessionRoutes' own withNoStore (applied to the REST handler
+	// at both mounts and outside the create gate, so it reaches the statuses no
+	// handler writes). TestAPICachePolicy_EveryAPIPathSetsNoStore enumerates them.
 	apiPrefix = "/api/"
 	// healthPath is the readiness route; buildHandler's ProbeLogLevel policy
 	// must name the same path the mux registers, or a healthy probe stops
@@ -49,8 +52,19 @@ const (
 )
 
 type routeDeps struct {
-	staticFS fs.FS
-	ready    *webhttp.Ready
+	// static is the embedded-static serving handler, built by the composition
+	// root (buildStaticSurface) together with the hash-pinned CSP the same tree
+	// produces: the root keeps the CSP for buildHandler's SecurityHeaders layer
+	// and hands the handler here, so neither derivative travels through the
+	// route registrar to reach its consumer.
+	static http.Handler
+	ready  *webhttp.Ready
+	// listenHint is "localhost[:port]" for THIS deployment, derived from the
+	// address the server actually listens on (WT_ADDR). The loopback surfaces'
+	// refusals quote it so the remedy they name works on a server that did not
+	// keep the default port. Empty (a test building routeDeps by hand) yields
+	// today's message minus the address, so no consumer is required to set it.
+	listenHint string
 	// nil is reserved for the two MOUNTING decisions (tools, kiroRescan); every
 	// policy function below is always non-nil, defaulted by the composition
 	// root's off-shape constructors (main.go's unmanagedKiroRuntime,
@@ -61,10 +75,13 @@ type routeDeps struct {
 	// /api/tools behind the loopback gate; toolsSyncing gates session
 	// creation on the boot convergence pass; toolsState feeds the
 	// /api/health informational tools field ("" outside the container, which
-	// the omitempty tag drops).
+	// the omitempty tag drops); toolsMissing feeds the separate whole-tree
+	// convergence count beside it, and its second return distinguishes "none
+	// outstanding" from "not counted yet" (see healthBody).
 	tools        *toolbelt.Engine
 	toolsSyncing func() bool
 	toolsState   func() string
+	toolsMissing func() (int, bool)
 	// containment, when non-nil, puts each tab's kiro-cli process tree in its own
 	// cgroup so ending the session ends the tree, and reports the session's peak
 	// memory in the logs. Nil is the off-shape and the only shape outside the
@@ -97,14 +114,26 @@ type routeDeps struct {
 	// own environment, which is what the root's off-shape constructors return.
 	sessionEnv func() []string
 	// sessionTitleEnv returns the per-session variables a kiro-cli hook needs to
-	// report which kiro session this tab is running: the tab's own id and the
-	// state directory to write the pairing into. Takes the session id because it
-	// is the one part of the child environment that differs per tab. A nil
-	// function (the root's off-shape constructors) leaves tabs on the engine's
-	// automatic name ladder.
+	// report which kiro session this tab is running: the tab's TITLE HANDLE (a
+	// minted value, deliberately not the session id — see sessiontitle.go's
+	// sessionEnv) and the state directory to write the pairing into. Takes the
+	// session id because the handle is derived per tab. A nil function (the root's
+	// off-shape constructors) leaves tabs on the engine's automatic name ladder.
 	sessionTitleEnv func(id string) []string
-	workDir         string
-	// logOSCText is the KWEB_LOG_OSC_TEXT opt-in: when true, an unrecognized
+	// scrollback is the operator's retained-history depth from
+	// terminal.ScrollbackEnvVar, or nil when they set nothing — in which case the
+	// option is OMITTED and the engine's own default applies. The engine owns
+	// both the variable's name and the sizing decision, because this app,
+	// web-terminal-server and vibekit share the knob and a number copied into
+	// each is three numbers that drift.
+	//
+	// A POINTER, so that "unset" is the ZERO VALUE. An int sentinel cannot be:
+	// 0 is a legal depth meaning "retain nothing", so a routeDeps built by hand
+	// — every test here does — would have silently disabled scrollback, which is
+	// exactly how this was caught.
+	scrollback *int
+	workDir    string
+	// logOSCText is the WT_LOG_OSC_TEXT opt-in: when true, an unrecognized
 	// OSC 9 notification's full text is logged at Debug. Default false — the
 	// text is arbitrary child output that may carry a token or device code, so
 	// the log otherwise carries only a content-free fingerprint (see
@@ -138,15 +167,13 @@ func buildStaticSurface(staticFS fs.FS) (http.Handler, string, error) {
 }
 
 // registerRoutes wires the full route table on mux and returns the session
-// manager (for shutdown) plus the hash-pinned CSP policy string built from the
-// embedded index.html (for buildHandler's SecurityHeaders layer) — both derive
-// from the same static tree, so they are assembled together, fail-loud.
-func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManager, string, error) {
-	staticSrv, cspPolicy, err := buildStaticSurface(deps.staticFS)
-	if err != nil {
-		return nil, "", err
-	}
-	mux.Handle("/", staticSrv)
+// manager (for shutdown). The static handler and the hash-pinned CSP policy
+// string both derive from the embedded static tree, and buildStaticSurface
+// assembles them together, fail-loud; the composition root calls it and gives
+// each derivative to its own consumer — the handler here as deps.static, the
+// CSP to buildHandler's SecurityHeaders layer.
+func registerRoutes(mux *http.ServeMux, deps *routeDeps) *terminal.SessionManager {
+	mux.Handle("/", deps.static)
 
 	mgr := terminal.NewSessionManager(newSessionFactory(deps),
 		terminal.WithManagerLogger(slog.Default()),
@@ -198,7 +225,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// Config-file edits + restart remain the primary toggle path; this
 	// API is the no-restart alternative.
 	if deps.tools != nil {
-		toolsAPI := loopbackOnly("tools API", httpapi.Handler(deps.tools, toolsPath))
+		toolsAPI := loopbackOnly("tools API", deps.listenHint, httpapi.Handler(deps.tools, toolsPath))
 		mux.Handle(toolsPath, toolsAPI)
 		mux.Handle(toolsPath+"/", toolsAPI)
 	}
@@ -211,7 +238,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 	// it until the container is recreated. This is the endpoint that makes such a
 	// repair observable without a recreate. It downloads nothing.
 	if deps.kiroRescan != nil {
-		mux.Handle("POST "+kiroRescanPath, loopbackOnly("kiro-cli rescan hook", handleKiroRescan(deps)))
+		mux.Handle("POST "+kiroRescanPath, loopbackOnly("kiro-cli rescan hook", deps.listenHint, handleKiroRescan(deps)))
 		// ServeMux synthesizes 405 only when NO pattern matches the request, and
 		// the "/" static mount matches every path — so without this mount a GET or
 		// PUT here is answered by the static handler's bare 404, which reads as "no
@@ -220,75 +247,93 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) (*terminal.SessionManag
 		// -> 405 Allow: POST). This pattern is less specific than the POST one
 		// above, so POST still reaches the handler, and it sits behind the same
 		// loopback gate so a remote caller learns nothing new.
-		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook",
+		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook", deps.listenHint,
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Allow", http.MethodPost)
 				webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "",
-					"kiro-cli rescan is POST-only (curl -X POST localhost:9848"+kiroRescanPath+")")
+					"kiro-cli rescan is POST-only (curl -X POST "+deps.listenHint+kiroRescanPath+")")
 			})))
 	}
 
 	mux.HandleFunc(healthPath, handleHealth(deps))
 
-	return mgr, cspPolicy, nil
+	return mgr
 }
 
 // kiroRescanBody is the repair hook's response envelope, matching healthBody's key
-// order and vocabulary (status first, then the reason) so an operator reads the same
-// shape from both surfaces.
+// order (status first, then the reason) so an operator reads the same shape from
+// both surfaces. The status VOCABULARY is only partly shared: "ok" and "unready"
+// mean what they mean on /api/health, while "abandoned" is this hook's own and
+// /api/health never serves it -- only a rescan can fail to reach a verdict at all.
 type kiroRescanBody struct {
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
 }
 
+// reasonRescanAbandoned is the repair hook's 503 reason when the request was
+// abandoned before pinstall reached any verdict. It is deliberately NOT one of
+// main.go's kiroReasonText strings: those NAME the install manager's readiness
+// state, and this response reaches no verdict about the install at all -- it
+// reports only that the request was not serviced.
+const reasonRescanAbandoned = "kiro-cli rescan not performed: request abandoned before any verdict"
+
 // handleKiroRescan re-derives the active kiro-cli version from what is on disk right
 // now and reports the resulting readiness. 200 when a version is active afterwards,
 // 503 with the manager's own reason when none is: the same verdict /api/health will
-// serve from the next probe, so a caller gets its answer without polling.
+// serve from the next probe, so a caller gets its answer without polling. A request
+// abandoned before any verdict was reached also answers 503, under its own
+// "abandoned" status rather than a readiness verdict about the install.
 func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
-	// One admission slot for the whole endpoint. pinstall serializes rescans on its
-	// own opMu, whose acquisition is NOT context-aware, so without this gate every
-	// concurrent POST parks a handler goroutine inside the library until its turn
-	// comes — and because the operation context is detached below, an abandoned
-	// caller's rescan still runs later. A loopback agent retrying in a loop can
-	// therefore queue an unbounded number of handlers, each of which executes a
-	// serialized rescan long after its client is gone. Admission is what waits here
-	// instead, and waiting here IS cancellable.
-	admit := make(chan struct{}, 1)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A rescan probes the candidate binary and reasserts the required
 		// settings, so it is not free; it is also not cacheable under any
 		// circumstances.
 		w.Header().Set("Cache-Control", "no-store")
-		select {
-		case admit <- struct{}{}:
-			defer func() { <-admit }()
-		case <-r.Context().Done():
-			// Still QUEUED when the caller went away: nothing has entered pinstall
-			// on its behalf, so dropping it costs nothing and is the whole point of
-			// gating here. The in-flight rescan it was waiting behind continues,
-			// and its result is what the next probe of /api/health reports.
-			slog.Debug("kiro-cli rescan abandoned while queued behind an in-flight rescan",
-				"error", r.Context().Err())
-			return
-		}
-		// The rescan MUTATES readiness, so it must not inherit the request's
-		// cancellation: pinstall's Rescan probes each candidate with
-		// exec.CommandContext, and a canceled context makes every probe fail
-		// instantly, which the manager records as "no usable version" and
-		// publishes as unready (recordUnavailable clears the active version and
-		// assertionsOK). A caller that presses Ctrl-C, or passes --max-time,
-		// would therefore knock a healthy server unready and 503 every new
-		// session until the next successful rescan or a container recreate.
-		// WithoutCancel keeps the request-scoped values the logs correlate on
-		// (request id) while detaching the lifetime; no deadline is added on
-		// purpose, because pinstall bounds every subprocess itself (probeTimeout
-		// / assertionTimeout) and an expiring deadline would reintroduce exactly
-		// the canceled-probe verdict this removes. Detachment applies only ONCE
-		// ADMITTED: a rescan that has started must finish on its own terms.
-		ok, err := deps.kiroRescan(context.WithoutCancel(r.Context()))
+		// The request context goes straight through. pinstall >= v1.1.0 owns both
+		// halves this handler used to hand-roll: WAITING for its operation slot
+		// honours this context (a queued caller that goes away is dropped, and
+		// nothing has entered the library on its behalf), while an ADMITTED rescan
+		// runs detached, so a Ctrl-C or --max-time cannot make every candidate
+		// probe fail and have the manager record "no usable version". The
+		// app-local admission channel and context.WithoutCancel wrapper that
+		// stood in for those are gone; vibekit, which had neither, gained them on
+		// the same bump.
+		ok, err := deps.kiroRescan(r.Context())
 		if ok {
 			webhttp.WriteJSON(w, kiroRescanBody{Status: "ok"})
+			return
+		}
+		// A context error means the request was ABANDONED before pinstall reached
+		// any verdict, and there are TWO sources of it, not one. The caller's own
+		// cancellation while queued for pinstall's operation slot is the obvious
+		// one (an ADMITTED rescan runs detached -- Rescan calls
+		// context.WithoutCancel once it holds the slot -- so it can never surface
+		// the caller's cancellation). The second is this server's own shutdown:
+		// the pre-drain hook cancels baseCtx, which is the BaseContext of EVERY
+		// request, so a rescan still queued behind a first-boot install holding
+		// that slot is abandoned with a live client on the other end.
+		//
+		// Either way nothing entered the library on this caller's behalf and no
+		// verdict was reached. Reporting it as "no usable version" would be a
+		// false broken-install record on the one endpoint an operator uses while
+		// the manager is ALREADY unready (EnsureWithRetry holds the same slot for
+		// a whole first-boot download), the same false-alert class the session
+		// fast-death hook gates away on every deploy. So this answers 503 under its
+		// own "abandoned" status, with a reason naming it -- the request was not
+		// serviced -- and says nothing about the install. "unready" is wrong here
+		// even as a hedge: it IS a weak verdict, and it is not provably true, since
+		// a rescan queued behind another rescan can be abandoned on a manager that
+		// is perfectly ready. A distinct status carries that discrimination in the
+		// field a consumer switches on, instead of resting it all on the reason
+		// string. Writing nothing (the shape this replaced) left
+		// net/http to synthesize an implicit 200 with an empty body, so an
+		// operator's `curl -sfS -X POST` exited 0, reporting success for a repair
+		// that never ran.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			slog.Debug("kiro-cli rescan abandoned before a verdict was reached",
+				"error", err)
+			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
+				kiroRescanBody{Status: "abandoned", Reason: reasonRescanAbandoned})
 			return
 		}
 		// The manager has already logged the specific fault (and every path it
@@ -296,23 +341,23 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 		// error text: err can name a filesystem path, and this response is not
 		// the place to widen what a caller learns about the volume.
 		reason := reasonUnavailable
-		if _, r := deps.kiroReady(); r != "" {
-			reason = r
+		if _, why := deps.kiroReady(); why != "" {
+			reason = why
 		}
-		slog.Warn("kiro-cli rescan found no usable version", "reason", reason, "error", err)
+		// pinstall.Rescan's ordinary failure is (false, nil): no candidate was selected
+		// and recording that verdict succeeded. A nil error attribute would put
+		// "error":null on that common path, making it indistinguishable from a rescan
+		// whose own state write failed -- the one case that needs a different remedy.
+		attrs := []any{"reason", reason}
+		if err != nil {
+			attrs = append(attrs, "error", err)
+		}
+		slog.Warn("kiro-cli rescan found no usable version", attrs...)
 		webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable,
 			kiroRescanBody{Status: "unready", Reason: reason})
 	}
 }
 
-// newSessionFactory builds the per-session handler factory the session manager
-// calls once per tab: one independent PTY-backed kiro-cli chat process with its
-// own VT screen and scrollback. It owns four session-scoped policies — the
-// argv and PATH resolved from the install manager AT session-create time, the
-// LogID-truncated per-session logger (the session id is the /ws attach/resume
-// capability token), the WithCommandLogValue argv redaction (the argv carries
-// operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
-// surfaces a broken kiro-cli install.
 // childEnv is the environment overlay for one tab's kiro-cli process: the active
 // version's PATH lead, plus the two variables a hook needs to report which kiro
 // session this tab is running. Built as a fresh slice rather than appending to
@@ -335,13 +380,27 @@ func (d *routeDeps) childEnv(id string) []string {
 	return out
 }
 
+// newSessionFactory builds the per-session handler factory the session manager
+// calls once per tab: one independent PTY-backed kiro-cli chat process with its
+// own VT screen and scrollback. It owns four session-scoped policies — the
+// argv and PATH resolved from the install manager AT session-create time, the
+// LogID-truncated per-session logger (the session id is the /ws attach/resume
+// capability token), the WithCommandLogValue argv redaction (the argv carries
+// operator KIRO_CLI_CHAT_ARGS values), and the fast-death Warn hook that
+// surfaces a broken kiro-cli install.
 func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
-	// Scrollback 5000 covers a /chat transcript restore on reconnect (matches
-	// the client store's retained-line cap). WithKeepUnfocused pins the process
-	// to the DEC 1004 "unfocused" state so kiro-cli keeps emitting its
-	// focus-gated OSC 9 notifications (which drive the classifier) even though no
-	// browser tab claims focus; web-terminal-server deliberately does NOT use
-	// this, since a generic shell/editor wants real focus reporting.
+	// Retained-history depth carries no app-owned number any more. The option is
+	// appended at the BOTTOM of this factory only when resolveScrollback returns
+	// a valid operator override; unset, blank, or malformed values omit the
+	// option, so the engine's own terminal.DefaultScrollbackCapacity applies.
+	// This app used to pass its own constant, which made the sizing decision in
+	// three places across the family; the engine documents it once.
+	//
+	// WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so
+	// kiro-cli keeps emitting its focus-gated OSC 9 notifications (which drive
+	// the classifier) even though no browser tab claims focus;
+	// web-terminal-server deliberately does NOT use this, since a generic
+	// shell/editor wants real focus reporting.
 	//
 	// No TERM_PROGRAM override here: the engine advertises TERM_PROGRAM=
 	// iTerm.app (>= 3.6.6), which puts kiro-cli in its OSC 9;4 progress allowlist
@@ -366,22 +425,22 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 		// marker instead (WithCommandLogValue), the same way main.go's own
 		// startup line logs only chat_args_count.
 		sessionLogger := slog.Default().With("session", safeID)
-		return terminal.NewHandler(deps.cmd(),
+		opts := []terminal.Option{
 			terminal.WithWorkDir(deps.workDir),
-			terminal.WithScrollbackCapacity(5000),
 			terminal.WithKeepUnfocused(),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
-			// Put the active kiro-cli version's own directory first on the
-			// child's PATH. The engine appends WithEnv LAST when it composes
-			// os.Environ() plus its TERM identity, so this PATH wins — which is
-			// what makes `kiro-cli chat` dispatch its sidecar out of the same
-			// digest-verified install rather than out of a stale $TOOLS/bin copy
-			// left by a restored backup volume. A nil result (no version active,
-			// or no manager) leaves the server's own environment untouched.
-			// The version-directory PATH overlay, plus the two variables that
-			// let a kiro-cli hook report which kiro session this tab is running
-			// (sessionTitleEnv). Tab names come from kiro-cli's own session
+			// The active kiro-cli version's own directory first on the child's
+			// PATH, plus the two variables that let a kiro-cli hook report which
+			// kiro session this tab is running (childEnv composes both). The
+			// engine appends WithEnv LAST when it composes os.Environ() plus its
+			// TERM identity, so this PATH wins — which is what makes `kiro-cli
+			// chat` dispatch its sidecar out of the same digest-verified install
+			// rather than out of a stale $TOOLS/bin copy left by a restored
+			// backup volume. With no version active (or no manager) the PATH
+			// entry is simply absent; childEnv still carries the title variables,
+			// and an empty result leaves the server's own environment untouched.
+			// Tab names come from kiro-cli's own session
 			// record, so the engine's input-stream deriver (WithInputTitle) is
 			// deliberately NOT requested here: reconstructing a submitted line
 			// from raw bytes means modelling the agent shell's composer, and
@@ -429,7 +488,11 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 						"hint", "check /api/health and the kiro-cli install under /config/tools/kiro-cli-versions")
 				}
 			}),
-		)
+		}
+		if deps.scrollback != nil {
+			opts = append(opts, terminal.WithScrollbackCapacity(*deps.scrollback))
+		}
+		return terminal.NewHandler(deps.cmd(), opts...)
 	}
 }
 
@@ -448,10 +511,35 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 //
 // Tools is omitempty because it is INFORMATIONAL and absent when no tools engine
 // is wired (a bare `go run`), where an empty string would read as a state.
+//
+// ToolsMissing is the SECOND, independent tools question, and the pair is the
+// point: Tools answers "did the last install or reconcile succeed, or are we
+// still booting" — which is what keeps a long first-boot install from flapping
+// monitoring — while ToolsMissing answers "is the tree actually converged". They
+// disagree legitimately: repairing one of two missing tools through the loopback
+// tools API makes Tools "ok" (the repair DID succeed, exactly as README
+// documents) while ToolsMissing stays 1. Before this field existed that
+// disagreement had nowhere to live, so "ok" was readable as whole-tree health.
+//
+// A POINTER so the field is absent rather than 0 when the count is unknown — no
+// engine wired, or the first recount has not landed. Zero means converged, and
+// it must not be possible to read "not known yet" as that.
+//
+// FIELD ORDER IS THE WIRE CONTRACT, which is why fieldalignment is silenced here
+// rather than obeyed. encoding/json emits fields in DECLARATION order, so the
+// alignment-optimal layout (the pointer first) emits
+// {"tools_missing":…,"status":…} and breaks the key order this app shares with
+// web-terminal-server and subflux — the very divergence this struct exists to
+// remove. Attempted, and TestHealthEndpoint_envelopeMatchesTheLibrary caught it
+// byte-exactly. The trade is 8 bytes of padding on a value built once per health
+// request against a published envelope; the padding loses.
+//
+//nolint:govet // fieldalignment: declaration order is the JSON key order (above)
 type healthBody struct {
-	Status string `json:"status"`
-	Reason string `json:"reason,omitempty"`
-	Tools  string `json:"tools,omitempty"`
+	Status       string `json:"status"`
+	Reason       string `json:"reason,omitempty"`
+	Tools        string `json:"tools,omitempty"`
+	ToolsMissing *int   `json:"tools_missing,omitempty"`
 }
 
 // handleHealth returns the /api/health readiness handler. It reflects, in
@@ -468,6 +556,9 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	healthResponse := func(status, reason string) healthBody {
 		body := healthBody{Status: status, Reason: reason}
 		body.Tools = deps.toolsState()
+		if n, ok := deps.toolsMissing(); ok {
+			body.ToolsMissing = &n
+		}
 		return body
 	}
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -475,12 +566,12 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 		// contract wherever it is mounted: a readiness verdict must never be
 		// cached (a 200 with no explicit freshness is heuristically cacheable
 		// under RFC 9111, and a cached "ok" keeps traffic arriving at an instance
-		// that has begun draining). This is now the only thing setting it — the
-		// app's /api/-wide no-store middleware is gone, narrowed to the engine's
-		// session surface (see main.go's sessionNoStore) once every other route
-		// owner covered itself, which is exactly the independence this line
-		// already had. The same header comes from webhttp.ReadinessHandler for
-		// the apps that use it directly.
+		// that has begun draining). This is the only thing setting it on THIS
+		// route — the app carries no no-store middleware at all now that every
+		// route owner covers itself (the engine's session surface included, via
+		// terminal.MountSessionRoutes' withNoStore), which is exactly the
+		// independence this line already had. The same header comes from
+		// webhttp.ReadinessHandler for the apps that use it directly.
 		w.Header().Set("Cache-Control", "no-store")
 		unready := func(reason string) {
 			webhttp.WriteJSONStatus(w, http.StatusServiceUnavailable, healthResponse("unready", reason))
@@ -530,7 +621,7 @@ const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab sta
 // Deliberately does NOT contain unrecognizedNotifyMsg as a substring: these are two
 // different events and a log search (or a test) matching on one must not also match
 // the other.
-const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set KWEB_LOG_LEVEL=debug)"
+const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set WT_LOG_LEVEL=debug)"
 
 // recognizedNotifyMsg is the POSITIVE half of the classifier trace. Without it
 // the classifier is observable only when it fails to match, so a debug session
@@ -563,8 +654,8 @@ const unrecognizedNotifyCapRearm = 6 * time.Hour
 // unrecognizedNotifyHint is the operator-facing next step both Warn arms carry:
 // what to re-verify after a kiro-cli bump, and the two levers that surface the
 // notification's actual TEXT (raising the level alone is no longer enough —
-// KWEB_LOG_OSC_TEXT is the deliberate confidentiality opt-in).
-const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set KWEB_LOG_OSC_TEXT=true with KWEB_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
+// WT_LOG_OSC_TEXT is the deliberate confidentiality opt-in).
+const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set WT_LOG_OSC_TEXT=true with WT_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
 
 // notifyFingerprintHexDigits bounds the fingerprint written in place of the
 // notification text. 16 hex digits (64 bits of HMAC-SHA-256) is far more than
@@ -605,55 +696,40 @@ const notifyFingerprintKeyBytes = 32
 // lifetime is the classifier INSTANCE (one per process in production), so
 // fingerprints correlate across the Warn and Debug records of one run and
 // deliberately do NOT correlate across restarts; recovering the text itself is
-// a deliberate two-lever opt-in (KWEB_LOG_OSC_TEXT plus KWEB_LOG_LEVEL=debug),
+// a deliberate two-lever opt-in (WT_LOG_OSC_TEXT plus WT_LOG_LEVEL=debug),
 // not a side effect of raising the log level.
-//
-// A zero-value notifyFingerprinter (no key) is the FAIL-CLOSED state: it
-// produces no identifier at all rather than a predictable one, so a keying
-// failure costs the correlation hint and never the confidentiality property.
 type notifyFingerprinter struct {
 	key []byte
 }
 
-// newNotifyFingerprinter draws the per-classifier key. crypto/rand.Read does
-// not report failure on any supported platform (Go 1.24+ panics instead of
-// returning an error), so the error arm is a floor rather than a reachable
-// path: it exists so that a future or alternate source degrades to omitting the
-// identifier instead of silently keying every fingerprint with zeros.
+// newNotifyFingerprinter draws the per-classifier key. crypto/rand.Read never
+// returns an error: it calls io.ReadFull on Reader and crashes the program
+// irrecoverably if the OS source fails, so there is no keyless state to degrade
+// into and the identifier is always present.
 func newNotifyFingerprinter() notifyFingerprinter {
 	key := make([]byte, notifyFingerprintKeyBytes)
-	if _, err := rand.Read(key); err != nil {
-		slog.Warn("notification fingerprint key unavailable; unrecognized-notification records will carry a rune count only (a predictable fingerprint would be a guessable copy of arbitrary child output)",
-			"error", err)
-		return notifyFingerprinter{}
-	}
+	_, _ = rand.Read(key) // documented never to fail; it crashes the process instead
 	return notifyFingerprinter{key: key}
 }
 
 // fingerprint returns the leading notifyFingerprintHexDigits hex digits of
-// HMAC-SHA-256(key, msg), and false when this fingerprinter holds no key (see
-// the type's fail-closed note).
-func (f notifyFingerprinter) fingerprint(msg string) (string, bool) {
-	if len(f.key) == 0 {
-		return "", false
-	}
+// HMAC-SHA-256(key, msg).
+func (f notifyFingerprinter) fingerprint(msg string) string {
 	mac := hmac.New(sha256.New, f.key)
 	// hash.Hash.Write is documented never to return an error.
 	_, _ = mac.Write([]byte(msg))
-	return hex.EncodeToString(mac.Sum(nil))[:notifyFingerprintHexDigits], true
+	return hex.EncodeToString(mac.Sum(nil))[:notifyFingerprintHexDigits]
 }
 
 // metadata is the content-free description of a notification both the Warn arm
 // and the default (text-disabled) Debug arm log: which distinct wording it was,
-// and how long it was. The fingerprint attribute is omitted entirely when
-// keying failed; the rune count is always present, so a record never degrades
-// to "something unrecognized happened, no detail at all".
+// and how long it was. Both attributes are always present, so a record never
+// degrades to "something unrecognized happened, no detail at all".
 func (f notifyFingerprinter) metadata(msg string) []any {
-	attrs := make([]any, 0, 4)
-	if fp, ok := f.fingerprint(msg); ok {
-		attrs = append(attrs, "message_fingerprint", fp)
+	return []any{
+		"message_fingerprint", f.fingerprint(msg),
+		"message_runes", utf8.RuneCountInString(msg),
 	}
-	return append(attrs, "message_runes", utf8.RuneCountInString(msg))
 }
 
 // notifyWarningState is newStatusClassifier's bounded warn budget for
@@ -697,7 +773,10 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 	// time leaves a LATER kiro-cli rewording -- the drift this Warn exists to catch
 	// -- with no default-level record at all. The set still never grows past the
 	// cap, and log volume is still bounded (one line per window).
-	if !s.lastCapWarn.IsZero() && time.Since(s.lastCapWarn) < unrecognizedNotifyCapRearm {
+	// The zero value needs no carve-out: time.Since saturates to the maximum
+	// Duration for it, so this comparison is already false and the FIRST
+	// turned-away message announces.
+	if time.Since(s.lastCapWarn) < unrecognizedNotifyCapRearm {
 		return false, false
 	}
 	s.lastCapWarn = time.Now()
@@ -709,7 +788,7 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // with its own bounded warn latch: the first occurrence of each DISTINCT
 // unrecognized notification is promoted to Warn (up to unrecognizedNotifyCap),
 // so a kiro-cli notification-wording drift is visible in the DEFAULT (info) log
-// stream instead of only under KWEB_LOG_LEVEL=debug, while the Debug trace still
+// stream instead of only under WT_LOG_LEVEL=debug, while the Debug trace still
 // records every occurrence — a build that legitimately emits some other
 // notification cannot flood the shipped stream.
 //
@@ -746,7 +825,7 @@ func (s *notifyWarningState) observe(msg string) (warnFirst, warnCapped bool) {
 // engine stays generic (a plain shell server sets no classifier and derives
 // working/idle from output activity).
 //
-// logText is the KWEB_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
+// logText is the WT_LOG_OSC_TEXT opt-in (default false) and governs ONE thing:
 // whether an UNRECOGNIZED notification's TEXT may be logged at all. Off, every
 // unrecognized-arm record is content-free metadata (see notifyFingerprinter);
 // on, the Debug arm — and only the Debug arm — carries the full sanitized text,
@@ -773,7 +852,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			// silently stop latching. The first occurrence of each DISTINCT message
 			// warns (visible at the default info level, up to unrecognizedNotifyCap
 			// distinct strings); the Debug line records every occurrence, so
-			// KWEB_LOG_LEVEL=debug is what shows the full set after a version bump.
+			// WT_LOG_LEVEL=debug is what shows the full set after a version bump.
 			//
 			// Neither record carries the notification TEXT by default, and the Warn
 			// never does. The text is arbitrary child output: the engine's
@@ -788,7 +867,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 			// the distinct wordings apart and correlate repeats within this
 			// process, carrying none of the content and offering no offline
 			// guessing oracle. Recovering the text is the explicit
-			// KWEB_LOG_OSC_TEXT opt-in below, at Debug only.
+			// WT_LOG_OSC_TEXT opt-in below, at Debug only.
 			//
 			// Decide under the lock, log outside it: slog handlers can block on I/O and
 			// this runs on every session's event goroutine, so holding the mutex across
@@ -812,7 +891,7 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 						"distinct_limit", unrecognizedNotifyCap,
 						"hint", unrecognizedNotifyHint)...)
 			}
-			// ONE Debug record either way; the KWEB_LOG_OSC_TEXT opt-in only ADDS
+			// ONE Debug record either way; the WT_LOG_OSC_TEXT opt-in only ADDS
 			// the text. Whoever set BOTH it and the debug level accepted (and was
 			// warned at startup) that terminal notification text may contain
 			// secrets. The metadata rides along rather than being replaced: the
@@ -833,13 +912,13 @@ func newStatusClassifier(logText bool) func(string) (string, bool) {
 // webhttp.StaticHandler (which supplies the ETag/gzip mechanism; asset paths
 // arrive normalized, no leading slash):
 //   - fonts (vendor/fonts/**): public, 30 days, NOT immutable. The Monaspace
-//     .otf files are large (~2.4 MB each, ~9.4 MB total) and their glyphs are
-//     fixed for a given vendored web-terminal-ui version, so a long max-age
+//     .woff2 files are sizable (~1.3 MB each, ~5.1 MB total) and their glyphs
+//     are fixed for a given vendored web-terminal-ui version, so a long max-age
 //     keeps an ordinary navigation from re-requesting them at all. `immutable`
 //     is deliberately absent: the filenames are NOT content-addressed and this
 //     app cannot make them so (the four @font-face URLs come from the vendored
-//     UI's page.css, and Dockerfile's NERDFONT_VERSION step extracts the same
-//     fixed names), so the bytes DO change under one filename on a nerd-fonts
+//     UI's page.css, and Dockerfile's MONASPACE_VERSION step fetches the same
+//     fixed names), so the bytes DO change under one filename on a Monaspace
 //     bump. Without `immutable` a reload revalidates against the helper's
 //     content-hash ETag — a ~200-byte 304 when nothing changed, the new face
 //     when it did — which is the operator's and the user's only lever after a
@@ -892,7 +971,7 @@ const cspTemplate = "default-src 'self'; " +
 // the bootstrap watchdog (the script-load-failure alertdialog) — both hashed;
 // the external /app.js module is covered by script-src 'self'.
 //
-// FAIL LOUD: a malformed build — a nil FS, an unreadable index.html, zero
+// FAIL LOUD: a malformed build — an unreadable index.html, zero
 // inline scripts, or anything other than exactly one <style> block — aborts
 // startup rather than silently dropping the script-src or style-src hardening,
 // or serving a hash set that would block the importmap and break ES module
@@ -901,9 +980,6 @@ const cspTemplate = "default-src 'self'; " +
 // The one-block assertion stays HERE rather than in the library: "exactly one"
 // is this app's contract about its own page, not a property of style hashing.
 func buildCSPPolicy(sub fs.FS) (string, error) {
-	if sub == nil {
-		return "", errors.New("buildCSPPolicy: nil static FS")
-	}
 	html, err := fs.ReadFile(sub, "index.html")
 	if err != nil {
 		return "", fmt.Errorf("buildCSPPolicy: read index.html: %w", err)
@@ -960,52 +1036,28 @@ func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, st
 	}
 }
 
-// proxyProvenanceHeaders are the headers a request acquires by travelling
-// through a browser or a reverse proxy. The loopback gate's consumer is an
-// in-container CLI client, which sends none of them, so their presence is
-// positive evidence that this request did NOT originate inside the container
-// even when the socket peer and Host both canonicalize to loopback (a proxy
-// sharing the loopback interface with the server — host networking, a shared
-// network namespace — rewrites Host to its upstream address by default in
-// nginx and Apache, which satisfies webhttp.LoopbackRequest's Host leg).
-var proxyProvenanceHeaders = []string{
-	"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
-	"X-Real-Ip", "Sec-Fetch-Site", "Origin",
-}
-
-// proxiedOrigin reports whether h carries any evidence the request was
-// forwarded by a proxy or issued by a browser.
-func proxiedOrigin(h http.Header) bool {
-	for _, name := range proxyProvenanceHeaders {
-		if h.Get(name) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// loopbackOnly admits only requests whose SOCKET PEER *and* Host header are
-// both loopback, and which carry no proxy/browser provenance header. The
-// two-legged loopback test is webhttp.LoopbackRequest — the shared conjunction
-// the library exports, which reads only RemoteAddr and Host and fails closed on
-// either being unparseable; the provenance refusal stays THIS app's policy,
-// composed on top as an additional deny. Forwarded headers are never TRUSTED —
-// they can only refuse, never admit — and this gate is the guarded surface's
-// only boundary on an otherwise-unauthenticated port.
-// In-container consumers (kiro-cli's ! escape hitting curl localhost:9848) pass;
-// everything routed in from outside — LAN browsers, the reverse proxy — is
-// refused, as is a DNS-rebound page whose loopback socket peer carries an
-// attacker Host, and a same-loopback proxy that rewrites Host to its upstream
-// address (nginx's and Apache's defaults) and so satisfies both loopback legs.
-func loopbackOnly(surface string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !webhttp.LoopbackRequest(r) || proxiedOrigin(r.Header) {
-			webhttp.WriteError(w, r, http.StatusForbidden, "",
-				surface+" is loopback-only; call it from inside the container (curl localhost:9848)")
-			return
-		}
-		next.ServeHTTP(w, r)
+// loopbackOnly admits only requests whose SOCKET PEER and Host header are both
+// loopback and which carry no proxy/browser provenance header, and is now a thin
+// naming wrapper over webhttp.LoopbackOnly.
+//
+// The whole decision moved into the library (webhttp >= v1.23.0): the two-legged
+// predicate, the seven-header provenance deny this app used to own, and the
+// reasoning for both. What stays here is only what is genuinely this app's — the
+// refusal wording, which names the guarded surface and the deployment's own
+// listen hint, because the 403 is the whole of what a refused caller is told and
+// must not name a port the operator moved away from.
+//
+// It moved because webhttp's own rule said when it should: bindclass.go names the
+// reopen conditions as "a second peer-gating consumer appears or the app/library
+// copies are ever found diverging", and both had happened — vibekit gates the
+// same way with NO provenance deny, on the hook that spawns processes. That gap
+// closes on its bump.
+func loopbackOnly(surface, hint string, next http.Handler) http.Handler {
+	refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhttp.WriteError(w, r, http.StatusForbidden, "",
+			surface+" is loopback-only; call it from inside the container (curl "+hint+")")
 	})
+	return webhttp.LoopbackOnly(refuse)(next)
 }
 
 // sessionCostInterval is how often a contained session logs what it is currently

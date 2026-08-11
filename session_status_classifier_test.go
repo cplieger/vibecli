@@ -61,7 +61,7 @@ func TestStatusClassifierWiredIntoManager(t *testing.T) {
 // occurrence of each DISTINCT unknown notification is promoted to Warn so a
 // kiro-cli wording drift is visible at the default info level, a REPEAT of a
 // message already warned about is not, and EVERY occurrence stays recorded at
-// Debug for KWEB_LOG_LEVEL=debug. Without this test, deleting the Warn block,
+// Debug for WT_LOG_LEVEL=debug. Without this test, deleting the Warn block,
 // warning on every occurrence (log flooding), or deleting the Debug trace all
 // leave the suite green.
 //
@@ -110,7 +110,7 @@ func TestClassifyStatus_unrecognizedNotificationLogsBoundedWarning(t *testing.T)
 // half of the classifier trace. The unrecognized arm's Warn/Debug pair answers
 // "a wording this app does not recognize appeared"; nothing answered "a wording
 // it DOES recognize appeared", so an operator running the documented
-// KWEB_LOG_LEVEL=debug step after the tab status dots stop latching saw an empty
+// WT_LOG_LEVEL=debug step after the tab status dots stop latching saw an empty
 // classifier trace with two incompatible meanings: kiro-cli emitted no OSC 9
 // notification at all (its notifier's focus gate, the engine's DEC 1004
 // unfocused pin, or kiro-cli dropping the TERM_PROGRAM identity from its OSC
@@ -243,14 +243,14 @@ func TestClassifyStatus_unrecognizedNotificationCapsDistinctWarnings(t *testing.
 // any program in the terminal can emit `ESC ] 9 ; <text>` — and the engine's
 // sanitization redacts nothing, so that text can carry a token or a device
 // code. A bounded excerpt used to stand in for redaction and did not redact (a
-// short secret fits inside any excerpt), so with KWEB_LOG_OSC_TEXT off NEITHER
+// short secret fits inside any excerpt), so with WT_LOG_OSC_TEXT off NEITHER
 // record may carry the text: the Warn and the Debug both get a content-free
 // fingerprint plus a rune count. Without this test, restoring an excerpt — or
-// putting the text back on the Debug record that KWEB_LOG_LEVEL=debug is
+// putting the text back on the Debug record that WT_LOG_LEVEL=debug is
 // routinely recommended for — leaves the suite green while re-creating a durable
 // credential copy in the log store.
 //
-// INTEGRITY (the opt-in path): with KWEB_LOG_OSC_TEXT on, the Debug record does
+// INTEGRITY (the opt-in path): with WT_LOG_OSC_TEXT on, the Debug record does
 // carry the full text, and its only forging defence is the engine's capture-time
 // sanitization (runesafe drops C0/DEL, C1, Bidi controls and U+2028/29, and
 // rune-caps the text). That justification is an assumption about a
@@ -350,7 +350,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 						got := a.Value.String()
 						switch {
 						case strings.Contains(got, "evilwording"):
-							t.Errorf("%s record attr %q = %q carries the notification text with KWEB_LOG_OSC_TEXT off; arbitrary child output may be a token or a device code, and the log store outlives and out-queries the PTY scrollback", r.Level, a.Key, got)
+							t.Errorf("%s record attr %q = %q carries the notification text with WT_LOG_OSC_TEXT off; arbitrary child output may be a token or a device code, and the log store outlives and out-queries the PTY scrollback", r.Level, a.Key, got)
 						case strings.Contains(got, unsafeRune):
 							t.Errorf("%s record attr %q = %q carries U+202E; the engine must sanitize notification text before the classifier sees it", r.Level, a.Key, got)
 						}
@@ -361,7 +361,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 				// lands: the 11-rune "evilwording" needle above misses a short
 				// prefix, and a device code fits in 9 characters.
 				if logContains(records, "evil") {
-					t.Errorf("log = %q carries a prefix of the notification text with KWEB_LOG_OSC_TEXT off; "+
+					t.Errorf("log = %q carries a prefix of the notification text with WT_LOG_OSC_TEXT off; "+
 						"arbitrary child output may be a token or a device code", records.Messages())
 				}
 				assertAttrSchema(t, records, slog.LevelWarn, unrecognizedNotifyMsg, map[string]attrCheck{
@@ -385,7 +385,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 	t.Run("opt-in logs the sanitized full text at debug only", func(t *testing.T) {
 		records := capture.Default(t)
 		deps := newTestDeps(true)
-		deps.logOSCText = true // KWEB_LOG_OSC_TEXT=true
+		deps.logOSCText = true // WT_LOG_OSC_TEXT=true
 		deps.cmd = staticCmd("/bin/sh", "-c", `printf '\033]9;`+emitted+`\a'; exec cat`)
 		mustStartSession(t, deps)
 
@@ -395,7 +395,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 			_, _, haveWarn := attrOf(records, slog.LevelWarn, "message_fingerprint")
 			if haveDebug && haveWarn {
 				if !haveText {
-					t.Fatalf("Debug record carries no message attr with KWEB_LOG_OSC_TEXT on; the opt-in exists to make the text recoverable after a kiro-cli wording bump; log = %q", records.Messages())
+					t.Fatalf("Debug record carries no message attr with WT_LOG_OSC_TEXT on; the opt-in exists to make the text recoverable after a kiro-cli wording bump; log = %q", records.Messages())
 				}
 				// The opt-in ADDS the text; it does not trade the correlation key
 				// away for it. The Warn is what sends an operator here, and with a
@@ -406,7 +406,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 				warnFP, haveWarnFP, _ := attrOf(records, slog.LevelWarn, "message_fingerprint")
 				debugFP, haveDebugFP, _ := attrOf(records, slog.LevelDebug, "message_fingerprint")
 				if !haveDebugFP {
-					t.Errorf("Debug record carries no message_fingerprint with KWEB_LOG_OSC_TEXT on; the opt-in must ADD the text to the default record, not replace the key that pairs it with its Warn")
+					t.Errorf("Debug record carries no message_fingerprint with WT_LOG_OSC_TEXT on; the opt-in must ADD the text to the default record, not replace the key that pairs it with its Warn")
 				} else if haveWarnFP && warnFP != debugFP {
 					t.Errorf("Warn message_fingerprint = %q but Debug = %q; one classifier instance must stamp both records identically or an operator cannot pair them", warnFP, debugFP)
 				}
@@ -421,7 +421,7 @@ func TestClassifyStatus_notificationTextLogging(t *testing.T) {
 				// The opt-in widens Debug ONLY. The always-on stream stays
 				// content-free whatever the switch says.
 				if warnText, haveWarnText, _ := attrOf(records, slog.LevelWarn, "message"); haveWarnText {
-					t.Errorf("Warn record carries a message attr (%q) with KWEB_LOG_OSC_TEXT on; notification content must never reach the default stream, which is what makes the opt-in bounded", warnText)
+					t.Errorf("Warn record carries a message attr (%q) with WT_LOG_OSC_TEXT on; notification content must never reach the default stream, which is what makes the opt-in bounded", warnText)
 				}
 				for _, r := range records.Records() {
 					if r.Level != slog.LevelWarn || !strings.Contains(r.Message, unrecognizedNotifyMsg) {

@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/cplieger/toolbelt/v2"
 )
 
 // FuzzSessionCommandNeverSplices generalizes the ONE property that makes the
@@ -51,6 +53,27 @@ func FuzzSessionCommandNeverSplices(f *testing.F) {
 		}
 		if argv[4] != arg || argv[5] != arg {
 			t.Errorf("chat args = %q, want %q twice, verbatim", argv[4:], arg)
+		}
+	})
+}
+
+// FuzzParseCatalogRefreshIsOutcomeTransparent asserts the outcome-transparency
+// invariant over arbitrary bytes, so a vocabulary change upstream is caught even
+// for a spelling no hand-written case anticipated. The unit-test twin and the
+// full rationale for the invariant (the settled catalog-refresh redaction
+// decision) live beside TestParseCatalogRefreshIsOutcomeTransparent in
+// main_test.go.
+func FuzzParseCatalogRefreshIsOutcomeTransparent(f *testing.F) {
+	for _, seed := range []string{
+		"", "off", "disabled", "24h", "24H", "0", "0s", "-5m", "5min", "abc",
+		" 90m ", "OFF", "1h30m", "\x00", "1e3s",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw string) {
+		want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+		if got := parseCatalogRefresh(raw); got != want {
+			t.Fatalf("parseCatalogRefresh(%q) = %v, library returns %v — outcome divergence", raw, got, want)
 		}
 	})
 }

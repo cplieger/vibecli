@@ -15,6 +15,21 @@
     <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
     <link rel="manifest" href="/manifest.json">
+    <!-- The terminal's FIRST FRAME is gated on this font, so its fetch is on the
+         critical path to the loading overlay coming down: createTerminal awaits
+         document.fonts.load('14px "Monaspace Neon NF"'), maybeSendFirstResize()
+         refuses to send the initial resize until that resolves, the server sizes
+         the screen from that resize, and markReady() dismisses the overlay only
+         on the resulting first screen frame (web-terminal-ui
+         src/kernel/kernel.ts). Nothing requests the font earlier: the @font-face
+         in page.css is never render-triggered (no text is laid out in it before
+         the terminal builds), so without this hint the fetch cannot start until
+         /app.js AND its whole vendored module graph have downloaded and
+         evaluated. Only the 400/normal face is awaited, so only that file is
+         hinted. `crossorigin` is mandatory even same-origin: font requests are
+         CORS-mode, and a preload without it fills a separate cache entry and
+         downloads the file twice. -->
+    <link rel="preload" href="/vendor/fonts/MonaspaceNeonNF-Regular.woff2" as="font" type="font/woff2" crossorigin>
     <link rel="stylesheet" href="/style.css">
     <!-- [html-validate-disable-next no-style-tag -- critical CSS for instant loading indicator] -->
     <style>
@@ -46,7 +61,13 @@
         z-index: 200;
         display: flex;
         background: #000;
-        color: var(--wt-loading-accent);
+        /* The library's own panel (web-terminal-ui css/10-primitives.css
+           .wt-fatal) puts near-white --text on the copy and reserves --accent for
+           the Reload action. This is that token's value restated as a literal,
+           because .wt-root does not exist when the terminal failed to build.
+           Colouring every element with the accent left the dialog with no
+           hierarchy and no visibly primary action. */
+        color: oklch(90% 0.005 280deg);
         flex-direction: column;
         align-items: center;
         /* Keep the ONLY recovery affordance reachable. This is a fixed
@@ -88,18 +109,22 @@
          rather than document structure. */
       #loading[role="alertdialog"] h2 {
         margin: 0;
-        font-size: 1.125rem;
+        /* .wt-fatal-title's scale and leading (10-primitives.css). */
+        font-size: clamp(1.25rem, 5vi, 1.5rem);
         font-weight: 600;
-        line-height: 1.3;
+        line-height: 1.2;
       }
       #loading[role="alertdialog"] button {
         min-inline-size: 2.75rem;
         min-block-size: 2.75rem;
         padding-inline: 1rem;
-        border: 1px solid currentcolor;
+        border: 1px solid transparent;
         border-radius: 0.5rem;
-        background: color-mix(in oklch, currentcolor 16%, transparent);
-        color: inherit;
+        /* Filled accent, like .wt-fatal-reload: the only action on the screen is
+           the only accent-coloured element. Dark ink on the accent measures
+           9.2:1 (#000 on #c099ff), well over WCAG 1.4.3 AA. */
+        background: var(--wt-loading-accent);
+        color: #000;
         font: inherit;
         font-weight: 600;
         cursor: pointer;
@@ -116,7 +141,10 @@
          is a dead end: the extra ring can only ever appear on a click of Reload
          itself. */
       #loading[role="alertdialog"] button:focus {
-        outline: 2px solid currentcolor;
+        /* NOT currentcolor: the filled button's ink is #000 and outline-offset
+           puts the ring on the black page background, where black is invisible
+           (WCAG 1.4.11). The accent measures 9.2:1 against #000. */
+        outline: 2px solid var(--wt-loading-accent);
         outline-offset: 3px;
       }
       /* Hover gated on ANY-hover, never (hover: hover): `hover` reports only the
@@ -128,11 +156,12 @@
          Press feedback on touch comes from :active either way. */
       @media (any-hover: hover) {
         #loading[role="alertdialog"] button:hover {
-          background: color-mix(in oklch, currentcolor 28%, transparent);
+          background: color-mix(in oklch, var(--wt-loading-accent), #fff 12%);
         }
       }
       #loading[role="alertdialog"] button:active {
-        background: color-mix(in oklch, currentcolor 36%, transparent);
+        background: color-mix(in oklch, var(--wt-loading-accent), #000 12%);
+        transform: translateY(1px);
       }
       #loading[role="alertdialog"] p {
         margin: 0;
@@ -146,7 +175,11 @@
            one edge-to-edge line on any desktop window. The flex column already
            centres the block, so the cap alone places it. */
         max-inline-size: 34rem;
+        /* .wt-fatal-message's size and 20%-transparent tone, so the diagnostic
+           sentence sits under the title rather than beside it in weight. */
+        font-size: 0.9375rem;
         line-height: 1.5;
+        color: color-mix(in oklch, currentcolor, transparent 20%);
       }
       /* The document <h1>'s permanent off-screen hide (a body-level sibling no
          builder clears). Same technique web-terminal-ui's kernel announcer uses
@@ -254,17 +287,17 @@
         "error",
         (e) => {
           const overlay = document.getElementById("loading");
-          // Only while the pre-JS overlay is still pristine (bar present, no
-          // alert yet, and no fade-out started): after boot the kernel removes
-          // the overlay on transitionend, but between the first frame's
-          // fade-out and that removal the bar is still a child, so a stray
-          // uncaught runtime error in that window would otherwise convert a
-          // BOOTED terminal's invisible (opacity:0, pointer-events:none)
-          // overlay into a focus-stealing alertdialog.
+          // Three of the four stand-down states -- the fourth, a booted
+          // #terminal, is checked separately below: no overlay at
+          // all (after boot the kernel removes it on transitionend), an overlay
+          // this watchdog already claimed through data-bootstrap-fatal, or one
+          // the kernel has started fading out -- between the first frame's
+          // fade-out and that removal a stray uncaught runtime error would
+          // otherwise convert a BOOTED terminal's invisible (opacity:0,
+          // pointer-events:none) overlay into a focus-stealing alertdialog.
           if (
             !overlay ||
             overlay.hasAttribute("data-bootstrap-fatal") ||
-            !overlay.querySelector(".wt-loading-bar") ||
             overlay.classList.contains("fade")
           )
             return;
@@ -285,7 +318,17 @@
           // icon/manifest links 404 in the wild and must NOT raise the dialog.
           const failedStylesheet =
             e.target instanceof HTMLLinkElement && e.target.rel === "stylesheet";
-          if (!(e.target instanceof HTMLScriptElement) && !failedStylesheet && !e.error)
+          // Classify by event SHAPE, not by the thrown value's truthiness: a
+          // module may legally `throw null` (or undefined/false/0/""), and the
+          // window error event still reports a real module-evaluation failure.
+          // Testing e.error for truthiness would stand down on those and leave
+          // the user behind a pristine, infinitely animating loading overlay.
+          const runtimeError = "error" in e;
+          if (
+            !(e.target instanceof HTMLScriptElement) &&
+            !failedStylesheet &&
+            !runtimeError
+          )
             return;
           // alertdialog, not alert: the overlay carries an interactive Reload
           // button and moves focus into it, the alertdialog interaction model

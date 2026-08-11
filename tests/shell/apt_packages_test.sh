@@ -44,6 +44,7 @@ if [ ! -s "$WORK/block.sh" ] || ! bash -n "$WORK/block.sh" 2>/dev/null; then
   printf 'harness error: the extracted APT_PACKAGES block is empty or does not parse\n' >&2
   exit 1
 fi
+extract_function logfmt_value "$WORK/logfmt.sh" >/dev/null
 extract_function warn_skipped_apt_token "$WORK/warn.sh" >/dev/null
 
 # RUN_CWD lets a case choose the directory the harness runs FROM. Empty means "here":
@@ -159,6 +160,7 @@ rm() {
   esac
   command rm "\$@"
 }
+$(cat "$WORK/logfmt.sh")
 $(cat "$WORK/warn.sh")
 $(cat "$WORK/block.sh")
 HARNESS
@@ -174,6 +176,7 @@ HARNESS
   INSTALLED=$(tr '\n' ' ' <"$WORK/installed" | sed 's/ *$//')
   INSTALL_CALLS=$(grep -c 'install-call' "$WORK/calls" 2>/dev/null || true)
   DPKG_CONFIGURE_CALLS=$(grep -c 'dpkg-configure' "$WORK/calls" 2>/dev/null || true)
+  RECLAIM_CALLS=$(grep -c 'apt-lists-reclaim' "$WORK/calls" 2>/dev/null || true)
 }
 
 # warn_for <token> -> the warn line that named exactly this token (empty if none)
@@ -366,5 +369,30 @@ run 0 ok 'jq'
 [ "$DPKG_CONFIGURE_CALLS" -eq 0 ] && [ "$INSTALLED" = "jq" ] \
   && ok "healthy dpkg: no audit output, no journal, no reconfigure" \
   || no "dpkg recovery false positive" "configure_calls=$DPKG_CONFIGURE_CALLS installed='$INSTALLED', want 0 / 'jq'"
+
+# --- the index reclaim keys on ATTEMPTED, not succeeded -----------------------
+# The condition is `[ -n "${apt_update_rc:-}" ]`, and its whole point is the
+# non-zero case: a PARTIAL refresh writes the index files and returns non-zero, so
+# rc=0 kept ~21 MB of Debian indexes in the container layer on exactly the boots
+# this file spends most of its cases on. Every `run 100` case above drives that
+# branch and the harness has recorded the reclaim since it was written, so the
+# assertion costs one line and nothing else can see the branch: reverting the
+# condition to `-eq 0` leaves all 152 assertions green.
+run 0 ok 'jq'
+[ "$RECLAIM_CALLS" -eq 1 ] \
+  && ok "successful update: the indexes are reclaimed" \
+  || no "reclaim on rc=0" "reclaim_calls=$RECLAIM_CALLS, want 1"
+run 100 ok 'jq'
+[ "$RECLAIM_CALLS" -eq 1 ] \
+  && ok "partial refresh (non-zero rc, index written): the indexes are still reclaimed" \
+  || no "reclaim on rc!=0" "reclaim_calls=$RECLAIM_CALLS, want 1"
+# The load-bearing negative, and the case the condition's own comment names: with
+# every token grammar-invalid the update block never runs, apt_update_rc is UNSET,
+# and there is nothing to delete. A condition of `[ -n "${apt_update_rc-x}" ]`, or
+# a plain unconditional `rm -rf`, passes both cases above and fails here.
+run 0 ok '-0day ../etc/passwd'
+[ "$RECLAIM_CALLS" -eq 0 ] && [ -z "$INSTALLED" ] \
+  && ok "no valid token: update never ran, so nothing is reclaimed" \
+  || no "reclaim with update unrun" "reclaim_calls=$RECLAIM_CALLS installed='$INSTALLED', want 0 / ''"
 
 report

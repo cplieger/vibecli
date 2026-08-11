@@ -83,17 +83,28 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Nerd Font. kiro-cli's diff UI uses nerd-font private-use-area
 # glyphs (line markers, file-type icons). System monospace fonts
 # don't carry these, so they render as tofu (black squares) in
-# the terminal display. Bundling one Mono-width Nerd Font + serving
-# it via @font-face fixes that. The four MonaspiceNe Nerd Font Mono
-# faces grow the web-terminal-kiro binary via go:embed and ship gzipped
-# over the wire.
-# renovate: datasource=github-releases depName=ryanoasis/nerd-fonts
-ARG NERDFONT_VERSION=v3.5.0
-# sha256 of Monaspace.tar.xz for this tag. GitHub release assets are MUTABLE (a
-# retag can swap the bytes under a fixed tag), so this gate is the real
-# integrity anchor here.
-# repin: dep=ryanoasis/nerd-fonts url=https://github.com/ryanoasis/nerd-fonts/releases/download/{version}/Monaspace.tar.xz
-ARG NERDFONT_SHA256=bc34fd1998deee7105573e4604ca3fc3d568c1549fc6035c53981eba4160c0dc
+# the terminal display. Bundling one cell-width-icon Nerd Font +
+# serving it via @font-face fixes that. The four Monaspace Neon NF
+# WOFF2 faces come from GitHub's own Monaspace repo, which publishes
+# official nerd-fonts-patched webfonts (the nerd-fonts release repo is
+# OTF-only); WOFF2 halves the served bytes (~5.1 MB vs ~10.9 MB), and
+# the swap was gated on a metrics check: outlines and every PUA icon
+# advance are identical to the previously bundled MonaspiceNe NFM OTFs
+# (icons stay exactly one cell). The faces grow the web-terminal-kiro
+# binary via go:embed and ship pre-compressed over the wire.
+# renovate: datasource=github-releases depName=githubnext/monaspace
+ARG MONASPACE_VERSION=v1.400
+# sha256 per face for this tag. Raw files at a git tag are as mutable as
+# GitHub release assets (a force-pushed tag swaps the bytes under a fixed
+# ref), so these gates are the real integrity anchor here.
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Regular.woff2
+ARG MONASPACE_REGULAR_SHA256=8063ea45b6997c658035a4d876f996ecfa306c88fd0541d35d533fb1f9400c84
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Bold.woff2
+ARG MONASPACE_BOLD_SHA256=45f56dceff8e569d61b6e3168fe208432e7bf0bc3e56e41b4d754cc575a063bd
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-Italic.woff2
+ARG MONASPACE_ITALIC_SHA256=3d77eb9a5ec9e32c5ac7ea49c4325e5d6c8e5fefda7317527de905130a88f3cf
+# repin: dep=githubnext/monaspace url=https://raw.githubusercontent.com/githubnext/monaspace/{version}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-BoldItalic.woff2
+ARG MONASPACE_BOLDITALIC_SHA256=5dffc9465be18eb63263671f1f3ba266ede49043cb6b3edcd65ea993c909b3aa
 
 WORKDIR /build
 COPY go.mod go.sum ./
@@ -149,7 +160,12 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # fail-closing every image build on the gate below.
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
 ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.8
-# hadolint ignore=DL3062
+# No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
+# already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
+# (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
+# only silence DL3062 if the `@${...}` suffix were ever dropped, which is the one case on
+# this instruction worth failing the build for -- same reasoning as the wirecheck step
+# below.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
     : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
@@ -161,38 +177,51 @@ RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.
     go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
-# Fetch Nerd Font for the monospace terminal display.
-RUN mkdir -p static/vendor/fonts && \
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/mona.tar.xz \
-      "https://github.com/ryanoasis/nerd-fonts/releases/download/${NERDFONT_VERSION}/Monaspace.tar.xz" && \
-    printf '%s  /tmp/mona.tar.xz\n' "$NERDFONT_SHA256" | sha256sum -c - && \
-    tar -xJ -C static/vendor/fonts -f /tmp/mona.tar.xz \
-        MonaspiceNeNerdFontMono-Regular.otf \
-        MonaspiceNeNerdFontMono-Bold.otf \
-        MonaspiceNeNerdFontMono-Italic.otf \
-        MonaspiceNeNerdFontMono-BoldItalic.otf && \
-    rm /tmp/mona.tar.xz
+# Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
+#
+# Each face is verified in the SAME loop iteration that downloads it, so the
+# downloaded set and the verified set are one list by construction: a face added
+# to the loop with no matching sha ARG dies on the `*)` arm instead of shipping
+# unverified. `set -e` is what makes the per-iteration check bite -- a for-loop's
+# status is only its LAST iteration's, so a failure inside an earlier one used to
+# be swallowed. These gates are the only integrity anchor here (the source is a
+# git tag, which a force-push can rewrite under a fixed ref), and the face list is
+# also read by scripts/dev-build.sh from the `# repin:` markers above.
+RUN set -e; mkdir -p static/vendor/fonts; \
+    for face in Regular Bold Italic BoldItalic; do \
+      case "$face" in \
+        Regular) face_sha="$MONASPACE_REGULAR_SHA256" ;; \
+        Bold) face_sha="$MONASPACE_BOLD_SHA256" ;; \
+        Italic) face_sha="$MONASPACE_ITALIC_SHA256" ;; \
+        BoldItalic) face_sha="$MONASPACE_BOLDITALIC_SHA256" ;; \
+        *) echo "ERROR font-sha-missing: no sha256 ARG for Monaspace face $face" >&2; exit 1 ;; \
+      esac; \
+      curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL \
+        -o "static/vendor/fonts/MonaspaceNeonNF-${face}.woff2" \
+        "https://raw.githubusercontent.com/githubnext/monaspace/${MONASPACE_VERSION}/fonts/Web%20Fonts/NerdFonts%20Web%20Fonts/Monaspace%20Neon/MonaspaceNeonNF-${face}.woff2"; \
+      printf '%s  static/vendor/fonts/MonaspaceNeonNF-%s.woff2\n' "$face_sha" "$face" | sha256sum -c -; \
+    done
 
 # Fetch the engine + UI TypeScript from the npm registry. Both publish TS
 # source only (no precompiled JS) — same pattern as @cplieger/reactive,
 # matching how local TS files in static-src/ are treated. Extracted side by
 # side under static-src/node_modules/@cplieger so tsc's bundler resolution
 # finds the engine when compiling the UI's `@cplieger/web-terminal-engine` import.
-# Integrity note: unlike the Go, tsc, and Nerd Font fetches above, the two
-# @cplieger npm tarballs are NOT sha256-pinned. npm published package versions
-# are immutable (the registry refuses to re-publish an existing version), and
-# both are first-party packages fetched over pinned TLS (--proto '=https'
-# --tlsv1.2 below). The residual risk (a registry-side byte-swap or a
-# first-party npm account takeover) is accepted here; add per-package sha256
-# ARGs + `sha256sum -c` for parity with the tsc gate if that risk is later
-# deemed in scope. The old objection to doing so -- a manual sha bump on every
-# engine/UI release -- no longer applies: a `# repin:` marker would put both
-# pins on the same Renovate postUpgradeTask that maintains the four above, so
-# the cost is now one marker line each, not recurring toil.
+# Integrity note: all four of the Go, tsc, Nerd Font and tool-catalog fetches
+# above are sha256-gated, and so are both @cplieger npm tarballs below — each
+# carries a `# repin:`-marked sha256 ARG that the Renovate postUpgradeTask
+# recomputes in the same commit that bumps its version.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.5.0
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.7.0
+# sha256 of the published tarball. npm publishes SHA-512 (dist.integrity), not this
+# digest, so the version and the digest come from different sources: Renovate bumps
+# the version and the repin postUpgradeTask recomputes this line in the same commit.
+# repin: dep=@cplieger/web-terminal-engine url=https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-{version}.tgz
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=5212bb39529b2662720c6c9078082280e550f59a648e636d5494f23245e39983
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.2.3
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.3.0
+# repin: dep=@cplieger/web-terminal-ui url=https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-{version}.tgz
+ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=2393a545c0ea9330f1a8a80890a5a9077842d3e9336bf2eb7924addf8fb10d02
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is
@@ -229,9 +258,11 @@ RUN ENGINE_NPM=$(sed -n 's|.*"@cplieger/web-terminal-engine": "\([^"]*\)".*|\1|p
     fi && \
     mkdir -p static-src/node_modules/@cplieger/web-terminal-engine static-src/node_modules/@cplieger/web-terminal-ui && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/engine.tgz "https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-${CPLIEGER_WEB_TERMINAL_ENGINE_VERSION}.tgz" && \
+    printf '%s  /tmp/engine.tgz\n' "$CPLIEGER_WEB_TERMINAL_ENGINE_SHA256" | sha256sum -c - && \
     tar -xz -C static-src/node_modules/@cplieger/web-terminal-engine --strip-components=1 -f /tmp/engine.tgz && \
     rm /tmp/engine.tgz && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/ui.tgz "https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-${CPLIEGER_WEB_TERMINAL_UI_VERSION}.tgz" && \
+    printf '%s  /tmp/ui.tgz\n' "$CPLIEGER_WEB_TERMINAL_UI_SHA256" | sha256sum -c - && \
     tar -xz -C static-src/node_modules/@cplieger/web-terminal-ui --strip-components=1 -f /tmp/ui.tgz && \
     rm /tmp/ui.tgz
 
@@ -247,37 +278,24 @@ COPY . ./
 # floors, not version strings. Assert both directional floors at build time —
 # a declared-incompatible pairing would refuse every session at first connect
 # (close code 4002) while /api/health stays green, so fail HERE instead.
-# Client constants come from the vendored artifact fetched above (published
-# source, frozen export shape); server constants come from the engine's
-# public Go API inside scripts/wirecheck (no source scraping on the Go half).
+# Client constants come from the vendored artifact's own language-neutral
+# manifest (`wire-compatibility.json` at its package root, published via the
+# npm `files` list and the `./wire-compatibility.json` export subpath — the
+# engine generates it for exactly this consumer); server constants come from
+# the engine's public Go API inside scripts/wirecheck. Neither half scrapes
+# engine source: the gate reads the manifest with encoding/json, where the
+# parse is unit-testable and cannot depend on the engine's src layout.
 #
 # The gate is BUILT and then INVOKED, never `go run`: `go run` reports its OWN
 # exit status 1 for any non-zero program exit (it prints "exit status 2" to
 # stderr but does not propagate the 2), which collapses the gate's two failure
-# modes into one code. They mean opposite things — exit 2 is "the extraction
-# below is broken, fix the gate, do NOT bump a pin", exit 1 is "genuine wire
-# incompatibility, move a pin" — so the machine-readable half of that
-# distinction only survives when the compiled binary is the process the shell
-# observes. The binary is written into a tmpfs mount, so it is discarded when
-# the RUN ends and lands in neither this stage's layer nor a later one; it is a
-# build-time gate with no runtime role.
-#
-# FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): the two
-# `sed` scrapes below parse the vendored engine's TypeScript SOURCE for the
-# client wire constants. The engine now generates a language-neutral manifest
-# for exactly this consumer — `wire-compatibility.json` at the package root
-# (published via the npm `files` list and the `./wire-compatibility.json`
-# export subpath, so the vendored tarball carries it at
-# static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json).
-# Shape: {"schemaVersion":1,"generatedBy":...,"wireCompatibility":
-# {"protocolVersion","minimumServerProtocolVersion","incompatibleCloseCode"}};
-# read `schemaVersion` first and reject an unknown one. When the engine version
-# this Dockerfile pins carries that file, the parsing should move INTO
-# scripts/wirecheck (a `-manifest <path>` flag reading the JSON with
-# encoding/json), where it is unit-testable, rather than being reimplemented as
-# a shell JSON scrape: these `sed` lines and their `${VAR:?}` guards exist only
-# because shell had to do the parsing, and their failure mode (a silently empty
-# capture) is the reason the guards are loud.
+# modes into one code. They mean opposite things — exit 2 is "the gate cannot
+# read the client's declaration, fix the gate, do NOT bump a pin", exit 1 is
+# "genuine wire incompatibility, move a pin" — so the machine-readable half of
+# that distinction only survives when the compiled binary is the process the
+# shell observes. The binary is written into a tmpfs mount, so it is discarded
+# when the RUN ends and lands in neither this stage's layer nor a later one; it
+# is a build-time gate with no runtime role.
 #
 # No `hadolint ignore=DL3062` here any more: that rule fires on an unpinned
 # `go run`/`go install <pkg>` (it wants `@<version>`), which is meaningless for
@@ -286,27 +304,23 @@ COPY . ./
 # an unneeded one suppresses a real future warning on this step.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=tmpfs,target=/tmp/wirecheck-bin \
-    WIRE_TS=static-src/node_modules/@cplieger/web-terminal-engine/src/wire-compatibility.ts && \
-    CLIENT_REV=$(sed -n 's|^export const WIRE_PROTOCOL_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
-    CLIENT_MIN_SERVER=$(sed -n 's|^export const MIN_SUPPORTED_SERVER_WIRE_VERSION = \([0-9]\{1,\}\);.*|\1|p' "$WIRE_TS") && \
-    : "${CLIENT_REV:?wire-floor-gate: WIRE_PROTOCOL_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
-    : "${CLIENT_MIN_SERVER:?wire-floor-gate: MIN_SUPPORTED_SERVER_WIRE_VERSION not found in the vendored engine artifact (source layout changed?)}" && \
     go build -o /tmp/wirecheck-bin/wirecheck ./scripts/wirecheck && \
-    /tmp/wirecheck-bin/wirecheck -client-rev "$CLIENT_REV" -client-min-server "$CLIENT_MIN_SERVER"
+    /tmp/wirecheck-bin/wirecheck -manifest static-src/node_modules/@cplieger/web-terminal-engine/wire-compatibility.json
 
 # Compile client TypeScript and the engine + UI libs in a single layer.
 # Must run before the binary build because main.go's `//go:embed static`
 # captures static/ at `go build` time.
 #
-# Re-arm the bash SHELL before the bash-only RUNs below. It is already declared
-# at the top of this stage and nothing changed it, but hadolint (>=2.15.0) resets
-# its shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
+# Re-arm the bash SHELL for the RUNs below. It is already declared at the top of
+# this stage and nothing changed it, but hadolint (>=2.15.0) resets its
+# shell-dialect tracking to POSIX sh on any ARG or ENV that FOLLOWS a SHELL
 # directive -- the Renovate-pinned ARGs above do exactly that -- and then
-# shellchecks the rest of the stage as sh, calling this file's bash arrays
-# (SC3054) and process substitution (SC3001) undefined. Re-declaring keeps those
-# two checks live and real, where suppressing the codes on the instruction would
-# switch them off for good. Docker-side this is a no-op: same shell, no layer.
-# Drop it when upstream honours the first declaration again.
+# shellchecks the rest of the stage as sh. The bash-only constructs that used to
+# live in these RUNs (arrays, process substitution) now live in
+# scripts/vendor-tsc.sh, which shellcheck reads as bash from its own shebang, so
+# what this keeps honest is the stage's declared dialect matching the shell that
+# actually runs it -- `-o pipefail` included. Docker-side this is a no-op: same
+# shell, no layer. Drop it when upstream honours the first declaration again.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Step 1: tsc --project compiles app TS — tsconfig.json's outDir is
@@ -319,41 +333,26 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # browser can fetch the compiled JS via the importmap. Internal imports (the
 # UI's bare `@cplieger/web-terminal-engine` and both packages' relative `./*.js`) are
 # preserved and resolve via the importmap + vendored dirs at runtime.
-# -type f, not a bare -name: a directory, symlink or FIFO named *.ts in a
-# mis-published or crafted vendored tarball would otherwise be handed to tsc, and
-# a FIFO blocks the build forever with no deadline -- the same class
-# scripts/css-bundle.sh refuses per MANIFEST entry for the CSS half of this build.
-RUN mapfile -t ui_ts < <(find static-src/node_modules/@cplieger/web-terminal-ui/src -type f -name '*.ts') && \
-    mapfile -t engine_ts < <(find static-src/node_modules/@cplieger/web-terminal-engine/src -type f -name '*.ts') && \
-    { [ "${#ui_ts[@]}" -gt 0 ] \
-      || { echo "ERROR ui-src-empty: no *.ts under the vendored @cplieger/web-terminal-ui src tree (tarball layout changed?)" >&2; exit 1; }; } && \
-    { [ "${#engine_ts[@]}" -gt 0 ] \
-      || { echo "ERROR engine-src-empty: no *.ts under the vendored @cplieger/web-terminal-engine src tree (tarball layout changed?)" >&2; exit 1; }; } && \
-    /tmp/package/lib/tsc --project static-src/tsconfig.json && \
-    /tmp/package/lib/tsc \
-        --module ESNext \
-        --target ESNext \
-        --moduleResolution bundler \
-        --outDir static/vendor/cplieger-web-terminal-engine \
-        --rootDir static-src/node_modules/@cplieger/web-terminal-engine/src \
-        --skipLibCheck \
-        --strict \
-        "${engine_ts[@]}" && \
-    /tmp/package/lib/tsc \
-        --module ESNext \
-        --target ESNext \
-        --moduleResolution bundler \
-        --outDir static/vendor/cplieger-web-terminal-ui \
-        --rootDir static-src/node_modules/@cplieger/web-terminal-ui/src \
-        --skipLibCheck \
-        --strict \
-        "${ui_ts[@]}" && \
-    for emitted in static/app.js \
-        static/vendor/cplieger-web-terminal-engine/index.js \
-        static/vendor/cplieger-web-terminal-ui/index.js \
-        static/vendor/cplieger-web-terminal-ui/presets.js; do \
-      [ -s "$emitted" ] || { echo "ERROR tsc-emit-missing: $emitted is absent or empty after the tsc steps; static/index.html's script and importmap targets would 404 at runtime (outDir/rootDir or vendored src layout drift?)" >&2; exit 1; }; \
-    done
+#
+# Canonical recipes: scripts/vendor-tsc.sh (the flag set, the source collection
+# and the <label>-src-empty gate) and scripts/assert-emit.sh (every module the
+# page loads was emitted non-empty), both shared with scripts/dev-build.sh -- the
+# same shape the CSS half of this build already uses via scripts/css-bundle.sh.
+# Spelling the recipe here AND in dev-build.sh meant a flag added to one gave a
+# dev binary typechecked differently from the shipped image, and assert-emit.sh
+# now DERIVES its target list from static/index.html's importmap instead of
+# restating it, so a new importmap entry cannot leave a build path unchecked.
+# Step 1 (the app tsc --project) stays at the call site: dev-build.sh has to
+# `rm -f static/app.js` first for a persistent gitignored emit the image build
+# cannot have, so that asymmetry is deliberately not shared.
+RUN /tmp/package/lib/tsc --project static-src/tsconfig.json && \
+    bash scripts/vendor-tsc.sh /tmp/package/lib/tsc engine \
+      static-src/node_modules/@cplieger/web-terminal-engine/src \
+      static/vendor/cplieger-web-terminal-engine && \
+    bash scripts/vendor-tsc.sh /tmp/package/lib/tsc ui \
+      static-src/node_modules/@cplieger/web-terminal-ui/src \
+      static/vendor/cplieger-web-terminal-ui && \
+    sh scripts/assert-emit.sh
 
 # Concatenate the UI package's per-feature CSS splits into the served bundle
 # (canonical recipe: scripts/css-bundle.sh, shared with scripts/dev-build.sh).
@@ -370,13 +369,19 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Baked-in dependencies. kiro-cli itself is downloaded on first boot
-# by entrypoint.sh (licensing prevents us from baking it into the
-# image); everything else is stable utility surface web-terminal-kiro or the
+# Baked-in dependencies. kiro-cli itself is NOT one of them: it is
+# proprietary and cannot be redistributed in the image, so the Go server's
+# pinstall manager downloads and verifies it after the listener binds.
+# Everything else here is stable utility surface web-terminal-kiro or the
 # interactive user needs:
 #   - bash: the entrypoint interpreter (entrypoint.sh is a bash
 #     script; Debian's /bin/sh is dash)
-#   - ca-certificates + curl + unzip: kiro-cli installer + HTTPS trust
+#   - ca-certificates + curl: HTTPS trust, the baked HEALTHCHECK probe, and the
+#     archive/catalog fetches the server and the toolbelt engine make
+#   - unzip: `.zip` extraction for tools the toolbelt engine installs at runtime
+#     (toolbelt extract.go shells out to it), the same reason xz-utils is here.
+#     NOT the kiro-cli install -- the pinstall library unpacks that archive with
+#     Go's archive/zip, so this package looks droppable and is not.
 #   - git: source control from inside the terminal (gh is NOT baked; it
 #     is opt-in via /config/tools/tools.json)
 #   - openssh-client: git over ssh (and gh over ssh once gh is enabled)
@@ -421,8 +426,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # This keeps the image
 # ~32 MB slimmer and free of the daily LSP-bump rebuild churn.
 
-# kiro-cli installs under $HOME/.local. Home is under /config so the
-# install survives container restarts.
+# HOME is under /config so Kiro authentication, settings and SSH state survive
+# container recreation. It does NOT hold the kiro-cli install: server-managed
+# versions live separately under /config/tools/kiro-cli-versions.
 ENV HOME=/config/home
 # PATH leads with the engine-managed bin dir. The two `runtimes/{go,node}/bin`
 # segments are GONE: the audit they were gated on ran on the borgcube volume
@@ -448,8 +454,8 @@ ENV HOME=/config/home
 # land in the bin dir via the engine's own GOBIN env at install time.
 ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-ENV KWEB_WORK_DIR=/workspace
-ENV KWEB_ADDR=:9848
+ENV WT_WORKDIR=/workspace
+ENV WT_ADDR=:9848
 
 # Repoint root's pw_dir to /config/home so OpenSSH (which resolves "~"
 # via getpwuid, NOT $HOME) reads and writes ~/.ssh/known_hosts under
@@ -546,13 +552,13 @@ EXPOSE 9848
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.
 # DL3025 wants JSON notation, which cannot express this: the URL is built with
-# the shell parameter expansion ${KWEB_ADDR##*:} to read the port out of the
+# the shell parameter expansion ${WT_ADDR##*:} to read the port out of the
 # runtime listen address, and exec form performs no expansion at all -- it would
 # probe a literal. This image also runs as root with a shell for git/gh, so it
 # will never be shell-less, and the distroless case the rule guards does not
 # arise here.
 # hadolint ignore=DL3025
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20m \
-    CMD curl -sfS --max-time 4 "http://127.0.0.1:${KWEB_ADDR##*:}/api/health" || exit 1
+    CMD curl -sfS --max-time 4 "http://127.0.0.1:${WT_ADDR##*:}/api/health"
 
 ENTRYPOINT ["/opt/web-terminal-kiro/entrypoint.sh"]

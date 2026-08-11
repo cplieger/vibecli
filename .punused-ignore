@@ -1,0 +1,14 @@
+# Adjudicated `punused` findings for web-terminal-kiro. One reason per entry;
+# entries match as literal substrings of the finding line, so never include
+# file:line:col — line numbers shift and the entry silently goes stale.
+
+# --- Startup-failure stage attribution (main.go).
+#
+# Unwrap is called by the standard library, never by name from this repo:
+# `errors.As`/`errors.Is` walk a chain by type-asserting to `interface{ Unwrap()
+# error }`, so no call site exists for punused to find. Deleting it would not
+# fail the build — it would silently break the chain, which is why the
+# attribution's own test asserts `errors.Is` still reaches the cause
+# (TestAtStagePreservesTheMessageAndTheChain). The method is load-bearing and
+# permanently call-site-free.
+method (*stageError).Unwrap

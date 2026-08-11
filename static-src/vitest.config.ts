@@ -56,8 +56,8 @@ export default defineConfig({
       requireAssertions: true,
     },
 
-    // Auto-clean/reset/restore all mocks and stubs before each test.
-    clearMocks: true,
+    // Reset/restore all mocks and stubs before each test. mockReset clears call
+    // history first, so no separate clearMocks is needed.
     mockReset: true,
     restoreMocks: true,
     unstubEnvs: true,
@@ -92,14 +92,20 @@ export default defineConfig({
     // Print stack traces with every console.* call in tests.
     printConsoleTrace: true,
 
-    // Show full diff when a snapshot fails.
-    expandSnapshotDiff: true,
-
     // V8 coverage with AST-accurate remapping.
     coverage: {
       provider: "v8",
       include: ["*.ts"],
-      exclude: ["*.test.ts", "*.d.ts"],
+      // vitest 4 ships NO built-in coverage exclusions -- coverageConfigDefaults
+      // .exclude is [] in the pinned 4.1.10, because v4 moved the responsibility to
+      // coverage.include (the "*.ts" above). So unlike test.exclude, which spreads a
+      // genuinely non-empty configDefaults.exclude, this array IS the whole set and
+      // every entry has to be spelled here.
+      // "*.config.ts" covers playwright.config.ts, which include: ["*.ts"] matched and
+      // v8 reported at 0%, holding the 90% thresholds permanently red.
+      // "*.d.ts" is not covered by anything else: a root-level ambient declaration file
+      // matches "*.ts" too, and would re-red the thresholds the same way.
+      exclude: ["*.test.ts", "*.d.ts", "*.config.ts"],
       reportOnFailure: true,
       reporter: ["text", "text-summary", "lcov"],
       thresholds: {
@@ -117,11 +123,6 @@ export default defineConfig({
       truncateThreshold: 0,
       showDiff: true,
       includeStack: true,
-    },
-
-    experimental: {
-      fsModuleCache: true,
-      fsModuleCachePath: ".vitest-cache",
     },
   },
 });

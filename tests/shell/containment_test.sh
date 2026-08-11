@@ -26,19 +26,39 @@ set -u
 . "$(dirname -- "$0")/lib.sh"
 new_workdir >/dev/null
 
+load_function logfmt_value
 load_function enable_session_containment
 
-# --- 1. the success path: a writable tree reports availability -------------------
+# --- 1. the success path: a writable tree reports the REMOUNT, nothing more -----
 # `mount` is the only external command the function runs, so stubbing it is the
-# whole environment.
+# whole environment. The cgroup root is a PARAMETER (default /sys/fs/cgroup) purely
+# so this case can hand it a temp dir rather than depend on the CI runner's own
+# mount state. The function inspects nothing inside the tree: vacating the root and
+# enabling controllers belong to the server's NewContainment, whose verifyOwnRoot
+# REFUSES a root holding any non-"wt-" child directory -- so a leaf created here
+# would disable the very feature this line used to claim.
 mount() { return 0; }
-out=$(enable_session_containment 2>&1)
+mkdir -p "$WORK/cg"
+out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
 [ "$rc" -eq 0 ] && ok "a successful remount returns 0" \
   || no "a successful remount returns 0" "rc=$rc"
 case "$out" in
-  *level=info*containment\ available*) ok "success logs at info" ;;
-  *) no "success logs at info" "got: $out" ;;
+  *level=info*"remounted rw"*) ok "success logs the remount at info" ;;
+  *) no "success logs the remount at info" "got: $out" ;;
+esac
+# The defect this pins is what shipped: the message claimed "per-session process
+# containment available" on the strength of the remount alone, while the server
+# failed with EBUSY on cgroup.subtree_control six seconds later (measured on
+# borgcube, image v2.7.7) and every session ran uncontained. This script proves the
+# MOUNT; only the server can report containment, and it does.
+case "$out" in
+  *containment\ available*) no "the remount report must not claim containment is available" "got: $out" ;;
+  *) ok "the remount report does not claim containment is available" ;;
+esac
+case "$out" in
+  *"by the server"*) ok "the remount report names the server as the reporter of the verdict" ;;
+  *) no "the remount report names who reports the verdict" "got: $out" ;;
 esac
 
 # --- 2. the refusal path: warn, non-zero, and NEVER fatal -----------------------
@@ -46,7 +66,7 @@ esac
 # `fatal` here (or any exit) would be an unbootable image for every user of the
 # public compose example.
 mount() { return 32; }
-out=$(enable_session_containment 2>&1)
+out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
 [ "$rc" -ne 0 ] && ok "a refused remount reports failure to its caller" \
   || no "a refused remount reports failure" "rc=0"
@@ -63,6 +83,79 @@ esac
 case "$out" in
   *SYS_ADMIN*) ok "the refusal warn names the capability to add" ;;
   *) no "the refusal warn names the capability" "got: $out" ;;
+esac
+# 2a. mount's message is the only text in this line the script did not author, and
+# the stubs above print nothing, so without this case every sanitization rule is
+# unexercised. All three assertions discriminate (red-checked: each fails with its
+# rule removed). A lone trailing backslash escapes the closing quote, after which a
+# logfmt reader swallows hint= -- the remedy this warn exists to name; a bare CR
+# splits or overwrites the record; an unescaped double quote closes the error field
+# early and lets mount's own text forge a logfmt key. An assertion that SYS_ADMIN is
+# merely PRESENT is deliberately not added: the substring survives a malformed field,
+# so it cannot fail for the reason it would claim.
+#
+# shellcheck disable=SC1003  # the trailing \\ is a literal backslash for printf to
+# emit, which is the malformed value under test -- not an attempt to escape a quote.
+mount() {
+  printf 'mount: /x: "denied" a\r\\' >&2
+  return 32
+}
+out=$(enable_session_containment "$WORK/cg" 2>&1)
+case "$out" in
+  *'\\" hint='*) ok "a backslash is doubled, so the error field closes and hint= survives" ;;
+  *) no "a backslash is doubled before the field closes" "got: $out" ;;
+esac
+case "$out" in
+  *$'\r'*) no "a carriage return must not reach the log record" "got: $out" ;;
+  *) ok "a carriage return is replaced, not passed through" ;;
+esac
+# Negative on purpose: the property is that mount's quote does not SURVIVE into the
+# record, not that it becomes an apostrophe specifically, so a later change of
+# replacement character does not fail it spuriously. `"denied"` appears nowhere else
+# in the line (neither msg= nor hint= contains the word), so the match cannot be
+# satisfied by unrelated text.
+case "$out" in
+  *'"denied"'*) no "mount's own double quote must not reach the log record" "got: $out" ;;
+  *) ok "a double quote is neutralized, so it cannot close the error field early" ;;
+esac
+unset -f mount
+
+# --- 2b. the function creates NOTHING inside the cgroup root --------------------
+# This replaces a case that asserted a pid-count report the function no longer
+# makes, and it pins the reason that report is gone. An earlier fix here created an
+# `init` leaf and migrated the root's pids into it, to clear cgroup v2's
+# no-internal-process constraint before the server writes cgroup.subtree_control.
+# Read against the engine's terminal/containment_linux.go (unchanged in this respect
+# since containment landed, first tagged v3.4.0 -- do not re-anchor this to the current
+# go.mod pin, it moves on every Renovate bump), that is
+# both redundant and actively harmful: NewContainment's own vacateRoot (step 5)
+# already moves every pid into its "wt-server" leaf before delegating, and its
+# verifyOwnRoot (step 2, which runs FIRST) refuses the entire root the moment it
+# holds a child directory not prefixed "wt-" -- a foreign child being how it detects
+# a HOST cgroup root it must not reshape. So an `init` leaf here does not enable
+# containment, it disables it, on precisely the hosts where it would have worked.
+mount() { return 0; }
+mkdir -p "$WORK/cg2"
+printf '1\n' >"$WORK/cg2/cgroup.procs"
+# Snapshot the tree RECURSIVELY, not just the root's own entries: the removed
+# migration wrote into $cg_root/init/cgroup.procs, so it created a path BELOW the
+# root that an `ls -A` of the root alone does not report. A content check on the
+# root's cgroup.procs cannot serve here at all -- only the kernel removes a pid from
+# a parent's file, so a plain temp file reads "1" whether the function migrated or
+# not, which is why that assertion is gone rather than kept alongside.
+before=$(find "$WORK/cg2" | sort)
+out=$(enable_session_containment "$WORK/cg2" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ok "an occupied root still returns 0 (hygiene, never fatal)" \
+  || no "an occupied root returns 0" "rc=$rc"
+[ "$(find "$WORK/cg2" | sort)" = "$before" ] \
+  && ok "the remount writes nothing below the cgroup root, so verifyOwnRoot cannot refuse it" \
+  || no "the remount writes nothing below the cgroup root" "tree changed"
+# An occupied root is now ORDINARY -- the server vacates it -- so this function must
+# not warn about it, or every boot carries a warn for the expected state.
+case "$out" in
+  *level=warn*) no "an occupied root must not warn: the server vacates it" "got: $out" ;;
+  *) ok "an occupied root does not warn; it is the expected pre-vacate state" ;;
 esac
 unset -f mount
 
@@ -139,14 +232,14 @@ printf '%s' "$tail_block" | grep -Eq 'level=warn.*not held' \
 # It re-runs this same script, so the marker is the only thing between one drop and
 # an infinite exec loop. Assert it is set BEFORE the exec, and exported (the child
 # is a fresh process, so an unexported marker would not survive).
-marker_line=$(grep -n 'KWEB_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" | head -1 | cut -d: -f1)
+marker_line=$(grep -n 'WT_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 [ -n "$marker_line" ] && [ "$marker_line" -lt "$exec_line" ] \
   && ok "the loop marker is set before the exec" \
   || no "the loop marker is set before the exec" "marker at ${marker_line:-none}, exec at $exec_line"
-grep -Eq 'export KWEB_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" \
+grep -Eq 'export WT_CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" \
   && ok "the loop marker is exported so the re-exec sees it" \
   || no "the loop marker is exported" "an unexported marker cannot survive exec, so boot would loop"
-grep -Eq '\$\{KWEB_CONTAINMENT_CAPS_DROPPED:-\}" != "1"' "$ENTRYPOINT" \
+grep -Eq '\$\{WT_CONTAINMENT_CAPS_DROPPED:-\}" != "1"' "$ENTRYPOINT" \
   && ok "the guard tests the marker" \
   || no "the guard tests the marker" "no marker test found"
 

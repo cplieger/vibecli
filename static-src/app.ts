@@ -1,4 +1,8 @@
-import { createTerminal, type CreateTerminalOptions } from "@cplieger/web-terminal-ui";
+import {
+  createTerminal,
+  localScrollbackStorage,
+  type CreateTerminalOptions,
+} from "@cplieger/web-terminal-ui";
 import { presetAgentTabbed } from "@cplieger/web-terminal-ui/presets";
 import type { PublicThemeToken } from "@cplieger/web-terminal-ui/style-contract";
 
@@ -27,6 +31,30 @@ const options: CreateTerminalOptions = {
   // dot from tab creation. Pass the function so preset failures remain inside
   // createTerminal's recovery boundary.
   features: presetAgentTabbed,
+  // Restore each tab's scrollback from browser storage instead of pulling it back
+  // over the wire, keyed by kiro-cli session id and stored per tab.
+  //
+  // This is the remedy the jetsam investigation landed on. iOS reclaims this
+  // page's content process routinely — measured 19 boots in 22h on a phone,
+  // driven by OTHER apps' memory pressure rather than by this one's footprint —
+  // and the server holds every session across it, so the reload is only expensive
+  // because the client comes back holding nothing and asks for everything. The
+  // visible cost was the whole scrollback refilling line by line, which is what
+  // made an ordinary tab eviction look like a crash. Making that restore cheap
+  // beats chasing the surfaces that get us reaped, because the reaping is not
+  // about us.
+  //
+  // On by default here, as in the sibling web-terminal-server: this is a
+  // single-operator dev box on a phone that discards its tabs, which is exactly
+  // the population the feature is for. A snapshot from a previous server process
+  // is DETECTED on the first resume and cleared behind the loading overlay (and
+  // discarded outright when that session is already gone), so a container restart
+  // cannot leave last run's output on screen; a tab's entry is dropped when the tab
+  // closes, and the rest expire after a week. What it does mean is that a couple of
+  // hundred lines of each session's output sit in this origin's localStorage on the
+  // device, readable from that browser without reaching the server — README's
+  // security section says so.
+  persistScrollback: localScrollbackStorage(),
   // web-terminal-kiro's purple theme (the consumer "settings"; the UI library ships
   // the neutral defaults). Reaches the ACTIVE tab (fill/edge/label, desktop strip
   // + mobile switcher row), the accent icons (the mobile "+", the toggled keyboard

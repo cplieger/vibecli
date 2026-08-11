@@ -4,7 +4,6 @@
 # output from crossing the `go:embed static` edge (see main.go's comment there).
 static/*.js
 node_modules/
-.vitest-cache/
 static-src/coverage/
 
 # Local `go build` output. The Dockerfile builds to /web-terminal-kiro in the
@@ -32,3 +31,8 @@ static/vendor/
 # Stryker mutation-testing artifacts (weekly-stryker.yaml / local npx stryker run)
 reports/
 .stryker-tmp/
+
+# Playwright e2e failure artifacts (playwright.config.ts trace: retain-on-failure /
+# screenshot: only-on-failure write to the default outputDir). Traces record every
+# request URL including /ws?session=<id> — a live session capability token.
+static-src/test-results/

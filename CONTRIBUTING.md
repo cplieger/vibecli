@@ -24,9 +24,18 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   assertion of the settings the app depends on, pruning, and the one-shot purge
   of the pre-2026-07 `/config/tools/bin` layout. What stays app-side is data and
   wording: the required set (`kiro-cli` plus the `kiro-cli-chat` sidecar), the
-  four best-effort settings, the purge target list, the taint observation, and
-  `kiroReasonText`, which turns the library's typed `pinstall.Reason` into the
-  four 503 reason strings an operator reads. Its verdict is what `/api/health`
+  four best-effort settings, the purge target list, the taint observation, the
+  trusted-writer declaration, and `kiroReasonText`, which turns the library's
+  typed `pinstall.Reason` into the four 503 reason strings an operator reads.
+  The trusted-writer declaration is the one that can stop a boot: the library
+  refuses to install into a tree another identity can write, and it reads
+  access-control lists to find that out. This app declares NOTHING by default —
+  `parseTrustedInstallUIDs` reads `WT_TRUSTED_INSTALL_UIDS` and passes it to
+  `TrustedUIDs`, so an unset variable (the shipped default) leaves the check
+  fully enforcing. An operator whose volume the check refuses names the uid
+  themselves, which is an assertion that the account is already at least as
+  privileged as this server; a value baked into the image would make that
+  assertion on behalf of every deployment that pulled it. Its verdict is what `/api/health`
   and the session-create gate read, its active version directory leads every
   session's `PATH`, and its `Rescan` backs the loopback
   `POST /api/kiro-cli/rescan` repair hook.
@@ -97,11 +106,11 @@ Run the server directly once assets exist:
 
 ```sh
 go generate ./...
-KWEB_WORK_DIR=/path/to/workdir go run .
+WT_WORKDIR=/path/to/workdir go run .
 ```
 
-`KWEB_WORK_DIR` must point at an existing directory (the server exits if it is
-missing) and `KWEB_ADDR` defaults to `:9848`. A bare `go run` installs nothing:
+`WT_WORKDIR` must point at an existing directory (the server exits if it is
+missing) and `WT_ADDR` defaults to `:9848`. A bare `go run` installs nothing:
 with no pins in the environment the server resolves `kiro-cli` by bare name
 through your own `PATH`, so the terminal works if you have one installed. In
 production `entrypoint.sh` exports the Renovate-pinned version and both per-arch
@@ -134,7 +143,7 @@ V="$KIRO_CLI_TOOLS_DIR/kiro-cli-versions/$KIRO_CLI_VERSION"
 mkdir -p "$V"
 cp /path/to/kiro-cli /path/to/kiro-cli-chat "$V/"
 printf '%s\n' "$KIRO_CLI_VERSION" >"$V/.complete"
-KWEB_WORK_DIR=/path/to/workdir go run .
+WT_WORKDIR=/path/to/workdir go run .
 ```
 
 Leaving both digest variables unset does NOT work, and fails in the least

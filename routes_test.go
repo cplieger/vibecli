@@ -364,7 +364,7 @@ func TestSecurityHeaders_presentOnNormalResponse(t *testing.T) {
 // rather than against a handler directly, because three of the four owners set
 // the header somewhere the handler-level call cannot see: toolbelt's httpapi
 // wraps its own mux, the engine's REST handler has an inner mux of its own, and
-// the app's remaining sessionNoStore is chain middleware. Calling a handler
+// the engine's own withNoStore wraps that handler at its mount. Calling a handler
 // directly would assert the wrong thing and stay green through a chain edit.
 func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 	deps := newToolsDeps(t)
@@ -400,22 +400,23 @@ func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 
 		// The engine's session surface BEYOND writeJSON. writeJSON is reached
 		// only by create and list, so every row below carries no Cache-Control
-		// from the engine and is covered by the app's sessionNoStore. Delete
-		// that middleware and exactly these rows go red — which is the test
-		// that keeps it from being deleted as dead weight, and the test that
-		// tells the next reader it can go once the engine covers its own mux.
-		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
-		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "app sessionNoStore"},
-		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "app sessionNoStore"},
-		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "app sessionNoStore"},
-		{"set pinned title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/pinned-title", `{"title":"x"}`, noStore, "app sessionNoStore"},
-		{"clear pinned title, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef/pinned-title", "", noStore, "app sessionNoStore"},
+		// from writeJSON — the header comes from the engine's own withNoStore,
+		// applied to the REST handler at BOTH mounts (SessionsPath and
+		// SessionsSubtreePath) and outside the create gate, so it reaches the
+		// statuses no handler writes. These rows hold with no app middleware at
+		// all; they go red if the engine stops covering its own mux.
+		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"set pinned title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/pinned-title", `{"title":"x"}`, noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"clear pinned title, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef/pinned-title", "", noStore, "engine withNoStore (MountSessionRoutes)"},
 		// The engine's INNER mux generates these itself, which is why no
 		// per-handler fix inside the engine would reach them: a 405 for a
 		// method the session path does not serve, and a 404 for the bare
 		// subtree path (no {id} segment to match).
-		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "app sessionNoStore"},
-		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "app sessionNoStore"},
+		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "engine withNoStore (MountSessionRoutes)"},
 
 		// The app's own handlers, each setting the header at the top of the
 		// function rather than relying on middleware.
@@ -571,8 +572,8 @@ func TestCSPScriptHashesMatchEmbeddedInlineScripts(t *testing.T) {
 }
 
 // TestBuildCSPPolicyFailsLoud pins the fail-loud contract: buildCSPPolicy
-// returns an error (never a silent 'unsafe-inline' degrade) when the static FS
-// is nil, index.html is missing, index.html holds no inline <script>, or its
+// returns an error (never a silent 'unsafe-inline' degrade) when
+// index.html is missing, index.html holds no inline <script>, or its
 // inline <style> block is absent, unterminated, or duplicated. A
 // production build always embeds index.html with its inline importmap and its
 // single critical-CSS <style>, so any of these means a malformed build that must
@@ -582,7 +583,6 @@ func TestBuildCSPPolicyFailsLoud(t *testing.T) {
 		name string
 		fsys fs.FS
 	}{
-		{"nil FS", nil},
 		{"missing index.html", fstest.MapFS{}},
 		{"only external scripts", fstest.MapFS{
 			"index.html": &fstest.MapFile{Data: []byte(`<html><body><script src="/app.js"></script></body></html>`)},
@@ -696,7 +696,7 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 //
 // This is a COMPOSITION test, and it exists because the composition is the part
 // that breaks. Tab names come from kiro-cli's own session record, and the whole
-// chain rests on one thing this app must do per session: inject KWEB_SESSION_ID
+// chain rests on one thing this app must do per session: inject WT_TITLE_HANDLE
 // into the child environment so a kiro-cli hook can report which kiro session the
 // tab is running (sessiontitle.go). Nothing else can supply that pairing. Drop the
 // option and every tab silently falls back to the engine's automatic cwd rung and
@@ -709,14 +709,15 @@ func TestSessionFactoryRequestsTheTitleEnv(t *testing.T) {
 	ready.Set(true)
 
 	var gotIDs []string
+	staticSrv, _ := testStaticSurface()
 	deps := withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
+		static:  staticSrv,
+		ready:   &ready,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
 		sessionTitleEnv: func(id string) []string {
 			gotIDs = append(gotIDs, id)
-			return []string{"KWEB_SESSION_ID=" + id}
+			return []string{"WT_TITLE_HANDLE=" + id}
 		},
 	})
 	_, _, _, id := mustStartSession(t, deps)
@@ -734,10 +735,10 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 	t.Run("both overlays present", func(t *testing.T) {
 		d := &routeDeps{
 			sessionEnv:      func() []string { return []string{"PATH=/pinned:/usr/bin"} },
-			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
+			sessionTitleEnv: func(id string) []string { return []string{"WT_TITLE_HANDLE=" + id} },
 		}
 		got := d.childEnv("tab7")
-		want := []string{"PATH=/pinned:/usr/bin", "KWEB_SESSION_ID=tab7"}
+		want := []string{"PATH=/pinned:/usr/bin", "WT_TITLE_HANDLE=tab7"}
 		if !slices.Equal(got, want) {
 			t.Errorf("childEnv = %v, want %v", got, want)
 		}
@@ -755,14 +756,14 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 		base[0] = "PATH=/pinned"
 		d := &routeDeps{
 			sessionEnv:      func() []string { return base },
-			sessionTitleEnv: func(id string) []string { return []string{"KWEB_SESSION_ID=" + id} },
+			sessionTitleEnv: func(id string) []string { return []string{"WT_TITLE_HANDLE=" + id} },
 		}
 		a := d.childEnv("tabA")
 		b := d.childEnv("tabB")
-		if a[1] != "KWEB_SESSION_ID=tabA" {
+		if a[1] != "WT_TITLE_HANDLE=tabA" {
 			t.Errorf("first overlay = %v, want it unchanged by the second", a)
 		}
-		if b[1] != "KWEB_SESSION_ID=tabB" {
+		if b[1] != "WT_TITLE_HANDLE=tabB" {
 			t.Errorf("second overlay = %v", b)
 		}
 	})
@@ -898,6 +899,17 @@ func TestHealthEndpoint_envelopeMatchesTheLibrary(t *testing.T) {
 		// handleHealth's healthResponse to the pre-fix early-return shape leaves the
 		// whole suite green.
 		{"unready carries the informational tools state", unreadyDepsWithTools(), http.StatusServiceUnavailable, `{"status":"unready","reason":"starting up or shutting down","tools":"syncing"}`},
+		// The whole-tree convergence count is the SECOND tools question, and the
+		// disagreement is the point: the last repair succeeded (tools "ok") while
+		// one enabled tool is still missing. Before this field existed, "ok" was
+		// the only signal and read as whole-tree health.
+		{"a partial repair reports ok alongside an outstanding count", depsWithToolsMissing(true, 1), http.StatusOK, `{"status":"ok","tools":"ok","tools_missing":1}`},
+		// Zero MUST be emitted rather than dropped: it is the converged answer,
+		// and omitempty on a plain int would erase exactly the good news.
+		{"a converged tree reports zero rather than omitting it", depsWithToolsMissing(true, 0), http.StatusOK, `{"status":"ok","tools":"ok","tools_missing":0}`},
+		// Unknown is absent, so "not counted yet" can never be misread as
+		// converged.
+		{"an uncounted tree omits the field", depsWithToolsMissing(false, 0), http.StatusOK, `{"status":"ok","tools":"ok"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			mux, _, _ := mustRegisterRoutes(t, tc.deps)
@@ -960,23 +972,44 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 func withDefaultPolicies(d *routeDeps) *routeDeps {
 	d.toolsSyncing = func() bool { return false }
 	d.toolsState = func() string { return "" }
+	d.toolsMissing = func() (int, bool) { return 0, false }
 	d.kiroReady = func() (bool, string) { return true, "" }
 	d.sessionEnv = func() []string { return nil }
 	return d
 }
 
+// testStaticFS is the index fixture that satisfies the fail-loud CSP build,
+// standing in for the embedded static tree.
+func testStaticFS() fs.FS {
+	return fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}}
+}
+
+// testStaticSurface builds the two derivatives the composition root builds in
+// production — the serving handler routeDeps.static carries, and the hash-pinned
+// CSP buildHandler is given — from that fixture. It panics rather than taking a
+// *testing.T so the t-free fixture helpers (newTestDeps) can call it: the fixture
+// is a constant, so a failure here is a broken harness rather than a test case.
+func testStaticSurface() (http.Handler, string) {
+	srv, csp, err := buildStaticSurface(testStaticFS())
+	if err != nil {
+		panic("buildStaticSurface on the test index fixture: " + err.Error())
+	}
+	return srv, csp
+}
+
 // newTestDeps returns the minimal routeDeps the route tests build
-// repeatedly: the index fixture that satisfies the fail-loud CSP build,
-// a ready flag, and a short-lived cat as the session command. Tests
+// repeatedly: the static handler the composition root builds from the index
+// fixture, a ready flag, and a short-lived cat as the session command. Tests
 // tweak fields (cmd, kiroReady) before registering.
 func newTestDeps(ready bool) *routeDeps {
 	var r webhttp.Ready
 	r.Set(ready)
+	staticSrv, _ := testStaticSurface()
 	return withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &r,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
+		static:  staticSrv,
+		ready:   &r,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
 	})
 }
 
@@ -996,15 +1029,24 @@ func unreadyDepsWithTools() *routeDeps {
 	return d
 }
 
-// mustRegisterRoutes wires deps on a fresh mux, failing the test on
-// error and scheduling manager shutdown.
+// depsWithToolsMissing builds a ready runtime whose last job succeeded, with the
+// whole-tree convergence count either known (ok) or not yet taken.
+func depsWithToolsMissing(known bool, n int) *routeDeps {
+	d := newTestDeps(true)
+	d.toolsState = func() string { return "ok" }
+	d.toolsMissing = func() (int, bool) { return n, known }
+	return d
+}
+
+// mustRegisterRoutes wires deps on a fresh mux and schedules manager shutdown.
+// It also returns the hash-pinned CSP the composition root derives from the
+// same static fixture (buildStaticSurface), which is what production hands
+// buildHandler — registerRoutes itself no longer produces it.
 func mustRegisterRoutes(t *testing.T, deps *routeDeps) (*http.ServeMux, *terminal.SessionManager, string) {
 	t.Helper()
 	mux := http.NewServeMux()
-	mgr, csp, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	_, csp := testStaticSurface()
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 	return mux, mgr, csp
 }
@@ -1074,13 +1116,42 @@ func newToolsDeps(t *testing.T) *routeDeps {
 	t.Cleanup(eng.Close)
 	var ready webhttp.Ready
 	ready.Set(true)
+	staticSrv, _ := testStaticSurface()
 	return withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-		tools:    eng,
+		static:  staticSrv,
+		ready:   &ready,
+		workDir: "",
+		cmd:     staticCmd("/bin/cat"),
+		tools:   eng,
 	})
+}
+
+// TestLoopbackHint pins the WT_ADDR -> "localhost[:port]" mapping the loopback
+// surfaces' refusals quote. The 403 is the whole of what a refused caller is told, so a
+// hint naming a port the deployment moved away from sends the operator to
+// connection-refused with nothing else to work from; the fallback arm must degrade to a
+// reachable host rather than to a broken URL like "localhost:" or ":9848".
+func TestLoopbackHint(t *testing.T) {
+	for name, tc := range map[string]struct{ addr, want string }{
+		"the default host-less form": {":9848", "localhost:9848"},
+		"a moved port":               {":8080", "localhost:8080"},
+		"an explicit bind address":   {"0.0.0.0:8080", "localhost:8080"},
+		"a loopback bind":            {"127.0.0.1:9848", "localhost:9848"},
+		"an IPv6 bind":               {"[::1]:9848", "localhost:9848"},
+		"no port at all":             {"localhost", "localhost"},
+		// net.SplitHostPort returns NO error for an empty port, so `port != ""` is
+		// the only thing standing between these two and the broken "localhost:"
+		// URL this test's comment promises to prevent.
+		"a host with an empty port": {"localhost:", "localhost"},
+		"a bare colon":              {":", "localhost"},
+		"empty":                     {"", "localhost"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := loopbackHint(tc.addr); got != tc.want {
+				t.Errorf("loopbackHint(%q) = %q, want %q", tc.addr, got, tc.want)
+			}
+		})
+	}
 }
 
 // TestToolsAPI_LoopbackOnly pins the tools API's only boundary on this
@@ -1093,10 +1164,10 @@ func newToolsDeps(t *testing.T) *routeDeps {
 func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	// A non-default port, so the assertion below fails if the refusal goes back to a
+	// hardcoded address instead of this deployment's own.
+	deps.listenHint = loopbackHint(":8080")
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	// Remote peer: refused, even claiming loopback via forwarded headers.
@@ -1123,6 +1194,11 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	}
 	if !strings.Contains(denied.Error, "loopback-only") || denied.Code != "" {
 		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message with an empty code", denied.Error, denied.Code)
+	}
+	// The remedy the 403 names must be this deployment's address, not the default
+	// port: a refused caller sees nothing else.
+	if !strings.Contains(denied.Error, "curl localhost:8080") {
+		t.Errorf("remote peer: envelope error = %q, want it to name this deployment's address (curl localhost:8080)", denied.Error)
 	}
 
 	// Loopback peer AND loopback Host: served. The fresh engine has an empty
@@ -1213,10 +1289,13 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 		}
 	}
 
-	// The provenance leg (proxiedOrigin): a request that passes BOTH loopback legs
-	// but carries proxy or browser evidence is refused. Without these rows, deleting
-	// `|| proxiedOrigin(r.Header)` from loopbackOnly -- or emptying
-	// proxyProvenanceHeaders -- keeps the entire suite green while a same-loopback
+	// The provenance leg (webhttp.ProxiedRequest): a request that passes BOTH
+	// loopback legs but carries proxy or browser evidence is refused. The deny
+	// lives in the library since the webhttp.LoopbackOnly adoption (the app-local
+	// proxiedOrigin / proxyProvenanceHeaders copies are deleted), so these rows
+	// pin that loopbackOnly still COMPOSES that middleware: rewiring it around
+	// webhttp.LoopbackRequest alone -- the shape it had before the adoption's
+	// library existed -- keeps the rest of the suite green while a same-loopback
 	// proxy that rewrites Host to its upstream address readmits the API that runs
 	// `manual` install strings as root. Refuse-only by design: a header can never
 	// ADMIT, which is why the positive cases above carry none.
@@ -1250,10 +1329,7 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 func TestToolsAPI_LoopbackOnly_malformedPeerFailsClosed(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	for _, tc := range []struct{ name, remoteAddr string }{
@@ -1296,10 +1372,7 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	syncing.Store(true)
 	deps.toolsSyncing = syncing.Load
 	deps.toolsState = func() string { return "syncing" }
-	mgr, _, err := registerRoutes(mux, deps)
-	if err != nil {
-		t.Fatalf("registerRoutes: %v", err)
-	}
+	mgr := registerRoutes(mux, deps)
 	t.Cleanup(mgr.Shutdown)
 
 	create := func() *httptest.ResponseRecorder {
@@ -1359,21 +1432,14 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	}
 }
 
-// TestRegisterRoutes_failsLoudOnMalformedStatic pins the error propagation of
-// the fail-loud CSP build through registerRoutes: an embedded index.html with
-// no inline <script> (a malformed build) must abort route registration with an
-// error, never register routes with a silently-degraded CSP.
-func TestRegisterRoutes_failsLoudOnMalformedStatic(t *testing.T) {
-	mux := http.NewServeMux()
-	var ready webhttp.Ready
-	deps := withDefaultPolicies(&routeDeps{
-		staticFS: fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-	})
-	if _, _, err := registerRoutes(mux, deps); err == nil {
-		t.Fatal("registerRoutes returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
+// TestBuildStaticSurface_failsLoudOnMalformedStatic pins the fail-loud CSP leg
+// of buildStaticSurface, which the composition root calls before it wires any
+// route: an embedded index.html with no inline <script> (a malformed build) must
+// abort startup with an error, never yield a silently-degraded CSP.
+func TestBuildStaticSurface_failsLoudOnMalformedStatic(t *testing.T) {
+	fsys := fstest.MapFS{"static/index.html": &fstest.MapFile{Data: []byte(`<script src="/app.js"></script>`)}}
+	if _, _, err := buildStaticSurface(fsys); err == nil {
+		t.Fatal("buildStaticSurface returned nil error for an index.html with no inline script; the hash-pinned CSP must abort startup, not degrade silently")
 	}
 }
 
@@ -1430,29 +1496,21 @@ func (f failOpenFS) Open(name string) (fs.File, error) {
 	return f.FS.Open(name)
 }
 
-// TestRegisterRoutes_failsLoudOnUnreadableStaticTree pins the static-handler
+// TestBuildStaticSurface_failsLoudOnUnreadableStaticTree pins the static-handler
 // leg of buildStaticSurface's fail-loud contract, which
-// TestRegisterRoutes_failsLoudOnMalformedStatic (the CSP leg) does not reach:
+// TestBuildStaticSurface_failsLoudOnMalformedStatic (the CSP leg) does not reach:
 // webhttp.StaticHandler walks and hashes every file at construction, so a
-// static tree with an unreadable file (a malformed build) must abort route
-// registration with an error rather than serve a partial site. index.html
+// static tree with an unreadable file (a malformed build) must abort startup
+// with an error rather than serve a partial site. index.html
 // itself stays readable so the CSP build succeeds and the failure is
 // attributable to the static-handler leg alone.
-func TestRegisterRoutes_failsLoudOnUnreadableStaticTree(t *testing.T) {
+func TestBuildStaticSurface_failsLoudOnUnreadableStaticTree(t *testing.T) {
 	base := fstest.MapFS{
 		"static/index.html": &fstest.MapFile{Data: []byte(testIndexHTML)},
 		"static/broken.js":  &fstest.MapFile{Data: []byte("x")},
 	}
-	mux := http.NewServeMux()
-	var ready webhttp.Ready
-	deps := withDefaultPolicies(&routeDeps{
-		staticFS: failOpenFS{FS: base, failPath: "static/broken.js"},
-		ready:    &ready,
-		workDir:  "",
-		cmd:      staticCmd("/bin/cat"),
-	})
-	if _, _, err := registerRoutes(mux, deps); err == nil {
-		t.Fatal("registerRoutes returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
+	if _, _, err := buildStaticSurface(failOpenFS{FS: base, failPath: "static/broken.js"}); err == nil {
+		t.Fatal("buildStaticSurface returned nil error for a static tree with an unreadable file; an unhashable asset must abort startup, not serve a partial site")
 	}
 }
 
@@ -1517,10 +1575,7 @@ func TestNotifyFingerprint(t *testing.T) {
 	seen := make(map[string]string, len(inputs))
 	for name, msg := range inputs {
 		t.Run(name, func(t *testing.T) {
-			got, ok := fp.fingerprint(msg)
-			if !ok {
-				t.Fatalf("fingerprint(%q) reported no key on a keyed fingerprinter; the Warn and Debug records would lose their only identifier", msg)
-			}
+			got := fp.fingerprint(msg)
 			if len(got) != notifyFingerprintHexDigits {
 				t.Errorf("fingerprint(%q) = %q (%d chars), want exactly %d; the record's width must not depend on child output", msg, got, len(got), notifyFingerprintHexDigits)
 			}
@@ -1529,7 +1584,7 @@ func TestNotifyFingerprint(t *testing.T) {
 			if strings.Trim(got, "0123456789abcdef") != "" {
 				t.Errorf("fingerprint(%q) = %q, want lowercase hex only; anything else means child output reached the log verbatim", msg, got)
 			}
-			if again, _ := fp.fingerprint(msg); again != got {
+			if again := fp.fingerprint(msg); again != got {
 				t.Errorf("fingerprint(%q) is unstable (%q then %q); an operator could not correlate the Warn with its Debug twin", msg, got, again)
 			}
 			// metadata is the integration point: it supplies the attrs routes.go
@@ -1545,7 +1600,7 @@ func TestNotifyFingerprint(t *testing.T) {
 				t.Errorf("metadata(%q) = %v, want [message_fingerprint %s message_runes %d]; the logged attribute must BE the keyed fingerprint, not another hex-shaped encoding of the notification", msg, meta, got, len([]rune(msg)))
 			}
 		})
-		got, _ := fp.fingerprint(msg)
+		got := fp.fingerprint(msg)
 		if other, dup := seen[got]; dup {
 			t.Errorf("fingerprint collides for %q and %q (both %q); two distinct wordings would read as one", msg, other, got)
 		}
@@ -1557,23 +1612,12 @@ func TestNotifyFingerprint(t *testing.T) {
 	// digest of it is recoverable by offline enumeration. Two keys must not
 	// agree on it — a plain hash would.
 	const deviceCode = "ABCD-EFGH"
-	underOneKey, _ := fp.fingerprint(deviceCode)
-	underAnotherKey, _ := otherKey.fingerprint(deviceCode)
+	underOneKey := fp.fingerprint(deviceCode)
+	underAnotherKey := otherKey.fingerprint(deviceCode)
 	if underOneKey == underAnotherKey {
 		t.Errorf("fingerprint(%q) = %q under two different keys; the identifier is unkeyed, so anyone reading the log can enumerate short candidates offline and confirm the notification's text", deviceCode, underOneKey)
 	}
 
-	// Fail-closed: a fingerprinter with no key (crypto/rand unavailable at
-	// construction) must omit the identifier rather than emit a predictable one,
-	// and must still report the rune count so the record stays diagnosable.
-	unkeyed := notifyFingerprinter{}
-	if got, ok := unkeyed.fingerprint(deviceCode); ok || got != "" {
-		t.Errorf("unkeyed fingerprint(%q) = (%q, %v), want (%q, false); a keyless fallback would be a guessable copy of child output", deviceCode, got, ok, "")
-	}
-	attrs := unkeyed.metadata(deviceCode)
-	if len(attrs) != 2 || attrs[0] != "message_runes" || attrs[1] != len([]rune(deviceCode)) {
-		t.Errorf("unkeyed metadata(%q) = %v, want exactly [message_runes %d]; the record must drop the fingerprint and keep the length", deviceCode, attrs, len([]rune(deviceCode)))
-	}
 	if keyed := fp.metadata(deviceCode); len(keyed) != 4 || keyed[0] != "message_fingerprint" {
 		t.Errorf("keyed metadata(%q) = %v, want [message_fingerprint <hex> message_runes <n>]", deviceCode, keyed)
 	}
@@ -1626,94 +1670,111 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 	}
 }
 
-// TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall pins the
-// admission gate, which is not observable from a single request. pinstall
-// serializes rescans on an opMu whose acquisition ignores context, so before the
-// gate every concurrent POST parked a handler goroutine inside the library and —
-// because the operation context is deliberately detached from the request — still
-// ran its rescan after the caller was gone. A loopback agent retrying in a loop
-// (the documented consumer: kiro-cli's ! escape + curl) could queue an unbounded
-// number of them.
+// TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached pins the two non-ok
+// outcomes, neither of which any other test reaches, and the property that
+// separates them: BOTH answer 503, and only the one that reached a verdict speaks
+// about the install. pinstall's ORDINARY refusal is (false, nil) -- no candidate
+// selected, and recording that verdict succeeded -- which answers the manager's
+// own reason. A context error means the request was ABANDONED before any verdict
+// (the caller's own cancellation while queued for pinstall's operation slot, or
+// this server's shutdown pre-drain cancelling the BaseContext every request is
+// built on; an ADMITTED rescan detaches with context.WithoutCancel, and a probe or
+// assertion that times out surfaces as *exec.ExitError, not as a context error),
+// so it answers under its own "abandoned" status and does NOT report "no usable
+// version" -- that would be a false broken-install verdict on the one endpoint an
+// operator uses while the manager is already unready. "unready" is not a safe
+// hedge either: it is itself a weak verdict, and an abandoned rescan says nothing
+// about readiness (a caller queued behind another rescan can be dropped on a
+// manager that is ready), so the status field carries the discrimination rather
+// than the reason string alone.
 //
-// The assertion is the rescan INVOCATION COUNT, not the response: the abandoned
-// caller has no reader left, so status codes prove nothing here, and a
-// count-blind test stays green with the gate deleted. Deterministic by
-// construction — the first request signals from inside the rescan and blocks
-// there, so the second request is provably queued rather than merely likely to be.
-func TestKiroRescan_AbandonedRequestQueuedBehindAnotherNeverEntersPinstall(t *testing.T) {
-	var calls atomic.Int64
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	deps := newTestDeps(true)
-	deps.kiroRescan = func(context.Context) (bool, error) {
-		// Only the FIRST call holds the slot; a second call (which is the defect
-		// this pins) returns at once, so a broken gate fails the count assertion
-		// below instead of deadlocking the suite.
-		if calls.Add(1) == 1 {
-			close(entered)
-			<-release
-		}
-		return true, nil
-	}
-	h := handleKiroRescan(deps)
+// The empty wantBody this case used to carry was a defect, not a contract: writing
+// nothing let net/http synthesize an implicit 200, so an operator's
+// `curl -sfS -X POST .../api/kiro-cli/rescan` exited 0 -- reporting success for a
+// repair that never ran. Both assertions below are load-bearing against a
+// regression to that shape.
+func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
+	for name, tc := range map[string]struct {
+		rescanErr error
+		wantCode  int
+		wantBody  string
+	}{
+		"a refusal that reached a verdict reports unready": {
+			rescanErr: nil,
+			wantCode:  http.StatusServiceUnavailable,
+			wantBody:  `{"status":"unready","reason":"kiro-cli unavailable"}`,
+		},
+		"an abandoned caller reports the abandonment, never a verdict": {
+			rescanErr: context.Canceled,
+			wantCode:  http.StatusServiceUnavailable,
+			wantBody:  `{"status":"abandoned","reason":"kiro-cli rescan not performed: request abandoned before any verdict"}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			deps := newTestDeps(true)
+			deps.kiroReady = func() (bool, string) { return false, "kiro-cli unavailable" }
+			deps.kiroRescan = func(context.Context) (bool, error) { return false, tc.rescanErr }
+			mux, _, _ := mustRegisterRoutes(t, deps)
 
-	firstDone := make(chan struct{})
-	go func() {
-		defer close(firstDone)
-		req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
-		h(httptest.NewRecorder(), req)
-	}()
-	<-entered // the first rescan holds the only admission slot
+			req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
+			req.RemoteAddr = "127.0.0.1:5555"
+			req.Host = "localhost:9848"
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
 
-	// The second caller goes away while queued: exactly the abandoned-POST shape.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody)
-	h(httptest.NewRecorder(), req.WithContext(ctx))
-
-	if got := calls.Load(); got != 1 {
-		t.Errorf("kiroRescan calls after an abandoned queued request = %d, want 1 — an abandoned caller must not enter pinstall, or a retry loop queues unbounded serialized rescans", got)
-	}
-
-	close(release)
-	<-firstDone
-	if got := calls.Load(); got != 1 {
-		t.Errorf("kiroRescan calls after the in-flight rescan finished = %d, want 1", got)
+			if rec.Code != tc.wantCode {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != tc.wantBody {
+				t.Errorf("body = %q, want %q", got, tc.wantBody)
+			}
+		})
 	}
 }
 
-// TestKiroRescan_AdmittedRescanSurvivesClientDisconnect is the other half of the
-// gate's contract, and the reason the cancellation check sits at ADMISSION only:
-// once a rescan is running, a caller that disconnects (Ctrl-C, --max-time) must
-// not abort it, because pinstall reads a canceled probe as "no usable version"
-// and publishes unready. The request context is canceled while the rescan is
-// executing; the rescan must still be allowed to complete.
-func TestKiroRescan_AdmittedRescanSurvivesClientDisconnect(t *testing.T) {
-	entered := make(chan struct{})
-	sawCancel := make(chan error, 1)
+// The two tests that used to sit here pinned this app's OWN admission gate and
+// its context.WithoutCancel wrapper: that an abandoned queued caller never
+// entered pinstall, and that an admitted rescan survived a client disconnect.
+// Both behaviours are now the LIBRARY's (pinstall >= v1.1.0 makes waiting for its
+// operation slot cancellable and runs an admitted rescan detached), and they are
+// pinned there by TestRescanQueuedCallerCanAbandon and
+// TestAdmittedRescanIgnoresCallerCancellation, which exercise the real manager.
+// These app-level versions drove a FAKE kiroRescan, so after the move they could
+// only ever assert that the fake had no gate — a test of the stub, not the app.
+//
+// What is still this app's to get wrong is the one line below, and it is the
+// reason this test exists rather than nothing: the handler must hand the REQUEST
+// context to the manager unchanged. Re-detaching it here (the shape that was
+// correct before the bump) would defeat the library's cancellable wait, silently
+// restoring the unbounded-queue hazard the gate was written for.
+func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
+	seen := make(chan context.Context, 1)
 	deps := newTestDeps(true)
 	deps.kiroRescan = func(ctx context.Context) (bool, error) {
-		close(entered)
-		// Whatever the caller does now, the operation context must stay live.
-		<-sawCancel
-		return ctx.Err() == nil, nil
+		seen <- ctx
+		return true, nil
 	}
-	h := handleKiroRescan(deps)
+	mux, _, _ := mustRegisterRoutes(t, deps)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody).WithContext(ctx)
-	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h(rec, req)
-	}()
-	<-entered
-	cancel() // the client disconnects mid-rescan
-	sawCancel <- nil
-	<-done
+	req.RemoteAddr = "127.0.0.1:5555"
+	req.Host = "localhost:9848"
+	mux.ServeHTTP(httptest.NewRecorder(), req)
 
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d — an admitted rescan must run to completion on a detached context; a canceled probe would publish a false unready", rec.Code, http.StatusOK)
+	var got context.Context
+	select {
+	case got = <-seen:
+	default:
+		t.Fatal("the rescan hook was never called")
+	}
+
+	// Cancelling the REQUEST must be visible to the manager: that is what lets
+	// pinstall drop a caller still queued for its operation slot.
+	cancel()
+	select {
+	case <-got.Done():
+	default:
+		t.Error("cancelling the request did not reach the context handed to pinstall; the handler is detaching it itself, which defeats the library's cancellable wait and restores the unbounded-queue hazard")
 	}
 }

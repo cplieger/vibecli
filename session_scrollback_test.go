@@ -1,150 +1,191 @@
 package main
 
 import (
-	"context"
-	"encoding/binary"
 	"fmt"
-	"net/http/httptest"
-	"strings"
+	"log/slog"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
+	"github.com/cplieger/slogx/capture"
 	"github.com/cplieger/web-terminal-engine/v3/terminal"
 )
 
-// resumeAck frame offsets (the engine's encodeResumeAck layout):
-// [0] msg type, [1:9] ack, [9:17] epoch, [17:25] committed, [25:33] oldestIndex.
+// This file pins what this app decides about retained-history depth, which after
+// 2026-08 is deliberately NOTHING: the session factory omits
+// terminal.WithScrollbackCapacity so the engine's own default applies, and an
+// operator overrides it per deployment through the env var the ENGINE names.
 //
-// FOLLOW-UP (blocked on a web-terminal-engine release, then mechanical): DELETE
-// these four constants and readResumeAckBounds' frame parsing. They hard-code the
-// engine's PRIVATE encodeResumeAck layout — msg type 2, offsets 17 and 25, min
-// length 33 — only because no accessor existed when this test was written; a
-// layout change inside the engine turns this test into a silent
-// never-sees-a-resumeAck timeout rather than a compile error. The engine now
-// exports the bounds directly:
+// It used to pin a literal wired into registerRoutes (5000, then 20000). That was
+// the wrong thing to guard: the depth is a sizing decision shared by this app,
+// web-terminal-server and vibekit, so a number here made it three numbers that
+// drift, and the test only asserted that someone had typed the same digits twice.
+// What is worth guarding is the PLUMBING — that the app adds no opinion of its
+// own, that the shared variable actually reaches the ring, and that the one
+// adjustment made to an operator's number is the engine's rather than a local
+// copy of the threshold.
 //
-//	func (h *terminal.Handler) ScrollbackBounds() (committed, oldest uint64)
-//
-// read-only, both values under ONE mutex acquisition (so the pair is a state the
-// session actually had), half-open range [oldest, committed), both 0 on a fresh
-// session. When the pinned engine version carries it, rewrite this test to hold
-// the session's Handler and call ScrollbackBounds() instead of dialing /ws and
-// decoding a frame — which also drops the websocket dial, the read-limit bump and
-// the resume-control JSON from this file.
-//
-// WHOEVER REWRITES IT MUST KEEP IT ABLE TO FAIL. An earlier version of this test
-// was VACUOUS: it emitted 2500 lines and asserted oldest == 0, so ANY capacity
-// above ~2500 passed and a raised capacity was invisible. The current shape is
-// deliberate and must survive the rewrite: emit PAST the configured capacity
-// (5250 > 5000) so eviction is observable, wait until enough lines are committed,
-// and assert committed-oldest == 5000 EXACTLY — an equality that fails both when
-// terminal.WithScrollbackCapacity(5000) is deleted (the engine default retains
-// 1000) and when the number is changed in either direction. Red-check the rewrite
-// by editing the capacity in registerRoutes' session factory and confirming it
-// fails.
-const resumeAckMsgType byte = 2
+// THE SHAPE OF THESE ASSERTIONS IS LOAD-BEARING. An early version of the literal
+// test was VACUOUS: it emitted 2500 lines and asserted oldest == 0, so ANY
+// capacity above ~2500 passed. So each case emits PAST the capacity it expects,
+// making eviction observable, and asserts committed-oldest EXACTLY. Red-check any
+// change by editing the factory and confirming the failure.
 
-const (
-	resumeAckMinLen        = 33
-	resumeAckCommittedAt   = 17
-	resumeAckOldestIndexAt = 25
-)
-
-// TestSessionScrollbackCapacityWiredIntoSessionFactory pins the exact 5000-line
-// retention policy wired into registerRoutes' session factory:
-// terminal.WithScrollbackCapacity(5000). The engine's own default is 1000 lines,
-// and the browser's own LineStore retains 5000, so a smaller server capacity
-// silently truncates a reconnect while a larger one wastes memory the client will
-// never retain -- and this app's in-memory-only session model has no on-disk store
-// to fall back on. 5000 is therefore the pin because it is the CLIENT's retention
-// cap, not because it is merely "more than the engine default".
-//
-// The observable is the engine's resumeAck frame, which carries the absolute
-// bounds of retained history (committed, oldestIndex) -- the same pair the browser
-// client uses to detect an eviction gap. The child emits PAST the configured
-// capacity, so eviction is observable and committed-oldest reports the capacity
-// exactly: deleting the option fails (the 1000-line default retains a fifth), and
-// so does REDUCING it, which the older ">= emitted lines" form could not see
-// (it emitted 2500 and asserted oldest == 0, so any capacity above ~2500 passed).
-//
-// haveThrough is set far in the future so the server replays no history: this
-// exchange is only asked for the bounds. Polling re-sends the resume until the
-// scrollback has committed enough lines, rather than sleeping a guessed
-// interval.
-func TestSessionScrollbackCapacityWiredIntoSessionFactory(t *testing.T) {
-	const (
-		emitted       = 5250 // past the app-owned 5000-line capacity, so eviction is observable
-		wantCommitted = 5100 // enough evicted lines that committed-oldest IS the capacity
-		wantCapacity  = 5000 // the app's policy, matching the client's own retention cap
-	)
+// retainedLines drives the production session factory with the given deps,
+// emits `emitted` lines, and returns the retention the ring settled on
+// (committed - oldest) once enough lines have been committed to make eviction
+// observable.
+func retainedLines(t *testing.T, scrollback *int, emitted, awaitCommitted int) uint64 {
+	t.Helper()
 	deps := newTestDeps(true)
+	deps.scrollback = scrollback
 	deps.cmd = staticCmd("/bin/sh", "-c", fmt.Sprintf(
 		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted))
-	mux, _, csp, id := mustStartSession(t, deps)
 
-	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
-	t.Cleanup(srv.Close)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	conn, resp, err := websocket.Dial(ctx,
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/ws?session="+id,
-		&websocket.DialOptions{HTTPClient: srv.Client()})
-	if resp != nil && resp.Body != nil {
-		defer resp.Body.Close()
+	h := newSessionFactory(deps)("scrollback-probe")
+	if err := h.StartEager(); err != nil {
+		t.Fatalf("StartEager: %v", err)
 	}
-	if err != nil {
-		t.Fatalf("dial /ws: %v", err)
-	}
-	defer conn.CloseNow()
-	// The window frame plus modes/title easily exceeds coder/websocket's 32 KiB
-	// default read limit on a 120-column screen; without this the library closes
-	// the connection mid-exchange and the assertion never runs.
-	conn.SetReadLimit(1 << 22)
+	t.Cleanup(h.Shutdown)
 
-	resume := append([]byte{0x00}, fmt.Sprintf(
-		`{"type":"resume","sessionId":%q,"haveThrough":1000000000,"protocolVersion":%d}`,
-		id, terminal.WireProtocolVersion)...)
-
-	deadline := time.Now().Add(20 * time.Second)
-	var committed, oldest uint64
+	deadline := time.Now().Add(60 * time.Second)
 	for {
-		if err := conn.Write(ctx, websocket.MessageBinary, resume); err != nil {
-			t.Fatalf("write resume control: %v", err)
-		}
-		if c, o, ok := readResumeAckBounds(ctx, t, conn); ok {
-			committed, oldest = c, o
-			if committed >= wantCommitted {
-				break
-			}
+		committed, oldest := h.ScrollbackBounds()
+		if committed >= uint64(awaitCommitted) { // #nosec G115 -- test-controlled line counts
+			return committed - oldest
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("scrollback never committed %d lines (committed=%d oldest=%d); the child must emit %d lines",
-				wantCommitted, committed, oldest, emitted)
+			t.Fatalf("scrollback never committed %d lines (committed=%d oldest=%d); the child must emit %d",
+				awaitCommitted, committed, oldest, emitted)
 		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if got := committed - oldest; got != wantCapacity {
-		t.Errorf("retained scrollback lines = %d (committed=%d oldest=%d), want exactly %d -- terminal.WithScrollbackCapacity must stay wired to the app's 5000-line reconnect policy, which is the client store's own retention cap",
-			got, committed, oldest, wantCapacity)
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-// readResumeAckBounds reads frames until the engine's resumeAck arrives and
-// returns the absolute bounds of retained history it carries.
-func readResumeAckBounds(ctx context.Context, t *testing.T, conn *websocket.Conn) (committed, oldest uint64, ok bool) {
-	t.Helper()
-	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	for {
-		_, msg, err := conn.Read(readCtx)
-		if err != nil {
-			return 0, 0, false
-		}
-		if len(msg) >= resumeAckMinLen && msg[0] == resumeAckMsgType {
-			return binary.LittleEndian.Uint64(msg[resumeAckCommittedAt:]),
-				binary.LittleEndian.Uint64(msg[resumeAckOldestIndexAt:]), true
-		}
+// TestSessionScrollbackUsesTheEngineDefault pins that this app adds no depth of
+// its own: with no operator override the ring retains exactly what the engine
+// documents. A reintroduced local WithScrollbackCapacity fails here, in either
+// direction, without this test naming the number.
+func TestSessionScrollbackUsesTheEngineDefault(t *testing.T) {
+	if testing.Short() {
+		t.Skip("emits >100k lines through a PTY")
+	}
+	want := uint64(terminal.DefaultScrollbackCapacity) // #nosec G115 -- a positive constant
+	// Emit past the ceiling so eviction is observable, and wait until enough
+	// lines are evicted that committed-oldest IS the capacity.
+	got := retainedLines(t, nil,
+		terminal.DefaultScrollbackCapacity+1000,
+		terminal.DefaultScrollbackCapacity+400)
+	if got != want {
+		t.Errorf("retained %d lines with no override, want exactly %d (the engine default must reach the ring untouched)",
+			got, want)
+	}
+}
+
+// TestSessionScrollbackHonoursTheSharedEnvVar pins the override end to end: the
+// variable the ENGINE names, read by this app's composition root, reaching the
+// ring the session factory builds. The value is small enough to keep the test
+// quick and still above the paging floor so the clamp does not rewrite it.
+func TestSessionScrollbackHonoursTheSharedEnvVar(t *testing.T) {
+	const capacity = 6000
+	if capacity <= terminal.MinPagingCapacity {
+		t.Fatalf("fixture must stay above the paging floor (%d) or the clamp rewrites it", terminal.MinPagingCapacity)
+	}
+	t.Setenv(terminal.ScrollbackEnvVar, strconv.Itoa(capacity))
+	scrollback := resolveScrollback()
+	if scrollback == nil || *scrollback != capacity {
+		t.Fatalf("resolveScrollback() = %v, want %d", scrollback, capacity)
+	}
+	if got := retainedLines(t, scrollback, capacity+500, capacity+200); got != capacity {
+		t.Errorf("retained %d lines, want exactly %d from %s", got, capacity, terminal.ScrollbackEnvVar)
+	}
+}
+
+// TestResolveScrollback pins the operator-facing read of the shared
+// retained-history knob: the depth it returns AND what it puts in the log. The
+// log half is what nothing else covers, and it is a house rule rather than a
+// preference — WT_TRUSTED_PROXIES (count only), KIRO_CLI_CHAT_ARGS (flag count),
+// WT_LOG_LEVEL, WT_LOG_OSC_TEXT and TOOL_CATALOG_REFRESH are all read
+// by-name-only because a compose expansion mistake can put a credential on any
+// key (CWE-532), and the last two each carry a test saying so. Four properties:
+//
+//   - absent and blank fall through to the engine default, and do so SILENTLY: a
+//     warning on the path every deployment that never set the knob takes is a
+//     line on every boot forever;
+//   - a malformed value falls through with exactly ONE Warn, which names the key
+//     and carries no copy of the raw value in its message or in any attribute;
+//   - a value the ENGINE clamps keeps the engine's own warning, which does quote
+//     the number — deliberately, because it already parsed as an integer and so
+//     cannot be the secret this rule protects;
+//   - the returned depth is the engine's verdict, never a local copy of the
+//     threshold.
+//
+// Serial: capture.Default mutates the process-global default logger, and
+// t.Setenv forbids t.Parallel anyway.
+func TestResolveScrollback(t *testing.T) {
+	const token = "s3cr3t-token-abc123"
+	tests := []struct {
+		name      string
+		raw       string
+		absent    bool // the variable is not in the environment at all
+		want      *int // nil = the option is omitted and the engine default applies
+		wantWarns int
+		// rawMustStayOut asks for the confidentiality assertion. It is set only
+		// for values distinctive enough that finding one in the log PROVES a
+		// leak; a bare number occurs in these warnings by design.
+		rawMustStayOut bool
+	}{
+		{name: "absent falls through to the engine default in silence", absent: true, want: nil},
+		{name: "blank is not a number and must not disable history", raw: "   ", want: nil},
+		{name: "malformed warns by name and falls through", raw: "lots", want: nil, wantWarns: 1, rawMustStayOut: true},
+		// The shape that motivates the rule: a compose interpolation that lands a
+		// credential on this key must not put it in the log store.
+		{name: "a token-shaped value cannot reach the log", raw: token, want: nil, wantWarns: 1, rawMustStayOut: true},
+		{name: "a plain depth is honoured", raw: "40000", want: new(40000)},
+		// 0 is the operator saying "retain nothing beyond the live screen", and it
+		// is the one shallow value the clamp leaves alone: a client cannot page
+		// against a server holding no history, so the inverted outcome the clamp
+		// exists to prevent cannot arise.
+		{name: "zero disables history and is passed through", raw: "0", want: new(0)},
+		// The awkward middle: honoured by the ring, too shallow for the engine to
+		// offer paging, and the browser's fallback then retains MORE than the
+		// operator asked to save. Clamped up by the ENGINE, whose warning quotes
+		// the number it was given.
+		{name: "below the paging floor clamps up and the engine says so", raw: "2000", want: new(terminal.MinPagingCapacity), wantWarns: 1},
+		// No upper bound: an absurd number is how this family spells "never
+		// truncate", and the engine's ring allocates only what it fills.
+		{name: "an absurd depth is honoured as given", raw: "50000000", want: new(50_000_000)},
+		{name: "negative is not reachable via the ring and reads as disabled", raw: "-5", want: new(0), wantWarns: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			records := capture.Default(t)
+			// t.Setenv first either way: it records the pre-test value and
+			// restores it at cleanup, so the Unsetenv below is safe.
+			t.Setenv(terminal.ScrollbackEnvVar, tc.raw)
+			if tc.absent {
+				if err := os.Unsetenv(terminal.ScrollbackEnvVar); err != nil {
+					t.Fatalf("Unsetenv(%s): %v", terminal.ScrollbackEnvVar, err)
+				}
+			}
+
+			got := resolveScrollback()
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("resolveScrollback() = %d, want unset (the engine default)", *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("resolveScrollback() = unset, want %d", *tc.want)
+			case tc.want != nil && got != nil && *got != *tc.want:
+				t.Errorf("resolveScrollback() = %d, want %d", *got, *tc.want)
+			}
+			if n := records.CountLevel(slog.LevelWarn, ""); n != tc.wantWarns {
+				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), tc.wantWarns, n)
+			}
+			if tc.rawMustStayOut && logContains(records, tc.raw) {
+				t.Errorf("log = %q carries the raw %s value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only",
+					records.Messages(), terminal.ScrollbackEnvVar)
+			}
+		})
 	}
 }

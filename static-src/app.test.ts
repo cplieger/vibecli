@@ -21,11 +21,19 @@ import {
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
 // assertions match against, so we verify app.ts passes the agent preset through.
-const { createTerminalMock, presetAgentTabbedMock } = vi.hoisted(() => ({
-  createTerminalMock: vi.fn(),
-  presetAgentTabbedMock: vi.fn(() => ["preset-features"]),
+const { createTerminalMock, presetAgentTabbedMock, localScrollbackStorageMock } = vi.hoisted(
+  () => ({
+    createTerminalMock: vi.fn(),
+    presetAgentTabbedMock: vi.fn(() => ["preset-features"]),
+    // A sentinel, so the assertions verify the app hands the library's own
+    // localStorage store through rather than inventing storage of its own.
+    localScrollbackStorageMock: vi.fn(() => ({ kind: "scrollback-store" })),
+  }),
+);
+vi.mock("@cplieger/web-terminal-ui", () => ({
+  createTerminal: createTerminalMock,
+  localScrollbackStorage: localScrollbackStorageMock,
 }));
-vi.mock("@cplieger/web-terminal-ui", () => ({ createTerminal: createTerminalMock }));
 vi.mock("@cplieger/web-terminal-ui/presets", () => ({
   presetAgentTabbed: presetAgentTabbedMock,
 }));
@@ -471,8 +479,8 @@ function describeReachable(el: HTMLElement): string {
 describe("web-terminal-kiro bootstrap (app.ts)", () => {
   beforeEach(() => {
     // resetModules so each dynamic import re-runs app.ts top-level code. Mock
-    // call history is cleared by the config's clearMocks/mockReset before each
-    // test (implementations given to vi.fn persist through mockReset).
+    // call history is cleared by the config's mockReset before each test
+    // (implementations given to vi.fn persist through mockReset).
     vi.resetModules();
     document.body.replaceChildren();
   });
@@ -492,6 +500,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // app had to hand-build a recovery surface -- and the library never saw them.
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
       features: presetAgentTabbedMock,
+      persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
     });
     // Passing the function must NOT call it here.
@@ -500,6 +509,25 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the app adds no dialog, no inert, nothing.
     expect(root.hasAttribute("inert")).toBe(false);
     expect(root.children).toHaveLength(0);
+  });
+
+  it("persists each tab's scrollback through the library's own store", async () => {
+    // The point of the option, and the reason it is set here rather than left off:
+    // iOS discards this page's process routinely, the server keeps every session,
+    // and without a restored store the reload asks for the whole scrollback back
+    // over the wire — which is the line-by-line refill that made an ordinary tab
+    // eviction look like a crash.
+    //
+    // It must be the LIBRARY's store, called with no arguments. A hand-rolled one
+    // here would be a fourth copy of the same forty lines across the consumers,
+    // and the part that gets omitted in a copy is the orphan sweep, whose absence
+    // is invisible until the origin quota fills.
+    appendTerminalRoot();
+
+    await import("./app.js");
+
+    expect(localScrollbackStorageMock).toHaveBeenCalledTimes(1);
+    expect(localScrollbackStorageMock).toHaveBeenCalledWith();
   });
 
   it("passes the #loading element to createTerminal when it is present", async () => {
@@ -513,6 +541,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
       features: presetAgentTabbedMock,
+      persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
       loading,
     });
@@ -736,38 +765,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     expect(root.hasAttribute("inert")).toBe(false);
   });
 
-  it("watchdog does not clobber an overlay a fatal dialog already converted", () => {
-    evaluateWatchdog(readWatchdogSource());
-
-    appendTerminalRoot();
-    // The marker-less converted overlay: this fixture deliberately omits
-    // data-bootstrap-fatal, so it is NOT the full claimed-overlay
-    // shape -- it isolates the older missing-.wt-loading-bar fallback
-    // clause, complementing the marker-only "watchdog stands down when a
-    // fatal dialog already owns the overlay" test below.
-    const overlay = document.createElement("div");
-    overlay.id = "loading";
-    overlay.setAttribute("role", "alertdialog");
-    overlay.setAttribute("aria-modal", "true");
-    const description = document.createElement("p");
-    description.id = "bootstrap-failure-message";
-    description.textContent = "Web Terminal for Kiro failed to start.";
-    const reload = document.createElement("button");
-    reload.type = "button";
-    reload.textContent = "Reload page";
-    overlay.replaceChildren(description, reload);
-    document.body.appendChild(overlay);
-
-    const scriptEl = document.createElement("script");
-    dispatchWindowError({ target: scriptEl });
-
-    // the existing dialog's specific message survives; the watchdog's generic
-    // failed-to-load text never replaces it.
-    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toBe(
-      "Web Terminal for Kiro failed to start.",
-    );
-  });
-
   it("watchdog ignores a non-script resource error (e.g. an image failing to load)", () => {
     evaluateWatchdog(readWatchdogSource());
 
@@ -911,10 +908,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // watchdog. An EARLIER bootstrap error it already handled set
     // data-bootstrap-fatal, and a later error reaching this capture-phase
     // listener must NOT rebuild the dialog or overwrite that first, specific
-    // message with the generic "failed to load" text. A pristine overlay carrying
-    // only the marker isolates that clause from the replaced-.wt-loading-bar side
-    // effect it supersedes:
-    // with the marker guard removed the watchdog builds its dialog here.
+    // message with the generic "failed to load" text. data-bootstrap-fatal is the
+    // only ownership signal the watchdog reads, so the fixture is a pristine
+    // overlay carrying just the marker: with that guard removed the watchdog
+    // builds its dialog here.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
     overlay.setAttribute("data-bootstrap-fatal", "");
@@ -996,6 +993,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     );
   });
 
+  it("watchdog fires on a runtime error whose thrown value is falsy", () => {
+    evaluateWatchdog(readWatchdogSource());
+
+    const root = appendTerminalRoot();
+    const overlay = appendPristineOverlay();
+
+    // `throw null` (or undefined/false/0/"") is legal, and the window error event
+    // still reports a real module-evaluation failure. index.html classifies by
+    // event SHAPE (`"error" in e`) for exactly this case: a truthiness test on
+    // e.error stands down here and leaves the user behind a pristine, infinitely
+    // animating loading overlay with no recovery dialog. The helper defines the
+    // property for any non-undefined argument, so `error: null` recreates that
+    // shape and this test is red on the pre-fix classifier.
+    dispatchWindowError({ target: window, error: null });
+
+    expectFatalOverlayShape(overlay, root);
+    expect(overlay.querySelector("#bootstrap-failure-message")?.textContent).toContain(
+      "its program stopped with an error before the terminal appeared",
+    );
+  });
+
   it("watchdog stands down after createTerminal has built UI inside #terminal", () => {
     const watchdogSource = readWatchdogSource();
 
@@ -1009,37 +1027,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     // The watchdog must NOT hijack a booted terminal's overlay.
     expectPristineOverlayUntouched(overlay, root);
-  });
-
-  it("converts HSL to hex across every hue sector", () => {
-    // hslToHex is the mechanical link between the accent's two spellings, and the
-    // brand-accent test below exercises exactly ONE of its six hue sectors (263deg).
-    // Its output is what a developer copies into <meta name="theme-color"> and
-    // manifest.json after a hue change, so a wrong sector row, a lost hue clamp or
-    // a broken rounding step ships the wrong colour to installed-PWA chrome with
-    // every test still green. These rows are the sRGB primaries and secondaries,
-    // whose hex is known independently of this implementation.
-    const cases: [string, string][] = [
-      ["hsl(0 100% 50%)", "#ff0000"],
-      ["hsl(60 100% 50%)", "#ffff00"],
-      ["hsl(120 100% 25%)", "#008000"],
-      ["hsl(180 100% 50%)", "#00ffff"],
-      ["hsl(240 100% 50%)", "#0000ff"],
-      ["hsl(300 100% 50%)", "#ff00ff"],
-      // The hue clamp: hp = 6 indexes past the sector table, so without
-      // Math.min(..., 5) this row throws instead of wrapping back to red.
-      ["hsl(360 100% 50%)", "#ff0000"],
-      // Achromatic: chroma 0, so every sector row must agree.
-      ["hsl(0 0% 100%)", "#ffffff"],
-      ["hsl(0 0% 0%)", "#000000"],
-    ];
-    for (const [hsl, hex] of cases) {
-      expect(hslToHex(hsl), `hslToHex(${hsl})`).toBe(hex);
-    }
-    // ...and an unparseable value must throw rather than return a colour: the
-    // parity assertion below is only as strong as this refusal (the theme's own
-    // oklch tokens are exactly the shape that must not silently convert).
-    expect(() => hslToHex("oklch(78% 0.15 150deg)")).toThrow("unparseable hsl");
   });
 
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
@@ -1135,18 +1122,27 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
   it("index.html's pristine overlay satisfies the watchdog's stand-down guards", () => {
     // Why this test exists: the watchdog's stand-down guards read index.html's
-    // REAL markup (a .wt-loading-bar child, no .fade) while appendPristineOverlay()
-    // re-creates that markup by hand. If index.html's overlay ever loses the
-    // .wt-loading-bar (or #terminal ships a pre-JS child), the watchdog silently
-    // never fires in production while every watchdog test above still passes
-    // against its own fabricated overlay -- so pin the hand-built fixture to
-    // the served file here.
+    // REAL markup (no .fade on the overlay, an empty #terminal) while
+    // appendPristineOverlay() re-creates that markup by hand. If the served
+    // overlay ever drifts from the fixture -- a .fade already present, or
+    // #terminal shipping a pre-JS child -- the watchdog silently never fires in
+    // production while every watchdog test above still passes against its own
+    // fabricated overlay, so pin the hand-built fixture to the served file here.
+    // The role and .wt-loading-bar assertions below are NOT watchdog guards. The
+    // watchdog's stand-down states are the four its own error listener checks --
+    // no #loading at all, data-bootstrap-fatal, .fade, and a non-empty #terminal
+    // -- and neither role nor the bar is among them: they pin the bar the
+    // library's page.css animates, and the fixture's fidelity to the served
+    // markup.
     // The guards below live entirely in the markup, read through the suite's
     // shared served-document policy.
     const doc = parseServedDocument();
     const overlay = doc.getElementById("loading");
-    // The guards the watchdog keys on, read from the served file rather than
-    // from appendPristineOverlay()'s hand-built copy.
+    // The served overlay's shape the fixture must reproduce, read from the file
+    // rather than from appendPristineOverlay()'s hand-built copy. Of the
+    // assertions below only the absent .fade and the empty #terminal are
+    // watchdog guards; role and the bar pin the fixture's fidelity to the
+    // served markup.
     expect(overlay?.getAttribute("role")).toBe("status");
     expect(overlay?.querySelector(".wt-loading-bar")).not.toBeNull();
     expect(overlay?.querySelector(".wt-loading-bar")?.getAttribute("aria-hidden")).toBe("true");

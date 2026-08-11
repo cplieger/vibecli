@@ -155,7 +155,7 @@ check_behaviour() {
   script=$1
   # First hop leaves the marker set, so run the stand-in through one extra exec of
   # itself before letting it restore.
-  KWEB_SESSION_PATH=${KWEB_SESSION_PATH:-$PATH} exec bash "$script"' _ "$STANDIN" 2>/dev/null)
+  WT_SESSION_PATH=${WT_SESSION_PATH:-$PATH} exec bash "$script"' _ "$STANDIN" 2>/dev/null)
   case ":$twice_path:" in
     *:/config/tools/bin:*)
       ok "the carried PATH is idempotent across repeated re-execs"
@@ -196,7 +196,7 @@ elif ! eval "$setpriv_invocation -- true" 2>/dev/null; then
   skip "the real setpriv invocation preserves the carry" \
     "this environment cannot run '$setpriv_invocation' (needs CAP_SETPCAP)"
 else
-  carried=$(eval "KWEB_SESSION_PATH='$IMAGE_PATH' $setpriv_invocation -- sh -c 'printf %s \"\$KWEB_SESSION_PATH\"'" 2>/dev/null)
+  carried=$(eval "WT_SESSION_PATH='$IMAGE_PATH' $setpriv_invocation -- sh -c 'printf %s \"\$WT_SESSION_PATH\"'" 2>/dev/null)
   [ "$carried" = "$IMAGE_PATH" ] \
     && ok "the real setpriv invocation passes the carry variable through untouched" \
     || no "setpriv preserves the carry" \
@@ -207,13 +207,13 @@ fi
 # It is exported only so the re-exec'd invocation can read it, and dropped before
 # the server is exec'd. Left in place it would show up in the environment of every
 # terminal session as a second copy of PATH that looks configurable.
-grep -q '^export KWEB_SESSION_PATH="\$SESSION_PATH"$' "$ENTRYPOINT" \
+grep -q '^export WT_SESSION_PATH="\$SESSION_PATH"$' "$ENTRYPOINT" \
   && ok "the carry variable is exported so the re-exec'd invocation can read it" \
   || no "carry is exported" "without the export the re-exec'd invocation cannot see it and the restore silently narrows again"
 
-grep -q '^unset KWEB_SESSION_PATH$' "$ENTRYPOINT" \
+grep -q '^unset WT_SESSION_PATH$' "$ENTRYPOINT" \
   && ok "the carry variable is dropped before the server is exec'd" \
-  || no "carry is dropped" "KWEB_SESSION_PATH would leak into the server and every PTY session as a second copy of PATH"
+  || no "carry is dropped" "WT_SESSION_PATH would leak into the server and every PTY session as a second copy of PATH"
 
 # --- the narrowing is real ----------------------------------------------------
 # A narrowed list that still contained a /config component would defeat the whole

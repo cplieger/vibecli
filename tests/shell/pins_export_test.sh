@@ -33,8 +33,8 @@ MAIN="$REPO/main.go"
 # assertions read the Go side or the README, so without these seams that half
 # could not be red-checked at all -- and an assertion nobody has seen fail is not
 # evidence.
-GO_SOURCE_ROOT="${KWEB_GO_SOURCE_ROOT:-$REPO}"
-README="${KWEB_README:-$REPO/README.md}"
+GO_SOURCE_ROOT="${WT_GO_SOURCE_ROOT:-$REPO}"
+README="${WT_README:-$REPO/README.md}"
 # A precondition, not decoration: an unreadable main.go makes every cross-file
 # assertion below fail for the same reason a genuine drift would, so it has to be
 # fatal for the section rather than reported as a drift.

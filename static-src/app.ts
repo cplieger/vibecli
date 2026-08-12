@@ -28,9 +28,21 @@ if (loading?.hasAttribute("data-bootstrap-fatal")) {
 
 const options: CreateTerminalOptions = {
   // Every session is an agent expected to report OSC 9;4, so show its activity
-  // dot from tab creation. Pass the function so preset failures remain inside
-  // createTerminal's recovery boundary.
-  features: presetAgentTabbed,
+  // dot from tab creation. The preset is called inside an ARROW so the call still
+  // happens within createTerminal's recovery boundary; a bare reference is
+  // equivalent and is what this was before the preset took options.
+  //
+  // attentionIcons opts into the tab-icon half of the attention surfaces: while a
+  // BACKGROUND session wants the user, every link[rel=icon] is pointed at a
+  // variant carrying the same coloured dot its chip shows. Enabling it is a
+  // promise that static/ serves favicon-{input,done,alert} in each of this page's
+  // three icon formats, which app.test.ts asserts against the real directory,
+  // because a missing variant is a blank tab icon rather than a missing dot. The
+  // assets are generated from the theme below by the UI repo's
+  // scripts/gen-attention-icons.py -- regenerate them if a --status-* token here
+  // changes. The title count and the installed-app badge need no opt-in and no
+  // assets, so they work whatever this is set to.
+  features: () => presetAgentTabbed({ attentionIcons: true }),
   // Restore each tab's scrollback from browser storage instead of pulling it back
   // over the wire, keyed by kiro-cli session id and stored per tab.
   //
@@ -79,31 +91,33 @@ const options: CreateTerminalOptions = {
     "--tab-hover-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 16%)`,
     "--tab-active-bg": `hsl(${ACCENT_HSL_COMPONENTS} / 32%)`,
     "--tab-active-fg": "#fff",
-    // Tab activity-dot vocabulary for the three states this app's server can
-    // actually report, replacing the library defaults: violet = thinking, green
-    // = done, yellow = action required. One family -- 78% lightness / 0.15
-    // chroma, only the hue varying -- at the pastel accent's own level, so none
-    // of THESE THREE is separated by lightness; the wave/ring/shape cues carry
-    // that (the WCAG 1.4.1 note below).
+    // Tab activity-dot vocabulary for the states this app's server reports,
+    // replacing the library defaults: violet = thinking, green = done, yellow =
+    // action required. Those three are one family -- 78% lightness / 0.15 chroma,
+    // only the hue varying -- at the pastel accent's own level, so none of THEM is
+    // separated by lightness; the wave/ring/shape cues carry that (the WCAG 1.4.1
+    // note below).
     //
-    // The library publishes FIVE --status-* tokens; --status-warning and
-    // --status-failed (OSC 9;4 progress states 4 and 2) deliberately keep the
-    // library defaults, because the pinned Go engine reports only
-    // working/idle/input/done/exited (web-terminal-engine/v3 terminal/
-    // session_manager.go), so this app can never paint those two dots. Do NOT
-    // read the lightness sentence above as a general rule if that ever changes:
-    // PUBLIC_THEME_TOKENS requires the three ANIMATED states
-    // (working/warning/failed, which share one travelling wave and differ only
-    // in hue) to keep a LIGHTNESS spread, and this violet working dot (OKLab L
-    // 77.6%) already sits 8.5 L points from the library's default warning
-    // yellow (#facc15, L 86.1%) where the library's own blue working dot sat
-    // 14.2 apart. Retheme those two in-family before adopting an engine that
-    // emits them.
+    // --status-failed is themed too, and NOT in that family: it is the one state
+    // that must not read as a sibling of the others. It keeps the library's red
+    // hue and takes a deliberate lightness gap from the working violet (OKLab L
+    // 77.6%), which is what PUBLIC_THEME_TOKENS requires of the three ANIMATED
+    // states -- working / warning / failed share one travelling wave and differ
+    // only in hue, so hue alone cannot carry them apart.
     //
-    // Working is pinned as an sRGB HEX while its two siblings stay in oklch,
-    // because oklch(78% 0.15 300deg) -- the family formula at the violet hue --
-    // is outside sRGB AND outside Display P3, so no display we ship to can render
-    // it as declared: every one shows a gamut-mapped approximation of the
+    // --status-warning keeps the library default. It is the one status this app
+    // receives that is deliberately NOT surfaced anywhere else: kiro-cli emits
+    // OSC 9;4 state 4 with the context-window fill percentage, which is ongoing
+    // and informational, so it raises no cue (see CueStatus in the UI package).
+    // An earlier note here claimed the pinned engine could report neither warning
+    // nor failed and that this app could therefore never paint them; that was
+    // wrong in both directions -- engine v3's session_manager.go defines both, and
+    // kiro-cli drives state 4 routinely and state 2 on an errored turn.
+    //
+    // Working is pinned as an sRGB HEX while its two family siblings stay in
+    // oklch, because oklch(78% 0.15 300deg) -- the family formula at the violet
+    // hue -- is outside sRGB AND outside Display P3, so no display we ship to can
+    // render it as declared: every one shows a gamut-mapped approximation of the
     // browser's choosing. #c6a0ff is that approximation made explicit (what
     // Chromium paints on sRGB, deltaEOK 0.0099 from the P3 rendering, well inside
     // a ~0.02 JND). Green (150deg) and yellow (95deg) are in gamut and keep the
@@ -114,10 +128,13 @@ const options: CreateTerminalOptions = {
     // inside a static hard-edged RING (differing by edge quality as well as
     // motion), done the bare ringless disc. Under prefers-reduced-motion the
     // library punches working's disc into a donut, so all three stay distinct by
-    // shape with no motion at all.
+    // shape with no motion at all. The tab-ICON dot has none of that room (it is
+    // a few pixels of flat colour), which is why the title count carries the same
+    // fact non-chromatically rather than the icon being the only channel.
     "--status-working": "#c6a0ff",
     "--status-done": "oklch(78% 0.15 150deg)",
     "--status-input": "oklch(78% 0.15 95deg)",
+    "--status-failed": "#dc2626",
   } satisfies Partial<Record<PublicThemeToken, string>>,
 };
 

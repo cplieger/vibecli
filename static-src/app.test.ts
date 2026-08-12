@@ -49,6 +49,7 @@ const THEME = {
   "--status-working": "#c6a0ff",
   "--status-done": "oklch(78% 0.15 150deg)",
   "--status-input": "oklch(78% 0.15 95deg)",
+  "--status-failed": "#dc2626",
 };
 
 // The brand accent is declared independently in app.ts's createTerminal
@@ -499,12 +500,19 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // element and an already-called preset put both failures out here, where the
     // app had to hand-build a recovery surface -- and the library never saw them.
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
-      features: presetAgentTabbedMock,
+      features: expect.any(Function),
       persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
     });
     // Passing the function must NOT call it here.
     expect(presetAgentTabbedMock).not.toHaveBeenCalled();
+    // ...and calling it must reach the preset with this app's options, which is
+    // the half a bare `expect.any(Function)` would not catch: an arrow that
+    // dropped attentionIcons would still be a function, and the tab icon would
+    // silently never change.
+    const passed = createTerminalMock.mock.calls[0]?.[1] as { features: () => unknown };
+    passed.features();
+    expect(presetAgentTabbedMock).toHaveBeenCalledExactlyOnceWith({ attentionIcons: true });
     // The root is untouched by this module: the mocked kernel builds nothing, and
     // the app adds no dialog, no inert, nothing.
     expect(root.hasAttribute("inert")).toBe(false);
@@ -540,7 +548,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
-      features: presetAgentTabbedMock,
+      features: expect.any(Function),
       persistScrollback: { kind: "scrollback-store" },
       theme: THEME,
       loading,
@@ -1363,5 +1371,66 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // .wt-loading-text status region is the KERNEL's own (it creates it inside the
     // overlay at runtime), so it is deliberately not asserted as app markup.
     expect(overlay?.querySelector(`.${LOADING_OVERLAY_CLASSES.bar}`)).not.toBeNull();
+  });
+});
+
+describe("the attention icon variants app.ts opts into are actually served", () => {
+  // app.ts passes attentionIcons: true, which is a PROMISE to the UI library that
+  // three variants of every icon link exist. The library cannot check it: the
+  // files live in this repo, the dot's colour comes from this app's theme, and the
+  // library derives the URLs by a naming convention rather than reading a map. So
+  // the consequence of breaking the promise is a BLANK tab icon, and this test is
+  // the only thing standing between a renamed icon and that.
+  //
+  // The variant names are derived here the same way the library derives them
+  // (insert -<variant> after the `favicon` token, keep the extension), rather than
+  // listed literally, so a test that passes cannot be reading a stale list.
+  const VARIANTS = ["input", "done", "alert"] as const;
+
+  function variantOf(href: string, variant: string): string {
+    return href.replace(/(^|\/)favicon(?=[-.])/, `$1favicon-${variant}`);
+  }
+
+  it("serves every variant of every icon link declared in index.html", () => {
+    const html = readStaticAsset("index.html");
+    const hrefs = [...html.matchAll(/<link\s+rel="icon"[^>]*href="([^"]+)"/g)].map((m) => m[1]!);
+    // Guard the guard: a regex that matched nothing would make this test vacuous
+    // and it would pass on a page with no icons at all.
+    expect(hrefs.length).toBeGreaterThanOrEqual(3);
+
+    const served = new Set(readdirSync(resolve(fixtureRoot(), "../static")));
+    for (const href of hrefs) {
+      const base = href.replace(/^\//, "");
+      expect(served, `base icon ${base}`).toContain(base);
+      for (const variant of VARIANTS) {
+        const name = variantOf(base, variant);
+        // A variant that equals its base means the rename convention did not
+        // apply, so the library would leave that link alone and the dot would
+        // silently never appear on it.
+        expect(name, `${base} -> ${variant}`).not.toBe(base);
+        expect(served, `variant ${name}`).toContain(name);
+      }
+    }
+  });
+
+  it("paints each variant's dot in this app's own themed colour", () => {
+    // The SVG variants carry the colour as a literal, because a static asset
+    // cannot read a CSS custom property. That makes them a fourth spelling of the
+    // theme (alongside app.ts, index.html's critical CSS and manifest.json), so
+    // this pins them to the tokens above the same way the brand-accent test pins
+    // the accent. #d6b529 and #67d283 are oklch(78% 0.15 95deg) and
+    // oklch(78% 0.15 150deg) resolved to sRGB by the generator.
+    const expected: Record<string, string> = {
+      input: "#d6b529",
+      done: "#67d283",
+      alert: THEME["--status-failed"],
+    };
+    for (const [variant, colour] of Object.entries(expected)) {
+      const svg = readStaticAsset(`favicon-${variant}.svg`);
+      expect(svg, variant).toContain(`fill="${colour}"`);
+      // One dot, added on top of the base art rather than replacing it.
+      expect(svg.match(/<circle /g), variant).toHaveLength(1);
+      expect(svg, variant).toContain("<path");
+    }
   });
 });

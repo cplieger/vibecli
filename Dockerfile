@@ -222,16 +222,16 @@ RUN set -e; mkdir -p static/vendor/fonts; \
 # carries a `# repin:`-marked sha256 ARG that the Renovate postUpgradeTask
 # recomputes in the same commit that bumps its version.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.10.0
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.10.1
 # sha256 of the published tarball. npm publishes SHA-512 (dist.integrity), not this
 # digest, so the version and the digest come from different sources: Renovate bumps
 # the version and the repin postUpgradeTask recomputes this line in the same commit.
 # repin: dep=@cplieger/web-terminal-engine url=https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=319e21ada080316551464cc8c12eb12aba604ead0cbe834e08b7c0efefe10cf5
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=b01ca144b6286025c161c3b2836268215854a3d18bbb2b2dd30768d781cf7933
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.4.5
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.4.6
 # repin: dep=@cplieger/web-terminal-ui url=https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=7f1a63bd208c23f88a19117d9794f0b229b738278064cd6678f4682bf86ba027
+ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=9127d16b9a6929517ee869db2a40ea2c3b73f74bc35346cf5a81b1d4f164e535
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is

@@ -22,11 +22,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # The `# go<version>` trailer on each sha line is the anchor Renovate uses to
 # resolve that arch's digest — do not hand-edit; Renovate owns these lines.
 # renovate: datasource=golang-version depName=golang
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.26.6
 # renovate: datasource=custom.golang-amd64 depName=golang-amd64
-ARG GO_SHA256_AMD64=5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053  # go1.26.5
+ARG GO_SHA256_AMD64=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89  # go1.26.6
 # renovate: datasource=custom.golang-arm64 depName=golang-arm64
-ARG GO_SHA256_ARM64=fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49  # go1.26.5
+ARG GO_SHA256_ARM64=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e  # go1.26.6
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) GO_SHA256="$GO_SHA256_AMD64" ;; \

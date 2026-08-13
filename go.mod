@@ -5,11 +5,11 @@ go 1.26.6
 require (
 	github.com/cplieger/atomicfile/v2 v2.9.1
 	github.com/cplieger/pathinside v1.0.1
-	github.com/cplieger/pinstall/v2 v2.3.2
+	github.com/cplieger/pinstall/v2 v2.3.3
 	github.com/cplieger/runesafe v1.4.1
 	github.com/cplieger/slogx v1.6.1
 	github.com/cplieger/toolbelt/v2 v2.4.11
-	github.com/cplieger/web-terminal-engine/v3 v3.10.2
+	github.com/cplieger/web-terminal-engine/v3 v3.10.3
 	github.com/cplieger/webhttp v1.23.1
 )
 
@@ -26,6 +26,6 @@ require (
 
 require (
 	github.com/coder/websocket v1.8.15 // indirect
-	github.com/cplieger/envx v1.6.1
+	github.com/cplieger/envx v1.6.2
 	github.com/creack/pty v1.1.24 // indirect
 )

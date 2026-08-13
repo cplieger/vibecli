@@ -4,23 +4,23 @@ go 1.26.6
 
 require (
 	github.com/cplieger/atomicfile/v2 v2.9.1
-	github.com/cplieger/pathinside v1.0.0
+	github.com/cplieger/pathinside v1.0.1
 	github.com/cplieger/pinstall/v2 v2.3.2
-	github.com/cplieger/runesafe v1.4.0
-	github.com/cplieger/slogx v1.6.0
+	github.com/cplieger/runesafe v1.4.1
+	github.com/cplieger/slogx v1.6.1
 	github.com/cplieger/toolbelt/v2 v2.4.8
 	github.com/cplieger/web-terminal-engine/v3 v3.10.2
-	github.com/cplieger/webhttp v1.23.0
+	github.com/cplieger/webhttp v1.23.1
 )
 
 require (
-	github.com/cplieger/httpx/v4 v4.3.0 // indirect
+	github.com/cplieger/httpx/v4 v4.3.1 // indirect
 	github.com/cplieger/keyenc v1.0.2 // indirect
-	github.com/cplieger/scheduler/v3 v3.0.0 // indirect
+	github.com/cplieger/scheduler/v3 v3.0.1 // indirect
 	github.com/cplieger/ssrf/v3 v3.0.1 // indirect
 	github.com/expr-lang/expr v1.17.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
-	golang.org/x/mod v0.39.0 // indirect
+	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
 

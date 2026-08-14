@@ -26,7 +26,7 @@
     "eslint": "10.8.1",
     "happy-dom": "20.11.2",
     "html-validate": "11.6.2",
-    "knip": "6.32.1",
+    "knip": "6.32.2",
     "postcss-html": "2.0.0",
     "prettier": "3.9.6",
     "stylelint": "17.14.1",

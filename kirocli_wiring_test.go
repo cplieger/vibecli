@@ -458,7 +458,7 @@ func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 	}
 
 	// The repair hook re-derives the same answer from disk without downloading.
-	ok, err := rt.rescan(context.Background())
+	ok, err := rt.rescan(t.Context())
 	if !ok || err != nil {
 		t.Errorf("rescan on a healthy install = (%v, %v), want (true, nil)", ok, err)
 	}
@@ -516,7 +516,7 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 	t.Cleanup(func() {
 		rt.stop()
 		if rt.rescan != nil {
-			_, _ = rt.rescan(context.Background())
+			_, _ = rt.rescan(t.Context())
 		}
 	})
 	if rt.ready == nil {

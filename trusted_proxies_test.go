@@ -534,7 +534,7 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 		{method: http.MethodGet, path: "/probe"},
 		{method: http.MethodGet, path: "/api/sessions/live-token-9012/extra/title"},
 	} {
-		ctx := context.Background()
+		ctx := t.Context()
 		if req.stream {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithCancel(ctx)

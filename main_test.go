@@ -1388,7 +1388,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: enqueue: %v", stage, err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 		defer cancel()
 		final, err := rt.engine.Wait(ctx, j.ID)
 		if err != nil {

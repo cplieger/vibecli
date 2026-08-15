@@ -290,7 +290,7 @@ func TestCanonicalPathGuard_leavesStaticWSAndSSEAlone(t *testing.T) {
 	t.Run("sse stream, canonical", func(t *testing.T) {
 		srv := httptest.NewServer(h)
 		t.Cleanup(srv.Close)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+terminal.SessionEventsPath, http.NoBody)
 		if err != nil {

@@ -203,7 +203,7 @@ func TestSSEStreamsThroughLoggingMiddleware(t *testing.T) {
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/sessions/events", http.NoBody)
 	resp, err := srv.Client().Do(req)
@@ -1756,7 +1756,7 @@ func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
 	}
 	mux, _, _ := mustRegisterRoutes(t, deps)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	req := httptest.NewRequest(http.MethodPost, kiroRescanPath, http.NoBody).WithContext(ctx)
 	req.RemoteAddr = "127.0.0.1:5555"
 	req.Host = "localhost:9848"

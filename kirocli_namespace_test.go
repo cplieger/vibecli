@@ -23,7 +23,6 @@ package main
 // apart.
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -277,7 +276,7 @@ func TestToolbeltKiroCLIFootprintSurvivesABoot(t *testing.T) {
 	own := env.plantOwnVersion()
 	mgr := env.manager()
 
-	if err := mgr.Ensure(context.Background()); err != nil {
+	if err := mgr.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -405,7 +404,7 @@ func TestInstallRootIsOutsideTheToolbeltNamespace(t *testing.T) {
 	env := newNSEnv(t)
 	own := env.plantOwnVersion()
 	mgr := env.manager()
-	if err := mgr.Ensure(context.Background()); err != nil {
+	if err := mgr.Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 	if mgr.PathEntry() != own {
@@ -447,7 +446,7 @@ func TestLegacySweepSparesToolbeltSymlinks(t *testing.T) {
 	residue := env.plantLegacyResidue()
 	own := env.plantOwnVersion()
 
-	if err := env.manager().Ensure(context.Background()); err != nil {
+	if err := env.manager().Ensure(t.Context()); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
 
@@ -481,7 +480,7 @@ func TestLegacySweepRunsOncePerVolume(t *testing.T) {
 	env.plantOwnVersion()
 	residue := env.plantLegacyResidue(nsTool + "-chat")
 
-	if err := env.manager().Ensure(context.Background()); err != nil {
+	if err := env.manager().Ensure(t.Context()); err != nil {
 		t.Fatalf("first Ensure: %v", err)
 	}
 	for _, p := range residue {
@@ -497,7 +496,7 @@ func TestLegacySweepRunsOncePerVolume(t *testing.T) {
 	// Plant the sweep's own targets again, in the shape it removes. Only a second
 	// pass could take them.
 	replanted := env.plantLegacyResidue(nsTool + "-chat")
-	if err := env.manager().Ensure(context.Background()); err != nil {
+	if err := env.manager().Ensure(t.Context()); err != nil {
 		t.Fatalf("second Ensure: %v", err)
 	}
 	for _, p := range replanted {
@@ -544,7 +543,7 @@ func TestKiroInstallConfig_requiresTheChatSidecar(t *testing.T) {
 	}
 	mgr := env.manager()
 
-	if ok, _ := mgr.Rescan(context.Background()); ok {
+	if ok, _ := mgr.Rescan(t.Context()); ok {
 		t.Fatalf("a version directory holding only %s was activated: it answers --version correctly and then kills every terminal at chat", nsTool)
 	}
 	if ready, why := mgr.Ready(); ready || why != pinstall.ReasonUnavailable {
@@ -558,7 +557,7 @@ func TestKiroInstallConfig_requiresTheChatSidecar(t *testing.T) {
 	// fixture is unusable for an unrelated reason: adding the sidecar to the SAME
 	// directory, changing nothing else, makes it activatable.
 	env.writeScript(filepath.Join(dir, nsTool+"-chat"), "exit 0\n")
-	ok, err := mgr.Rescan(context.Background())
+	ok, err := mgr.Rescan(t.Context())
 	if !ok || err != nil {
 		t.Fatalf("Rescan with the sidecar present = (%v, %v), want (true, nil)", ok, err)
 	}

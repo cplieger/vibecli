@@ -25,32 +25,21 @@ import (
 )
 
 // usageErrMsg is the exit-2 line: the client-side values are unusable, so the
-// extraction is broken. Shared by readManifest's refusals and flag's parse-error
-// path (an unknown flag lands there), so both exit-2 shapes tell the
-// reader to fix the gate rather than move a pin. It is deliberately NOT
-// installed as flag.Usage: flag calls Usage for -h as well as for a parse
-// error, so doing that would tell a maintainer reading the flag names that the
-// gate is broken — on the one program whose job is to be trusted about whether
-// the gate or the pin is at fault.
+// extraction is broken. Shared by readManifest's refusals and flag's parse-error path,
+// so both exit-2 shapes tell the reader to fix the gate rather than move a pin.
+// Deliberately NOT installed as flag.Usage — flag calls Usage for -h as well as for a
+// parse error, so doing that would tell a maintainer reading the flag names that the
+// gate is broken.
 const usageErrMsg = "ERROR wire-floor-gate-usage: the client wire revisions are unusable — pass -manifest <engine-pkg>/wire-compatibility.json (the extraction is broken — fix the gate, do not bump a pin)"
 
-// readManifest resolves the client half of the pairing from the engine artifact's
-// own manifest, via the engine's exported decoder (terminal.ReadWireManifest).
+// readManifest resolves the client half of the pairing from the engine artifact's own
+// manifest, via the engine's exported decoder — the DECODING is the engine's, because it
+// publishes the format.
 //
-// The DECODING is the engine's: it publishes the format, so it owns read, parse,
-// schema check and the unusable-revisions check. This gate used to mirror that
-// schema in a local struct; all three family gates did, and two of them were
-// still scraping the TypeScript source with sed instead. The engine already kept
-// the same mirror in a conformance test, so exporting it moved the copy to the
-// producer's side rather than adding anything.
-//
-// The POLICY stays here, and it is the whole reason this wrapper exists: every
-// failure becomes the usage error's exit 2, never a compatibility verdict. An
-// unreadable, malformed or unknown-schema manifest says the gate cannot see the
-// client's declaration — a broken extraction, never a reason to move a pin.
-// terminal.ErrWireManifestSchema is called out by name because its remedy is the
-// opposite one (bump this gate, do not touch a pin), and a maintainer reading a
-// red build needs to be told which.
+// The POLICY stays here, and is the whole reason this wrapper exists: every failure becomes
+// the usage error's exit 2, never a compatibility verdict, because an unreadable or
+// unknown-schema manifest says the gate cannot see the client's declaration.
+// ErrWireManifestSchema is named because its remedy is the opposite one — bump this gate.
 func readManifest(path string, stderr io.Writer) (clientRev, clientMinServer int, ok bool) {
 	m, err := terminal.ReadWireManifest(path)
 	if err != nil {
@@ -89,20 +78,14 @@ func main() {
 	os.Exit(run(rev, minServer, os.Stdout, os.Stderr))
 }
 
-// run performs the wire-floor gate against the engine's exported constants and
-// returns the process exit code main hands to os.Exit: 0 declared-compatible,
-// 1 floor violated (fail the build). The third code, 2, is main's: a manifest
-// the gate cannot read (see readManifest).
+// run performs the wire-floor gate against the engine's exported constants and returns the
+// process exit code: 0 declared-compatible, 1 floor violated. The third code, 2, is main's.
 //
-// All three codes reach the Dockerfile's wire-floor gate, which BUILDS this
-// program and invokes the binary for exactly that reason: `go run` reports its
-// OWN exit status 1 for ANY non-zero program exit (it prints "exit status 2" to
-// stderr but does not propagate the 2), which collapsed 2 and 1 into one code
-// and left only the stderr line to tell "the gate's extraction is broken, do NOT
-// bump a pin" from "genuine wire incompatibility". Do not put the step back on
-// `go run`; TestDockerfileBuildsTheGateInsteadOfGoRun fails if anyone does, and
-// TestGateProcessReadsTheManifestFlagTheDockerfilePasses pins main's propagation
-// of these codes through the shipped invocation.
+// All three reach the Dockerfile's wire-floor gate, which BUILDS this program and invokes the
+// binary for exactly that reason: `go run` reports its OWN exit status 1 for ANY non-zero
+// program exit, which collapsed 2 and 1 into one code and left only stderr to tell "the
+// gate's extraction is broken" from "genuine wire incompatibility". Do not put the step back
+// on `go run`; a test fails if anyone does.
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	if reason := terminal.WirePairIncompatibility(
 		terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion,

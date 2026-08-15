@@ -1102,6 +1102,30 @@ func kiroSettings() []pinstall.Assertion {
 		// Raw because the value is not a boolean.
 		kirocli.SettingRaw("chat.notificationMethod", "osc9"),
 		kirocli.Setting("chat.terminalTitle", false),
+		// The retained-history recovery, and a settings assertion is the ONLY way to
+		// reach it: kiro-cli exposes no `chat` flag and no TWINKI_* env var for it
+		// (checked against 2.18.0), so KIRO_CLI_CHAT_ARGS cannot carry it and there
+		// is nothing for a compose file to set.
+		//
+		// Without it kiro-cli emits ED3 ("\x1b[3J", Erase Saved Lines) on every
+		// full-viewport repaint and the engine honors it by CLEARING the ring, which
+		// made WT_SCROLLBACK and the engine's 100000-line default unreachable:
+		// 2294-3185 lines retained across 5 real sessions, roughly 3%. With it the
+		// streaming and overflow repaint emits zero ED3 (measured 3 -> 0 over three
+		// `!seq 1 200` bursts in a fixed 14x100 viewport) and each redraw is about
+		// half the bytes, which is WebSocket traffic in this app.
+		//
+		// It does NOT fix resizes, height-only included: 4 ED3 with the setting and 4
+		// without, over 14x100 -> 30x100 -> 10x100, because kiro-cli's debounced
+		// resize callback writes its CLEAR_ALL unconditionally and its width-changed
+		// redraw branch is ungated (upstream Kiro#10780, reopened 2026-08-15). So
+		// this recovers the full depth on a fixed viewport and buys a phone nothing,
+		// since a soft keyboard opening is a height change.
+		//
+		// Needs kiro-cli 2.17.0+. On anything older the key is unknown and the
+		// assertion warns, which is exactly why best-effort is the right class here:
+		// a retained predecessor selected after a failed install must still serve.
+		kirocli.Setting("chat.preserveScrollback", true),
 	}
 }
 

@@ -501,7 +501,7 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 		func(string) *terminal.Handler { return terminal.NewHandler([]string{"/bin/true"}) },
 		terminal.WithManagerLogger(slog.New(slog.DiscardHandler)),
 	)
-	t.Cleanup(mgr.Shutdown)
+	t.Cleanup(func() { shutdownManager(t, mgr) })
 	mgr.MountAPI(mux)
 	mux.HandleFunc("/api/health", ok)
 	mux.HandleFunc("/probe", ok)

@@ -239,6 +239,28 @@ curl -s -X PATCH localhost:9848/api/tools/gopls -d '{"disabled": false}'   # ena
 curl -s -X POST  localhost:9848/api/tools -d '{"name": "ripgrep"}'         # add from the catalog
 ```
 
+## Healthcheck
+
+The image probes `/api/health` on loopback every 30s, after a 20-minute start period
+covering the first-boot kiro-cli download. It reports kiro-cli readiness rather than
+merely that the listener is up, and a 503 body names which state it is in. Readiness, not
+liveness: nothing restarts on an unhealthy state, so a broken install shows as `unhealthy`
+in `docker ps` without a restart loop.
+
+## Dependencies
+
+| Dependency | Source |
+| --- | --- |
+| Debian trixie-slim | Base image, digest-pinned; `apt-get upgrade` runs at build time. |
+| `kiro-cli` | Downloaded and digest-verified at first boot, never baked into the image (licensing). |
+| `web-terminal-engine`, `@cplieger/web-terminal-ui` | The PTY/VT engine and the browser UI. |
+| `toolbelt`, `tool-catalog` | The tools engine and the registry it installs from. |
+| `pinstall` | The version-addressed, digest-verified kiro-cli installer. |
+| `webhttp`, `envx`, `slogx`, `atomicfile` | HTTP plumbing, env parsing, slog setup, atomic writes. |
+
+Every version is pinned and every build-time download is checked against a recorded
+sha256. Updates arrive as automated pull requests and ship in a fresh image build.
+
 ## Related projects
 
 - [vibekit](https://github.com/cplieger/vibekit): the sister app, a chat-first Kiro web UI (chat history, MCP, agent tools) instead of a raw terminal.

@@ -1192,8 +1192,8 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &denied); err != nil {
 		t.Fatalf("remote peer: body %q is not the standard envelope: %v", rec.Body.String(), err)
 	}
-	if !strings.Contains(denied.Error, "loopback-only") || denied.Code != "" {
-		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message with an empty code", denied.Error, denied.Code)
+	if !strings.Contains(denied.Error, "loopback-only") || denied.Code != "loopback_only" {
+		t.Errorf("remote peer: envelope = {error:%q code:%q}, want a loopback-only message and code %q", denied.Error, denied.Code, "loopback_only")
 	}
 	// The remedy the 403 names must be this deployment's address, not the default
 	// port: a refused caller sees nothing else.
@@ -1387,14 +1387,14 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("create during sync: status = %d, want 503 (body %s)", rec.Code, rec.Body.String())
 	}
-	// The 503 speaks the standard webhttp error envelope (empty code), the
-	// same dialect as the app's 403 gates — not a hand-rolled body.
+	// The 503 speaks the standard webhttp error envelope with a machine-readable
+	// code, the same dialect as the app's 403 gates — not a hand-rolled body.
 	var env webhttp.ErrorResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatalf("create during sync: body %q is not the standard envelope: %v", rec.Body.String(), err)
 	}
-	if env.Error != "tools installing" || env.Code != "" {
-		t.Fatalf("create during sync: envelope = {error:%q code:%q}, want {error:%q code:%q}", env.Error, env.Code, "tools installing", "")
+	if env.Error != "tools installing" || env.Code != "not_ready" {
+		t.Fatalf("create during sync: envelope = {error:%q code:%q}, want {error:%q code:%q}", env.Error, env.Code, "tools installing", "not_ready")
 	}
 
 	// Health stays reachable and reports the informational tools state.

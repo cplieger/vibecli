@@ -250,7 +250,7 @@ func registerRoutes(mux *http.ServeMux, deps *routeDeps) *terminal.SessionManage
 		mux.Handle(kiroRescanPath, loopbackOnly("kiro-cli rescan hook", deps.listenHint,
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Allow", http.MethodPost)
-				webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "",
+				webhttp.WriteError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
 					"kiro-cli rescan is POST-only (curl -X POST "+deps.listenHint+kiroRescanPath+")")
 			})))
 	}
@@ -1042,7 +1042,7 @@ func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, st
 				// has a predictable remaining time, so a cheap re-poll beats an
 				// HTTP-date the server cannot honestly compute.
 				w.Header().Set("Retry-After", "5")
-				webhttp.WriteError(w, r, http.StatusServiceUnavailable, "", reason)
+				webhttp.WriteError(w, r, http.StatusServiceUnavailable, "not_ready", reason)
 				return
 			}
 			gated.ServeHTTP(w, r)
@@ -1068,7 +1068,7 @@ func composeGate(inner func(http.Handler) http.Handler, blocked func() (bool, st
 // closes on its bump.
 func loopbackOnly(surface, hint string, next http.Handler) http.Handler {
 	refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		webhttp.WriteError(w, r, http.StatusForbidden, "",
+		webhttp.WriteError(w, r, http.StatusForbidden, "loopback_only",
 			surface+" is loopback-only; call it from inside the container (curl "+hint+")")
 	})
 	return webhttp.LoopbackOnly(refuse)(next)

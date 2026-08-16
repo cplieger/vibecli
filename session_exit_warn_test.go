@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 // TestSessionFastDeathWarn pins the operator-facing fast-death signal wired in

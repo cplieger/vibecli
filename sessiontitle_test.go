@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/atomicfile/v2"
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 // fakeSetter records what the syncer pushed onto the engine's client title rung,

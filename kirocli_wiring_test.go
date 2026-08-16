@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cplieger/pinstall/v2"
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 // This file covers the SEAM between the install manager and the server: the

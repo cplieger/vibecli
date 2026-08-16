@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 // TestSessionLoggerRedactsCommand pins the credential boundary around the

@@ -471,6 +471,14 @@ func main() {
 	}
 }
 
+// shutdownGrace bounds the whole graceful stop: the drain, then the session
+// teardown inside whatever the drain left. The engine's own budget guidance is
+// larger than this (it bounds a stubborn child's reap at 5s, and the containment
+// and marker ladders each spend several grace windows on top), so a stop with
+// many live tabs can overrun it. That is the deliberate choice: this server would
+// rather log the overrun than hold the container past its stop timeout.
+const shutdownGrace = 5 * time.Second
+
 // The startup stages a failure can be attributed to. Values, not messages: these
 // are the strings an operator's log query or alert rule matches, so they are
 // enumerated here and changing one is a breaking change to the log surface.
@@ -764,6 +772,20 @@ func run() error {
 		containment:     startContainment(),
 	})
 
+	// The engine's blocking teardown, on whatever budget the caller hands it. An
+	// expiry means a session's teardown (reaping the child, ending its cgroup,
+	// sweeping /proc for escapees) did not finish inside the grace, which is
+	// otherwise silent: there is no branch to take, because the process is
+	// stopping either way, so the only useful thing to do is say so. It is also
+	// the one place that reports a stranded session tree at shutdown, which this
+	// container carries no mem_limit to catch later.
+	shutdownSessions := func(ctx context.Context) {
+		if teardownErr := mgr.Shutdown(ctx); teardownErr != nil {
+			slog.Warn("session teardown did not finish within the shutdown grace",
+				"grace", shutdownGrace, "error", teardownErr)
+		}
+	}
+
 	// The listener is bound before the base context + server are built, which
 	// used to be forced by gocritic exitAfterDefer (a listen-failure os.Exit had
 	// to run with no pending defer). The exit is gone, so the ordering is now
@@ -825,8 +847,8 @@ func run() error {
 	// handler (it returns only on r.Context().Done(); srv.Shutdown does not
 	// interrupt an active stream, so without this the drain blocks the full
 	// grace window whenever a tab is open).
-	if err := webhttp.Run(ctx, srv, ln, func(context.Context) { mgr.Shutdown() },
-		webhttp.WithShutdownGrace(5*time.Second),
+	if err := webhttp.Run(ctx, srv, ln, shutdownSessions,
+		webhttp.WithShutdownGrace(shutdownGrace),
 		webhttp.WithPreDrain(func(context.Context) {
 			ready.Set(false)
 			cancelBase()
@@ -838,7 +860,11 @@ func run() error {
 		// SIGTERM path clears it in the pre-drain hook; this fatal path must
 		// do the same or a teardown would emit a false broken-install alert).
 		ready.Set(false)
-		mgr.Shutdown()
+		// This path gets its own budget: webhttp builds a teardown context only
+		// on the graceful path, and it returns before the pre-drain hook here.
+		tctx, cancelTeardown := context.WithTimeout(context.Background(), shutdownGrace)
+		shutdownSessions(tctx)
+		cancelTeardown()
 		return atStage(stageServe, fmt.Errorf("http server exited: %w", err))
 	}
 	return nil

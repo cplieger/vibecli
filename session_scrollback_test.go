@@ -47,7 +47,7 @@ func retainedLines(t *testing.T, scrollback *int, emitted, awaitCommitted int) u
 	if err := h.StartEager(); err != nil {
 		t.Fatalf("StartEager: %v", err)
 	}
-	t.Cleanup(h.Shutdown)
+	t.Cleanup(func() { shutdownHandler(t, h) })
 
 	deadline := time.Now().Add(60 * time.Second)
 	for {

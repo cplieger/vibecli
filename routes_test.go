@@ -1038,6 +1038,37 @@ func depsWithToolsMissing(known bool, n int) *routeDeps {
 	return d
 }
 
+// shutdownManager tears the manager down at the end of a test and fails it when
+// the teardown does not finish. It builds its own context rather than taking the
+// test's: a subtest's context is already cancelled by the time cleanups run, so a
+// wait against it would report an expiry on every test.
+//
+// The budget is deliberately generous against the real ceiling (the engine bounds
+// a stubborn child's reap at 5s, and the containment and marker ladders each
+// spend several grace windows), so a failure here means teardown genuinely hung
+// rather than that the runner was loaded.
+func shutdownManager(t *testing.T, mgr *terminal.SessionManager) {
+	t.Helper()
+	const budget = 20 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	if err := mgr.Shutdown(ctx); err != nil {
+		t.Errorf("SessionManager.Shutdown(ctx) = %v, want nil (teardown must finish within %v)", err, budget)
+	}
+}
+
+// shutdownHandler is the single-session sibling of shutdownManager, for a test
+// that builds one handler through the factory instead of a whole manager.
+func shutdownHandler(t *testing.T, h *terminal.Handler) {
+	t.Helper()
+	const budget = 20 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	if err := h.Shutdown(ctx); err != nil {
+		t.Errorf("Handler.Shutdown(ctx) = %v, want nil (teardown must finish within %v)", err, budget)
+	}
+}
+
 // mustRegisterRoutes wires deps on a fresh mux and schedules manager shutdown.
 // It also returns the hash-pinned CSP the composition root derives from the
 // same static fixture (buildStaticSurface), which is what production hands
@@ -1047,7 +1078,7 @@ func mustRegisterRoutes(t *testing.T, deps *routeDeps) (*http.ServeMux, *termina
 	mux := http.NewServeMux()
 	_, csp := testStaticSurface()
 	mgr := registerRoutes(mux, deps)
-	t.Cleanup(mgr.Shutdown)
+	t.Cleanup(func() { shutdownManager(t, mgr) })
 	return mux, mgr, csp
 }
 
@@ -1168,7 +1199,7 @@ func TestToolsAPI_LoopbackOnly(t *testing.T) {
 	// hardcoded address instead of this deployment's own.
 	deps.listenHint = loopbackHint(":8080")
 	mgr := registerRoutes(mux, deps)
-	t.Cleanup(mgr.Shutdown)
+	t.Cleanup(func() { shutdownManager(t, mgr) })
 
 	// Remote peer: refused, even claiming loopback via forwarded headers.
 	req := httptest.NewRequest(http.MethodGet, "/api/tools", http.NoBody)
@@ -1330,7 +1361,7 @@ func TestToolsAPI_LoopbackOnly_malformedPeerFailsClosed(t *testing.T) {
 	mux := http.NewServeMux()
 	deps := newToolsDeps(t)
 	mgr := registerRoutes(mux, deps)
-	t.Cleanup(mgr.Shutdown)
+	t.Cleanup(func() { shutdownManager(t, mgr) })
 
 	for _, tc := range []struct{ name, remoteAddr string }{
 		{name: "no port fails SplitHostPort", remoteAddr: "127.0.0.1"},
@@ -1373,7 +1404,7 @@ func TestSessionCreateGate_ToolsSyncing(t *testing.T) {
 	deps.toolsSyncing = syncing.Load
 	deps.toolsState = func() string { return "syncing" }
 	mgr := registerRoutes(mux, deps)
-	t.Cleanup(mgr.Shutdown)
+	t.Cleanup(func() { shutdownManager(t, mgr) })
 
 	create := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader("{}"))

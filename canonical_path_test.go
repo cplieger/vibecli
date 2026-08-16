@@ -87,10 +87,14 @@ func TestCanonicalPathGuard_refusesNonCanonicalControlPlanePath(t *testing.T) {
 					tc.method, tc.target, rec.Code, http.StatusBadRequest, rec.Body.String())
 			}
 
-			// The refusal speaks this app's OWN envelope: webhttp.ErrorResponse
-			// with an empty code, like every other app-owned refusal here (the
-			// two 403 gates, the 405, the 503s), and carrying the request id so a
-			// refused call correlates with its access-log line.
+			// The refusal speaks this app's OWN envelope: webhttp.ErrorResponse with a
+			// machine-readable code in the same snake_case taxonomy as the other
+			// app-owned refusals here (the two 403 gates, the 405, the 503s), and
+			// carrying the request id so a refused call correlates with its access-log
+			// line. The code used to be empty on every one of them, which suppressed the
+			// key entirely (ErrorResponse.Code is omitempty) and, on the host allowlist,
+			// also overrode webhttp's own "host_not_allowed" default — a loss with no
+			// upside. web-terminal-server carried the codes first; this is the parity fix.
 			var got webhttp.ErrorResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 				t.Fatalf("%s %s: body %q is not the app's JSON error envelope: %v",
@@ -99,9 +103,9 @@ func TestCanonicalPathGuard_refusesNonCanonicalControlPlanePath(t *testing.T) {
 			if got.Error != canonicalPathRefusal {
 				t.Errorf("%s %s: error = %q, want %q", tc.method, tc.target, got.Error, canonicalPathRefusal)
 			}
-			if got.Code != "" {
-				t.Errorf("%s %s: code = %q, want empty (this app's app-owned refusals carry no code)",
-					tc.method, tc.target, got.Code)
+			if got.Code != "non_canonical_path" {
+				t.Errorf("%s %s: code = %q, want %q (a refusal a script can branch on)",
+					tc.method, tc.target, got.Code, "non_canonical_path")
 			}
 			if got.RequestID == "" {
 				t.Errorf("%s %s: request_id is empty; a refused control-plane call must correlate with its access-log line",

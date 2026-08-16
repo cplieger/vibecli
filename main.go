@@ -136,7 +136,7 @@ func parseAllowedHosts() *webhttp.HostPolicy {
 	const key = "WT_ALLOWED_HOSTS"
 	policy, invalid := webhttp.ParseHostList(strings.Split(envx.String(key, ""), ","),
 		webhttp.WithLoopbackExempt(),
-		webhttp.WithHostAllowlistError("",
+		webhttp.WithHostAllowlistError("host_not_allowed",
 			"host not allowed; add it to WT_ALLOWED_HOSTS to serve this hostname"))
 	if len(invalid) > 0 {
 		// Count-only, like parseTrustedProxies: the rejected raw values could
@@ -2044,7 +2044,7 @@ func canonicalPathGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		webhttp.WriteError(w, r, http.StatusBadRequest, "", canonicalPathRefusal)
+		webhttp.WriteError(w, r, http.StatusBadRequest, "non_canonical_path", canonicalPathRefusal)
 	})
 }
 

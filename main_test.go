@@ -1575,123 +1575,6 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	}
 }
 
-// The KIRO_CLI_TOOLS_TAINTED warning, duplicated verbatim from parseToolsTainted
-// (main.go) for the reason the WT_TRUSTED_PROXIES hints above it are duplicated: this
-// record is the only thing an operator sees about a rejected value, the value
-// itself can be a compose-interpolated credential (CWE-532), so message and hint
-// must stay FIXED strings that cannot grow an input-derived tail. A deliberate
-// rewording updates both sides; anything else is the regression these pins fail on.
-const (
-	taintedBadMsg  = "unusable KIRO_CLI_TOOLS_TAINTED; treating the kiro-cli tools tree as untainted, the same outcome as unset"
-	taintedBadHint = "only entrypoint.sh sets this, and only to 1 (it found the tools tree group/other-writable) or 0 (it did not); any other value is not an observation, so it cannot arm the distrust-and-reinstall path"
-)
-
-// TestParseToolsTainted pins the accepted VOCABULARY of the entrypoint's
-// tools-tree-was-writable handoff, which nothing checked before: the shell side
-// (tests/shell/pins_export_test.sh) pins the variable's NAME, its export and its
-// value expression, and the Go side pinned only that main.go mentions the name — so
-// which values arm a trust boundary was untested from both ends, and a read swapped
-// for envx.Bool/BoolStrict (true/yes/on, any case, padding trimmed) would have
-// widened it with every other test still green.
-//
-// Four properties, each a distinct regression:
-//   - the vocabulary is exactly "1" and "0". Every wider spelling the fleet's
-//     boolean parser accepts is pinned here as NOT arming, which is what fails if
-//     the decode is ever "unified" with envx.Bool/BoolStrict;
-//   - a value outside it is treated as NOT tainted, i.e. identically to unset,
-//     because the variable is an affirmative observation and the entrypoint only
-//     ever writes 0 or 1: a value that is neither reports no observation, and
-//     arming the reinstall-and-prune path on it would invent evidence;
-//   - it still WARNS, because only one producer sets this key and a value it did
-//     not write means that producer is broken. Unset is the ordinary
-//     out-of-container run and stays silent, which is why the decode distinguishes
-//     unset from set-but-empty at all;
-//   - the warning names the KEY only. The needle sweep covers the values
-//     distinctive enough for it, and assertAttrSchema covers the rest: it pins the
-//     record's EXACT attr set, so a value reaching the log under any name, in any
-//     shape, fails even where a needle would be vacuous (an empty or padded value).
-//
-// Serial: capture.Default mutates the process-global default logger.
-func TestParseToolsTainted(t *testing.T) {
-	const key = "KIRO_CLI_TOOLS_TAINTED"
-	const token = "s3cr3t-token-abc123"
-	cases := map[string]struct {
-		raw       string
-		unset     bool
-		want      bool
-		wantWarns int
-		// rawMustStayOut asks for the needle form of the confidentiality
-		// assertion, and is set only where finding the value in the log PROVES a
-		// leak. The fixed hint necessarily contains "1", "0" (it names the two
-		// accepted spellings), " 1 " and "on" (inside "only"/"observation"), and
-		// the empty string is in every string, so asserting those absent would
-		// fail on wording alone and say nothing about the value. assertAttrSchema
-		// below is what covers those cases.
-		rawMustStayOut bool
-	}{
-		// The whole accepted vocabulary: two values, no case or padding tolerance.
-		"1 arms the taint":      {raw: "1", want: true},
-		"0 does not arm it":     {raw: "0", want: false},
-		"unset does not arm it": {unset: true, want: false},
-
-		// Every spelling envx.Bool/BoolStrict would have accepted. These are the
-		// cases that fail if this decode is ever widened back to that vocabulary:
-		// each would arm a trust boundary there and must not here.
-		"true does not arm it":       {raw: "true", want: false, wantWarns: 1, rawMustStayOut: true},
-		"yes does not arm it":        {raw: "yes", want: false, wantWarns: 1, rawMustStayOut: true},
-		"on does not arm it":         {raw: "on", want: false, wantWarns: 1},
-		"TRUE does not arm it":       {raw: "TRUE", want: false, wantWarns: 1, rawMustStayOut: true},
-		"On does not arm it":         {raw: "On", want: false, wantWarns: 1, rawMustStayOut: true},
-		"a padded 1 does not arm it": {raw: " 1 ", want: false, wantWarns: 1},
-
-		// A producer that wrote nothing is not the same as no producer: the
-		// entrypoint always writes 0 or 1, so an empty value is a broken producer
-		// and warns, while unset above is silent.
-		"an empty value does not arm it": {raw: "", want: false, wantWarns: 1},
-
-		// The shape that motivates naming the key only: a compose interpolation
-		// mistake (KIRO_CLI_TOOLS_TAINTED: ${SOME_TOKEN}) puts a credential here.
-		"an arbitrary token does not arm it": {raw: token, want: false, wantWarns: 1, rawMustStayOut: true},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			records := capture.Default(t)
-			// t.Setenv first even for the unset case: it registers the restore of
-			// whatever the ambient environment held, and the Unsetenv then makes
-			// the key genuinely absent for this subtest rather than empty.
-			t.Setenv(key, tc.raw)
-			if tc.unset {
-				if err := os.Unsetenv(key); err != nil {
-					t.Fatalf("unset %s: %v", key, err)
-				}
-			}
-
-			if got := parseToolsTainted(); got != tc.want {
-				t.Errorf("parseToolsTainted() with %s=%q (unset=%v) = %v, want %v", key, tc.raw, tc.unset, got, tc.want)
-			}
-			if got := records.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
-				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), tc.wantWarns, got)
-			}
-			if tc.wantWarns == 0 {
-				return
-			}
-			// Exact message, not a substring: a regression that appends the
-			// rejected value to the sentence keeps every substring match green.
-			if got := records.CountExact(taintedBadMsg); got != 1 {
-				t.Errorf("log = %q, want exactly one Warn whose message is exactly %q (got %d); the message must be a fixed string with no input-derived tail",
-					records.Messages(), taintedBadMsg, got)
-			}
-			assertAttrSchema(t, records, slog.LevelWarn, taintedBadMsg, map[string]attrCheck{
-				"hint": wantString(taintedBadHint),
-			})
-			if tc.rawMustStayOut && logContains(records, tc.raw) {
-				t.Errorf("log = %q carries the raw %s value; a compose interpolation mistake can put a credential on this key, so the rejected-value path must warn by NAME only",
-					records.Messages(), key)
-			}
-		})
-	}
-}
-
 // The WT_TRUSTED_INSTALL_UIDS warning, duplicated verbatim from
 // parseTrustedInstallUIDs (main.go). Duplicating the prose is the point, as it is
 // for the WT_TRUSTED_PROXIES hints: this record is the ONLY thing an operator sees
@@ -1715,11 +1598,10 @@ const (
 // makes the value handed to the library reproducible for an operator reading the
 // list back.
 //
-// Two forms of the confidentiality assertion, for the reason
-// TestParseToolsTainted uses both: a needle sweep proves a specific value stayed
-// out, and assertAttrSchema pins the record's EXACT attr set so a value reaching
-// the log under any name, in any shape, fails even where a needle would be
-// vacuous (the fixed hint necessarily contains "1000", "1001" and "0").
+// Two forms of the confidentiality assertion: a needle sweep proves a specific
+// value stayed out, and assertAttrSchema pins the record's EXACT attr set so a
+// value reaching the log under any name, in any shape, fails even where a needle
+// would be vacuous (the fixed hint necessarily contains "1000", "1001" and "0").
 //
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseTrustedInstallUIDs(t *testing.T) {

@@ -187,29 +187,6 @@ func parseLogOSCText() bool {
 	return logOSCText
 }
 
-// parseToolsTainted decodes KIRO_CLI_TOOLS_TAINTED, the entrypoint's
-// tools-tree-was-writable observation, into the flag that makes the install manager
-// distrust every version directory already on the volume. One producer, not a knob.
-//
-// The vocabulary is exactly "1" and "0", and the narrowness IS the property: the
-// variable is an affirmative observation, so anything else means none was made — the
-// same state as unset. Hence not envx.Bool/BoolStrict, which also accept true/yes/on;
-// tests/shell/pins_export_test.sh pins the producer side.
-func parseToolsTainted() bool {
-	const key = "KIRO_CLI_TOOLS_TAINTED"
-	raw, set := os.LookupEnv(key)
-	switch {
-	case !set, raw == "0":
-		return false
-	case raw == "1":
-		return true
-	default:
-		slog.Warn("unusable "+key+"; treating the kiro-cli tools tree as untainted, the same outcome as unset",
-			"hint", "only entrypoint.sh sets this, and only to 1 (it found the tools tree group/other-writable) or 0 (it did not); any other value is not an observation, so it cannot arm the distrust-and-reinstall path")
-		return false
-	}
-}
-
 // parseTrustedInstallUIDs decodes WT_TRUSTED_INSTALL_UIDS, a comma-separated list of
 // numeric uids, into the identities pinstall may find with write access to the kiro-cli
 // installation tree without treating custody as broken. EMPTY BY DEFAULT, and the
@@ -430,7 +407,7 @@ func run() error {
 	// so a session outliving its browser IS the resume feature. Any reaper window short
 	// enough to bound a runaway creator is short enough to break that; the create-rate
 	// limiter in routes.go is the bound chosen instead.
-	tainted := parseToolsTainted()
+	tainted := os.Getenv("KIRO_CLI_TOOLS_TAINTED") == "1"
 	kiro := startKiroCLI(&baseKiro{
 		version:            envx.String("KIRO_CLI_VERSION", ""),
 		sha256:             envx.String("KIRO_CLI_SHA256", ""),

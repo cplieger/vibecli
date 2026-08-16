@@ -21,7 +21,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 // usageErrMsg is the exit-2 line: the client-side values are unusable, so the

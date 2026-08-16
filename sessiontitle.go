@@ -60,7 +60,7 @@ import (
 
 	"github.com/cplieger/atomicfile/v2"
 	"github.com/cplieger/runesafe"
-	"github.com/cplieger/web-terminal-engine/v3/terminal"
+	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 
 const (

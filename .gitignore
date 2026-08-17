@@ -16,11 +16,10 @@ static-src/coverage/
 static/style.css
 static/style.css.*
 
-# Kiro skill artifacts (app-review, code-review, refactor, steering-maintenance, judgement)
+# Kiro skill artifacts (app-review, code-review, judgement, steering-maintenance)
 **/.app-review/
 **/.code-review/
 **/.judgement/
-**/.refactor/
 **/.steering-maintenance/
 
 # Local dev build (scripts/dev-build.sh) — not for CI/release

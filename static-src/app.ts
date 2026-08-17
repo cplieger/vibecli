@@ -38,9 +38,9 @@ const options: CreateTerminalOptions = {
   // promise that static/ serves favicon-{input,done,alert} in each of this page's
   // three icon formats, which app.test.ts asserts against the real directory,
   // because a missing variant is a blank tab icon rather than a missing dot. The
-  // assets are generated from the theme below by the UI repo's
-  // scripts/gen-attention-icons.py -- regenerate them if a --status-* token here
-  // changes. The title count and the installed-app badge need no opt-in and no
+  // assets are generated from the theme below by the fleet's
+  // .kiro/scripts/gen-attention-icons.py -- regenerate them if a --status-* token
+  // here changes. The title count and the installed-app badge need no opt-in and no
   // assets, so they work whatever this is set to.
   features: () => presetAgentTabbed({ attentionIcons: true }),
   // Restore each tab's scrollback from browser storage instead of pulling it back

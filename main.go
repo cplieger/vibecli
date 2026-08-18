@@ -45,13 +45,13 @@ import (
 var staticFS embed.FS
 
 // parseTrustedProxies reads a comma-separated list of CIDRs / bare IPs from
-// WT_TRUSTED_PROXIES into the trusted-proxy set the access log's client-IP resolver
+// TRUSTED_PROXIES into the trusted-proxy set the access log's client-IP resolver
 // consults. Intentionally LENIENT — a malformed entry is dropped and the valid
 // subset used, so one typo cannot disable proxy awareness entirely — and it never
 // fails open: unset yields nil, "trust nothing", which logs the unspoofable socket
 // peer.
 func parseTrustedProxies() []*net.IPNet {
-	const key = "WT_TRUSTED_PROXIES"
+	const key = "TRUSTED_PROXIES"
 	v := envx.String(key)
 	if v == "" {
 		return nil
@@ -80,7 +80,7 @@ func parseTrustedProxies() []*net.IPNet {
 	return nets
 }
 
-// parseAllowedHosts reads the comma-separated WT_ALLOWED_HOSTS list of exact hostnames
+// parseAllowedHosts reads the comma-separated ALLOWED_HOSTS list of exact hostnames
 // / IPs this server answers for into a webhttp.HostPolicy. It closes the DNS-rebinding
 // hole a same-origin check alone leaves open: rebinding makes Origin and Host AGREE, so
 // CrossOriginProtection admits it (CWE-346). Unset yields an INACTIVE policy, the
@@ -88,16 +88,16 @@ func parseTrustedProxies() []*net.IPNet {
 // active EMPTY policy — deny-all but the loopback carve-out, warned by name since every
 // request would otherwise 403 unexplained.
 func parseAllowedHosts() *webhttp.HostPolicy {
-	const key = "WT_ALLOWED_HOSTS"
+	const key = "ALLOWED_HOSTS"
 	policy, invalid := webhttp.ParseHostList(strings.Split(envx.String(key), ","),
 		webhttp.WithLoopbackExempt(true),
 		webhttp.WithHostAllowlistError("host_not_allowed",
-			"host not allowed; add it to WT_ALLOWED_HOSTS to serve this hostname"))
+			"host not allowed; add it to ALLOWED_HOSTS to serve this hostname"))
 	if len(invalid) > 0 {
 		// Count-only, like parseTrustedProxies.
 		slog.Warn("dropping malformed "+key+" entries; they cannot match any browser-sent Host",
 			"invalid_count", len(invalid),
-			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,192.168.1.5,webterm.example.com; a lone port like :9848 belongs in WT_ADDR")
+			"hint", "use bare hostnames or IPs only (no scheme, path, or CIDR), e.g. localhost,192.168.1.5,webterm.example.com; a lone port like :9848 belongs in LISTEN_ADDR")
 	}
 	if policy.Active() && policy.Size() == 0 {
 		slog.Warn(key+" has no usable entries; rejecting every non-loopback request (fail closed)",
@@ -163,7 +163,7 @@ func parseCatalogRefresh(raw string) time.Duration {
 	return toolbelt.ParseCatalogRefresh(toolbelt.RefreshEnv(raw), catalogRefreshKey)
 }
 
-// parseLogOSCText reads the WT_LOG_OSC_TEXT knob (default false), reporting whether
+// parseLogOSCText reads the LOG_OSC_TEXT knob (default false), reporting whether
 // an unrecognized OSC 9 notification's TEXT may be logged. That text is arbitrary
 // child output — any program in the terminal can emit `ESC ] 9 ; <text>` — so it can
 // carry a token or a device code; hence the content-free default.
@@ -172,7 +172,7 @@ func parseCatalogRefresh(raw string) time.Duration {
 // than a style choice: Bool's malformed path Warns with the RAW value (CWE-532), while
 // BoolStrict shares its parser but logs nothing.
 func parseLogOSCText() bool {
-	const key = "WT_LOG_OSC_TEXT"
+	const key = "LOG_OSC_TEXT"
 	logOSCText, _, err := envx.BoolStrict(key)
 	if err != nil {
 		// Fail closed, stated rather than inherited from BoolStrict's zero value.
@@ -188,7 +188,7 @@ func parseLogOSCText() bool {
 	return logOSCText
 }
 
-// parseTrustedInstallUIDs decodes WT_TRUSTED_INSTALL_UIDS, a comma-separated list of
+// parseTrustedInstallUIDs decodes TRUSTED_INSTALL_UIDS, a comma-separated list of
 // numeric uids, into the identities pinstall may find with write access to the kiro-cli
 // installation tree without treating custody as broken. EMPTY BY DEFAULT, and the
 // default is the point: setting it asserts what the library's field doc requires — every
@@ -196,7 +196,7 @@ func parseLogOSCText() bool {
 // can escalate through a binary this app installs and then executes. A malformed entry
 // is DROPPED, which is fail-closed: a uid that never lands keeps the check enforcing.
 func parseTrustedInstallUIDs() []int {
-	const key = "WT_TRUSTED_INSTALL_UIDS"
+	const key = "TRUSTED_INSTALL_UIDS"
 	uids, rejected := pinstall.ParseIdentities(envx.String(key))
 	if rejected > 0 {
 		slog.Warn("dropping unusable "+key+" entries; the kiro-cli install keeps enforcing custody against those identities",
@@ -228,7 +228,7 @@ exec "$0" chat "$@"`
 }
 
 // loopbackHint renders the address an in-container caller uses to reach this
-// server, for the loopback surfaces' refusal messages. Derived from WT_ADDR so a
+// server, for the loopback surfaces' refusal messages. Derived from LISTEN_ADDR so a
 // deployment that moved the port is not told to curl the default one — the 403 is
 // the whole of what a refused caller is told. A port-less or malformed addr
 // degrades to the bare host rather than to a broken URL.
@@ -306,12 +306,12 @@ func stageOf(err error) string {
 // handler installs at the configured level; warn AFTER Setup so the warning emits
 // through the configured handler (the slogx contract).
 func setupLogging() {
-	logLevel, ok := slogx.ParseLevel(envx.String("WT_LOG_LEVEL"), slog.LevelInfo)
+	logLevel, ok := slogx.ParseLevel(envx.String("LOG_LEVEL"), slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: logLevel})
 	if !ok {
 		// Field-name-only: a compose expansion mistake could put a secret in the
 		// value, so the raw string never reaches the log.
-		slog.Warn("unparseable WT_LOG_LEVEL; using the info default",
+		slog.Warn("unparseable LOG_LEVEL; using the info default",
 			"hint", "use debug, info, warn, or error")
 	}
 }
@@ -359,7 +359,7 @@ func run() error {
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	defer cancelBase()
 
-	addr := cmp.Or(envx.String("WT_ADDR"), ":9848")
+	addr := cmp.Or(envx.String("LISTEN_ADDR"), ":9848")
 	// Warn for any bind reachable beyond loopback: a client that can reach this
 	// port gets an UNAUTHENTICATED kiro-cli PTY. Only a definite exposure warns; an
 	// unparseable addr will fail at Listen with its own error.
@@ -368,7 +368,7 @@ func run() error {
 			"addr", addr,
 			"hint", "any client that can reach this port gets a kiro-cli PTY with filesystem access to /workspace and the /config home (auth tokens, ssh keys, gitconfig)")
 	}
-	workDir := cmp.Or(envx.String("WT_WORKDIR"), "/workspace")
+	workDir := cmp.Or(envx.String("WORK_DIR"), "/workspace")
 	if err := checkWorkDir(workDir); err != nil {
 		return err
 	}
@@ -401,8 +401,8 @@ func run() error {
 	// cover it. Warn.
 	hostPolicy := parseAllowedHosts()
 	if !hostPolicy.Active() {
-		slog.Warn("WT_ALLOWED_HOSTS is unset or blank; any Host header is accepted, leaving DNS rebinding open even on loopback/private binds",
-			"hint", "set WT_ALLOWED_HOSTS to the exact hostnames/IPs you browse to (e.g. localhost,192.168.1.5,webterm.example.com)")
+		slog.Warn("ALLOWED_HOSTS is unset or blank; any Host header is accepted, leaving DNS rebinding open even on loopback/private binds",
+			"hint", "set ALLOWED_HOSTS to the exact hostnames/IPs you browse to (e.g. localhost,192.168.1.5,webterm.example.com)")
 	}
 
 	logOSCText := parseLogOSCText()

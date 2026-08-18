@@ -1157,7 +1157,7 @@ func newToolsDeps(t *testing.T) *routeDeps {
 	})
 }
 
-// TestLoopbackHint pins the WT_ADDR -> "localhost[:port]" mapping the loopback
+// TestLoopbackHint pins the LISTEN_ADDR -> "localhost[:port]" mapping the loopback
 // surfaces' refusals quote. The 403 is the whole of what a refused caller is told, so a
 // hint naming a port the deployment moved away from sends the operator to
 // connection-refused with nothing else to work from; the fallback arm must degrade to a

@@ -8,7 +8,7 @@ import (
 
 // TestSessionWorkDirWiredIntoSessionFactory pins terminal.WithWorkDir in
 // registerRoutes' session factory: every kiro-cli chat must start in
-// WT_WORKDIR (/workspace in the container), never in the server process's
+// WORK_DIR (/workspace in the container), never in the server process's
 // own working directory. Nothing asserted this option -- every other session
 // test leaves workDir "" and checks only status, logs, or titles -- so
 // deleting it keeps the whole suite green while each tab opens on the wrong
@@ -32,6 +32,6 @@ func TestSessionWorkDirWiredIntoSessionFactory(t *testing.T) {
 
 	got := strings.TrimSpace(string(readMarkerWithin(t, marker, 1, "report its working directory; the session command must run pwd -P into the marker")))
 	if got != workDir {
-		t.Errorf("session working directory = %q, want %q -- terminal.WithWorkDir(deps.workDir) is missing from the session factory, so every session starts in the server's cwd instead of WT_WORKDIR", got, workDir)
+		t.Errorf("session working directory = %q, want %q -- terminal.WithWorkDir(deps.workDir) is missing from the session factory, so every session starts in the server's cwd instead of WORK_DIR", got, workDir)
 	}
 }

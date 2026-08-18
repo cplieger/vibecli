@@ -47,7 +47,7 @@ type routeDeps struct {
 	// travels through the route registrar to reach its consumer.
 	static http.Handler
 	ready  *webhttp.Ready
-	// listenHint is "localhost[:port]" for THIS deployment, derived from WT_ADDR. The
+	// listenHint is "localhost[:port]" for THIS deployment, derived from LISTEN_ADDR. The
 	// loopback refusals quote it so the remedy they name works on a server that did not
 	// keep the default port — the 403 is the whole of what a refused caller is told.
 	listenHint string
@@ -92,7 +92,7 @@ type routeDeps struct {
 	// routeDeps, which is how this was caught.
 	scrollback *int
 	workDir    string
-	// logOSCText is the WT_LOG_OSC_TEXT opt-in: when true, an unrecognized OSC 9
+	// logOSCText is the LOG_OSC_TEXT opt-in: when true, an unrecognized OSC 9
 	// notification's full text is logged at Debug. Default false — the text is arbitrary
 	// child output that may carry a token or device code.
 	logOSCText bool
@@ -424,7 +424,7 @@ const unrecognizedNotifyMsg = "unrecognized kiro-cli OSC 9 notification; tab sta
 // silent stop is never mistaken for "nothing new appeared". Deliberately shares no
 // substring with unrecognizedNotifyMsg: these are two different events, and a log search
 // or test matching one must not match the other.
-const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set WT_LOG_LEVEL=debug)"
+const unrecognizedNotifyCapMsg = "kiro-cli OSC 9 notification warn budget exhausted; further distinct wordings are Debug-only (set LOG_LEVEL=debug)"
 
 // recognizedNotifyMsg is the POSITIVE half of the classifier trace. Without it the
 // classifier is observable only when it fails to match, so a debug session that sees no
@@ -450,7 +450,7 @@ const unrecognizedNotifyCapRearm = 6 * time.Hour
 // unrecognizedNotifyHint is the operator-facing next step both Warn arms carry: what to
 // re-verify after a kiro-cli bump, and the two levers that surface the notification's
 // actual TEXT.
-const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set WT_LOG_OSC_TEXT=true with WT_LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
+const unrecognizedNotifyHint = `re-verify the "Response complete" / "Permission required" / "Input required" strings in the pinned kiro-cli-chat binary and update newStatusClassifier; set LOG_OSC_TEXT=true with LOG_LEVEL=debug to log the notification text itself (it is arbitrary child output and may contain a token or device code)`
 
 // notifyFingerprintHexDigits bounds the fingerprint written in place of the notification
 // text. 64 bits of HMAC-SHA-256 is far more than enough to tell a handful of distinct

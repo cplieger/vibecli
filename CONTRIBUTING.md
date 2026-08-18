@@ -30,7 +30,7 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   The trusted-writer declaration is the one that can stop a boot: the library
   refuses to install into a tree another identity can write, and it reads
   access-control lists to find that out. This app declares NOTHING by default —
-  `parseTrustedInstallUIDs` reads `WT_TRUSTED_INSTALL_UIDS` and passes it to
+  `parseTrustedInstallUIDs` reads `TRUSTED_INSTALL_UIDS` and passes it to
   `TrustedUIDs`, so an unset variable (the shipped default) leaves the check
   fully enforcing. An operator whose volume the check refuses names the uid
   themselves, which is an assertion that the account is already at least as
@@ -106,11 +106,11 @@ Run the server directly once assets exist:
 
 ```sh
 go generate ./...
-WT_WORKDIR=/path/to/workdir go run .
+WORK_DIR=/path/to/workdir go run .
 ```
 
-`WT_WORKDIR` must point at an existing directory (the server exits if it is
-missing) and `WT_ADDR` defaults to `:9848`. A bare `go run` installs nothing:
+`WORK_DIR` must point at an existing directory (the server exits if it is
+missing) and `LISTEN_ADDR` defaults to `:9848`. A bare `go run` installs nothing:
 with no pins in the environment the server resolves `kiro-cli` by bare name
 through your own `PATH`, so the terminal works if you have one installed. In
 production `entrypoint.sh` exports the Renovate-pinned version and both per-arch
@@ -143,7 +143,7 @@ V="$KIRO_CLI_TOOLS_DIR/kiro-cli-versions/$KIRO_CLI_VERSION"
 mkdir -p "$V"
 cp /path/to/kiro-cli /path/to/kiro-cli-chat "$V/"
 printf '%s\n' "$KIRO_CLI_VERSION" >"$V/.complete"
-WT_WORKDIR=/path/to/workdir go run .
+WORK_DIR=/path/to/workdir go run .
 ```
 
 Leaving both digest variables unset does NOT work, and fails in the least

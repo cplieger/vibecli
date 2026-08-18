@@ -145,6 +145,14 @@ func (s *sessionTitleSync) sessionEnv(tabID terminal.SessionID) []string {
 		return nil
 	}
 	return []string{
+		// These two KEEP the WT_ prefix while every operator knob lost it (LISTEN_ADDR,
+		// LOG_LEVEL, WORK_DIR, …). The knobs are read from the server's own environment,
+		// where the prefix only leaked an internal component name at an operator who has
+		// no reason to know a library called web-terminal-engine serves their HTTP. These
+		// are INJECTED into a PTY child's environment, which the user's shell shares with
+		// everything else the system, kiro-cli and the user's own profile set — so the
+		// prefix is namespacing that earns its keep, and a bare TITLE_HANDLE would be a
+		// collision waiting to happen. Same reasoning as the entrypoint's WT_SESSION_PATH.
 		"WT_TITLE_HANDLE=" + handle,
 		"WT_TITLE_STATE_DIR=" + s.stateDir,
 	}

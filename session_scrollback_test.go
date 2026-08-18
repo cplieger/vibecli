@@ -105,8 +105,8 @@ func TestSessionScrollbackHonoursTheSharedEnvVar(t *testing.T) {
 // TestResolveScrollback pins the operator-facing read of the shared
 // retained-history knob: the depth it returns AND what it puts in the log. The
 // log half is what nothing else covers, and it is a house rule rather than a
-// preference — WT_TRUSTED_PROXIES (count only), KIRO_CLI_CHAT_ARGS (flag count),
-// WT_LOG_LEVEL, WT_LOG_OSC_TEXT and TOOL_CATALOG_REFRESH are all read
+// preference — TRUSTED_PROXIES (count only), KIRO_CLI_CHAT_ARGS (flag count),
+// LOG_LEVEL, LOG_OSC_TEXT and TOOL_CATALOG_REFRESH are all read
 // by-name-only because a compose expansion mistake can put a credential on any
 // key (CWE-532), and the last two each carry a test saying so. Four properties:
 //

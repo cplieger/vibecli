@@ -486,8 +486,8 @@ ENV HOME=/config/home
 # land in the bin dir via the engine's own GOBIN env at install time.
 ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-ENV WT_WORKDIR=/workspace
-ENV WT_ADDR=:9848
+ENV WORK_DIR=/workspace
+ENV LISTEN_ADDR=:9848
 
 # Repoint root's pw_dir to /config/home so OpenSSH (which resolves "~"
 # via getpwuid, NOT $HOME) reads and writes ~/.ssh/known_hosts under
@@ -584,13 +584,13 @@ EXPOSE 9848
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.
 # DL3025 wants JSON notation, which cannot express this: the URL is built with
-# the shell parameter expansion ${WT_ADDR##*:} to read the port out of the
+# the shell parameter expansion ${LISTEN_ADDR##*:} to read the port out of the
 # runtime listen address, and exec form performs no expansion at all -- it would
 # probe a literal. This image also runs as root with a shell for git/gh, so it
 # will never be shell-less, and the distroless case the rule guards does not
 # arise here.
 # hadolint ignore=DL3025
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20m \
-    CMD curl -sfS --max-time 4 "http://127.0.0.1:${WT_ADDR##*:}/api/health"
+    CMD curl -sfS --max-time 4 "http://127.0.0.1:${LISTEN_ADDR##*:}/api/health"
 
 ENTRYPOINT ["/opt/web-terminal-kiro/entrypoint.sh"]

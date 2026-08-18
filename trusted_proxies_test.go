@@ -38,7 +38,7 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 	return n
 }
 
-// TestParseTrustedProxies pins the WT_TRUSTED_PROXIES parsing that feeds
+// TestParseTrustedProxies pins the TRUSTED_PROXIES parsing that feeds
 // webhttp.WithClientIP via the shared webhttp.ParseCIDRs helper. Four
 // contracts: an unset/blank var yields nil (so ClientIP ignores X-Forwarded-For
 // and logs the spoof-proof socket peer — the directly-exposed default), a valid
@@ -51,21 +51,21 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 // process-global default logger, so the subtests run serially (no t.Parallel).
 func TestParseTrustedProxies(t *testing.T) {
 	t.Run("unset/empty yields nil (socket-peer default)", func(t *testing.T) {
-		t.Setenv("WT_TRUSTED_PROXIES", "")
+		t.Setenv("TRUSTED_PROXIES", "")
 		if got := parseTrustedProxies(); got != nil {
-			t.Errorf("parseTrustedProxies = %v, want nil when WT_TRUSTED_PROXIES is empty", got)
+			t.Errorf("parseTrustedProxies = %v, want nil when TRUSTED_PROXIES is empty", got)
 		}
 	})
 
 	t.Run("whitespace-only yields nil", func(t *testing.T) {
-		t.Setenv("WT_TRUSTED_PROXIES", "  ,  , ")
+		t.Setenv("TRUSTED_PROXIES", "  ,  , ")
 		if got := parseTrustedProxies(); got != nil {
 			t.Errorf("parseTrustedProxies = %v, want nil for a blank list", got)
 		}
 	})
 
 	t.Run("valid CIDR and bare-IP mix parsed", func(t *testing.T) {
-		t.Setenv("WT_TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5 , ::1")
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, 192.168.1.5 , ::1")
 		nets := parseTrustedProxies()
 		if len(nets) != 3 {
 			t.Fatalf("parseTrustedProxies len = %d, want 3 (%v)", len(nets), nets)
@@ -95,7 +95,7 @@ func TestParseTrustedProxies(t *testing.T) {
 		// and the warning must never copy the rejected raw value into the
 		// aggregated log stream (CWE-532).
 		const secretEntry = "hunter2-sekret-token"
-		t.Setenv("WT_TRUSTED_PROXIES", "10.0.0.0/8, not-an-ip, "+secretEntry)
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8, not-an-ip, "+secretEntry)
 		nets := parseTrustedProxies()
 
 		// Startup is not aborted; only the one valid CIDR is kept.
@@ -163,7 +163,7 @@ func TestParseTrustedProxies(t *testing.T) {
 		// (main.go breaks out of the loop), so this fixture is what makes that
 		// `break` load-bearing -- with one entry the count assertion below
 		// cannot tell one-per-boot from one-per-entry.
-		t.Setenv("WT_TRUSTED_PROXIES", "0.0.0.0/0,::/0,"+sibling)
+		t.Setenv("TRUSTED_PROXIES", "0.0.0.0/0,::/0,"+sibling)
 		nets := parseTrustedProxies()
 
 		if len(nets) != 3 {
@@ -179,7 +179,7 @@ func TestParseTrustedProxies(t *testing.T) {
 			t.Errorf("log = %q, want exactly 1 default-route Warn (got %d; one per boot, not one per entry)", records.Messages(), warns)
 		}
 		if logContains(records, sibling) {
-			t.Error("log enumerates the configured WT_TRUSTED_PROXIES entries; this var can hold a compose-interpolated credential, so the warning must name the var and the prefix class only")
+			t.Error("log enumerates the configured TRUSTED_PROXIES entries; this var can hold a compose-interpolated credential, so the warning must name the var and the prefix class only")
 		}
 		// The needle above only catches the one value this test knows; the schema
 		// catches an entry echoed under ANY key, of ANY length, and (because the
@@ -193,7 +193,7 @@ func TestParseTrustedProxies(t *testing.T) {
 
 	t.Run("narrower entries emit no default-route warning", func(t *testing.T) {
 		records := capture.Default(t)
-		t.Setenv("WT_TRUSTED_PROXIES", "10.0.0.0/8,192.0.2.10,::/128")
+		t.Setenv("TRUSTED_PROXIES", "10.0.0.0/8,192.0.2.10,::/128")
 		if got := len(parseTrustedProxies()); got != 3 {
 			t.Fatalf("parseTrustedProxies len = %d, want 3", got)
 		}
@@ -240,7 +240,7 @@ func logContains(records *capture.Recorder, s string) bool {
 	return false
 }
 
-// The two WT_TRUSTED_PROXIES warning hints, duplicated verbatim from
+// The two TRUSTED_PROXIES warning hints, duplicated verbatim from
 // parseTrustedProxies (main.go). Duplicating the prose is the point: these
 // records are the ONLY thing an operator sees about a rejected entry, and the
 // entries themselves can be compose-interpolated credentials (CWE-532), so the
@@ -249,7 +249,7 @@ func logContains(records *capture.Recorder, s string) bool {
 // pins exist to fail.
 const (
 	malformedProxyHint = "each entry must be a CIDR (e.g. 10.0.0.0/8) or a bare IP (e.g. 192.168.1.5)"
-	defaultRouteHint   = "list only the reverse proxy's own address(es), e.g. 10.0.0.0/8 or 192.0.2.10; leave WT_TRUSTED_PROXIES unset to log the unspoofable socket peer"
+	defaultRouteHint   = "list only the reverse proxy's own address(es), e.g. 10.0.0.0/8 or 192.0.2.10; leave TRUSTED_PROXIES unset to log the unspoofable socket peer"
 )
 
 // attrCheck validates one attribute's value. A schema pairs every attr key that
@@ -291,7 +291,7 @@ func isNotifyFingerprint(v slog.Value) bool {
 // and a message that matched nothing at all fails on its own).
 // A needle sweep only catches content the test already knows; this catches
 // content under any name, of any length, in any shape. Shared by the package's
-// two credential boundaries (a rejected WT_TRUSTED_PROXIES entry and a classifier
+// two credential boundaries (a rejected TRUSTED_PROXIES entry and a classifier
 // notification), so one implementation covers both.
 func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, schema map[string]attrCheck) {
 	t.Helper()

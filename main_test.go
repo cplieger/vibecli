@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/toolbelt/v2"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/toolbelt/v3"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // fakeCLI writes an executable shell stub standing in for kiro-cli. Its whoami
@@ -231,7 +231,7 @@ func writeToolsManifest(t *testing.T, configDir, manifest string) {
 func TestStartTools_configDirMissing(t *testing.T) {
 	records := capture.Default(t)
 
-	rt := startTools(baseTools{
+	rt := startTools(t.Context(), baseTools{
 		configDir:   filepath.Join(t.TempDir(), "absent"),
 		catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 	})
@@ -284,7 +284,7 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			records := capture.Default(t)
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   tc.configDir,
 				catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 			})
@@ -336,7 +336,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 	// is where a retired-format one has to be planted to be read at all.
 	writeToolsManifest(t, dir, `{"runtimes":{"node":{"enabled":false}}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 
 	if rt.engine != nil {
 		t.Fatal("engine is non-nil despite a failed toolbelt.New; want no engine (degraded-not-dead)")
@@ -384,7 +384,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 // eventually-check on the atomic-backed funcs (race-free).
 func TestStartTools_bootConvergenceLiftsGate(t *testing.T) {
 	dir := t.TempDir()
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -429,7 +429,7 @@ func TestStartTools_toolsRootResolution(t *testing.T) {
 				wantRoot = exported
 			}
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   configDir,
 				toolsDir:    exported,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
@@ -516,7 +516,7 @@ func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
 			root := filepath.Join(configDir, "tools")
 			tc.unfit(t, root)
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   configDir,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
 			})
@@ -770,7 +770,7 @@ func TestStartTools_reconcileFailureLiftsGateDegraded(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{"no-such-tool-xyz":{}}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -796,7 +796,7 @@ func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -1091,7 +1091,7 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	t.Cleanup(eng.Close)
 
 	var verdicts []string
-	awaitBootConvergence(eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+	awaitBootConvergence(t.Context(), eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if len(verdicts) != 1 || verdicts[0] != "degraded" {
 		t.Fatalf("verdicts = %v, want exactly one \"degraded\" (the syncing gate must lift even when the job outcome is unknowable)", verdicts)
@@ -1312,7 +1312,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 		`}}`
 	writeToolsManifest(t, dir, manifest)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -1862,7 +1862,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 	// A COMPLETED handshake: the one shape whose access line would be a lie
 	// (status 101 recorded now, the line emitted hours later at socket close
 	// with a session-length duration).
-	resp, err := srv.Client().Do(newWSUpgradeRequest(t, srv.URL, id, srv.URL))
+	resp, err := srv.Client().Do(newWSUpgradeRequest(t, srv.URL, string(id), srv.URL))
 	if err != nil {
 		t.Fatalf("/ws handshake: %v", err)
 	}
@@ -1924,7 +1924,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 	}
 	for i, tc := range refusals {
 		t.Run(tc.name, func(t *testing.T) {
-			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
+			req := newWSUpgradeRequest(t, srv.URL, string(id), srv.URL)
 			tc.mangle(req)
 			refused, doErr := srv.Client().Do(req)
 			if doErr != nil {
@@ -2204,7 +2204,7 @@ func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
+			req := newWSUpgradeRequest(t, srv.URL, string(id), srv.URL)
 			req.Header.Del("Upgrade")
 			req.Header.Del("Connection")
 			for _, v := range tc.upgrade {
@@ -2216,7 +2216,7 @@ func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 
 			// The same header set the server will see, so the predicate is
 			// judged on exactly the request the handshake judges.
-			probe := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+id, http.NoBody)
+			probe := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+string(id), http.NoBody)
 			probe.Header = req.Header.Clone()
 			predicate := isWebSocketUpgrade(probe)
 
@@ -2270,14 +2270,14 @@ func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toolbelt.New: %v", err)
 	}
-	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	job, _, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
 	if rerr != nil || job == nil {
 		t.Fatalf("Reconcile = %v, %v; want an enqueued job for Close to cancel", job, rerr)
 	}
 	eng.Close() // the SIGTERM shape: Engine.Close cancels the active job
 
 	var verdicts []string
-	awaitBootConvergence(eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+	awaitBootConvergence(t.Context(), eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
 		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift on a cancelled boot pass too",
@@ -2298,6 +2298,71 @@ func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
 	}
 }
 
+// TestAwaitBootConvergence_shutdownAbandonsWithoutTheTail covers the arm the
+// C20 context threading added, and it is the arm two review findings landed in:
+// a cancelled Wait must record Info (never the false broken-install Warn), lift
+// the gate as degraded, and RETURN so the post-convergence tail cannot run.
+//
+// The tail matters because the engine is still OPEN here: the server's pre-drain
+// hook cancels the shutdown context while tools.close() is still pending in the
+// deferred teardown, so an Update() enqueue on a draining process would SUCCEED.
+// This test cancels the ctx WITHOUT closing the engine, which is exactly that
+// window, and the earlier cancellation test cannot reach it (it closes the
+// engine first, so Update would fail on its own).
+//
+// It also pins the ordering the fix depends on: Wait checks for a terminal job
+// before it selects on ctx.Done(), so keying the arm on ctx.Err() rather than
+// the returned error would misreport a job that finished in the same instant.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestAwaitBootConvergence_shutdownAbandonsWithoutTheTail(t *testing.T) {
+	records := capture.Default(t)
+	dir := t.TempDir()
+	manifest := `{"version":2,"tools":{"sleepytool":{"source":"manual","version":"1.0.0",` +
+		`"probe":"sleepytool","install":"sleep 300"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	eng, err := toolbelt.New(&toolbelt.Config{
+		ConfigDir:   dir,
+		ToolsDir:    filepath.Join(dir, "tools"),
+		CatalogPath: filepath.Join(dir, "absent-catalog.json"),
+	})
+	if err != nil {
+		t.Fatalf("toolbelt.New: %v", err)
+	}
+	t.Cleanup(eng.Close)
+	job, _, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	if rerr != nil || job == nil {
+		t.Fatalf("Reconcile = %v, %v; want an enqueued job still running when the ctx is cancelled", job, rerr)
+	}
+
+	// Cancel the shutdown context with the engine still open: the pre-drain
+	// window, not the post-Close one.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var verdicts []string
+	awaitBootConvergence(ctx, eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+
+	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
+		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift at shutdown too", verdicts, toolsStateDegraded)
+	}
+	if got := records.CountLevel(slog.LevelInfo, "boot convergence abandoned at shutdown"); got != 1 {
+		t.Errorf("log = %q, want exactly one shutdown Info (got %d)", records.Messages(), got)
+	}
+	if got := records.CountLevel(slog.LevelWarn, "boot reconcile wait failed"); got != 0 {
+		t.Errorf("log = %q; a shutdown cancellation must not be reported as a wait failure -- that Warn is the false broken-install alert on every deploy (got %d)",
+			records.Messages(), got)
+	}
+	for _, tail := range []string{"update pass not enqueued", "no language servers enabled"} {
+		if got := records.CountLevel(slog.LevelWarn, tail); got != 0 {
+			t.Errorf("log = %q; the post-convergence tail must be skipped at shutdown, but %q fired %d time(s) -- the engine is still open here, so an Update enqueue would land on a draining process",
+				records.Messages(), tail, got)
+		}
+	}
+}
+
 // TestStartTools_logsTheGatedWindowOpening pins the one record that marks the
 // gated window OPENING. The terminal boot-convergence records (converged /
 // degraded / cancelled) are all asserted elsewhere, but they only say when the
@@ -2313,7 +2378,7 @@ func TestStartTools_logsTheGatedWindowOpening(t *testing.T) {
 	records := capture.Default(t)
 	dir := t.TempDir()
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -2763,7 +2828,7 @@ func TestParseCatalogRefreshIsOutcomeTransparent(t *testing.T) {
 		"9999999h", "-0", "+24h", ".5h", "1.5h",
 	} {
 		t.Run("value="+raw, func(t *testing.T) {
-			want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+			want := toolbelt.ParseCatalogRefresh(toolbelt.RefreshEnv(raw), catalogRefreshKey)
 			if got := parseCatalogRefresh(raw); got != want {
 				t.Errorf("parseCatalogRefresh(%q) = %v, library returns %v — the local pre-parse changed the OUTCOME, so its accept vocabulary has drifted from scheduler's",
 					raw, got, want)

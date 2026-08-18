@@ -16,10 +16,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/toolbelt/v2"
-	"github.com/cplieger/toolbelt/v2/httpapi"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/toolbelt/v3"
+	"github.com/cplieger/toolbelt/v3/httpapi"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // App-owned route paths. Every engine route comes from the engine's exported
@@ -84,7 +84,7 @@ type routeDeps struct {
 	// which kiro session this tab is running: the tab's TITLE HANDLE (a minted value,
 	// deliberately not the session id — see sessiontitle.go) and the state directory. A
 	// nil function leaves tabs on the engine's automatic name ladder.
-	sessionTitleEnv func(id string) []string
+	sessionTitleEnv func(id terminal.SessionID) []string
 	// scrollback is the operator's retained-history depth, or nil when they set nothing —
 	// in which case the option is OMITTED and the engine's own default applies. A
 	// POINTER, so that "unset" is the ZERO VALUE: 0 is a legal depth meaning "retain
@@ -255,7 +255,7 @@ func handleKiroRescan(deps *routeDeps) http.HandlerFunc {
 // PATH lead, plus the two variables a hook needs to report which kiro session this tab is
 // running. Built as a fresh slice rather than appending to sessionEnv's return, so one
 // session's overlay can never alias another's backing array.
-func (d *routeDeps) childEnv(id string) []string {
+func (d *routeDeps) childEnv(id terminal.SessionID) []string {
 	base := d.sessionEnv()
 	var extra []string
 	if d.sessionTitleEnv != nil {
@@ -275,7 +275,7 @@ func (d *routeDeps) childEnv(id string) []string {
 // scrollback. It owns four session-scoped policies — the argv and PATH resolved from the
 // install manager AT session-create time, the LogID-truncated per-session logger, the
 // argv redaction, and the fast-death Warn hook that surfaces a broken kiro-cli install.
-func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
+func newSessionFactory(deps *routeDeps) func(terminal.SessionID) *terminal.Handler {
 	// WithKeepUnfocused pins the process to the DEC 1004 "unfocused" state so kiro-cli
 	// keeps emitting its focus-gated OSC 9 notifications even though no browser tab claims
 	// focus. web-terminal-server deliberately does NOT use this, since a generic
@@ -283,7 +283,7 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 	//
 	// No TERM_PROGRAM override: the engine advertises iTerm.app, which puts kiro-cli in
 	// its OSC 9;4 progress allowlist and enables DEC 2026 synchronized output.
-	return func(id string) *terminal.Handler {
+	return func(id terminal.SessionID) *terminal.Handler {
 		start := time.Now()
 		// The session id doubles as the /ws attach + resume capability token, so only the
 		// engine's LogID-truncated form is ever bound to a logger: the full value would
@@ -296,7 +296,7 @@ func newSessionFactory(deps *routeDeps) func(string) *terminal.Handler {
 		sessionLogger := slog.Default().With("session", safeID)
 		opts := []terminal.Option{
 			terminal.WithWorkDir(deps.workDir),
-			terminal.WithKeepUnfocused(),
+			terminal.WithKeepUnfocused(true),
 			terminal.WithLogger(sessionLogger),
 			terminal.WithCommandLogValue("[redacted]"),
 			// The active kiro-cli version's own directory first on the child's PATH, plus

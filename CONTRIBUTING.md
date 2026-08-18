@@ -50,7 +50,7 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   not the manifest.
 
 Web Terminal for Kiro is a thin consumer of the first-party web-terminal libraries: the
-terminal engine `web-terminal-engine` (`github.com/cplieger/web-terminal-engine/v4`
+terminal engine `web-terminal-engine` (`github.com/cplieger/web-terminal-engine/v5`
 server-side, `@cplieger/web-terminal-engine` client-side) and the reference UI
 `@cplieger/web-terminal-ui`. Most of "what the terminal does" lives in those
 repos, not here. The Go server and TS client share a binary wire protocol, not

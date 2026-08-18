@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // loopbackRequest returns a request shaped like the ONE sender the guarded
@@ -314,7 +314,7 @@ func TestCanonicalPathGuard_leavesStaticWSAndSSEAlone(t *testing.T) {
 		}
 		sc := bufio.NewScanner(resp.Body)
 		for sc.Scan() {
-			if line := sc.Text(); strings.HasPrefix(line, "data:") && strings.Contains(line, sessionID) {
+			if line := sc.Text(); strings.HasPrefix(line, "data:") && strings.Contains(line, string(sessionID)) {
 				return // the initial-sync event still flushes with the guard in the chain
 			}
 		}

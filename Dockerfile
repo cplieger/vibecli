@@ -168,8 +168,8 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # `ARG ...`, so prose wedged between them silently untracks the pin. That is
 # how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
 # fail-closing every image build on the gate below.
-# renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.5.0
+# renovate: datasource=go depName=github.com/cplieger/toolbelt/v3
+ARG TOOLBELT_TOOLCATALOG_VERSION=v3.0.0
 # No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
 # already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
 # (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
@@ -177,14 +177,14 @@ ARG TOOLBELT_TOOLCATALOG_VERSION=v2.5.0
 # this instruction worth failing the build for -- same reasoning as the wirecheck step
 # below.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
-    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
+    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v3 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
+    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v3 require found in go.mod}" && \
     if [ "$TOOLBELT_GOMOD" != "$TOOLBELT_TOOLCATALOG_VERSION" ]; then \
-      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v2 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
+      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v3 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
     fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
     printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
-    go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
+    go run "github.com/cplieger/toolbelt/v3/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
 # Fetch the Monaspace Neon NF webfonts for the monospace terminal display.

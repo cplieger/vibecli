@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/toolbelt/v2"
+	"github.com/cplieger/toolbelt/v3"
 )
 
 // FuzzSessionCommandNeverSplices generalizes the ONE property that makes the
@@ -71,7 +71,7 @@ func FuzzParseCatalogRefreshIsOutcomeTransparent(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, raw string) {
-		want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+		want := toolbelt.ParseCatalogRefresh(toolbelt.RefreshEnv(raw), catalogRefreshKey)
 		if got := parseCatalogRefresh(raw); got != want {
 			t.Fatalf("parseCatalogRefresh(%q) = %v, library returns %v — outcome divergence", raw, got, want)
 		}

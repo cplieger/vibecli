@@ -14,7 +14,7 @@ import (
 
 	"github.com/cplieger/slogx"
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 // trustedContains reports whether ip is inside any of the parsed trusted nets.
@@ -498,7 +498,7 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	// factory is never invoked (nothing here creates a session), so no PTY is
 	// spawned; MountAPI only registers patterns.
 	mgr := terminal.NewSessionManager(
-		func(string) *terminal.Handler { return terminal.NewHandler([]string{"/bin/true"}) },
+		func(terminal.SessionID) *terminal.Handler { return terminal.NewHandler([]string{"/bin/true"}) },
 		terminal.WithManagerLogger(slog.New(slog.DiscardHandler)),
 	)
 	t.Cleanup(func() { shutdownManager(t, mgr) })

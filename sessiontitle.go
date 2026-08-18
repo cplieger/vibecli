@@ -25,9 +25,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/cplieger/atomicfile/v2"
-	"github.com/cplieger/runesafe"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/atomicfile/v3"
+	"github.com/cplieger/runesafe/v2"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 const (
@@ -59,7 +59,7 @@ const (
 // (below a user's pin, above the automatic cwd/process ladder). An interface rather than
 // the concrete manager so the poller is testable without a PTY.
 type titleSetter interface {
-	SetSessionTitle(id, title string) bool
+	SetSessionTitle(id terminal.SessionID, title string) bool
 	// List is the live-tab set, and the only reclaim signal that does not depend on a
 	// title still CHANGING: a closed tab's kiro-cli is gone, so its session.json title is
 	// frozen, so syncOne's memo returns early and the SetSessionTitle-false probe below it
@@ -87,7 +87,7 @@ type sessionTitleSync struct {
 	// pushed keeps the kiro session and title last pushed per tab, keyed by TAB ID; the
 	// mapping identity lets syncOne clear the old conversation's title when a hook re-points
 	// a tab. Touched only by the poller goroutine, so it needs no lock.
-	pushed map[string]pushedTitle
+	pushed map[terminal.SessionID]pushedTitle
 	// handleByTab and tabByHandle are the same per-tab title handle indexed both ways:
 	// sessionEnv needs tab -> handle, the poller needs handle -> tab.
 	//
@@ -96,8 +96,8 @@ type sessionTitleSync struct {
 	// index against pass()'s liveness snapshot — the handle is minted BEFORE the manager
 	// lists the session, so a tick in that window would drop a LIVE tab's handle while the
 	// hook keeps writing under it, and the server could never re-learn it.
-	handleByTab map[string]string
-	tabByHandle map[string]string
+	handleByTab map[terminal.SessionID]string
+	tabByHandle map[string]terminal.SessionID
 	stateDir    string
 	// sessionsRoot is kiro-cli's session store ($HOME/.kiro/sessions). Sessions live one
 	// level down under a per-workspace hash directory, so a session id is resolved by
@@ -123,9 +123,9 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 	return &sessionTitleSync{
 		stateDir:     filepath.Join(stateRoot, titleStateDirName),
 		sessionsRoot: filepath.Join(home, ".kiro", "sessions"),
-		pushed:       make(map[string]pushedTitle),
-		handleByTab:  make(map[string]string),
-		tabByHandle:  make(map[string]string),
+		pushed:       make(map[terminal.SessionID]pushedTitle),
+		handleByTab:  make(map[terminal.SessionID]string),
+		tabByHandle:  make(map[string]terminal.SessionID),
 	}
 }
 
@@ -137,7 +137,7 @@ func newSessionTitleSync(stateRoot, home string) *sessionTitleSync {
 // with — so shipping it made a live token the filename of a file in a directory this app
 // does not own. It carries no authentication meaning but is unguessable even so, because
 // that is what keeps forgery resistance where it was.
-func (s *sessionTitleSync) sessionEnv(tabID string) []string {
+func (s *sessionTitleSync) sessionEnv(tabID terminal.SessionID) []string {
 	handle, err := s.titleHandle(tabID)
 	if err != nil {
 		slog.Warn("session title: could not mint a title handle; this tab keeps the automatic name ladder",
@@ -153,7 +153,7 @@ func (s *sessionTitleSync) sessionEnv(tabID string) []string {
 // titleHandle returns this tab's title handle, minting one the first time the tab needs it.
 // Reusing an existing handle keeps the invariant the poller relies on — one live mapping
 // file per tab — so a second call cannot strand a file under an abandoned name.
-func (s *sessionTitleSync) titleHandle(tabID string) (string, error) {
+func (s *sessionTitleSync) titleHandle(tabID terminal.SessionID) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if handle, ok := s.handleByTab[tabID]; ok {
@@ -171,7 +171,7 @@ func (s *sessionTitleSync) titleHandle(tabID string) (string, error) {
 // tabForHandle resolves a mapping FILENAME back to the tab it belongs to. A handle this
 // process never minted — a file left behind by a previous server run, or one a local writer
 // invented — names no tab, and the caller then reclaims it.
-func (s *sessionTitleSync) tabForHandle(handle string) (string, bool) {
+func (s *sessionTitleSync) tabForHandle(handle string) (terminal.SessionID, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tabID, ok := s.tabByHandle[handle]
@@ -311,7 +311,7 @@ func enforceLevelMode(dir string) (os.FileMode, error) {
 // plus a bool, so "inject but do not poll" cannot be expressed at all. A refusal that only
 // WARNED left both sinks pointed at the refused path: the hook still received
 // WT_TITLE_STATE_DIR, and pass()/forget() still followed it with ReadDir and Remove.
-func enableSessionTitles(titles *sessionTitleSync) func(tabID string) []string {
+func enableSessionTitles(titles *sessionTitleSync) func(tabID terminal.SessionID) []string {
 	if err := titles.ensureStateDir(); err != nil {
 		slog.Warn("session title state dir refused; tabs keep the automatic name ladder and the title poller stays off",
 			"dir", titles.stateDir, "error", err,
@@ -332,14 +332,14 @@ func (s *sessionTitleSync) Run(ctx context.Context, mgr titleSetter) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.pass(mgr)
+			s.pass(ctx, mgr)
 		}
 	}
 }
 
 // pass runs one sweep: reclaim every mapping whose tab is gone, then for the ones that
 // remain, read that kiro session's title and push it if it changed.
-func (s *sessionTitleSync) pass(mgr titleSetter) {
+func (s *sessionTitleSync) pass(ctx context.Context, mgr titleSetter) {
 	entries, err := os.ReadDir(s.stateDir)
 	if err != nil {
 		// No ErrNotExist carve-out. The poller runs ONLY on enableSessionTitles' true
@@ -354,7 +354,7 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 	}
 	// One liveness snapshot per sweep rather than per entry: the manager takes its own
 	// lock, and every mapping is then judged against the same picture.
-	live := make(map[string]struct{}, len(entries))
+	live := make(map[terminal.SessionID]struct{}, len(entries))
 	for _, info := range mgr.List() {
 		live[info.ID] = struct{}{}
 	}
@@ -396,7 +396,7 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 			continue
 		}
 		mapped++
-		s.syncOne(mgr, e.Name(), tabID)
+		s.syncOne(ctx, mgr, e.Name(), tabID)
 	}
 	if mapped == 0 && len(live) > 0 {
 		// Tabs exist and not one has a kiro session mapping, so every one keeps the engine's
@@ -413,14 +413,14 @@ func (s *sessionTitleSync) pass(mgr titleSetter) {
 // syncOne maps one tab to its kiro session and pushes that session's title. handle is the
 // mapping file's name; tabID is what pass() resolved it to and the only one of the two the
 // engine understands.
-func (s *sessionTitleSync) syncOne(mgr titleSetter, handle, tabID string) {
-	kiroID, ok := s.readMapping(handle)
+func (s *sessionTitleSync) syncOne(ctx context.Context, mgr titleSetter, handle string, tabID terminal.SessionID) {
+	kiroID, ok := s.readMapping(ctx, handle)
 	if !ok {
 		return
 	}
 	previous, pushed := s.pushed[tabID]
 	repointed := pushed && previous.kiroID != kiroID
-	title, ok := s.readTitle(kiroID)
+	title, ok := s.readTitle(ctx, kiroID)
 	if !ok {
 		if !repointed {
 			return
@@ -460,8 +460,8 @@ func (s *sessionTitleSync) syncOne(mgr titleSetter, handle, tabID string) {
 // readMapping reads the handle -> kiro-session-id file the hook wrote. The value is
 // validated as a kiro session id rather than trusted: it is interpolated into a filesystem
 // path below, and the file is written by a shell hook this app does not execute itself.
-func (s *sessionTitleSync) readMapping(handle string) (string, bool) {
-	raw, err := readSmallFile(filepath.Join(s.stateDir, handle))
+func (s *sessionTitleSync) readMapping(ctx context.Context, handle string) (string, bool) {
+	raw, err := readSmallFile(ctx, filepath.Join(s.stateDir, handle))
 	if err != nil {
 		// pass() just enumerated this entry, so any failure here is abnormal — EACCES, a
 		// refused symlink/FIFO, an oversized file — not absence.
@@ -484,7 +484,7 @@ func (s *sessionTitleSync) readMapping(handle string) (string, bool) {
 
 // readTitle finds a kiro session's record under the per-workspace hash level and returns
 // its title. Absent, placeholder, and blank titles all read as "no title".
-func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
+func (s *sessionTitleSync) readTitle(ctx context.Context, kiroID string) (string, bool) {
 	hashDirs, err := os.ReadDir(s.sessionsRoot)
 	if err != nil {
 		// A missing tree is the normal state before kiro-cli has written its first session,
@@ -501,7 +501,7 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 		if !hd.IsDir() {
 			continue
 		}
-		if title, settled := s.titleFromRecord(hd.Name(), kiroID); settled {
+		if title, settled := s.titleFromRecord(ctx, hd.Name(), kiroID); settled {
 			return title, title != ""
 		}
 	}
@@ -513,8 +513,8 @@ func (s *sessionTitleSync) readTitle(kiroID string) (string, bool) {
 // reached at all its contents are the answer — a corrupt or title-less record settles the
 // lookup as "no title" rather than sending the scan on. A record that could not be READ at
 // all is the miss that keeps scanning.
-func (s *sessionTitleSync) titleFromRecord(hashDir, kiroID string) (string, bool) {
-	raw, err := readSmallFile(filepath.Join(s.sessionsRoot, hashDir, kiroID, "session.json"))
+func (s *sessionTitleSync) titleFromRecord(ctx context.Context, hashDir, kiroID string) (string, bool) {
+	raw, err := readSmallFile(ctx, filepath.Join(s.sessionsRoot, hashDir, kiroID, "session.json"))
 	if err != nil {
 		// ENOENT is the normal miss (the session lives under one hash dir); anything else
 		// silently kills this tab's title, the failure class readTitle's comment says a
@@ -563,13 +563,16 @@ func (s *sessionTitleSync) forget(handle string) {
 // goroutine in open(2), and a stat of the OPEN HANDLE rather than of the pathname a second
 // time — and ReadBoundedFile applies the byte bound to that same descriptor, refusing a
 // larger file rather than truncating it.
-func readSmallFile(path string) ([]byte, error) {
+func readSmallFile(ctx context.Context, path string) ([]byte, error) {
 	f, _, err := atomicfile.OpenRegular(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }() // read-only
-	return atomicfile.ReadBoundedFile(context.Background(), f, maxTitleFileBytes)
+	// The sweep's context, not context.Background(): ReadBoundedFile checks
+	// ctx.Err() at entry and mid-read, so a Background context would make the
+	// poller's file reads unabandonable at shutdown for no gain.
+	return atomicfile.ReadBoundedFile(ctx, f, maxTitleFileBytes)
 }
 
 // validKiroSessionID gates the id read out of a mapping file before it becomes a path

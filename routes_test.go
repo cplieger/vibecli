@@ -20,9 +20,9 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/cplieger/toolbelt/v2"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/toolbelt/v3"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // TestDebugRoutesNotExposed pins the route surface of registerRoutes: the
@@ -219,7 +219,7 @@ func TestSSEStreamsThroughLoggingMiddleware(t *testing.T) {
 	}
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
-		if line := sc.Text(); strings.HasPrefix(line, "data:") && strings.Contains(line, id) {
+		if line := sc.Text(); strings.HasPrefix(line, "data:") && strings.Contains(line, string(id)) {
 			return // the initial-sync event flushed through the middleware
 		}
 	}
@@ -405,7 +405,7 @@ func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 		// SessionsSubtreePath) and outside the create gate, so it reaches the
 		// statuses no handler writes. These rows hold with no app middleware at
 		// all; they go red if the engine stops covering its own mux.
-		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session close (204)", http.MethodDelete, terminal.SessionsPath + "/" + string(liveID), "", noStore, "engine withNoStore (MountSessionRoutes)"},
 		{"session close, unknown id (404)", http.MethodDelete, terminal.SessionsPath + "/deadbeef", "", noStore, "engine withNoStore (MountSessionRoutes)"},
 		{"set title, unknown id (404)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", `{"title":"x"}`, noStore, "engine withNoStore (MountSessionRoutes)"},
 		{"set title, undecodable body (400)", http.MethodPut, terminal.SessionsPath + "/deadbeef/title", "not json", noStore, "engine withNoStore (MountSessionRoutes)"},
@@ -415,7 +415,7 @@ func TestAPICachePolicy_EveryAPIPathSetsNoStore(t *testing.T) {
 		// per-handler fix inside the engine would reach them: a 405 for a
 		// method the session path does not serve, and a 404 for the bare
 		// subtree path (no {id} segment to match).
-		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + liveID, "", noStore, "engine withNoStore (MountSessionRoutes)"},
+		{"session path, unserved method (405)", http.MethodGet, terminal.SessionsPath + "/" + string(liveID), "", noStore, "engine withNoStore (MountSessionRoutes)"},
 		{"session subtree root (404)", http.MethodGet, terminal.SessionsSubtreePath, "", noStore, "engine withNoStore (MountSessionRoutes)"},
 
 		// The app's own handlers, each setting the header at the top of the
@@ -657,7 +657,7 @@ func TestWSRejectsCrossOrigin(t *testing.T) {
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
 
-	req := newWSUpgradeRequest(t, srv.URL, id, "http://evil.example")
+	req := newWSUpgradeRequest(t, srv.URL, string(id), "http://evil.example")
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("cross-origin /ws handshake: %v", err)
@@ -680,7 +680,7 @@ func TestWSAcceptsSameOrigin(t *testing.T) {
 	srv := httptest.NewServer(buildHandler(mux, nil, csp, nil))
 	t.Cleanup(srv.Close)
 
-	req := newWSUpgradeRequest(t, srv.URL, id, srv.URL) // same origin as the test server
+	req := newWSUpgradeRequest(t, srv.URL, string(id), srv.URL) // same origin as the test server
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("same-origin /ws handshake: %v", err)
@@ -708,16 +708,16 @@ func TestSessionFactoryRequestsTheTitleEnv(t *testing.T) {
 	var ready webhttp.Ready
 	ready.Set(true)
 
-	var gotIDs []string
+	var gotIDs []terminal.SessionID
 	staticSrv, _ := testStaticSurface()
 	deps := withDefaultPolicies(&routeDeps{
 		static:  staticSrv,
 		ready:   &ready,
 		workDir: "",
 		cmd:     staticCmd("/bin/cat"),
-		sessionTitleEnv: func(id string) []string {
+		sessionTitleEnv: func(id terminal.SessionID) []string {
 			gotIDs = append(gotIDs, id)
-			return []string{"WT_TITLE_HANDLE=" + id}
+			return []string{"WT_TITLE_HANDLE=" + string(id)}
 		},
 	})
 	_, _, _, id := mustStartSession(t, deps)
@@ -735,7 +735,7 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 	t.Run("both overlays present", func(t *testing.T) {
 		d := &routeDeps{
 			sessionEnv:      func() []string { return []string{"PATH=/pinned:/usr/bin"} },
-			sessionTitleEnv: func(id string) []string { return []string{"WT_TITLE_HANDLE=" + id} },
+			sessionTitleEnv: func(id terminal.SessionID) []string { return []string{"WT_TITLE_HANDLE=" + string(id)} },
 		}
 		got := d.childEnv("tab7")
 		want := []string{"PATH=/pinned:/usr/bin", "WT_TITLE_HANDLE=tab7"}
@@ -756,7 +756,7 @@ func TestChildEnvComposesBothOverlays(t *testing.T) {
 		base[0] = "PATH=/pinned"
 		d := &routeDeps{
 			sessionEnv:      func() []string { return base },
-			sessionTitleEnv: func(id string) []string { return []string{"WT_TITLE_HANDLE=" + id} },
+			sessionTitleEnv: func(id terminal.SessionID) []string { return []string{"WT_TITLE_HANDLE=" + string(id)} },
 		}
 		a := d.childEnv("tabA")
 		b := d.childEnv("tabB")
@@ -1120,7 +1120,7 @@ func readMarkerWithin(t *testing.T, path string, minBytes int, what string) []by
 // and four tests in this file had silently dropped it (a teardown kill then
 // injected a stray fast-death Warn into a later test's exact-count assertion).
 // A session started through this helper cannot forget it.
-func mustStartSession(t *testing.T, deps *routeDeps) (*http.ServeMux, *terminal.SessionManager, string, string) {
+func mustStartSession(t *testing.T, deps *routeDeps) (*http.ServeMux, *terminal.SessionManager, string, terminal.SessionID) {
 	t.Helper()
 	mux, mgr, csp := mustRegisterRoutes(t, deps)
 	id, err := mgr.Create()

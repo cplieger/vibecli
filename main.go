@@ -9,6 +9,7 @@ package main
 //go:generate static-src/node_modules/.bin/tsc --project static-src/tsconfig.json
 
 import (
+	"cmp"
 	"context"
 	"embed"
 	"errors"
@@ -25,13 +26,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cplieger/envx"
-	"github.com/cplieger/pinstall/v2"
-	"github.com/cplieger/pinstall/v2/kirocli"
+	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/pinstall/v3"
+	"github.com/cplieger/pinstall/v3/kirocli"
 	"github.com/cplieger/slogx"
-	"github.com/cplieger/toolbelt/v2"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/toolbelt/v3"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // staticFS holds the served asset tree. It embeds the DIRECTORY rather than a file
@@ -51,7 +52,7 @@ var staticFS embed.FS
 // peer.
 func parseTrustedProxies() []*net.IPNet {
 	const key = "WT_TRUSTED_PROXIES"
-	v := envx.String(key, "")
+	v := envx.String(key)
 	if v == "" {
 		return nil
 	}
@@ -88,8 +89,8 @@ func parseTrustedProxies() []*net.IPNet {
 // request would otherwise 403 unexplained.
 func parseAllowedHosts() *webhttp.HostPolicy {
 	const key = "WT_ALLOWED_HOSTS"
-	policy, invalid := webhttp.ParseHostList(strings.Split(envx.String(key, ""), ","),
-		webhttp.WithLoopbackExempt(),
+	policy, invalid := webhttp.ParseHostList(strings.Split(envx.String(key), ","),
+		webhttp.WithLoopbackExempt(true),
 		webhttp.WithHostAllowlistError("host_not_allowed",
 			"host not allowed; add it to WT_ALLOWED_HOSTS to serve this hostname"))
 	if len(invalid) > 0 {
@@ -159,7 +160,7 @@ func parseCatalogRefresh(raw string) time.Duration {
 			raw = ""
 		}
 	}
-	return toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+	return toolbelt.ParseCatalogRefresh(toolbelt.RefreshEnv(raw), catalogRefreshKey)
 }
 
 // parseLogOSCText reads the WT_LOG_OSC_TEXT knob (default false), reporting whether
@@ -196,7 +197,7 @@ func parseLogOSCText() bool {
 // is DROPPED, which is fail-closed: a uid that never lands keeps the check enforcing.
 func parseTrustedInstallUIDs() []int {
 	const key = "WT_TRUSTED_INSTALL_UIDS"
-	uids, rejected := pinstall.ParseIdentities(envx.String(key, ""))
+	uids, rejected := pinstall.ParseIdentities(envx.String(key))
 	if rejected > 0 {
 		slog.Warn("dropping unusable "+key+" entries; the kiro-cli install keeps enforcing custody against those identities",
 			"invalid_count", rejected,
@@ -305,7 +306,7 @@ func stageOf(err error) string {
 // handler installs at the configured level; warn AFTER Setup so the warning emits
 // through the configured handler (the slogx contract).
 func setupLogging() {
-	logLevel, ok := slogx.ParseLevel(envx.String("WT_LOG_LEVEL", ""), slog.LevelInfo)
+	logLevel, ok := slogx.ParseLevel(envx.String("WT_LOG_LEVEL"), slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: logLevel})
 	if !ok {
 		// Field-name-only: a compose expansion mistake could put a secret in the
@@ -344,7 +345,21 @@ func checkWorkDir(workDir string) error {
 func run() error {
 	setupLogging()
 
-	addr := envx.String("WT_ADDR", ":9848")
+	// The shutdown context every long-lived goroutine in run() keys its exit
+	// off: the tools convergence watcher and the boot-convergence waiter (both
+	// started inside startTools), the session-title poller, and the request
+	// contexts the server derives via BaseContext. The pre-drain hook cancels
+	// it. Created HERE rather than beside the server because startTools runs
+	// first, and a goroutine handed context.Background() for want of a shutdown
+	// signal has an exit path that can never fire (go-rulebook C20).
+	//
+	// Not every context in this process: startKiroCLI's own root is separate,
+	// and readSmallFile's callers thread the poller's context, not this one
+	// directly.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+
+	addr := cmp.Or(envx.String("WT_ADDR"), ":9848")
 	// Warn for any bind reachable beyond loopback: a client that can reach this
 	// port gets an UNAUTHENTICATED kiro-cli PTY. Only a definite exposure warns; an
 	// unparseable addr will fail at Listen with its own error.
@@ -353,7 +368,7 @@ func run() error {
 			"addr", addr,
 			"hint", "any client that can reach this port gets a kiro-cli PTY with filesystem access to /workspace and the /config home (auth tokens, ssh keys, gitconfig)")
 	}
-	workDir := envx.String("WT_WORKDIR", "/workspace")
+	workDir := cmp.Or(envx.String("WT_WORKDIR"), "/workspace")
 	if err := checkWorkDir(workDir); err != nil {
 		return err
 	}
@@ -364,18 +379,18 @@ func run() error {
 	// install Root). A SECOND derivation is what previously split toolbelt's
 	// manifest from the tree it describes. Empty outside the container, where
 	// startTools falls back to <configDir>/tools.
-	kiroToolsDir := envx.String("KIRO_CLI_TOOLS_DIR", "")
+	kiroToolsDir := envx.String("KIRO_CLI_TOOLS_DIR")
 
-	tools := startTools(baseTools{
+	tools := startTools(baseCtx, baseTools{
 		configDir:   configMountDir,
 		toolsDir:    kiroToolsDir,
-		catalogPath: envx.String("TOOL_CATALOG_PATH", "/app/tool-catalog.json"),
+		catalogPath: cmp.Or(envx.String("TOOL_CATALOG_PATH"), "/app/tool-catalog.json"),
 		// The baked catalog above is only the first-boot/offline fallback; the
 		// engine fetches the published catalog at boot and every
 		// TOOL_CATALOG_REFRESH, re-verifying the embedded required-tools list
 		// before a swap, and the last good catalog stands on any failure.
-		catalogURL:      envx.String("TOOL_CATALOG_URL", toolbelt.DefaultCatalogURL),
-		refreshInterval: parseCatalogRefresh(envx.String(catalogRefreshKey, "")),
+		catalogURL:      cmp.Or(envx.String("TOOL_CATALOG_URL"), toolbelt.DefaultCatalogURL),
+		refreshInterval: parseCatalogRefresh(envx.String(catalogRefreshKey)),
 	})
 
 	trustedProxies := parseTrustedProxies()
@@ -395,7 +410,7 @@ func run() error {
 	// KIRO_CLI_CHAT_ARGS appends extra launch flags to the per-session `kiro-cli
 	// chat` command (whitespace-separated, e.g. "--v3"). The values reach chat as
 	// positional shell params (see sessionCommand), never via string splicing.
-	chatArgs := strings.Fields(envx.String("KIRO_CLI_CHAT_ARGS", ""))
+	chatArgs := strings.Fields(envx.String("KIRO_CLI_CHAT_ARGS"))
 	if len(chatArgs) > 0 {
 		// Field-count-only: a compose expansion mistake or a value-bearing flag
 		// could put a secret in the args.
@@ -409,9 +424,9 @@ func run() error {
 	// limiter in routes.go is the bound chosen instead.
 	tainted := os.Getenv("KIRO_CLI_TOOLS_TAINTED") == "1"
 	kiro := startKiroCLI(&baseKiro{
-		version:            envx.String("KIRO_CLI_VERSION", ""),
-		sha256:             envx.String("KIRO_CLI_SHA256", ""),
-		sha256ARM64:        envx.String("KIRO_CLI_SHA256_ARM64", ""),
+		version:            envx.String("KIRO_CLI_VERSION"),
+		sha256:             envx.String("KIRO_CLI_SHA256"),
+		sha256ARM64:        envx.String("KIRO_CLI_SHA256_ARM64"),
 		toolsDir:           kiroToolsDir,
 		tainted:            tainted,
 		chatArgs:           chatArgs,
@@ -427,7 +442,7 @@ func run() error {
 	// container. A refused directory is a warn, and it is AUTHORITATIVE for both
 	// consumers: no tab gets the title variables, the poller never starts, and the
 	// engine's automatic ladder names every tab.
-	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME", ""))
+	titles := newSessionTitleSync(titleStateRoot, envx.String("HOME"))
 	sessionTitleEnv := enableSessionTitles(titles)
 
 	// The subsystem teardown, named once and deferred once, so a third subsystem is
@@ -499,9 +514,6 @@ func run() error {
 	if err != nil {
 		return atStage(stageListen, fmt.Errorf("listen on %s: %w", addr, err))
 	}
-
-	baseCtx, cancelBase := context.WithCancel(context.Background())
-	defer cancelBase()
 
 	// webhttp.NewServer supplies the streaming-safe timeout defaults the hijacked /ws
 	// stream needs. WithSlogErrorLog keeps net/http's OWN diagnostics inside the slog
@@ -1156,7 +1168,7 @@ func logRootIntegrityFindings(err error) {
 // the engine's counted jobs for the rest of the run. After convergence an async
 // update pass refreshes unpinned tools, and a boot warning nudges when no language
 // server is enabled (kiro-cli scans PATH for LSPs at session start).
-func startTools(cfg baseTools) toolsRuntime {
+func startTools(ctx context.Context, cfg baseTools) toolsRuntime {
 	// Three distinct outcomes, deliberately NOT collapsed: only a genuinely ABSENT
 	// directory is the intentionally-disabled out-of-container shape. A stat failure
 	// for any other reason, or a non-directory mounted at the config path, is a
@@ -1242,13 +1254,13 @@ func startTools(cfg baseTools) toolsRuntime {
 	// still refuses with "tools installing". A post-boot job failure stores only ok
 	// or degraded, so it can update the field without re-closing session creation.
 	// Boot failure lifting the gate is deliberate (degraded-not-dead).
-	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	job, enqueued, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
 	switch {
 	case rerr != nil:
 		slog.Warn("tools: boot reconcile not enqueued", "error", rerr)
 		status.recordBoot(toolsStateDegraded)
 		warnIfNoLSPEnabled(eng, manifestPath)
-	case job == nil: // empty manifest: nothing to converge
+	case !enqueued: // empty manifest: nothing to converge (v3 reports this directly)
 		status.recordBoot(toolsStateOK)
 		warnIfNoLSPEnabled(eng, manifestPath)
 	default:
@@ -1259,7 +1271,7 @@ func startTools(cfg baseTools) toolsRuntime {
 		slog.Info("tools: boot convergence started; session creation is gated until it finishes",
 			"job", job.ID,
 			"hint", "POST /api/sessions answers 503 \"tools installing\" (Retry-After 5) and /api/health reports tools=syncing until this converges")
-		go awaitBootConvergence(eng, job.ID, status.recordBoot, manifestPath)
+		go awaitBootConvergence(ctx, eng, job.ID, status.recordBoot, manifestPath)
 	}
 	// Boot catalog fetch, explicitly AFTER the reconcile enqueue: the engine's
 	// schedule deliberately has no fire-on-start, because an immediate enqueue
@@ -1269,10 +1281,13 @@ func startTools(cfg baseTools) toolsRuntime {
 	if _, rerr := eng.RefreshCatalog(); rerr != nil {
 		slog.Warn("tools: boot catalog refresh not enqueued", "error", rerr)
 	}
-	// Started here rather than beside the reducer, so it exists only for a runtime
-	// that has an engine to count. No shutdown ceremony: the engine outlives every
-	// request and Close() cancels its own work.
-	go status.watchConvergence(context.Background(), countMissingTools(eng))
+	// The convergence watcher is started here rather than beside the reducer, so
+	// it exists only for a runtime that actually has an engine to count. It gets
+	// the SHUTDOWN context, not context.Background(): the callee selects on
+	// ctx.Done() to return, and a Background context defeats that exit path at
+	// the call site, so the goroutine outlived every shutdown and the select arm
+	// was unreachable code.
+	go status.watchConvergence(ctx, countMissingTools(eng))
 
 	return toolsRuntime{
 		engine:  eng,
@@ -1287,9 +1302,37 @@ func startTools(cfg baseTools) toolsRuntime {
 // tail: the freshness pass for unpinned entries (off the boot path — version-check
 // network never holds the session gate) and the language-server nudge. manifestPath
 // is threaded through purely for that nudge's operator-facing `manifest` field.
-func awaitBootConvergence(eng *toolbelt.Engine, jobID string, finish func(string), manifestPath string) {
-	final, werr := eng.Wait(context.Background(), jobID)
+//
+// ctx is the process shutdown context, not context.Background(): a goroutine
+// blocked on Wait for a job budgeted at up to 30 minutes must not survive the
+// signal that ends the process. A cancelled Wait is not a fault — the engine's
+// own Close cancels the running job on the same path — so it lands on the
+// same not-a-tool-failure record as JobCancelled.
+func awaitBootConvergence(ctx context.Context, eng *toolbelt.Engine, jobID string, finish func(string), manifestPath string) {
+	final, werr := eng.Wait(ctx, jobID)
 	switch {
+	case errors.Is(werr, context.Canceled), errors.Is(werr, context.DeadlineExceeded):
+		// Shutdown won the race with convergence. Keyed on the ERROR Wait
+		// returned, not on ctx.Err(): Wait checks for a terminal job BEFORE it
+		// selects on ctx.Done() (toolbelt jobs.go), so a job that finished in
+		// the same instant SIGTERM arrived comes back as (job, nil) with a
+		// cancelled ctx — and a bare ctx.Err() arm would have recorded that
+		// SUCCESS as an abandoned, degraded pass.
+		//
+		// The verdict still degrades (this pass did not converge) but the
+		// RECORD stays Info for the same reason the JobCancelled arm below
+		// does: a restart during a first-boot install is routine, and a Warn
+		// here is the false broken-install alert every deploy would fire.
+		//
+		// Returns, like the JobCancelled arm: the post-convergence tail must
+		// not run. Update() enqueues a real network pass, and the pre-drain
+		// hook cancels this ctx while tools.close() is still pending in the
+		// deferred teardown, so the engine is still OPEN here and the enqueue
+		// would SUCCEED on a draining process.
+		slog.Info("tools: boot convergence abandoned at shutdown; not a tool failure",
+			"cause", context.Cause(ctx))
+		finish(toolsStateDegraded)
+		return
 	case werr != nil:
 		slog.Warn("tools: boot reconcile wait failed", "error", werr)
 		finish(toolsStateDegraded)
@@ -1423,7 +1466,7 @@ func buildHandler(mux http.Handler, trustedProxies []*net.IPNet, csp string, hos
 			// Every refusal therefore keeps its line by construction, including the
 			// 426 for missing upgrade headers (the classic reverse-proxy
 			// misconfiguration).
-			webhttp.WithSkipUpgrades(),
+			webhttp.WithSkipUpgrades(true),
 			// SSE needs its own path-shaped skip because it never switches protocols: it
 			// is a plain 200 that does not return until the client disconnects, so
 			// WithSkipUpgrades cannot see it and its record would START being emitted.
@@ -1485,7 +1528,7 @@ func wsAttachLog(trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == terminal.WSPath && isWebSocketUpgrade(r) {
 				slog.Info(wsAttachMsg,
-					"session", terminal.LogID(r.URL.Query().Get("session")),
+					"session", terminal.LogID(terminal.SessionID(r.URL.Query().Get("session"))),
 					"client_ip", webhttp.ClientIP(r, trustedProxies...),
 					"request_id", webhttp.RequestIDFromContext(r.Context()))
 			}

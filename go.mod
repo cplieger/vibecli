@@ -15,7 +15,7 @@ require (
 
 require (
 	github.com/cplieger/httpx/v4 v4.3.1 // indirect
-	github.com/cplieger/keyenc v1.0.2 // indirect
+	github.com/cplieger/keyenc v1.0.3 // indirect
 	github.com/cplieger/scheduler/v3 v3.0.1 // indirect
 	github.com/cplieger/ssrf/v3 v3.0.1 // indirect
 	github.com/expr-lang/expr v1.17.8 // indirect

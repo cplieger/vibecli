@@ -425,6 +425,14 @@ ARG PKG_REFRESH=static
 # dialect at the next ARG/ENV and shellchecks the rest of the stage as POSIX
 # sh. Docker-side a no-op (same shell, no layer); it keeps the SC checks live.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# libatomic1 is a RUNTIME dependency of the Node.js the tools engine
+# installs: node's official linux-x64 binaries link libatomic.so.1 from
+# v25 onward (measured — v24.18.0 does not, v26.7.0 does). It is listed
+# explicitly because the only reason this image had it was the homelab
+# compose passing `APT_PACKAGES: "gcc libc6-dev"`, where gcc pulls
+# libgcc-14-dev which depends on it. A deployment without that env got
+# sister app vibekit's failure instead: every npm-sourced tool dying with
+# `npm failed: exit status 127`.
 # hadolint ignore=DL3008
 RUN echo "OS package refresh: ${PKG_REFRESH}" \
     && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -435,6 +443,7 @@ RUN echo "OS package refresh: ${PKG_REFRESH}" \
     jq \
     less \
     libasound2 \
+    libatomic1 \
     openssh-client \
     unzip \
     xz-utils \

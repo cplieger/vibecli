@@ -89,7 +89,7 @@ func main() {
 func run(clientRev, clientMinServer int, stdout, stderr io.Writer) int {
 	server := terminal.WireEnd{Rev: terminal.WireProtocolVersion, MinPeer: terminal.MinSupportedClientWireVersion}
 	client := terminal.WireEnd{Rev: clientRev, MinPeer: clientMinServer}
-	if reason := terminal.WirePairIncompatibility(server, client); reason != "" {
+	if reason := terminal.WirePairIncompatibility(terminal.WirePair{Server: server, Client: client}); reason != "" {
 		fmt.Fprintf(stderr, "ERROR wire-floor-mismatch: %s\n%s\n", reason, remediation())
 		return 1
 	}

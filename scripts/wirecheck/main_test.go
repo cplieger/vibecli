@@ -450,10 +450,10 @@ func TestRun_delegatesToTheEngineRule(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.clientRev, tc.clientMinServer, &stdout, &stderr)
-			engineSaysCompatible := terminal.WirePairIncompatibility(
-				terminal.WireEnd{Rev: terminal.WireProtocolVersion, MinPeer: terminal.MinSupportedClientWireVersion},
-				terminal.WireEnd{Rev: tc.clientRev, MinPeer: tc.clientMinServer},
-			) == ""
+			engineSaysCompatible := terminal.WirePairIncompatibility(terminal.WirePair{
+				Server: terminal.WireEnd{Rev: terminal.WireProtocolVersion, MinPeer: terminal.MinSupportedClientWireVersion},
+				Client: terminal.WireEnd{Rev: tc.clientRev, MinPeer: tc.clientMinServer},
+			}) == ""
 			if engineSaysCompatible != tc.wantCompatible {
 				t.Fatalf("engine verdict for (%d,%d) = compatible:%v, test expected %v; the engine's rule changed and this table is stale",
 					tc.clientRev, tc.clientMinServer, engineSaysCompatible, tc.wantCompatible)

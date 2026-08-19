@@ -1547,7 +1547,27 @@ const (
 func startContainment() *terminal.Containment {
 	c, err := terminal.NewContainment(containCgroupRoot, containCgroupPrefix, slog.Default())
 	if err != nil {
-		slog.Info("per-session cgroup containment unavailable; session trees are still reaped, but per-session peak memory and task counts will not be reported",
+		// WARN, not Info, and the level is the whole point of the line.
+		//
+		// This reports that a layer the operator asked for is not running. At Info it
+		// sat in the same stream as routine boot chatter, six seconds after
+		// entrypoint.sh had already logged `cgroup tree remounted rw; per-session
+		// process containment available` — which is a claim about the MOUNT, not
+		// about containment. An operator reading the first line saw success, and the
+		// contradiction below it was not loud enough to correct them.
+		//
+		// The cost of missing it is measured, not hypothetical: containment ran
+		// silently off on borgcube while 28 stranded session trees accumulated
+		// 16.2 GB, and the incident reached 32.6 GB with 17,290 zombies before
+		// anyone read this line. Nothing else announces the state, and this
+		// container deliberately carries no mem_limit, so the fleet's
+		// ContainerMemoryHigh rule is structurally exempt from catching the
+		// consequence (see web-terminal-kiro.md, "No mem_limit, on purpose").
+		//
+		// It stays a warning rather than a fatal because the app's failure posture
+		// says so: reaping closes the process leak without containment, so the
+		// terminal must keep serving.
+		slog.Warn("per-session cgroup containment unavailable; session trees are still reaped, but per-session peak memory and task counts will not be reported",
 			"error", err,
 			"hint", "containment needs a writable cgroup v2 root, which needs CAP_SYS_ADMIN for a one-time remount. Not granted by default: the engine's marker-based reaping closes the process leak without it.")
 		return nil

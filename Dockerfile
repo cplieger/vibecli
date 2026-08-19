@@ -22,11 +22,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # The `# go<version>` trailer on each sha line is the anchor Renovate uses to
 # resolve that arch's digest — do not hand-edit; Renovate owns these lines.
 # renovate: datasource=golang-version depName=golang
-ARG GO_VERSION=1.26.6
+ARG GO_VERSION=1.26.7
 # renovate: datasource=custom.golang-amd64 depName=golang-amd64
-ARG GO_SHA256_AMD64=708effb774be8237570d0add163225abbdfaf4fca28b2611df167beba4feef89  # go1.26.6
+ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca  # go1.26.7
 # renovate: datasource=custom.golang-arm64 depName=golang-arm64
-ARG GO_SHA256_ARM64=d0507e9e9d7fe012aae570108cbd76c15de879e17130ab8cb90d4d7445cb1f2e  # go1.26.6
+ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37  # go1.26.7
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) GO_SHA256="$GO_SHA256_AMD64" ;; \
@@ -169,7 +169,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
 # fail-closing every image build on the gate below.
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.4.12
+ARG TOOLBELT_TOOLCATALOG_VERSION=v2.5.0
 # No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
 # already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
 # (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
@@ -222,16 +222,16 @@ RUN set -e; mkdir -p static/vendor/fonts; \
 # carries a `# repin:`-marked sha256 ARG that the Renovate postUpgradeTask
 # recomputes in the same commit that bumps its version.
 # renovate: datasource=npm depName=@cplieger/web-terminal-engine
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=3.10.4
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_VERSION=4.0.3
 # sha256 of the published tarball. npm publishes SHA-512 (dist.integrity), not this
 # digest, so the version and the digest come from different sources: Renovate bumps
 # the version and the repin postUpgradeTask recomputes this line in the same commit.
 # repin: dep=@cplieger/web-terminal-engine url=https://registry.npmjs.org/@cplieger/web-terminal-engine/-/web-terminal-engine-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=fdf345f25efd86652b1e8b355972db50b429393ba489e3219777a65438823b29
+ARG CPLIEGER_WEB_TERMINAL_ENGINE_SHA256=c1b259fb11f1a2f2654ca32aca09d696883d333b7546828217792f38b773dee6
 # renovate: datasource=npm depName=@cplieger/web-terminal-ui
-ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=5.6.0
+ARG CPLIEGER_WEB_TERMINAL_UI_VERSION=6.1.2
 # repin: dep=@cplieger/web-terminal-ui url=https://registry.npmjs.org/@cplieger/web-terminal-ui/-/web-terminal-ui-{version}.tgz
-ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=2734e81640f419fef3077f4175af4f160eb1b80201cc18b63c78ab0a6e309d65
+ARG CPLIEGER_WEB_TERMINAL_UI_SHA256=282be0f856a9dd357e5694060e56a3601b7e5038cd7d2266ad82622b01fd760e
 # Pin gate (client-bundle parity): the SERVED client bundle is built from the
 # ARG-pinned npm tarballs above while static-src/package.json pins what local
 # dev compiles against — nothing else fails when they disagree, which is
@@ -425,6 +425,14 @@ ARG PKG_REFRESH=static
 # dialect at the next ARG/ENV and shellchecks the rest of the stage as POSIX
 # sh. Docker-side a no-op (same shell, no layer); it keeps the SC checks live.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+# libatomic1 is a RUNTIME dependency of the Node.js the tools engine
+# installs: node's official linux-x64 binaries link libatomic.so.1 from
+# v25 onward (measured — v24.18.0 does not, v26.7.0 does). It is listed
+# explicitly because the only reason this image had it was the homelab
+# compose passing `APT_PACKAGES: "gcc libc6-dev"`, where gcc pulls
+# libgcc-14-dev which depends on it. A deployment without that env got
+# sister app vibekit's failure instead: every npm-sourced tool dying with
+# `npm failed: exit status 127`.
 # hadolint ignore=DL3008
 RUN echo "OS package refresh: ${PKG_REFRESH}" \
     && apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -435,6 +443,7 @@ RUN echo "OS package refresh: ${PKG_REFRESH}" \
     jq \
     less \
     libasound2 \
+    libatomic1 \
     openssh-client \
     unzip \
     xz-utils \

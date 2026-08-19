@@ -376,8 +376,11 @@ func handleHealth(deps *routeDeps) http.HandlerFunc {
 	// moment the field used to disappear, because both unready paths returned before it
 	// was attached.
 	healthResponse := func(status, reason string) healthBody {
-		body := healthBody{Status: status, Reason: reason}
-		body.Tools = deps.toolsState()
+		body := healthBody{
+			Status: status,
+			Reason: reason,
+			Tools:  deps.toolsState(),
+		}
 		if n, ok := deps.toolsMissing(); ok {
 			body.ToolsMissing = &n
 		}

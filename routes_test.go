@@ -959,7 +959,8 @@ func libraryEnvelope(t *testing.T, ready bool) (body, cacheControl string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	webhttp.ReadinessHandler(readyStub(ready)).ServeHTTP(
-		rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody))
+		rec, httptest.NewRequest(http.MethodGet, healthPath, http.NoBody),
+	)
 	return strings.TrimSpace(rec.Body.String()), rec.Header().Get("Cache-Control")
 }
 
@@ -1674,7 +1675,8 @@ func TestComposeGate_syncingRefusalPreservesCreateBudget(t *testing.T) {
 		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			creates++
 			w.WriteHeader(http.StatusCreated)
-		}))
+		}),
+	)
 	post := func() *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
 		gated.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, terminal.SessionsPath, http.NoBody))

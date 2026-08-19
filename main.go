@@ -295,8 +295,7 @@ func atStage(stage string, err error) error {
 
 // stageOf reports the stage a failure was attributed to, or stageUnknown.
 func stageOf(err error) string {
-	var se *stageError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*stageError](err); ok {
 		return se.stage
 	}
 	return stageUnknown

@@ -41,7 +41,8 @@ func retainedLines(t *testing.T, scrollback *int, emitted, awaitCommitted int) u
 	deps := newTestDeps(true)
 	deps.scrollback = scrollback
 	deps.cmd = staticCmd("/bin/sh", "-c", fmt.Sprintf(
-		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted))
+		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted,
+	))
 
 	h := newSessionFactory(deps)("scrollback-probe")
 	if err := h.StartEager(); err != nil {

@@ -587,12 +587,8 @@ func readSmallFile(ctx context.Context, path string) ([]byte, error) {
 // component. kiro-cli's v3 ids are "sess_" followed by a UUID; requiring the prefix keeps a
 // malformed or hostile file from pointing the read anywhere else.
 func validKiroSessionID(id string) bool {
-	const prefix = "sess_"
-	if !strings.HasPrefix(id, prefix) || len(id) > 128 {
-		return false
-	}
-	rest := id[len(prefix):]
-	if rest == "" {
+	rest, ok := strings.CutPrefix(id, "sess_")
+	if !ok || rest == "" || len(id) > 128 {
 		return false
 	}
 	for i := range len(rest) {

@@ -488,9 +488,7 @@ func TestNotifyWarningState_concurrentObserveHonoursTheBudget(t *testing.T) {
 		release.Add(1)
 		for i := range distinct {
 			for range perMessage {
-				finished.Add(1)
-				go func(i int) {
-					defer finished.Done()
+				finished.Go(func() {
 					release.Wait() // start every caller at once, so the writes really overlap
 					warnFirst, warnCapped := state.observe(fmt.Sprintf("wording variant %d", i))
 					if warnFirst {
@@ -499,7 +497,7 @@ func TestNotifyWarningState_concurrentObserveHonoursTheBudget(t *testing.T) {
 					if warnCapped {
 						warnCappeds.Add(1)
 					}
-				}(i)
+				})
 			}
 		}
 		release.Done()

@@ -797,14 +797,15 @@ func kiroSettings() []pinstall.Assertion {
 		// Raw because the value is not a boolean.
 		kirocli.SettingRaw("chat.notificationMethod", "osc9"),
 		kirocli.Setting("chat.terminalTitle", false),
-		// A settings assertion is the ONLY way to reach this: kiro-cli exposes no `chat`
-		// flag and no env var for it (checked against 2.18.0). Without it kiro-cli emits
-		// ED3 on every full-viewport repaint and the engine honors it by CLEARING the
-		// ring, which made the engine's 100000-line default unreachable (2294-3185 lines
-		// retained across 5 real sessions). It does not fix resizes, because kiro-cli's
-		// debounced resize callback writes CLEAR_ALL unconditionally (upstream
-		// Kiro#10780). Needs 2.17.0+, which is why best-effort is right.
-		kirocli.Setting("chat.preserveScrollback", true),
+		// Pinned OFF: 2.17.0+ offers this to stop the ED3 that erases retained history
+		// on every full-viewport repaint, and it CORRUPTS the history it recovers.
+		// Dropping the ED3 leaves the over-height redraw unchanged, so rows already
+		// scrolled above the viewport top stay in the saved lines while the viewport-tail
+		// path re-emits the previous frame, COMPOSER INCLUDED (Kiro#10939). FALSE rather
+		// than absent: a volume that recorded true keeps it, so only an explicit
+		// assertion repairs a deployed /config. Accepted cost: retained depth returns to
+		// ~3k lines against the engine's 100000 default (Kiro#10780).
+		kirocli.Setting("chat.preserveScrollback", false),
 	}
 }
 

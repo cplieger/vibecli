@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -540,5 +541,49 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 				reason, reasonSettings)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestKiroSettings_preserveScrollbackIsAssertedOff pins the one setting in this
+// app's list where DROPPING the entry is not the same as setting it false, which
+// is the whole reason a value the caller could "clean up" as a redundant default
+// is written explicitly on every boot.
+//
+// kiro-cli's own default is false, so an absent key looks equivalent. It is not:
+// the key is persisted in the Kiro home on the /config volume, so a deployment
+// that recorded true once keeps it for the container's whole future life, and
+// nothing else in this process ever writes it back. Removing the assertion
+// therefore repairs a FRESH volume and leaves every already-affected one broken,
+// silently, with the duplicated-scrollback defect intact (Kiro#10939).
+//
+// A refactor that deletes the line, or a Renovate-adjacent edit that restores the
+// upstream-recommended true, both fail here rather than in a user's history.
+func TestKiroSettings_preserveScrollbackIsAssertedOff(t *testing.T) {
+	const key = "chat.preserveScrollback"
+
+	settings := kiroSettings()
+	var found *pinstall.Assertion
+	for i := range settings {
+		if settings[i].Name == key {
+			found = &settings[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("kiroSettings() asserts nothing for %q -- absence is NOT off: a /config volume that already recorded true keeps it, so the duplicated-scrollback defect survives every boot with no signal (Kiro#10939)", key)
+	}
+
+	// Assert the argv that actually reaches the binary rather than a reconstructed
+	// value: SettingRaw builds {"settings", key, value}.
+	want := []string{"settings", key, "false"}
+	if !slices.Equal(found.Args, want) {
+		t.Errorf("assertion argv for %q = %q, want %q -- true re-enables a kiro-cli path that writes stale copies of the previous frame, the composer included, into retained scrollback (Kiro#10939)",
+			key, found.Args, want)
+	}
+
+	// Best-effort, not Required: the app must keep serving on a kiro-cli that does
+	// not know the key, and readiness must not depend on a history preference.
+	if found.Required {
+		t.Errorf("assertion for %q is Required, want best-effort -- a build that rejects the key would withhold readiness and take the terminal down over a scrollback preference", key)
 	}
 }

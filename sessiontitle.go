@@ -59,7 +59,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cplieger/atomicfile/v2"
-	"github.com/cplieger/runesafe"
+	"github.com/cplieger/runesafe/v2"
 	"github.com/cplieger/web-terminal-engine/v4/terminal"
 )
 

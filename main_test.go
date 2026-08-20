@@ -2803,7 +2803,7 @@ func TestStageValuesAreStable(t *testing.T) {
 
 // parseCatalogRefresh is deliberately STRICTER than the fleet's config-echo
 // policy: envx states that config values are not secrets and its own tolerant
-// warnings include the raw value, scheduler's steering doc says plain *_INTERVAL
+// warnings include the raw value, the scheduler library treats plain *_INTERVAL
 // env reads should not redact, and 9 apps echo raw config values today. This app
 // does not, because its compose file is the operator's whole config surface, it
 // serves an unauthenticated root shell, and its README publishes a no-values

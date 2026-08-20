@@ -15,8 +15,8 @@ stream. This guide covers the things the codebase won't tell you at a glance.
 - The kiro-cli install is the external
   [`cplieger/pinstall`](https://github.com/cplieger/pinstall) library, and it is
   the only installer. `startKiroCLI` (main.go) builds a `pinstall.Manager` from
-  `kiroInstallConfig` — this app's deployment of the shared
-  `pinstall/kirocli` release profile, fed by the pins `entrypoint.sh` exports —
+  `kiroInstallConfig` (this app's deployment of the shared
+  `pinstall/kirocli` release profile, fed by the pins `entrypoint.sh` exports)
   and runs it in the background after the listener binds, the same bind-first
   shape `startTools` uses. The library owns the download and its SHA-256
   verification, the version-addressed layout under
@@ -29,7 +29,7 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   typed `pinstall.Reason` into the four 503 reason strings an operator reads.
   The trusted-writer declaration is the one that can stop a boot: the library
   refuses to install into a tree another identity can write, and it reads
-  access-control lists to find that out. This app declares NOTHING by default —
+  access-control lists to find that out. This app declares NOTHING by default:
   `parseTrustedInstallUIDs` reads `TRUSTED_INSTALL_UIDS` and passes it to
   `TrustedUIDs`, so an unset variable (the shipped default) leaves the check
   fully enforcing. An operator whose volume the check refuses names the uid
@@ -149,7 +149,7 @@ WORK_DIR=/path/to/workdir go run .
 Leaving both digest variables unset does NOT work, and fails in the least
 obvious way: the manager refuses to construct (`amd64 digest: want 64 hex
 characters, got 0`), so the server logs one error and then reports
-`kiro-cli unavailable` forever, with every session refused — even though the
+`kiro-cli unavailable` forever, with every session refused, even though the
 version directory on disk is complete and nothing was ever going to be
 downloaded. `.complete` is what makes the directory a selection candidate, and
 the two per-boot gates still run against whatever you put there: `kiro-cli
@@ -164,8 +164,7 @@ activates).
 HTTP listener is up: with no pins there is no install to gate on, and the tools
 engine is disabled when `/config` is missing (the container's persistent bind
 mount, and not configurable); a warn is logged and the `/api/tools` routes are
-simply absent. In
-the image it also reflects the install manager, so `/api/health` returns
+absent. In the image it also reflects the install manager, so `/api/health` returns
 `503 {"reason":"kiro-cli installing"}` while the first-boot download runs and a
 different reason (`kiro-cli install retrying`, `kiro-cli unavailable`,
 `kiro-cli required settings not enforced`) once something has gone wrong. The
@@ -191,6 +190,14 @@ golangci-lint fmt       # apply gofumpt + gci formatting
 
 `golangci-lint run` reports unformatted files as issues, so the formatters
 (`gofumpt` with extra rules, `gci`) are enforced, not just available.
+
+`entrypoint.sh` has its own unit tests, which CI runs by this filename. Run them
+after any change to the boot path; they extract the real functions and drive
+them against temporary directories, so they need no container:
+
+```sh
+bash tests/shell/run.sh
+```
 
 Frontend (from `static-src/`):
 
@@ -251,7 +258,7 @@ assert at least once (`expect.requireAssertions`) and `.only` is forbidden.
   Don't drop `kiro-cli-chat` from `Config.Require`: the library requires only the
   primary artifact by itself, and `chat` over a PTY is this app's product, so a
   directory without the sidecar would count as a complete install and then kill
-  every terminal at chat (vibekit's required set is deliberately smaller — don't
+  every terminal at chat (vibekit's required set is deliberately smaller; don't
   copy either app's set into the other).
   `/config/tools/bin/kiro-cli` is a convenience symlink for
   `docker exec … kiro-cli`; nothing in the product reads it, so don't gate

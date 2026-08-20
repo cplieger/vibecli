@@ -74,7 +74,7 @@ The image ships working defaults; most setups only pick a port and a volume.
 | `LOG_LEVEL` | Log verbosity: `debug`, `info`, `warn`, or `error` (case-insensitive); `debug` surfaces session-status diagnostics. An unparseable value falls back to `info` with a startup warning. | `info` |
 | `LOG_OSC_TEXT` | Log the text of terminal notifications the server does not recognize (needs `LOG_LEVEL=debug` to be visible). Off by default because any program running in the terminal can emit that text, so it can carry a token, a device code, or a tokenised URL. Off, the log still records a per-wording fingerprint and a length. Turn it on only for an active diagnostic session; it warns at startup while set. | `false` |
 | `WORK_DIR` | Directory each terminal session starts in (must exist). | `/workspace` |
-| `SCROLLBACK` | Lines of history the server retains per terminal: how far back you can scroll, and what a reconnect replays. Held in memory and grown as history is produced, so a large value costs nothing until a session reaches it; to say "never truncate", set a number no session will hit. `0` keeps nothing beyond the live screen, and a value between `1` and `2000` is raised to `2001` with a warning, because below the depth a reconnect replays in full the browser falls back to holding its whole buffer. This is the terminal engine's own variable, shared verbatim with every app built on it. | `100000` |
+| `SCROLLBACK` | Lines of history the server retains per terminal: how far back you can scroll, and what a reconnect replays. Held in memory and grown as history is produced, so a large value costs nothing until a session reaches it. kiro-cli clears the retained history on every full-viewport repaint, so a session keeps roughly 3000 lines whatever you set here, and raising it gains nothing. `0` keeps nothing beyond the live screen, and a value between `1` and `2000` is raised to `2001` with a warning, because below the depth a reconnect replays in full the browser falls back to holding its whole buffer. This is the terminal engine's own variable, shared verbatim with every app built on it. | `100000` |
 | `KIRO_CLI_CHAT_ARGS` | Extra launch flags appended to every session's `kiro-cli chat` command, whitespace-separated (for example `--effort high` or `--v3`). Flag values never reach the logs; the startup line records only a flag count. | _(unset)_ |
 | `TOOL_CATALOG_REFRESH` | How often the server refreshes the tool catalog from the published artifact (Go duration). `off` or `0` disables the schedule; a manual refresh stays available via `POST /api/tools/catalog/refresh` on loopback. | `24h` |
 | `TOOL_CATALOG_URL` | Where catalog refreshes fetch from. Point it at a fork or mirror to decouple from the default publisher. | the [tool-catalog](https://github.com/cplieger/tool-catalog) latest-release artifact |
@@ -86,9 +86,8 @@ The image ships working defaults; most setups only pick a port and a volume.
 
 - **Port:** `9848` (HTTP + WebSocket).
 - **Volumes:** `/config` persists kiro-cli auth/tokens, installed tools, settings, and `~/.ssh` + git config; `/workspace` is your repositories / working directory.
-- **Health:** the image's healthcheck reports healthy only once the server is up **and** kiro-cli is installed and runnable, so a failed first-boot install shows as `unhealthy` in `docker ps` instead of a terminal that silently errors.
 
-kiro-cli itself is pinned and downloaded on first boot; it is not redistributed inside the image, and newer versions arrive by pulling a newer image tag. The download runs after the server starts listening, so the web UI and `/api/health` answer immediately while it happens: new terminals report `503 {"reason":"kiro-cli installing"}` until the install finishes, and the reason names the stage if something goes wrong. Each version installs into its own directory under `/config/tools/kiro-cli-versions/`, and the previous one is kept so a bad upgrade has something to fall back to.
+kiro-cli itself is pinned and downloaded on first boot; it is not redistributed inside the image, and newer versions arrive by pulling a newer image tag. The download runs after the server starts listening, so the web UI and `/api/health` answer immediately while it happens: new terminals report `503 {"reason":"kiro-cli installing"}` until the install finishes, and the reason names the stage if something goes wrong.
 
 If an install fails for good (no network on first boot, a full volume), the container stays up and repairable: fix or clear `/config/tools/kiro-cli-versions` inside the container, then either restart it or run `curl -X POST localhost:9848/api/kiro-cli/rescan` from inside to make the repair take effect without a restart. That endpoint is loopback-only, like the tools API.
 
@@ -100,7 +99,7 @@ kiro-cli's own state lives on the `/config` volume and survives container recrea
 
 ### Behind a reverse proxy
 
-Web Terminal for Kiro has no built-in authentication, so put it behind a reverse proxy that terminates TLS and requires a login: HTTP Basic auth at minimum, forward auth (Authentik, oauth2-proxy, Caddy forward-auth) for real single sign-on. The proxy needs no special handling beyond passing WebSocket upgrades through, which mainstream proxies do by default.
+Terminate TLS at the proxy and require a login there, per the warning above: HTTP Basic auth at minimum, forward auth (Authentik, oauth2-proxy, Caddy forward-auth) for real single sign-on. The proxy needs no special handling beyond passing WebSocket upgrades through, which mainstream proxies do by default.
 
 Behind a proxy, also set `TRUSTED_PROXIES` to the proxy's address(es), a comma-separated list of CIDRs or bare IPs (for example `TRUSTED_PROXIES=10.0.0.0/8,192.0.2.10`); the access log then resolves the real client from a trusted `X-Forwarded-For` instead of logging the proxy as the peer. Unset (the default), the log records the direct socket peer and ignores `X-Forwarded-For`, so the logged IP cannot be spoofed; that is the right choice when the terminal is directly exposed. A malformed entry is logged and skipped; it does not abort startup.
 
@@ -129,7 +128,7 @@ One thing to configure on the proxy: the terminal WebSocket URL carries the sess
 
 - Auto-reconnect with screen + scrollback replay after laptop sleep, network drops, or proxy timeouts.
 - Input sent during an outage is re-delivered on reconnect (no lost or duplicated output), and a restarted server is detected and cleanly resynced.
-- **Fast recovery when your phone drops the page.** iOS reclaims a backgrounded tab's memory routinely, which re-runs the page when you come back. The sessions live on the server, and each tab's recent output is kept on the device, so returning asks only for what was printed while you were away. See [Stored scrollback](#stored-scrollback).
+- **Fast recovery when your phone drops the page.** iOS reclaims a backgrounded tab's memory routinely, which re-runs the page when you come back. The sessions live on the server and each tab's recent output is kept on the device, so returning asks only for what you missed. See [Stored scrollback](#stored-scrollback).
 
 ## Works with the whole kiro-cli TUI
 
@@ -185,30 +184,19 @@ no install commands, so it never goes stale.
 came from; `POST .../api/tools/catalog/refresh` forces a refresh (both
 loopback-only). Dependencies auto-adopt: enabling `typescript-language-server`
 installs `node` and the `typescript` package with it, no extra manifest
-entries needed. While tools install, the web UI and health endpoint stay
-reachable and only new-session creation waits, so the first session sees the
-finished PATH. If provisioning fails, sessions are not blocked: creation is
-allowed anyway, the failure is logged, and `/api/health` reports
-`"tools": "degraded"`.
+entries needed. New-session creation waits for the first pass, so the first tab
+sees the finished PATH, while the web UI and health endpoint stay reachable. If
+provisioning fails, sessions are not blocked: creation is allowed anyway, the
+failure is logged, and `/api/health` reports `"tools": "degraded"`.
 
 **The two health fields.** `/api/health` reports `tools` and `tools_missing`, and
-neither affects the container's healthy/unhealthy verdict. `tools` is **live**, not
-a boot result: `"syncing"` while the boot pass runs, then `"ok"` or `"degraded"`
-after each tool install or reconcile, including the ones you trigger through the
-loopback tools API. So repairing a failed install from inside the container
-(`POST localhost:9848/api/tools/...`) flips the field back to `"ok"` without
-restarting anything. Two failures it deliberately ignores: a **catalog refresh**
-(the last good catalog keeps serving, so your installed tools are unchanged) and
-an **update**, **uninstall** or **disable** (your installed versions stay on
-`PATH`).
-
-`tools_missing` answers the other question: how many enabled entries are still not
-installed. They disagree on purpose. Repair one of two missing tools through the
-loopback API and `tools` becomes `"ok"` (that repair did succeed) while
-`tools_missing` stays `1`. Disabled entries are templates and never counted; an
-entry still installing does count, because it is not on `PATH` yet. The key is
-**absent** when the count is not known, so a `0` always means converged and never
-"nobody has looked". kiro-cli's own readiness is separate: see the `status` and
+neither affects the container's healthy/unhealthy verdict. `tools` is live rather
+than a boot result: `"syncing"` while the boot pass runs, then `"ok"` or
+`"degraded"` after each install or reconcile, so a repair you drive from inside
+the container flips it back to `"ok"` with no restart. `tools_missing` counts the
+enabled entries still not installed (disabled templates never count, an entry
+still installing does), and the key is absent when the count is unknown, so a `0`
+always means converged. kiro-cli's own readiness is the separate `status` and
 `reason` keys.
 
 **Add more tools by name.** Any catalog name works as a bare entry; the engine

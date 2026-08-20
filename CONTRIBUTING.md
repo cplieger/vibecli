@@ -244,7 +244,7 @@ assert at least once (`expect.requireAssertions`) and `.only` is forbidden.
   `@cplieger/web-terminal-ui` (built on `@cplieger/web-terminal-engine`);
   don't reimplement them here.
 - **CI workflows are synced, not editable.** Files under `.github/workflows/`
-  carry a "Synced from cplieger/ci — DO NOT EDIT" header; the pipeline is
+  carry a "Synced from cplieger/ci, DO NOT EDIT" header; the pipeline is
   centralised in `cplieger/ci`. Change behaviour there, not here.
 - **kiro-cli install model.** `entrypoint.sh` declares `KIRO_CLI_VERSION` +
   both per-arch digests (Renovate-managed) and exports them; the `pinstall`

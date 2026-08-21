@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 // This file pins what this app decides about retained-history depth, which after
@@ -41,7 +41,8 @@ func retainedLines(t *testing.T, scrollback *int, emitted, awaitCommitted int) u
 	deps := newTestDeps(true)
 	deps.scrollback = scrollback
 	deps.cmd = staticCmd("/bin/sh", "-c", fmt.Sprintf(
-		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted))
+		`i=1; while [ $i -le %d ]; do echo "line $i"; i=$((i+1)); done; exec cat`, emitted,
+	))
 
 	h := newSessionFactory(deps)("scrollback-probe")
 	if err := h.StartEager(); err != nil {
@@ -105,8 +106,8 @@ func TestSessionScrollbackHonoursTheSharedEnvVar(t *testing.T) {
 // TestResolveScrollback pins the operator-facing read of the shared
 // retained-history knob: the depth it returns AND what it puts in the log. The
 // log half is what nothing else covers, and it is a house rule rather than a
-// preference — WT_TRUSTED_PROXIES (count only), KIRO_CLI_CHAT_ARGS (flag count),
-// WT_LOG_LEVEL, WT_LOG_OSC_TEXT and TOOL_CATALOG_REFRESH are all read
+// preference — TRUSTED_PROXIES (count only), KIRO_CLI_CHAT_ARGS (flag count),
+// LOG_LEVEL, LOG_OSC_TEXT and TOOL_CATALOG_REFRESH are all read
 // by-name-only because a compose expansion mistake can put a credential on any
 // key (CWE-532), and the last two each carry a test saying so. Four properties:
 //

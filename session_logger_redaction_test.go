@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 // TestSessionLoggerRedactsCommand pins the credential boundary around the
@@ -85,7 +85,7 @@ func TestSessionLoggerTruncatesSessionID(t *testing.T) {
 		t.Fatalf("session id %q is too short to exercise truncation", id)
 	}
 
-	if logContains(records, id) {
+	if logContains(records, string(id)) {
 		t.Errorf("captured log carries the FULL session id %q; it is the /ws resume capability token and must never be logged whole (CWE-532)", id)
 	}
 
@@ -96,7 +96,7 @@ func TestSessionLoggerTruncatesSessionID(t *testing.T) {
 	// 12 leaves headroom above LogID's 8 so this is not a restatement of the
 	// current engine constant.
 	const maxLoggedIDChars = 12
-	if logContains(records, id[:maxLoggedIDChars]) {
+	if logContains(records, string(id[:maxLoggedIDChars])) {
 		t.Errorf("captured log carries the first %d characters of session id %q; at most "+
 			"terminal.LogID's 8-digit prefix may be logged, or the /ws resume token loses "+
 			"brute-force entropy (CWE-532)", maxLoggedIDChars, id)
@@ -119,7 +119,7 @@ func TestSessionLoggerTruncatesSessionID(t *testing.T) {
 	if !sawSession {
 		t.Fatalf("no captured record carries a session attr; log = %q", records.Messages())
 	}
-	if !strings.HasPrefix(id, strings.TrimSuffix(want, "\u2026")) {
+	if !strings.HasPrefix(string(id), strings.TrimSuffix(want, "\u2026")) {
 		t.Errorf("LogID(%q) = %q, which is not a prefix of the id (correlation would break)", id, want)
 	}
 }

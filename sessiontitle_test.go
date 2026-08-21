@@ -12,23 +12,23 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/cplieger/atomicfile/v2"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/atomicfile/v3"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 // fakeSetter records what the syncer pushed onto the engine's client title rung,
 // and can report a session as gone (the manager's false return).
 type fakeSetter struct {
 	calls   []string // "id=title" in call order, so a repeat push is visible
-	missing map[string]bool
+	missing map[terminal.SessionID]bool
 	// live is the tab set List reports, i.e. what the engine's session manager
 	// still holds. pass() reclaims any mapping whose tab is not in it, so a test
 	// that expects a push has to name its tab here.
-	live []string
+	live []terminal.SessionID
 }
 
-func (f *fakeSetter) SetSessionTitle(id, title string) bool {
-	f.calls = append(f.calls, id+"="+title)
+func (f *fakeSetter) SetSessionTitle(id terminal.SessionID, title string) bool {
+	f.calls = append(f.calls, string(id)+"="+title)
 	return !f.missing[id]
 }
 
@@ -67,7 +67,7 @@ func newTitleFixture(t *testing.T) *titleFixture {
 // holding kiro's id. The handle comes from the real minting path, so a test joins
 // the two identities the same way the poller does rather than fabricating a filename
 // production would never produce.
-func (f *titleFixture) mapping(tabID, kiroID string) {
+func (f *titleFixture) mapping(tabID terminal.SessionID, kiroID string) {
 	f.t.Helper()
 	path := filepath.Join(f.sync.stateDir, f.handle(tabID))
 	if err := os.WriteFile(path, []byte(kiroID+"\n"), 0o600); err != nil {
@@ -78,13 +78,13 @@ func (f *titleFixture) mapping(tabID, kiroID string) {
 // handle mints (or returns) one tab's title handle, which is what a test must use to
 // name anything in the state directory: the mapping file is named for the handle and
 // never for the tab, because a tab id is the /ws capability token.
-func (f *titleFixture) handle(tabID string) string {
+func (f *titleFixture) handle(tabID terminal.SessionID) string {
 	f.t.Helper()
 	return titleHandleFor(f.t, f.sync, tabID)
 }
 
 // titleHandleFor is the fixture-free form, for the tests that build a syncer directly.
-func titleHandleFor(t *testing.T, s *sessionTitleSync, tabID string) string {
+func titleHandleFor(t *testing.T, s *sessionTitleSync, tabID terminal.SessionID) string {
 	t.Helper()
 	handle, err := s.titleHandle(tabID)
 	if err != nil {
@@ -410,8 +410,8 @@ func TestSessionTitlePushesKiroTitle(t *testing.T) {
 	f.session("hash0", "sess_11111111-2222-3333-4444-555555555555",
 		titleJSON("Kopia audit: landed, verified, cleaned"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	want := "tab1=Kopia audit: landed, verified, cleaned"
 	if len(set.calls) != 1 || set.calls[0] != want {
@@ -428,16 +428,16 @@ func TestSessionTitlePushesOnlyOnChange(t *testing.T) {
 	f.mapping("tab1", id)
 	f.session("hash0", id, titleJSON("first message verbatim"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 1 {
 		t.Fatalf("pushed %v, want one push for an unchanged title", set.calls)
 	}
 
 	// The agent renames the session mid-conversation: that must reach the tab.
 	f.session("hash0", id, titleJSON("Unsticking fleet CI/sync PRs"))
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 2 || set.calls[1] != "tab1=Unsticking fleet CI/sync PRs" {
 		t.Errorf("pushed %v, want the updated title as a second push", set.calls)
 	}
@@ -461,8 +461,8 @@ func TestSessionTitleSkipsUnusableTitles(t *testing.T) {
 			f.mapping("tab1", id)
 			f.session("hash0", id, body)
 
-			set := &fakeSetter{live: []string{"tab1"}}
-			f.sync.pass(set)
+			set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+			f.sync.pass(t.Context(), set)
 			if len(set.calls) != 0 {
 				t.Errorf("pushed %v, want nothing pushed", set.calls)
 			}
@@ -478,7 +478,7 @@ func TestSessionTitleNoMappingIsSilent(t *testing.T) {
 	f.session("hash0", "sess_11111111-2222-3333-4444-555555555555", titleJSON("orphan"))
 
 	set := &fakeSetter{}
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 0 {
 		t.Errorf("pushed %v with no mapping present, want nothing", set.calls)
 	}
@@ -500,8 +500,8 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	// The tab is still in the manager's list at snapshot time and disappears at the
 	// push, which is the within-sweep race this arm exists for -- not the ordinary
 	// close, which pass() now reclaims before syncOne is reached at all.
-	set := &fakeSetter{missing: map[string]bool{"gonetab": true}, live: []string{"gonetab"}}
-	f.sync.pass(set)
+	set := &fakeSetter{missing: map[terminal.SessionID]bool{"gonetab": true}, live: []terminal.SessionID{"gonetab"}}
+	f.sync.pass(t.Context(), set)
 
 	if _, err := os.Stat(mappingPath); !os.IsNotExist(err) {
 		t.Errorf("mapping for a closed tab still present (stat err = %v), want it removed", err)
@@ -528,8 +528,8 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 
 	// First sweep with the tab live: the title is pushed and memoized, which is the
 	// state that used to hide the dead tab from the reclaim.
-	set := &fakeSetter{live: []string{"closedtab"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"closedtab"}}
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 1 {
 		t.Fatalf("first pass pushed %v, want exactly one push before the tab closes", set.calls)
 	}
@@ -537,7 +537,7 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	// The tab closes. The title never changes again, so only the manager's list can
 	// report it: the mapping file must go, and no further push may be attempted.
 	set.live = nil
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 
 	if _, err := os.Stat(mappingPath); !os.IsNotExist(err) {
 		t.Errorf("mapping for a tab the manager no longer lists is still present (stat err = %v), want it reclaimed", err)
@@ -576,8 +576,8 @@ func TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted(t *testin
 	f.session("hash0", kiroID, titleJSON("a real title"))
 	own := filepath.Join(f.sync.stateDir, f.handle("tab1"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
 		t.Errorf("a mapping named for a handle this process never minted survives (stat err = %v); every previous run's files would stay on disk for the container's life, growing the per-tick ReadDir", err)
@@ -604,8 +604,8 @@ func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
 		t.Fatalf("plant an in-flight hook temp: %v", err)
 	}
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	if _, err := os.Stat(tmp); err != nil {
 		t.Errorf("stat the hook's in-flight temp = %v, want it left in place: the reclaim must not race the hook's rename", err)
@@ -640,8 +640,8 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 	t.Run("traversal in a mapping file reads nothing", func(t *testing.T) {
 		f := newTitleFixture(t)
 		f.mapping("tab1", "../../../../etc")
-		set := &fakeSetter{live: []string{"tab1"}}
-		f.sync.pass(set)
+		set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+		f.sync.pass(t.Context(), set)
 		if len(set.calls) != 0 {
 			t.Errorf("pushed %v from a traversal mapping, want nothing", set.calls)
 		}
@@ -657,11 +657,11 @@ func TestSessionTitleBoundsFileReads(t *testing.T) {
 	if err := os.WriteFile(huge, []byte(strings.Repeat("a", maxTitleFileBytes*3)), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := readSmallFile(huge); !errors.Is(err, atomicfile.ErrFileTooLarge) {
-		t.Fatalf("readSmallFile(oversized) = %v, want ErrFileTooLarge", err)
+	if _, err := readSmallFile(t.Context(), huge); !errors.Is(err, atomicfile.ErrFileTooLarge) {
+		t.Fatalf("readSmallFile(t.Context(), oversized) = %v, want ErrFileTooLarge", err)
 	}
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 0 {
 		t.Errorf("pushed %v from an oversized mapping, want nothing", set.calls)
 	}
@@ -757,8 +757,8 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	// lands: the mapping file the hook chose to write is one the poller finds,
 	// reads and believes.
 	f.session("hash0", kiroID, titleJSON(title))
-	set := &fakeSetter{live: []string{"tab42"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab42"}}
+	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 1 || set.calls[0] != "tab42="+title {
 		t.Errorf("the hook's mapping did not reach the poller: got %v, want [%q]", set.calls, "tab42="+title)
 	}
@@ -781,7 +781,7 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	// Shaped like the engine's own newSessionID (128-bit crypto-random hex), which
 	// is what makes a substring search for it meaningful.
-	const tabID = "3f7a1c9e5b2d4086af13e7c05d9b2846"
+	const tabID terminal.SessionID = "3f7a1c9e5b2d4086af13e7c05d9b2846"
 	const kiroID = "sess_11111111-2222-3333-4444-555555555555"
 
 	f := newTitleFixture(t)
@@ -791,14 +791,14 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	env := f.sync.sessionEnv(tabID)
 	handle := f.handle(tabID)
 	for _, kv := range env {
-		if strings.Contains(kv, tabID) {
+		if strings.Contains(kv, string(tabID)) {
 			t.Errorf("child env entry %q carries the tab id; that value is the /ws attach+resume capability token", kv)
 		}
 	}
 	if !slices.Contains(env, "WT_TITLE_HANDLE="+handle) {
 		t.Fatalf("child env = %v, want it to carry WT_TITLE_HANDLE=%s", env, handle)
 	}
-	if handle == tabID {
+	if handle == string(tabID) {
 		t.Fatal("the title handle IS the tab id; minting exists precisely so it is not")
 	}
 	// 128 bits of hex, the engine's own shape: unguessable on purpose even though
@@ -830,15 +830,15 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	set := &fakeSetter{live: []string{tabID}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{tabID}}
+	f.sync.pass(t.Context(), set)
 	f.mapping(tabID, "not-a-session-id")
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 	set.live = nil
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 
 	out := logged.String()
-	if strings.Contains(out, tabID) {
+	if strings.Contains(out, string(tabID)) {
 		t.Errorf("the tab id reached a log attribute whole; output was:\n%s", out)
 	}
 	// The truncating form too: `terminal.LogID(tabID)` is what a reviewer re-adding
@@ -873,8 +873,8 @@ func TestSessionTitleScansEveryWorkspaceHashDir(t *testing.T) {
 	}
 	f.session("hash2", id, titleJSON("Kopia audit: landed, verified, cleaned"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	want := "tab1=Kopia audit: landed, verified, cleaned"
 	if len(set.calls) != 1 || set.calls[0] != want {
@@ -895,8 +895,8 @@ func TestSessionTitleSanitizesUntrustedTitle(t *testing.T) {
 	f.mapping("tab1", id)
 	f.session("hash0", id, `{"title":"alpha\u202ebeta\nline\u0085tail"}`)
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	const want = "tab1=alpha beta line tail"
 	if len(set.calls) != 1 || set.calls[0] != want {
@@ -919,8 +919,8 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	f.mapping("tab1", first)
 	f.session("hash0", first, titleJSON("the first conversation"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 	if want := "tab1=the first conversation"; len(set.calls) != 1 || set.calls[0] != want {
 		t.Fatalf("first pass pushed %v, want [%q]", set.calls, want)
 	}
@@ -930,7 +930,7 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	// the first conversation's title on the tab.
 	f.mapping("tab1", second)
 	f.session("hash0", second, titleJSON(placeholderTitle))
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 
 	if want := "tab1="; len(set.calls) != 2 || set.calls[1] != want {
 		t.Fatalf("after the re-point pushed %v, want a clearing %q so the tab falls back to the engine's automatic ladder", set.calls, want)
@@ -942,7 +942,7 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	// The new conversation gains a real title: it must still be pushed after the clear
 	// dropped the tab's memo entry.
 	f.session("hash0", second, titleJSON("the second conversation"))
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 	if want := "tab1=the second conversation"; len(set.calls) != 3 || set.calls[2] != want {
 		t.Errorf("after the new session gained a title pushed %v, want %q", set.calls, want)
 	}
@@ -962,13 +962,13 @@ func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
 	f.mapping("tab1", first)
 	f.session("hash0", first, titleJSON("the first conversation"))
 
-	set := &fakeSetter{live: []string{"tab1"}}
-	f.sync.pass(set)
+	set := &fakeSetter{live: []terminal.SessionID{"tab1"}}
+	f.sync.pass(t.Context(), set)
 
 	// The hook re-points the tab to a conversation that ALREADY has its title.
 	f.mapping("tab1", second)
 	f.session("hash0", second, titleJSON("the second conversation"))
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 
 	if len(set.calls) != 2 || set.calls[0] != "tab1=the first conversation" || set.calls[1] != "tab1=the second conversation" {
 		t.Fatalf("pushed %v, want the two titles and no blanking push between them: a usable title replaces the rung in one store", set.calls)
@@ -982,7 +982,7 @@ func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
 	// on the previous session's id.
 	f.mapping("tab1", third)
 	f.session("hash0", third, titleJSON("the second conversation"))
-	f.sync.pass(set)
+	f.sync.pass(t.Context(), set)
 
 	if len(set.calls) != 3 || set.calls[2] != "tab1=the second conversation" {
 		t.Errorf("pushed %v, want a third push: a re-point is a change even when the title text is unchanged", set.calls)

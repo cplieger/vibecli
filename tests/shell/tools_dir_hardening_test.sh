@@ -2,8 +2,7 @@
 # secure_tools_dir(): tighten what we can, and never brick boot over a tree the
 # entrypoint does not own.
 #
-# The third argument encodes the app's failure posture (see the steering doc's
-# "Failure posture" section). owned=1 is for the NINE directories the entrypoint
+# The third argument encodes the app's failure posture. owned=1 is for the NINE directories the entrypoint
 # creates itself — /config, $TOOLS, $TOOLS/bin, $TOOLS/opt, $TOOLS/npm,
 # $TOOLS/npm/bin, $TOOLS/python, $TOOLS/python/bin and $TOOLS/kiro-cli-versions,
 # which is exactly the make_config_dir list outside $HOME. Two properties put a
@@ -234,7 +233,7 @@ fi
 
 # The whole fail-closed set, as a set: this fails both when a root is demoted and
 # when a NEW one is added, because either way the three places that describe this
-# policy (the function's doc comment, the steering doc, this file) have drifted
+# policy (the function's doc comment and this file) have drifted
 # from the code. Both sides go through the same `LC_ALL=C sort`, so the assertion
 # is about membership and never about the collation order of `$` versus `/`.
 OWNED_EXPECTED=$(printf '%s\n' \

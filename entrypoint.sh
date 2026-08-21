@@ -46,6 +46,16 @@ set -u
 # prevent. Moving the save/narrow pair BELOW the containment block would resolve that
 # block's own `mount`, `setpriv` and `awk` through /config/tools/bin for the same reason.
 # Both are pinned by tests/shell/session_path_test.sh.
+#
+# The carry KEEPS the WT_ prefix while every operator knob in this app lost one
+# (LISTEN_ADDR, LOG_LEVEL, WORK_DIR, ALLOWED_HOSTS, …). A knob is read from the
+# server's own environment, where the prefix only leaked an internal component name
+# at an operator with no reason to know which library serves their HTTP. This one
+# is exported into a process environment the whole system shares, so the prefix is
+# namespacing rather than branding -- a bare SESSION_PATH beside the local
+# SESSION_PATH variable, in an environment that also carries the user's profile and
+# kiro-cli's own exports, is a collision waiting to happen. Same reasoning as the
+# WT_TITLE_* keys injected per PTY session (sessiontitle.go).
 SESSION_PATH="${WT_SESSION_PATH:-$PATH}"
 export WT_SESSION_PATH="$SESSION_PATH"
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -252,9 +262,9 @@ enable_session_containment() {
 # ships in util-linux, which Debian marks Essential, so it cannot be missing; the
 # guard is there so a hand-built image without it degrades to a warning rather than
 # a container that cannot boot.
-if [ "${WT_CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
+if [ "${CONTAINMENT_CAPS_DROPPED:-}" != "1" ]; then
   enable_session_containment || true
-  export WT_CONTAINMENT_CAPS_DROPPED=1
+  export CONTAINMENT_CAPS_DROPPED=1
   # PRE-FLIGHT the drop before committing to it, because this is an `exec`: a
   # setpriv that fails here does not degrade, it ends the container. Two ways it
   # can fail on an image this one does not control -- setpriv absent from a
@@ -1319,6 +1329,6 @@ unset WT_SESSION_PATH
 # point re-execs this script and no Go code reads it, so leaving it exported would
 # advertise an internal control-flow flag to the server and every terminal session
 # as though it were a supported knob.
-unset WT_CONTAINMENT_CAPS_DROPPED
+unset CONTAINMENT_CAPS_DROPPED
 printf 'level=info msg="entrypoint complete; starting the web server" component=entrypoint\n' >&2
 exec /app/web-terminal-kiro

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
 // gatePackage is the gate's package path as the Dockerfile spells it, in the
@@ -414,7 +414,7 @@ func TestLineRunsTheGateUnbuilt(t *testing.T) {
 		},
 		"commented out":                     {"#    go run " + gatePackage + " " + manifest, false},
 		"prose mentioning it":               {"# never `go run ./scripts/wirecheck`: the exit code collapses", false},
-		"go run of an unrelated package":    {`    go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@v2.2.8" verify`, false},
+		"go run of an unrelated package":    {`    go run "github.com/cplieger/toolbelt/v3/cmd/toolcatalog@v3.0.0" verify`, false},
 		"echoed rather than executed":       {"    echo go run " + gatePackage, false},
 		"go build of the gate is not a run": {"    go build -o /tmp/x " + gatePackage, false},
 	}
@@ -450,10 +450,10 @@ func TestRun_delegatesToTheEngineRule(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.clientRev, tc.clientMinServer, &stdout, &stderr)
-			engineSaysCompatible := terminal.WirePairIncompatibility(
-				terminal.WireProtocolVersion, terminal.MinSupportedClientWireVersion,
-				tc.clientRev, tc.clientMinServer,
-			) == ""
+			engineSaysCompatible := terminal.WirePairIncompatibility(terminal.WirePair{
+				Server: terminal.WireEnd{Rev: terminal.WireProtocolVersion, MinPeer: terminal.MinSupportedClientWireVersion},
+				Client: terminal.WireEnd{Rev: tc.clientRev, MinPeer: tc.clientMinServer},
+			}) == ""
 			if engineSaysCompatible != tc.wantCompatible {
 				t.Fatalf("engine verdict for (%d,%d) = compatible:%v, test expected %v; the engine's rule changed and this table is stale",
 					tc.clientRev, tc.clientMinServer, engineSaysCompatible, tc.wantCompatible)

@@ -22,11 +22,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 # The `# go<version>` trailer on each sha line is the anchor Renovate uses to
 # resolve that arch's digest — do not hand-edit; Renovate owns these lines.
 # renovate: datasource=golang-version depName=golang
-ARG GO_VERSION=1.26.7
+ARG GO_VERSION=1.27.0
 # renovate: datasource=custom.golang-amd64 depName=golang-amd64
-ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca  # go1.26.7
+ARG GO_SHA256_AMD64=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685  # go1.27.0
 # renovate: datasource=custom.golang-arm64 depName=golang-arm64
-ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37  # go1.26.7
+ARG GO_SHA256_ARM64=51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda  # go1.27.0
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) GO_SHA256="$GO_SHA256_AMD64" ;; \
@@ -168,8 +168,8 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # `ARG ...`, so prose wedged between them silently untracks the pin. That is
 # how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
 # fail-closing every image build on the gate below.
-# renovate: datasource=go depName=github.com/cplieger/toolbelt/v2
-ARG TOOLBELT_TOOLCATALOG_VERSION=v2.5.2
+# renovate: datasource=go depName=github.com/cplieger/toolbelt/v3
+ARG TOOLBELT_TOOLCATALOG_VERSION=v3.0.0
 # No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
 # already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
 # (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
@@ -177,14 +177,14 @@ ARG TOOLBELT_TOOLCATALOG_VERSION=v2.5.2
 # this instruction worth failing the build for -- same reasoning as the wirecheck step
 # below.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v2 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
-    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v2 require found in go.mod}" && \
+    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v3 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
+    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v3 require found in go.mod}" && \
     if [ "$TOOLBELT_GOMOD" != "$TOOLBELT_TOOLCATALOG_VERSION" ]; then \
-      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v2 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
+      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v3 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
     fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
     printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
-    go run "github.com/cplieger/toolbelt/v2/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
+    go run "github.com/cplieger/toolbelt/v3/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
       verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
 # Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
@@ -486,8 +486,8 @@ ENV HOME=/config/home
 # land in the bin dir via the engine's own GOBIN env at install time.
 ENV PATH="/config/tools/bin:/config/tools/go/bin:/config/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ENV GOPATH="/config/tools/go"
-ENV WT_WORKDIR=/workspace
-ENV WT_ADDR=:9848
+ENV WORK_DIR=/workspace
+ENV LISTEN_ADDR=:9848
 
 # Repoint root's pw_dir to /config/home so OpenSSH (which resolves "~"
 # via getpwuid, NOT $HOME) reads and writes ~/.ssh/known_hosts under
@@ -584,13 +584,13 @@ EXPOSE 9848
 # not health status); under a liveness-acting orchestrator, wire /api/health
 # to a readinessProbe.
 # DL3025 wants JSON notation, which cannot express this: the URL is built with
-# the shell parameter expansion ${WT_ADDR##*:} to read the port out of the
+# the shell parameter expansion ${LISTEN_ADDR##*:} to read the port out of the
 # runtime listen address, and exec form performs no expansion at all -- it would
 # probe a literal. This image also runs as root with a shell for git/gh, so it
 # will never be shell-less, and the distroless case the rule guards does not
 # arise here.
 # hadolint ignore=DL3025
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=20m \
-    CMD curl -sfS --max-time 4 "http://127.0.0.1:${WT_ADDR##*:}/api/health"
+    CMD curl -sfS --max-time 4 "http://127.0.0.1:${LISTEN_ADDR##*:}/api/health"
 
 ENTRYPOINT ["/opt/web-terminal-kiro/entrypoint.sh"]

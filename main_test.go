@@ -20,9 +20,9 @@ import (
 	"time"
 
 	"github.com/cplieger/slogx/capture"
-	"github.com/cplieger/toolbelt/v2"
-	"github.com/cplieger/web-terminal-engine/v4/terminal"
-	"github.com/cplieger/webhttp"
+	"github.com/cplieger/toolbelt/v3"
+	"github.com/cplieger/web-terminal-engine/v5/terminal"
+	"github.com/cplieger/webhttp/v2"
 )
 
 // fakeCLI writes an executable shell stub standing in for kiro-cli. Its whoami
@@ -231,7 +231,7 @@ func writeToolsManifest(t *testing.T, configDir, manifest string) {
 func TestStartTools_configDirMissing(t *testing.T) {
 	records := capture.Default(t)
 
-	rt := startTools(baseTools{
+	rt := startTools(t.Context(), baseTools{
 		configDir:   filepath.Join(t.TempDir(), "absent"),
 		catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 	})
@@ -284,7 +284,7 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			records := capture.Default(t)
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   tc.configDir,
 				catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 			})
@@ -336,7 +336,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 	// is where a retired-format one has to be planted to be read at all.
 	writeToolsManifest(t, dir, `{"runtimes":{"node":{"enabled":false}}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 
 	if rt.engine != nil {
 		t.Fatal("engine is non-nil despite a failed toolbelt.New; want no engine (degraded-not-dead)")
@@ -384,7 +384,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 // eventually-check on the atomic-backed funcs (race-free).
 func TestStartTools_bootConvergenceLiftsGate(t *testing.T) {
 	dir := t.TempDir()
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -429,7 +429,7 @@ func TestStartTools_toolsRootResolution(t *testing.T) {
 				wantRoot = exported
 			}
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   configDir,
 				toolsDir:    exported,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
@@ -516,7 +516,7 @@ func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
 			root := filepath.Join(configDir, "tools")
 			tc.unfit(t, root)
 
-			rt := startTools(baseTools{
+			rt := startTools(t.Context(), baseTools{
 				configDir:   configDir,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
 			})
@@ -561,7 +561,7 @@ func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
 	}
 }
 
-// TestHostAllowlist pins the WT_ALLOWED_HOSTS anti-DNS-rebinding gate
+// TestHostAllowlist pins the ALLOWED_HOSTS anti-DNS-rebinding gate
 // through the real middleware stack (buildHandler): a rebinding attack makes
 // an attacker-controlled hostname resolve to this server, so Origin and Host
 // AGREE and CrossOriginProtection alone admits both session creation and the
@@ -592,7 +592,7 @@ func TestHostAllowlist(t *testing.T) {
 		return rec.Code
 	}
 
-	t.Setenv("WT_ALLOWED_HOSTS", "localhost, 192.168.1.5, ::1, Webterm.Example.COM.")
+	t.Setenv("ALLOWED_HOSTS", "localhost, 192.168.1.5, ::1, Webterm.Example.COM.")
 	h := buildHandler(mux, nil, "default-src 'self'", parseAllowedHosts())
 
 	cases := []struct {
@@ -653,7 +653,7 @@ func TestHostAllowlist(t *testing.T) {
 	t.Run("unset allowlist stays permissive", func(t *testing.T) {
 		open := buildHandler(mux, nil, "default-src 'self'", nil)
 		if got := do(open, "GET", "http://anything.example:9848/ws", "", ""); got != http.StatusOK {
-			t.Errorf("GET /ws with nil allowlist = %d, want %d (unset WT_ALLOWED_HOSTS must stay backward compatible)", got, http.StatusOK)
+			t.Errorf("GET /ws with nil allowlist = %d, want %d (unset ALLOWED_HOSTS must stay backward compatible)", got, http.StatusOK)
 		}
 	})
 }
@@ -673,7 +673,7 @@ func TestHostAllowlist_loopbackCarveOut(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	t.Setenv("WT_ALLOWED_HOSTS", "webterm.example.com") // deliberately no loopback entry
+	t.Setenv("ALLOWED_HOSTS", "webterm.example.com") // deliberately no loopback entry
 	h := buildHandler(mux, nil, "default-src 'self'", parseAllowedHosts())
 
 	do := func(url, remoteAddr string) int {
@@ -736,13 +736,13 @@ func TestHostAllowlist_loopbackCarveOut(t *testing.T) {
 }
 
 // TestHostAllowlist_blankConfigurationStaysPermissive drives a configured but
-// blank WT_ALLOWED_HOSTS (only commas and whitespace) through the real
+// blank ALLOWED_HOSTS (only commas and whitespace) through the real
 // parseAllowedHosts into the middleware: blank entries never engage the gate
 // (webhttp.ParseHostList leaves the policy INACTIVE), so the documented
 // permissive state must hold. Accidentally treating a blank entry as
 // non-blank would turn a blank configuration into a deny-all outage.
 func TestHostAllowlist_blankConfigurationStaysPermissive(t *testing.T) {
-	t.Setenv("WT_ALLOWED_HOSTS", "  ,  , ")
+	t.Setenv("ALLOWED_HOSTS", "  ,  , ")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -755,7 +755,7 @@ func TestHostAllowlist_blankConfigurationStaysPermissive(t *testing.T) {
 	)
 
 	if rec.Code != http.StatusNoContent {
-		t.Errorf("blank WT_ALLOWED_HOSTS: GET /probe status = %d, want %d", rec.Code, http.StatusNoContent)
+		t.Errorf("blank ALLOWED_HOSTS: GET /probe status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 }
 
@@ -770,7 +770,7 @@ func TestStartTools_reconcileFailureLiftsGateDegraded(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{"no-such-tool-xyz":{}}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -796,7 +796,7 @@ func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{}}`)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -908,7 +908,7 @@ func TestWarnIfNoLSPEnabled(t *testing.T) {
 	})
 }
 
-// TestParseAllowedHosts unit-tests the WT_ALLOWED_HOSTS parser directly,
+// TestParseAllowedHosts unit-tests the ALLOWED_HOSTS parser directly,
 // covering the branches TestHostAllowlist's middleware-level driving cannot
 // reach: an unset/empty var must yield an INACTIVE policy (the permissive
 // backward-compatible default main keys its rebinding warning on), and a
@@ -930,19 +930,19 @@ func TestParseAllowedHosts(t *testing.T) {
 	}
 
 	t.Run("unset env yields an inactive policy (any Host accepted)", func(t *testing.T) {
-		t.Setenv("WT_ALLOWED_HOSTS", "")
+		t.Setenv("ALLOWED_HOSTS", "")
 		policy := parseAllowedHosts()
 		if policy.Active() {
-			t.Error("parseAllowedHosts() is active for an unset/empty WT_ALLOWED_HOSTS; want the permissive backward-compatible default")
+			t.Error("parseAllowedHosts() is active for an unset/empty ALLOWED_HOSTS; want the permissive backward-compatible default")
 		}
 		if !allows(t, policy, "anything.example:9848", "") {
-			t.Error("inactive policy rejected a request; unset WT_ALLOWED_HOSTS must accept every Host")
+			t.Error("inactive policy rejected a request; unset ALLOWED_HOSTS must accept every Host")
 		}
 	})
 
 	t.Run("URL-shaped entry warns and is dropped", func(t *testing.T) {
 		records := capture.Default(t)
-		t.Setenv("WT_ALLOWED_HOSTS", "http://webterm.example.com, localhost")
+		t.Setenv("ALLOWED_HOSTS", "http://webterm.example.com, localhost")
 		policy := parseAllowedHosts()
 
 		if got := records.CountLevel(slog.LevelWarn, "dropping malformed"); got != 1 {
@@ -968,7 +968,7 @@ func TestParseAllowedHosts(t *testing.T) {
 
 // TestParseAllowedHosts_allInvalidFailsClosed pins the all-invalid branch
 // TestParseAllowedHosts's other cases never reach: a var whose entries are a
-// lone ":9848" (a pasted WT_ADDR value) and a URL-shaped credential paste
+// lone ":9848" (a pasted LISTEN_ADDR value) and a URL-shaped credential paste
 // canonicalizes to an empty host set no browser-sent Host can ever match, so
 // the parser must Warn twice — the dropped-entry count, then the resulting
 // deny-all state — and yield an ACTIVE EMPTY policy: every non-loopback
@@ -980,7 +980,7 @@ func TestParseAllowedHosts(t *testing.T) {
 func TestParseAllowedHosts_allInvalidFailsClosed(t *testing.T) {
 	records := capture.Default(t)
 	const secretEntry = "hunter2-sekret-token"
-	t.Setenv("WT_ALLOWED_HOSTS", ":9848,https://user:"+secretEntry+"@proxy.internal")
+	t.Setenv("ALLOWED_HOSTS", ":9848,https://user:"+secretEntry+"@proxy.internal")
 
 	policy := parseAllowedHosts()
 
@@ -1006,7 +1006,7 @@ func TestParseAllowedHosts_allInvalidFailsClosed(t *testing.T) {
 		t.Errorf("warn attr invalid_count = %d, want 2 (both malformed entries counted)", invalidCount)
 	}
 	if logContains(records, secretEntry) {
-		t.Errorf("log carries rejected raw entry containing %q; malformed WT_ALLOWED_HOSTS values may hold credentials and must never be logged", secretEntry)
+		t.Errorf("log carries rejected raw entry containing %q; malformed ALLOWED_HOSTS values may hold credentials and must never be logged", secretEntry)
 	}
 	if !policy.Active() {
 		t.Fatal("policy is inactive despite a non-blank configuration; an all-invalid list must fail closed, not fall open")
@@ -1091,7 +1091,7 @@ func TestAwaitBootConvergence_waitFailureLiftsGateDegraded(t *testing.T) {
 	t.Cleanup(eng.Close)
 
 	var verdicts []string
-	awaitBootConvergence(eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+	awaitBootConvergence(t.Context(), eng, "no-such-job-id", func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if len(verdicts) != 1 || verdicts[0] != "degraded" {
 		t.Fatalf("verdicts = %v, want exactly one \"degraded\" (the syncing gate must lift even when the job outcome is unknowable)", verdicts)
@@ -1312,7 +1312,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 		`}}`
 	writeToolsManifest(t, dir, manifest)
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -1501,8 +1501,8 @@ func TestToolsStatus_callbackAndHealthReadAreRaceClean(t *testing.T) {
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	const token = "s3cr3t-token-abc123"
-	const onMsg = "WT_LOG_OSC_TEXT is on"
-	const badMsg = "unparseable WT_LOG_OSC_TEXT"
+	const onMsg = "LOG_OSC_TEXT is on"
+	const badMsg = "unparseable LOG_OSC_TEXT"
 	cases := map[string]struct {
 		raw       string
 		wantValue bool
@@ -1556,7 +1556,7 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			records := capture.Default(t)
-			t.Setenv("WT_LOG_OSC_TEXT", tc.raw)
+			t.Setenv("LOG_OSC_TEXT", tc.raw)
 
 			if got := parseLogOSCText(); got != tc.wantValue {
 				t.Errorf("parseLogOSCText() with %q = %v, want %v", tc.raw, got, tc.wantValue)
@@ -1568,143 +1568,26 @@ func TestParseLogOSCText_warnsByNameOnly(t *testing.T) {
 				t.Errorf("log = %q, want a Warn containing %q", records.Messages(), tc.wantMsg)
 			}
 			if tc.rawMustStayOut && logContains(records, tc.raw) {
-				t.Errorf("log = %q carries the raw WT_LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why the read is envx.BoolStrict and not envx.Bool, whose malformed Warn carries the value)",
+				t.Errorf("log = %q carries the raw LOG_OSC_TEXT value; a compose expansion mistake can put a credential on this key, so the malformed path must warn by NAME only (this is why the read is envx.BoolStrict and not envx.Bool, whose malformed Warn carries the value)",
 					records.Messages())
 			}
 		})
 	}
 }
 
-// The KIRO_CLI_TOOLS_TAINTED warning, duplicated verbatim from parseToolsTainted
-// (main.go) for the reason the WT_TRUSTED_PROXIES hints above it are duplicated: this
-// record is the only thing an operator sees about a rejected value, the value
-// itself can be a compose-interpolated credential (CWE-532), so message and hint
-// must stay FIXED strings that cannot grow an input-derived tail. A deliberate
-// rewording updates both sides; anything else is the regression these pins fail on.
-const (
-	taintedBadMsg  = "unusable KIRO_CLI_TOOLS_TAINTED; treating the kiro-cli tools tree as untainted, the same outcome as unset"
-	taintedBadHint = "only entrypoint.sh sets this, and only to 1 (it found the tools tree group/other-writable) or 0 (it did not); any other value is not an observation, so it cannot arm the distrust-and-reinstall path"
-)
-
-// TestParseToolsTainted pins the accepted VOCABULARY of the entrypoint's
-// tools-tree-was-writable handoff, which nothing checked before: the shell side
-// (tests/shell/pins_export_test.sh) pins the variable's NAME, its export and its
-// value expression, and the Go side pinned only that main.go mentions the name — so
-// which values arm a trust boundary was untested from both ends, and a read swapped
-// for envx.Bool/BoolStrict (true/yes/on, any case, padding trimmed) would have
-// widened it with every other test still green.
-//
-// Four properties, each a distinct regression:
-//   - the vocabulary is exactly "1" and "0". Every wider spelling the fleet's
-//     boolean parser accepts is pinned here as NOT arming, which is what fails if
-//     the decode is ever "unified" with envx.Bool/BoolStrict;
-//   - a value outside it is treated as NOT tainted, i.e. identically to unset,
-//     because the variable is an affirmative observation and the entrypoint only
-//     ever writes 0 or 1: a value that is neither reports no observation, and
-//     arming the reinstall-and-prune path on it would invent evidence;
-//   - it still WARNS, because only one producer sets this key and a value it did
-//     not write means that producer is broken. Unset is the ordinary
-//     out-of-container run and stays silent, which is why the decode distinguishes
-//     unset from set-but-empty at all;
-//   - the warning names the KEY only. The needle sweep covers the values
-//     distinctive enough for it, and assertAttrSchema covers the rest: it pins the
-//     record's EXACT attr set, so a value reaching the log under any name, in any
-//     shape, fails even where a needle would be vacuous (an empty or padded value).
-//
-// Serial: capture.Default mutates the process-global default logger.
-func TestParseToolsTainted(t *testing.T) {
-	const key = "KIRO_CLI_TOOLS_TAINTED"
-	const token = "s3cr3t-token-abc123"
-	cases := map[string]struct {
-		raw       string
-		unset     bool
-		want      bool
-		wantWarns int
-		// rawMustStayOut asks for the needle form of the confidentiality
-		// assertion, and is set only where finding the value in the log PROVES a
-		// leak. The fixed hint necessarily contains "1", "0" (it names the two
-		// accepted spellings), " 1 " and "on" (inside "only"/"observation"), and
-		// the empty string is in every string, so asserting those absent would
-		// fail on wording alone and say nothing about the value. assertAttrSchema
-		// below is what covers those cases.
-		rawMustStayOut bool
-	}{
-		// The whole accepted vocabulary: two values, no case or padding tolerance.
-		"1 arms the taint":      {raw: "1", want: true},
-		"0 does not arm it":     {raw: "0", want: false},
-		"unset does not arm it": {unset: true, want: false},
-
-		// Every spelling envx.Bool/BoolStrict would have accepted. These are the
-		// cases that fail if this decode is ever widened back to that vocabulary:
-		// each would arm a trust boundary there and must not here.
-		"true does not arm it":       {raw: "true", want: false, wantWarns: 1, rawMustStayOut: true},
-		"yes does not arm it":        {raw: "yes", want: false, wantWarns: 1, rawMustStayOut: true},
-		"on does not arm it":         {raw: "on", want: false, wantWarns: 1},
-		"TRUE does not arm it":       {raw: "TRUE", want: false, wantWarns: 1, rawMustStayOut: true},
-		"On does not arm it":         {raw: "On", want: false, wantWarns: 1, rawMustStayOut: true},
-		"a padded 1 does not arm it": {raw: " 1 ", want: false, wantWarns: 1},
-
-		// A producer that wrote nothing is not the same as no producer: the
-		// entrypoint always writes 0 or 1, so an empty value is a broken producer
-		// and warns, while unset above is silent.
-		"an empty value does not arm it": {raw: "", want: false, wantWarns: 1},
-
-		// The shape that motivates naming the key only: a compose interpolation
-		// mistake (KIRO_CLI_TOOLS_TAINTED: ${SOME_TOKEN}) puts a credential here.
-		"an arbitrary token does not arm it": {raw: token, want: false, wantWarns: 1, rawMustStayOut: true},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			records := capture.Default(t)
-			// t.Setenv first even for the unset case: it registers the restore of
-			// whatever the ambient environment held, and the Unsetenv then makes
-			// the key genuinely absent for this subtest rather than empty.
-			t.Setenv(key, tc.raw)
-			if tc.unset {
-				if err := os.Unsetenv(key); err != nil {
-					t.Fatalf("unset %s: %v", key, err)
-				}
-			}
-
-			if got := parseToolsTainted(); got != tc.want {
-				t.Errorf("parseToolsTainted() with %s=%q (unset=%v) = %v, want %v", key, tc.raw, tc.unset, got, tc.want)
-			}
-			if got := records.CountLevel(slog.LevelWarn, ""); got != tc.wantWarns {
-				t.Errorf("log = %q, want exactly %d Warn (got %d)", records.Messages(), tc.wantWarns, got)
-			}
-			if tc.wantWarns == 0 {
-				return
-			}
-			// Exact message, not a substring: a regression that appends the
-			// rejected value to the sentence keeps every substring match green.
-			if got := records.CountExact(taintedBadMsg); got != 1 {
-				t.Errorf("log = %q, want exactly one Warn whose message is exactly %q (got %d); the message must be a fixed string with no input-derived tail",
-					records.Messages(), taintedBadMsg, got)
-			}
-			assertAttrSchema(t, records, slog.LevelWarn, taintedBadMsg, map[string]attrCheck{
-				"hint": wantString(taintedBadHint),
-			})
-			if tc.rawMustStayOut && logContains(records, tc.raw) {
-				t.Errorf("log = %q carries the raw %s value; a compose interpolation mistake can put a credential on this key, so the rejected-value path must warn by NAME only",
-					records.Messages(), key)
-			}
-		})
-	}
-}
-
-// The WT_TRUSTED_INSTALL_UIDS warning, duplicated verbatim from
+// The TRUSTED_INSTALL_UIDS warning, duplicated verbatim from
 // parseTrustedInstallUIDs (main.go). Duplicating the prose is the point, as it is
-// for the WT_TRUSTED_PROXIES hints: this record is the ONLY thing an operator sees
+// for the TRUSTED_PROXIES hints: this record is the ONLY thing an operator sees
 // about a dropped entry, and an entry can be a compose-interpolated credential
 // (CWE-532), so both strings must stay FIXED and cannot grow an input-derived
 // tail. A deliberate rewording updates both sides; anything else is the
 // regression these pins exist to fail.
 const (
-	trustedUIDsBadMsg  = "dropping unusable WT_TRUSTED_INSTALL_UIDS entries; the kiro-cli install keeps enforcing custody against those identities"
+	trustedUIDsBadMsg  = "dropping unusable TRUSTED_INSTALL_UIDS entries; the kiro-cli install keeps enforcing custody against those identities"
 	trustedUIDsBadHint = "each entry is a single numeric uid greater than 0 (e.g. 1000,1001); root is trusted already, and every identity listed must be at least as privileged as this server"
 )
 
-// TestParseTrustedInstallUIDs pins the whole WT_TRUSTED_INSTALL_UIDS contract:
+// TestParseTrustedInstallUIDs pins the whole TRUSTED_INSTALL_UIDS contract:
 // the EMPTY default (no trust grant, so pinstall's custody check applies in
 // full), the drop-the-unusable-keep-the-rest posture, the two numeric shapes that
 // are rejected as well as non-numeric text (0 is root, which the library trusts
@@ -1715,15 +1598,14 @@ const (
 // makes the value handed to the library reproducible for an operator reading the
 // list back.
 //
-// Two forms of the confidentiality assertion, for the reason
-// TestParseToolsTainted uses both: a needle sweep proves a specific value stayed
-// out, and assertAttrSchema pins the record's EXACT attr set so a value reaching
-// the log under any name, in any shape, fails even where a needle would be
-// vacuous (the fixed hint necessarily contains "1000", "1001" and "0").
+// Two forms of the confidentiality assertion: a needle sweep proves a specific
+// value stayed out, and assertAttrSchema pins the record's EXACT attr set so a
+// value reaching the log under any name, in any shape, fails even where a needle
+// would be vacuous (the fixed hint necessarily contains "1000", "1001" and "0").
 //
 // Serial: capture.Default mutates the process-global default logger.
 func TestParseTrustedInstallUIDs(t *testing.T) {
-	const key = "WT_TRUSTED_INSTALL_UIDS"
+	const key = "TRUSTED_INSTALL_UIDS"
 	const token = "s3cr3t-token-abc123"
 	cases := map[string]struct {
 		raw   string
@@ -1762,7 +1644,7 @@ func TestParseTrustedInstallUIDs(t *testing.T) {
 		"a float is dropped":             {raw: "1000.5", wantInvalid: 1, rawMustStayOut: true},
 
 		// The shape that motivates naming the key only: a compose interpolation
-		// mistake (WT_TRUSTED_INSTALL_UIDS: ${SOME_TOKEN}) puts a credential here.
+		// mistake (TRUSTED_INSTALL_UIDS: ${SOME_TOKEN}) puts a credential here.
 		"a token-shaped value is dropped": {raw: token, wantInvalid: 1, rawMustStayOut: true},
 
 		// Mixed: the usable entries survive, and every dropped one is counted.
@@ -1820,7 +1702,7 @@ func TestParseTrustedInstallUIDs(t *testing.T) {
 // ACCEPTS still gets toolbelt's answer. The wrapper exists only because
 // toolbelt's parser calls scheduler.ParseInterval WITHOUT
 // scheduler.WithRedactedValue, so its own fallback warning echoes the raw string
-// — the CWE-532 shape the WT_LOG_OSC_TEXT remedy closed on a knob of exactly
+// — the CWE-532 shape the LOG_OSC_TEXT remedy closed on a knob of exactly
 // this kind. Dropping the wrapper (calling toolbelt.ParseCatalogRefresh
 // directly) leaves every other test green.
 // Serial: capture.Default mutates the process-global default logger.
@@ -1980,7 +1862,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 	// A COMPLETED handshake: the one shape whose access line would be a lie
 	// (status 101 recorded now, the line emitted hours later at socket close
 	// with a session-length duration).
-	resp, err := srv.Client().Do(newWSUpgradeRequest(t, srv.URL, id, srv.URL))
+	resp, err := srv.Client().Do(newWSUpgradeRequest(t, srv.URL, string(id), srv.URL))
 	if err != nil {
 		t.Fatalf("/ws handshake: %v", err)
 	}
@@ -2042,7 +1924,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 	}
 	for i, tc := range refusals {
 		t.Run(tc.name, func(t *testing.T) {
-			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
+			req := newWSUpgradeRequest(t, srv.URL, string(id), srv.URL)
 			tc.mangle(req)
 			refused, doErr := srv.Client().Do(req)
 			if doErr != nil {
@@ -2088,7 +1970,7 @@ func TestAccessLogSkipsOnlyCompletedUpgrades(t *testing.T) {
 // Serial: capture.Default mutates the process-global default logger.
 func TestAccessLogKeepsStreamPathRefusals(t *testing.T) {
 	rec := capture.Default(t)
-	t.Setenv("WT_ALLOWED_HOSTS", "webterm.example.com")
+	t.Setenv("ALLOWED_HOSTS", "webterm.example.com")
 
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
@@ -2322,7 +2204,7 @@ func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := newWSUpgradeRequest(t, srv.URL, id, srv.URL)
+			req := newWSUpgradeRequest(t, srv.URL, string(id), srv.URL)
 			req.Header.Del("Upgrade")
 			req.Header.Del("Connection")
 			for _, v := range tc.upgrade {
@@ -2334,7 +2216,7 @@ func TestIsWebSocketUpgrade_agreesWithTheEngineHandshake(t *testing.T) {
 
 			// The same header set the server will see, so the predicate is
 			// judged on exactly the request the handshake judges.
-			probe := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+id, http.NoBody)
+			probe := httptest.NewRequest(http.MethodGet, terminal.WSPath+"?session="+string(id), http.NoBody)
 			probe.Header = req.Header.Clone()
 			predicate := isWebSocketUpgrade(probe)
 
@@ -2388,14 +2270,14 @@ func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("toolbelt.New: %v", err)
 	}
-	job, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	job, _, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
 	if rerr != nil || job == nil {
 		t.Fatalf("Reconcile = %v, %v; want an enqueued job for Close to cancel", job, rerr)
 	}
 	eng.Close() // the SIGTERM shape: Engine.Close cancels the active job
 
 	var verdicts []string
-	awaitBootConvergence(eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+	awaitBootConvergence(t.Context(), eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
 
 	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
 		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift on a cancelled boot pass too",
@@ -2416,6 +2298,71 @@ func TestAwaitBootConvergence_cancellationIsNotAToolFailure(t *testing.T) {
 	}
 }
 
+// TestAwaitBootConvergence_shutdownAbandonsWithoutTheTail covers the arm the
+// C20 context threading added, and it is the arm two review findings landed in:
+// a cancelled Wait must record Info (never the false broken-install Warn), lift
+// the gate as degraded, and RETURN so the post-convergence tail cannot run.
+//
+// The tail matters because the engine is still OPEN here: the server's pre-drain
+// hook cancels the shutdown context while tools.close() is still pending in the
+// deferred teardown, so an Update() enqueue on a draining process would SUCCEED.
+// This test cancels the ctx WITHOUT closing the engine, which is exactly that
+// window, and the earlier cancellation test cannot reach it (it closes the
+// engine first, so Update would fail on its own).
+//
+// It also pins the ordering the fix depends on: Wait checks for a terminal job
+// before it selects on ctx.Done(), so keying the arm on ctx.Err() rather than
+// the returned error would misreport a job that finished in the same instant.
+//
+// Serial: capture.Default mutates the process-global default logger.
+func TestAwaitBootConvergence_shutdownAbandonsWithoutTheTail(t *testing.T) {
+	records := capture.Default(t)
+	dir := t.TempDir()
+	manifest := `{"version":2,"tools":{"sleepytool":{"source":"manual","version":"1.0.0",` +
+		`"probe":"sleepytool","install":"sleep 300"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "tools.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	eng, err := toolbelt.New(&toolbelt.Config{
+		ConfigDir:   dir,
+		ToolsDir:    filepath.Join(dir, "tools"),
+		CatalogPath: filepath.Join(dir, "absent-catalog.json"),
+	})
+	if err != nil {
+		t.Fatalf("toolbelt.New: %v", err)
+	}
+	t.Cleanup(eng.Close)
+	job, _, rerr := eng.Reconcile(toolbelt.ReconcileMissing)
+	if rerr != nil || job == nil {
+		t.Fatalf("Reconcile = %v, %v; want an enqueued job still running when the ctx is cancelled", job, rerr)
+	}
+
+	// Cancel the shutdown context with the engine still open: the pre-drain
+	// window, not the post-Close one.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var verdicts []string
+	awaitBootConvergence(ctx, eng, job.ID, func(v string) { verdicts = append(verdicts, v) }, filepath.Join(dir, "tools.json"))
+
+	if !slices.Equal(verdicts, []string{toolsStateDegraded}) {
+		t.Fatalf("verdicts = %v, want exactly one %q; the syncing gate must lift at shutdown too", verdicts, toolsStateDegraded)
+	}
+	if got := records.CountLevel(slog.LevelInfo, "boot convergence abandoned at shutdown"); got != 1 {
+		t.Errorf("log = %q, want exactly one shutdown Info (got %d)", records.Messages(), got)
+	}
+	if got := records.CountLevel(slog.LevelWarn, "boot reconcile wait failed"); got != 0 {
+		t.Errorf("log = %q; a shutdown cancellation must not be reported as a wait failure -- that Warn is the false broken-install alert on every deploy (got %d)",
+			records.Messages(), got)
+	}
+	for _, tail := range []string{"update pass not enqueued", "no language servers enabled"} {
+		if got := records.CountLevel(slog.LevelWarn, tail); got != 0 {
+			t.Errorf("log = %q; the post-convergence tail must be skipped at shutdown, but %q fired %d time(s) -- the engine is still open here, so an Update enqueue would land on a draining process",
+				records.Messages(), tail, got)
+		}
+	}
+}
+
 // TestStartTools_logsTheGatedWindowOpening pins the one record that marks the
 // gated window OPENING. The terminal boot-convergence records (converged /
 // degraded / cancelled) are all asserted elsewhere, but they only say when the
@@ -2431,7 +2378,7 @@ func TestStartTools_logsTheGatedWindowOpening(t *testing.T) {
 	records := capture.Default(t)
 	dir := t.TempDir()
 
-	rt := startTools(baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -2856,7 +2803,7 @@ func TestStageValuesAreStable(t *testing.T) {
 
 // parseCatalogRefresh is deliberately STRICTER than the fleet's config-echo
 // policy: envx states that config values are not secrets and its own tolerant
-// warnings include the raw value, scheduler's steering doc says plain *_INTERVAL
+// warnings include the raw value, the scheduler library treats plain *_INTERVAL
 // env reads should not redact, and 9 apps echo raw config values today. This app
 // does not, because its compose file is the operator's whole config surface, it
 // serves an unauthenticated root shell, and its README publishes a no-values
@@ -2881,7 +2828,7 @@ func TestParseCatalogRefreshIsOutcomeTransparent(t *testing.T) {
 		"9999999h", "-0", "+24h", ".5h", "1.5h",
 	} {
 		t.Run("value="+raw, func(t *testing.T) {
-			want := toolbelt.ParseCatalogRefresh(raw, catalogRefreshKey)
+			want := toolbelt.ParseCatalogRefresh(toolbelt.RefreshEnv(raw), catalogRefreshKey)
 			if got := parseCatalogRefresh(raw); got != want {
 				t.Errorf("parseCatalogRefresh(%q) = %v, library returns %v — the local pre-parse changed the OUTCOME, so its accept vocabulary has drifted from scheduler's",
 					raw, got, want)
@@ -2996,10 +2943,10 @@ func setupLoggingStderr(t *testing.T) string {
 //     zero Options.Level is info, so the swap compiles and pins every deployment
 //     at info), silently decides for every deployment which lines exist —
 //     including the classifyStatus trace this app's own steering names as the
-//     WT_LOG_LEVEL=debug diagnosis path for stuck tab-status dots;
+//     LOG_LEVEL=debug diagnosis path for stuck tab-status dots;
 //   - the unparseable warning names the KEY and carries no copy of the VALUE.
 //     That is the app's house rule, stated in the function's own comment and
-//     applied at WT_TRUSTED_PROXIES, KIRO_CLI_CHAT_ARGS, WT_LOG_OSC_TEXT and
+//     applied at TRUSTED_PROXIES, KIRO_CLI_CHAT_ARGS, LOG_OSC_TEXT and
 //     TOOL_CATALOG_REFRESH — the last two each with a test saying so. This key
 //     was the only one where the claim was unchecked, and a compose
 //     interpolation mistake is what puts a credential on it (CWE-532).
@@ -3013,7 +2960,7 @@ func setupLoggingStderr(t *testing.T) string {
 func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 	const (
 		token   = "s3cr3t-token-abc123"
-		warnMsg = "unparseable WT_LOG_LEVEL"
+		warnMsg = "unparseable LOG_LEVEL"
 	)
 	cases := []struct {
 		name      string
@@ -3046,10 +2993,10 @@ func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 			// t.Setenv first either way: it records the pre-test value and
 			// restores it at cleanup, so the Unsetenv below is safe (the shape
 			// TestResolveScrollback uses for its absent case).
-			t.Setenv("WT_LOG_LEVEL", tc.raw)
+			t.Setenv("LOG_LEVEL", tc.raw)
 			if tc.absent {
-				if err := os.Unsetenv("WT_LOG_LEVEL"); err != nil {
-					t.Fatalf("Unsetenv(WT_LOG_LEVEL): %v", err)
+				if err := os.Unsetenv("LOG_LEVEL"); err != nil {
+					t.Fatalf("Unsetenv(LOG_LEVEL): %v", err)
 				}
 			}
 
@@ -3057,21 +3004,21 @@ func TestSetupLoggingInstallsTheParsedLevelAndWarnsByNameOnly(t *testing.T) {
 
 			ctx := t.Context()
 			if got := slog.Default().Enabled(ctx, slog.LevelDebug); got != tc.wantDebug {
-				t.Errorf("with WT_LOG_LEVEL=%q the installed handler admits Debug = %v, want %v", tc.raw, got, tc.wantDebug)
+				t.Errorf("with LOG_LEVEL=%q the installed handler admits Debug = %v, want %v", tc.raw, got, tc.wantDebug)
 			}
 			if got := slog.Default().Enabled(ctx, slog.LevelInfo); got != tc.wantInfo {
-				t.Errorf("with WT_LOG_LEVEL=%q the installed handler admits Info = %v, want %v", tc.raw, got, tc.wantInfo)
+				t.Errorf("with LOG_LEVEL=%q the installed handler admits Info = %v, want %v", tc.raw, got, tc.wantInfo)
 			}
 			// Error is always admitted; asserting it makes "the handler is a real
 			// leveled handler" explicit rather than assumed by the two above.
 			if !slog.Default().Enabled(ctx, slog.LevelError) {
-				t.Errorf("with WT_LOG_LEVEL=%q the installed handler drops Error records", tc.raw)
+				t.Errorf("with LOG_LEVEL=%q the installed handler drops Error records", tc.raw)
 			}
 			if got := strings.Count(out, warnMsg); (got > 0) != tc.wantWarn {
 				t.Errorf("stderr = %q, want the %q warning present = %v", out, warnMsg, tc.wantWarn)
 			}
 			if tc.rawMustStayOut && strings.Contains(out, tc.raw) {
-				t.Errorf("stderr = %q carries the raw WT_LOG_LEVEL value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only",
+				t.Errorf("stderr = %q carries the raw LOG_LEVEL value; a compose expansion mistake can put a credential on this key, so a rejected value must be warned about by NAME only",
 					out)
 			}
 		})

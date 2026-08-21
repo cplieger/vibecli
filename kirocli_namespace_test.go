@@ -30,8 +30,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cplieger/pathinside"
-	"github.com/cplieger/pinstall/v2"
+	"github.com/cplieger/pathinside/v2"
+	"github.com/cplieger/pinstall/v3"
 )
 
 // The pin these tests install, and the toolbelt tool name that collides with it.
@@ -233,13 +233,14 @@ func (e *nsEnv) assertIntact(survivors []string) {
 				e.t.Errorf("Readlink(%s): %v", p, err)
 				continue
 			}
-			// pathinside.Inside rather than a prefix test on the raw string: the
-			// link target is read off disk, so it need not be cleaned, and
-			// "<opt>/../elsewhere" carries the prefix while pointing outside the
-			// tree. Inside counts the opt dir ITSELF as inside, which no planted
-			// link is -- every survivor points at a file two levels down -- so
-			// the two rules agree on every value this test can produce.
-			if !pathinside.Inside(optTree, target) {
+			// pathinside.Root(...).Contains rather than a prefix test on the raw
+			// string: the link target is read off disk, so it need not be
+			// cleaned, and "<opt>/../elsewhere" carries the prefix while
+			// pointing outside the tree. Contains counts the opt dir ITSELF as
+			// inside, which no planted link is -- every survivor points at a
+			// file two levels down -- so the two rules agree on every value
+			// this test can produce.
+			if !pathinside.Root(optTree).Contains(target) {
 				e.t.Errorf("%s now points at %q, outside the engine's own opt tree: its symlink was republished under it", p, target)
 			}
 			continue

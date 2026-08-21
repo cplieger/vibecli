@@ -668,12 +668,12 @@ warn_skipped_apt_token() {
 # subcommand makes every container report kiro-cli unavailable (unhealthy, no restart
 # loop) rather than merely logging a warning.
 # renovate: datasource=custom.kiro-cli depName=kiro-cli
-KIRO_CLI_VERSION="2.19.0"
-KIRO_CLI_SHA256="51f88c55c5231100049207961fab7e50ed958b80e03c08d825216c8fc08f6170"
+KIRO_CLI_VERSION="2.19.1"
+KIRO_CLI_SHA256="7cde2ce720c73912e98a19c56311776655d59e0cca85d75272c79be74c126d23"
 # The `# kiro-cli <version>` trailer is Renovate's version anchor for this
 # arch's digest lookup — do not hand-edit or drop it.
 # renovate: datasource=custom.kiro-cli-arm64 depName=kiro-cli-arm64
-KIRO_CLI_SHA256_ARM64="a098f722c71d354de4ef1723930d69e5bbc7096d7a97f0cba77d8d66f2188614" # kiro-cli 2.19.0
+KIRO_CLI_SHA256_ARM64="6988e255f994f508e1299ddff937e6cb1157e06d43875d26c9f407cc2f12f299" # kiro-cli 2.19.1
 
 # Hand the pins and the tools tree to the server. The manager selects the digest for
 # the architecture it is running on, so both travel; the tools tree travels

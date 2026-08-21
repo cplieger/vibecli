@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cplieger/atomicfile/v3"
 	"github.com/cplieger/web-terminal-engine/v5/terminal"
@@ -628,6 +630,10 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 		for _, bad := range []string{
 			"../../../etc", "sess_../..", "sess_", "", "notasession",
 			"sess_" + strings.Repeat("a", 200), "sess_abc/def",
+			// Uppercase past F. The hex arm accepts A-F, so a widening of that arm
+			// admits the rest of the alphabet as a path component, and no other case
+			// here carries an uppercase letter at all.
+			"sess_ZZZZZZZZ-0000-1111-2222-333333333333",
 		} {
 			if validKiroSessionID(bad) {
 				t.Errorf("validKiroSessionID(%q) = true, want false", bad)
@@ -635,6 +641,31 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 		}
 		if !validKiroSessionID("sess_11111111-2222-3333-4444-555555555555") {
 			t.Error("a real kiro session id was rejected")
+		}
+		// Uppercase hex, which the predicate accepts on purpose: a UUID rendered in
+		// upper case is still a kiro session id, and every other id in this file is
+		// lower case, so narrowing the A-F arm would refuse one with the suite green.
+		if !validKiroSessionID("sess_ABCDEF01-2345-6789-ABCD-EF0123456789") {
+			t.Error("an uppercase-hex kiro session id was rejected; the A-F arm exists to accept it")
+		}
+	})
+	t.Run("the length cap is inclusive", func(t *testing.T) {
+		// The id becomes a path component, so its length is bounded at 128. Only a
+		// pair either side of that number can tell an inclusive bound from an
+		// exclusive one, and the 200-character case above sits far enough past it to
+		// be satisfied by both -- so a cap that rejected every id AT the limit would
+		// leave the whole suite green while refusing ids kiro-cli can legitimately
+		// mint.
+		atLimit := "sess_" + strings.Repeat("a", 123)
+		if len(atLimit) != 128 {
+			t.Fatalf("the fixture is %d characters, want 128: this case no longer sits on the boundary it exists to pin", len(atLimit))
+		}
+		if !validKiroSessionID(atLimit) {
+			t.Errorf("validKiroSessionID(a %d-character id) = false, want true: 128 is the longest id accepted, not the first one refused", len(atLimit))
+		}
+		pastLimit := "sess_" + strings.Repeat("a", 124)
+		if validKiroSessionID(pastLimit) {
+			t.Errorf("validKiroSessionID(a %d-character id) = true, want false", len(pastLimit))
 		}
 	})
 	t.Run("traversal in a mapping file reads nothing", func(t *testing.T) {
@@ -989,5 +1020,211 @@ func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
 	}
 	if got := f.sync.pushed["tab1"]; got.kiroID != third {
 		t.Errorf("memo kiroID = %q, want %q: the memo must follow the re-point", got.kiroID, third)
+	}
+}
+
+// capturedLog swaps the process-global default logger for a Debug-level handler
+// writing into a buffer, restores the previous one when the test ends, and returns
+// the buffer. slog.Default is process-global, so no test using this may be parallel:
+// a parallel sibling's records would land in this buffer.
+func capturedLog(t *testing.T) *strings.Builder {
+	t.Helper()
+	var buf strings.Builder
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
+
+// TestSessionTitleZeroMappingRecordNamesItsDiscriminator pins the sweep's
+// no-mapping diagnosis: which sweeps produce it, and the attribute that tells its
+// two causes apart. This record is the only thing that explains a container whose
+// tabs all kept the engine's automatic cwd label, and state_entries is what sends
+// the reader to the right half -- 0 means no mapping-shaped name was in the
+// directory at all, so the hook never ran, while non-zero means names were there
+// and every one belonged to a tab that is gone. Neither shape pushes a title, so no
+// other test in this file can see this branch fire on the wrong sweep or carry the
+// wrong count.
+func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
+	// A fragment of the message, not all of it: the hint attribute beside it carries
+	// prose a whole-message match would make brittle for no gain.
+	const record = "no live tab has a kiro session mapping"
+
+	t.Run("a live tab and an empty state dir reports zero entries", func(t *testing.T) {
+		f := newTitleFixture(t)
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
+
+		out := logged.String()
+		if !strings.Contains(out, record) {
+			t.Errorf("pass() with one live tab and nothing in the state dir logged %q, want a record naming %q: that tab keeps the automatic name ladder and nothing else says why", out, record)
+		}
+		if !strings.Contains(out, "state_entries=0") {
+			t.Errorf("pass() logged %q, want state_entries=0: an empty directory is the hook-never-ran half of the diagnosis", out)
+		}
+	})
+
+	t.Run("a live tab and one stale name reports one entry", func(t *testing.T) {
+		f := newTitleFixture(t)
+		// A well-formed handle from a previous run: the right alphabet and length, but
+		// no tab in this process answers to it, so the sweep reclaims it and leaves the
+		// live tab unmapped.
+		if err := os.WriteFile(filepath.Join(f.sync.stateDir, "0123456789abcdef0123456789abcdef"),
+			[]byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
+			t.Fatalf("plant a previous run's mapping: %v", err)
+		}
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
+
+		out := logged.String()
+		if !strings.Contains(out, record) {
+			t.Errorf("pass() with one live tab and one stale name logged %q, want a record naming %q", out, record)
+		}
+		if !strings.Contains(out, "state_entries=1") {
+			t.Errorf("pass() logged %q, want state_entries=1: a name WAS present and belonged to no live tab, which is the opposite diagnosis from an empty directory and sends an operator to the other half of the system", out)
+		}
+	})
+
+	t.Run("no live tab at all is silent", func(t *testing.T) {
+		f := newTitleFixture(t)
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{})
+
+		if out := logged.String(); strings.Contains(out, record) {
+			t.Errorf("pass() with no live tab logged %q, want no record naming %q: with no tabs open there is no tab wearing the wrong label, and an idling container would emit this every two seconds forever", out, record)
+		}
+	})
+
+	t.Run("a mapped tab is silent", func(t *testing.T) {
+		f := newTitleFixture(t)
+		id := "sess_22222222-3333-4444-5555-666666666666"
+		f.mapping("tab1", id)
+		f.session("hash0", id, titleJSON("a real title"))
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
+
+		if out := logged.String(); strings.Contains(out, record) {
+			t.Errorf("pass() over a tab whose mapping resolved logged %q, want no record naming %q: that tab is named from its kiro session, so nothing is degraded", out, record)
+		}
+	})
+}
+
+// TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile pins the gate on the
+// unusable-mapping record. A mapping file the hook has created but not yet filled is
+// the ordinary shape of a tab between spawn and first prompt, and the sweep re-reads
+// it every two seconds for as long as that lasts -- so a record for an EMPTY file is
+// a per-tick line about a state that is not a fault, while a record for a file
+// holding something that is not a kiro session id is the only signal that a hook is
+// writing garbage. Neither pushes a title, so the log is the whole difference.
+func TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile(t *testing.T) {
+	const record = "mapping file holds no usable session id"
+
+	t.Run("a value that is not a session id is reported", func(t *testing.T) {
+		f := newTitleFixture(t)
+		f.mapping("tab1", "not-a-session-id")
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
+
+		if out := logged.String(); !strings.Contains(out, record) {
+			t.Errorf("pass() over a mapping holding \"not-a-session-id\" logged %q, want a record naming %q: a hook writing an unusable value is otherwise indistinguishable from one that has not written yet", out, record)
+		}
+	})
+
+	t.Run("a file the hook has not filled yet is silent", func(t *testing.T) {
+		f := newTitleFixture(t)
+		f.mapping("tab1", "")
+		logged := capturedLog(t)
+
+		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
+
+		if out := logged.String(); strings.Contains(out, record) {
+			t.Errorf("pass() over an empty mapping logged %q, want no record naming %q: an unfilled file is the ordinary state before a tab's first prompt, and the sweep re-reads it every two seconds until then", out, record)
+		}
+	})
+}
+
+// TestSessionTitleReclaimIsSilentWhenItSucceeds pins the gate on forget's failure
+// record. The reclaim is routine -- every closed tab and every file a previous run
+// left behind goes through it -- so a record on the SUCCESS path is one line per
+// reclaim describing nothing wrong, and it buries the case the record exists for: a
+// mapping the sweep cannot remove, which it then re-reads and re-reclaims on every
+// tick forever. The reclaim's own effect is asserted by the two reclaim tests above;
+// only the log separates a removal that worked from one that did not.
+func TestSessionTitleReclaimIsSilentWhenItSucceeds(t *testing.T) {
+	const record = "could not drop a stale mapping"
+
+	f := newTitleFixture(t)
+	id := "sess_11111111-2222-3333-4444-555555555555"
+	f.mapping("closedtab", id)
+	f.session("hash0", id, titleJSON("a real title"))
+	logged := capturedLog(t)
+
+	// The manager no longer lists closedtab, so the sweep reclaims its mapping, and
+	// the file is present and removable -- the ordinary close.
+	f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"othertab"}})
+
+	if out := logged.String(); strings.Contains(out, record) {
+		t.Errorf("a reclaim that removed the file logged %q, want no record naming %q: it would fire once per reclaim on a healthy container and bury the mapping that genuinely cannot be removed", out, record)
+	}
+}
+
+// TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome pins the constructor's one
+// diagnostic. With HOME blank, filepath.Join("", ".kiro", "sessions") is RELATIVE,
+// so every title read resolves against the server's working directory and fails; the
+// feature degrades to the automatic name ladder either way, and this record is the
+// only thing that says why. It is equally a record that must not fire on an ordinary
+// boot -- the image always sets HOME, so a warning there is noise on every container
+// start.
+func TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome(t *testing.T) {
+	const record = "HOME is empty"
+
+	t.Run("a blank home says why no title will resolve", func(t *testing.T) {
+		logged := capturedLog(t)
+
+		newSessionTitleSync(t.TempDir(), "")
+
+		if out := logged.String(); !strings.Contains(out, record) {
+			t.Errorf("newSessionTitleSync with a blank home logged %q, want a record naming %q: every session read then resolves against the process working directory and nothing downstream reports that", out, record)
+		}
+	})
+
+	t.Run("a real home is silent", func(t *testing.T) {
+		logged := capturedLog(t)
+
+		newSessionTitleSync(t.TempDir(), t.TempDir())
+
+		if out := logged.String(); strings.Contains(out, record) {
+			t.Errorf("newSessionTitleSync with a real home logged %q, want silence: the image always sets HOME, so this record would fire on every ordinary boot", out)
+		}
+	})
+}
+
+// TestSessionTitleRunStopsWithItsContext pins Run's whole contract: it sweeps until
+// its context is cancelled and then RETURNS. main starts it as a goroutine for the
+// life of the process, so nothing else in this file reaches it -- every other test
+// drives pass() directly -- and both halves of the loop are invisible without it.
+// A poll interval that failed to be a positive duration takes the ticker
+// constructor down at the first sweep, which on a real boot is a panic in the
+// server's own goroutine.
+func TestSessionTitleRunStopsWithItsContext(t *testing.T) {
+	f := newTitleFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		f.sync.Run(ctx, &fakeSetter{})
+	}()
+	cancel()
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after its context was cancelled; the poller outlives the server it was started for, holding its ticker and re-reading the state dir for the life of the process")
 	}
 }

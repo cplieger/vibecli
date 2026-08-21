@@ -514,10 +514,25 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 	// yet acquired the slot returns at once). Joining on it is what orders the
 	// cleanup instead of leaving it to the scheduler. Cleanups run LIFO, so this one
 	// runs before the TempDir removal newNSEnv registered.
+	//
+	// The join needs a context of its OWN: t.Context() is cancelled just before the
+	// first cleanup runs, and the slot acquire is deliberately cancellable, so
+	// handing it t.Context() returns context.Canceled without waiting at all --
+	// a join that no-ops in precisely the case it exists for, the slot still held by
+	// the goroutine we are trying to order against. The check below is what keeps
+	// that regression from going quiet again: a cancelled join reports itself here
+	// instead of resurfacing as an unexplained RemoveAll failure under load.
 	t.Cleanup(func() {
 		rt.stop()
-		if rt.rescan != nil {
-			_, _ = rt.rescan(t.Context())
+		if rt.rescan == nil {
+			return
+		}
+		join, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		// The error itself is expected and ignored: the pinned version's settings
+		// assertions fail by construction, which is what this test is about.
+		if _, err := rt.rescan(join); errors.Is(err, context.Canceled) {
+			t.Errorf("the cleanup's join on the in-flight install returned %v instead of waiting for the install slot; t.TempDir's RemoveAll now races the install goroutine's unguarded tail", err)
 		}
 	})
 	if rt.ready == nil {

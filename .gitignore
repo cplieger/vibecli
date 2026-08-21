@@ -30,6 +30,10 @@ static/vendor/
 # Stryker mutation-testing artifacts (weekly-stryker.yaml / local npx stryker run)
 reports/
 .stryker-tmp/
+# `inPlace: true` runs Stryker in the real tree (see static-src/stryker.config.json),
+# where the vitest runner drops one setup file per worker into the package dir and
+# never removes them.
+static-src/stryker-setup-*.js
 
 # Playwright e2e failure artifacts (playwright.config.ts trace: retain-on-failure /
 # screenshot: only-on-failure write to the default outputDir). Traces record every

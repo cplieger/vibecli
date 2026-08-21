@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/cplieger/atomicfile/v3 v3.0.0
-	github.com/cplieger/envx/v2 v2.0.0
+	github.com/cplieger/envx/v2 v2.0.1
 	github.com/cplieger/pathinside/v2 v2.0.0
 	github.com/cplieger/pinstall/v3 v3.0.0
 	github.com/cplieger/runesafe/v2 v2.0.0

@@ -169,7 +169,7 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 # how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
 # fail-closing every image build on the gate below.
 # renovate: datasource=go depName=github.com/cplieger/toolbelt/v3
-ARG TOOLBELT_TOOLCATALOG_VERSION=v3.0.1
+ARG TOOLBELT_TOOLCATALOG_VERSION=v3.0.2
 # No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
 # already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
 # (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would

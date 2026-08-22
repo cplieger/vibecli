@@ -157,35 +157,32 @@ ARG TOOL_CATALOG_VERSION=v2026.07.24.1907
 # repin: dep=cplieger/tool-catalog url=https://github.com/cplieger/tool-catalog/releases/download/{version}/tool-catalog.json
 ARG TOOL_CATALOG_SHA256=651d11d218a313a029d7a7ad15eedccdaa1c2c7a48aad39661c33d0684b864cb # tool-catalog v2026.07.24.1907
 ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/${TOOL_CATALOG_VERSION}/tool-catalog.json
-# This is the SAME module go.mod requires (the runtime engine that re-verifies
-# required-tools.txt before every catalog swap), pinned a second time here to
-# select the build-time `toolcatalog verify` binary. The toolbelt-pin-gate in
-# the RUN below asserts the two pins are equal, so the build gate and the
-# runtime gate can never become different verifiers — same fail-loud treatment
-# the engine/UI/tsc pin pairs get against static-src/package.json.
-# The marker comment MUST stay immediately above the ARG line: the inherited
-# Dockerfile-ARG customManager matches `# renovate: ...` followed directly by
-# `ARG ...`, so prose wedged between them silently untracks the pin. That is
-# how this pin sat at v2.4.1 while the grouped Go PR moved go.mod to v2.4.2,
-# fail-closing every image build on the gate below.
-# renovate: datasource=go depName=github.com/cplieger/toolbelt/v3
-ARG TOOLBELT_TOOLCATALOG_VERSION=v3.0.3
-# No `hadolint ignore=DL3062` here: the rule wants `go run <pkg>@<version>` and this step
-# already pins via `@${TOOLBELT_TOOLCATALOG_VERSION}`, which hadolint reads as pinned
-# (verified against 2.15.1: the rule emits nothing on this line). Keeping the ignore would
-# only silence DL3062 if the `@${...}` suffix were ever dropped, which is the one case on
-# this instruction worth failing the build for -- same reasoning as the wirecheck step
-# below.
+# The build-time verifier is the SAME module go.mod requires (the runtime engine
+# that re-verifies required-tools.txt before every catalog swap), and that is now
+# structural rather than checked: a `tool` directive in go.mod names the binary,
+# so `go tool toolcatalog` can only ever be the version the engine links. This
+# replaced a second pin here plus a toolbelt-pin-gate that compared the two --
+# the gate that fail-closed every image build when this ARG sat at v2.4.1 while
+# the grouped Go PR moved go.mod to v2.4.2. One pin cannot disagree with itself.
+#
+# It also drops a build-time network dependency. `go run <pkg>@<version>` resolves
+# OUTSIDE the main module, so it re-fetched toolbelt and queried the module's
+# latest version to report a deprecation; a 404 on either is the documented
+# trigger to fall through to `direct`, direct means VCS, and this stage installs
+# no git -- so a proxy hiccup failed the build on `unable to resolve git version`
+# and said nothing about the catalog (measured on vibekit's main, 2026-08-22, at
+# this same step). Resolving through go.mod asks for neither query.
+#
+# Deliberately NOT `GOPROXY=off`, which vibekit's copy of this step does carry:
+# there `go mod download` writes into an image LAYER, while here it writes into a
+# cache MOUNT, and a mount is not restored when its RUN is a layer-cache hit. So
+# a cold module cache is legitimate at this point and must stay able to fetch.
+# Verified against a cold cache with no git on PATH: resolves via the proxy and
+# never shells out to git.
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    TOOLBELT_GOMOD=$(sed -n 's|^[[:space:]]*github.com/cplieger/toolbelt/v3 \(v[0-9][^[:space:]]*\).*|\1|p' go.mod | head -n1) && \
-    : "${TOOLBELT_GOMOD:?toolbelt-pin-gate: no github.com/cplieger/toolbelt/v3 require found in go.mod}" && \
-    if [ "$TOOLBELT_GOMOD" != "$TOOLBELT_TOOLCATALOG_VERSION" ]; then \
-      echo "ERROR toolbelt-pin-mismatch: go.mod requires github.com/cplieger/toolbelt/v3 ${TOOLBELT_GOMOD} but Dockerfile ARG TOOLBELT_TOOLCATALOG_VERSION=${TOOLBELT_TOOLCATALOG_VERSION}; the build-time catalog verifier must be the same version as the runtime engine that re-verifies before every swap" >&2; exit 1; \
-    fi && \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
     printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
-    go run "github.com/cplieger/toolbelt/v3/cmd/toolcatalog@${TOOLBELT_TOOLCATALOG_VERSION}" \
-      verify -catalog /tmp/tool-catalog.json -require required-tools.txt
+    go tool toolcatalog verify -catalog /tmp/tool-catalog.json -require required-tools.txt
 
 # Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
 #

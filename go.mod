@@ -15,6 +15,7 @@ require (
 )
 
 require (
+	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/cplieger/httpx/v5 v5.0.1 // indirect
 	github.com/cplieger/keyenc v1.0.6 // indirect
@@ -23,6 +24,9 @@ require (
 	github.com/creack/pty v1.1.24 // indirect
 	github.com/expr-lang/expr v1.17.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )
+
+tool github.com/cplieger/toolbelt/v3/cmd/toolcatalog

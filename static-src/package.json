@@ -24,7 +24,7 @@
     "@typescript/native": "npm:typescript@7.0.2",
     "@vitest/coverage-v8": "4.1.11",
     "eslint": "10.8.1",
-    "happy-dom": "20.11.2",
+    "happy-dom": "20.11.4",
     "html-validate": "11.8.0",
     "knip": "6.32.2",
     "postcss-html": "2.0.0",

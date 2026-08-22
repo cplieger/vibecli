@@ -10,14 +10,14 @@ require (
 	github.com/cplieger/runesafe/v2 v2.0.0
 	github.com/cplieger/slogx v1.6.3
 	github.com/cplieger/toolbelt/v3 v3.0.3
-	github.com/cplieger/web-terminal-engine/v5 v5.0.6
+	github.com/cplieger/web-terminal-engine/v5 v5.0.7
 	github.com/cplieger/webhttp/v2 v2.0.1
 )
 
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
-	github.com/cplieger/httpx/v5 v5.0.1 // indirect
+	github.com/cplieger/httpx/v5 v5.0.2 // indirect
 	github.com/cplieger/keyenc v1.0.6 // indirect
 	github.com/cplieger/scheduler/v4 v4.0.0 // indirect
 	github.com/cplieger/ssrf/v4 v4.1.0 // indirect

@@ -1,7 +1,12 @@
-// @vitest-environment happy-dom
-import { readdirSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
-import ts from "typescript";
+// The DOM half of this app's suite: it runs in the browser project, i.e. real
+// headless Chromium, and it carries no per-file environment pragma because
+// Browser Mode is a runner rather than an environment.
+//
+// Every static asset this file needs arrives as a `?raw` import, resolved by Vite
+// at transform time, so the assertions read the SHIPPED bytes without a
+// filesystem call. The four checks that genuinely need the filesystem — a
+// recursive walk of two dependency src trees, a served-directory listing, a
+// runtime-derived file list and PNG header bytes — live in app.node.test.ts.
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 // The real constant from the real package -- NOT mocked below. The point is to
 // compare the served HTML against what the library actually ships.
@@ -17,6 +22,21 @@ import {
   LOADING_OVERLAY_CLASSES,
   PUBLIC_THEME_TOKENS,
 } from "@cplieger/web-terminal-ui/style-contract";
+// The SERVED static assets, as text, next to static-src. Vite inlines each one at
+// transform time, which is strictly stronger than the readFileSync these replaced:
+// a renamed or deleted asset now fails to RESOLVE instead of throwing at runtime.
+import indexHtml from "../static/index.html?raw";
+import manifestJson from "../static/manifest.json?raw";
+import faviconAlertSvg from "../static/favicon-alert.svg?raw";
+import faviconDoneSvg from "../static/favicon-done.svg?raw";
+import faviconInputSvg from "../static/favicon-input.svg?raw";
+// Two files from the UI package that its `exports` map does not publish, read as
+// source text for the two parity assertions below (the overlay accent token
+// page.css must still read, and the class name the kernel adds on its first
+// frame). Relative paths into node_modules because a non-exported subpath cannot
+// be imported by package name.
+import kernelSource from "./node_modules/@cplieger/web-terminal-ui/src/kernel/kernel.ts?raw";
+import pageCss from "./node_modules/@cplieger/web-terminal-ui/css/page.css?raw";
 
 // app.ts imports createTerminal from the UI package and presetAgentTabbed from
 // its /presets subpath; mock both. presetAgentTabbed returns a sentinel the
@@ -95,65 +115,6 @@ function hslToHex(hsl: string): string {
   return `#${to(r1)}${to(g1)}${to(b1)}`;
 }
 
-// The single fixture-location policy for every file this suite reads. INIT_CWD is
-// set by the npm/npx launcher to the real static-src directory, so fixtures are
-// found even when the runner changes process.cwd() — Stryker's dry run executes
-// inside its .stryker-tmp sandbox, where a cwd-relative read ENOENTs.
-function fixtureRoot(): string {
-  return process.env["INIT_CWD"] ?? process.cwd();
-}
-
-// Read one of the SERVED static assets next to static-src.
-function readStaticAsset(name: string): string {
-  return readFileSync(resolve(fixtureRoot(), `../static/${name}`), "utf8");
-}
-
-// Every module specifier the BROWSER resolves at load time, read from the
-// TypeScript AST rather than matched by regex. app.ts ships as a plain tsc emit,
-// so every static import survives verbatim -- including forms a clause-shaped
-// pattern silently drops, such as the legal quoted import name
-// `import { "x" as x } from "@scope/pkg"`, whose specifier a regex that stops at
-// the first quote never sees. An extractor that returns nothing for a real import
-// leaves its caller asserting over an empty list and passing forever, so the
-// parser that emits the code is the only extractor that cannot fall behind it.
-// `import type` is excluded because tsc erases it, so it never reaches module
-// resolution; side-effect imports, dynamic `import()` string literals and
-// `export ... from "<specifier>"` re-exports are included because the browser
-// resolves all three.
-function browserResolvedSpecifiers(source: string): string[] {
-  const parsed = ts.createSourceFile("app.ts", source, ts.ScriptTarget.ESNext, true);
-  const specifiers: string[] = [];
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node)) {
-      if (node.importClause?.isTypeOnly !== true && ts.isStringLiteralLike(node.moduleSpecifier)) {
-        specifiers.push(node.moduleSpecifier.text);
-      }
-    } else if (ts.isExportDeclaration(node)) {
-      // `export ... from "<specifier>"` is resolved by the browser exactly like an
-      // import. app.ts has none, but the vendored-graph test below points this
-      // extractor at barrel-heavy library src trees where the form is idiomatic,
-      // and a re-exported bare specifier missing from the importmap breaks the
-      // whole module graph. `export type ... from` is erased by tsc, so it is
-      // excluded the same way `import type` is.
-      if (
-        node.isTypeOnly !== true &&
-        node.moduleSpecifier !== undefined &&
-        ts.isStringLiteralLike(node.moduleSpecifier)
-      ) {
-        specifiers.push(node.moduleSpecifier.text);
-      }
-    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-      const first = node.arguments[0];
-      if (first !== undefined && ts.isStringLiteralLike(first)) {
-        specifiers.push(first.text);
-      }
-    }
-    ts.forEachChild(node, visit);
-  };
-  ts.forEachChild(parsed, visit);
-  return specifiers;
-}
-
 // The fatal-overlay alertdialog contract of the inline pre-module bootstrap
 // watchdog (static/index.html). It is the LAST hand-built fatal surface in this
 // app: app.ts's own copy is gone (createTerminal owns every terminal startup
@@ -206,8 +167,9 @@ function expectFatalOverlayShape(overlay: HTMLElement, root: HTMLElement): void 
   // Tab-to-address-bar, which F6/Ctrl+L reach anyway, and the library's own fatal
   // panel ships without one. Asserted from BOTH the button and <body>: the trap this
   // replaces was document-scoped with nothing removing it, so a reintroduced one
-  // would leak across this suite (isolate is false) and swallow Tab for every later
-  // test. Either dispatch coming back cancelled means the trap is back.
+  // would leak across this file (every test in a file shares one window) and swallow
+  // Tab for every later test. Either dispatch coming back cancelled means the trap
+  // is back.
   for (const target of [reload, document.body]) {
     const tab = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
     expect(target?.dispatchEvent(tab)).toBe(true);
@@ -228,20 +190,17 @@ function expectPristineOverlayUntouched(overlay: HTMLElement, root: HTMLElement)
   expect(root.hasAttribute("inert")).toBe(false);
 }
 
-// Locate the real inline bootstrap watchdog in static/index.html: the only
+// Locate the real inline bootstrap watchdog in the served index.html: the only
 // inline <script> that is neither the importmap nor the src-bearing module
-// loader. readStaticAsset supplies the shared INIT_CWD fixture-location policy,
-// so watchdog discovery cannot drift from the suite's other static reads. Every
-// watchdog test obtains the source through this single helper so fixture
+// loader. Every watchdog test obtains the source through this single helper so
 // discovery cannot drift per test.
 function readWatchdogSource(): string {
-  const html = readStaticAsset("index.html");
   // The end-tag half is `<\/script\b[^>]*>`, not `<\/script\s*>`: an HTML parser
   // ends a script element at `</script foo>` and `</script\t\n bar>` too, so a
   // pattern that only tolerates whitespace before `>` reads past a real end tag
   // and swallows the rest of the document into match[2]. The `\b` keeps
   // `</scriptfoo>` out, which is not an end tag for this element.
-  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\b[^>]*>/gi)].filter(
+  const scripts = [...indexHtml.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\b[^>]*>/gi)].filter(
     (match) => !/src\s*=/i.test(match[1] ?? "") && !/importmap/i.test(match[1] ?? ""),
   );
   expect(scripts).toHaveLength(1);
@@ -250,13 +209,47 @@ function readWatchdogSource(): string {
   return source;
 }
 
+// A stand-in for `window` whose location.reload() can be observed.
+//
+// In a real browser `window.location` is [LegacyUnforgeable]: `reload` is a
+// non-configurable, non-writable OWN property of the Location instance (there is
+// no Location.prototype.reload to patch either), so neither vi.spyOn nor
+// Object.defineProperty can reach it -- `Cannot redefine property: reload`. The
+// DOM emulator this suite used to run under let the spy through; a browser does
+// not. Shadowing the `window` IDENTIFIER for one evaluation keeps the assertion
+// exactly as strong -- a real click on the real button runs the real handler, and
+// the call is observed -- without pretending a platform object is patchable.
+//
+// Every other property is forwarded to the real window, with functions bound to
+// it: a Web API method called with the proxy as its receiver is an illegal
+// invocation, and the watchdog reads window.addEventListener and
+// window.matchMedia through this same object.
+function windowWithObservableReload(reload: () => void): Window {
+  const location = { reload };
+  const shadow = new Proxy(window, {
+    get(target, property): unknown {
+      if (property === "location") {
+        return location;
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function"
+        ? (value as (...args: never[]) => unknown).bind(target)
+        : value;
+    },
+  });
+  return shadow;
+}
+
 // Evaluate the inline bootstrap watchdog, capturing the window listener(s) it
-// registers and removing them when the calling test finishes: isolate is
-// false, so window is shared across this file's tests, and a leaked
-// capture-phase error listener would clobber a pristine #loading overlay in
-// any later test that fires a window error event. Every watchdog test MUST
-// evaluate the script through this helper, never via a bare new Function().
-function evaluateWatchdog(source: string): void {
+// registers and removing them when the calling test finishes: every test in this
+// file shares one window, and a leaked capture-phase error listener would clobber
+// a pristine #loading overlay in any later test that fires a window error event.
+// Every watchdog test MUST evaluate the script through this helper, never via a
+// bare new Function().
+//
+// `reload` is passed only by the test that clicks the dialog's Reload button; see
+// windowWithObservableReload above for why that needs its own evaluation shape.
+function evaluateWatchdog(source: string, { reload }: { reload?: () => void } = {}): void {
   const registered: Parameters<typeof window.addEventListener>[] = [];
   const originalAddEventListener = window.addEventListener.bind(window);
   const addSpy = vi.spyOn(window, "addEventListener").mockImplementation((...args) => {
@@ -269,7 +262,11 @@ function evaluateWatchdog(source: string): void {
     }
   });
   try {
-    new Function(source)();
+    if (reload === undefined) {
+      new Function(source)();
+    } else {
+      new Function("window", source)(windowWithObservableReload(reload));
+    }
   } finally {
     addSpy.mockRestore();
   }
@@ -317,10 +314,12 @@ function appendPristineOverlay({ fade = false } = {}): HTMLElement {
 // A <link rel="stylesheet"> in <head>: the fixture index.html's
 // post-registration sweep reads. In <head> because that is where index.html
 // declares it -- and beforeEach only clears <body>, so the link MUST be removed
-// when the test finishes: isolate is false, so a leaked link is swept by every
-// later watchdog test in this file. Never given an href, so happy-dom cannot
-// attempt a real fetch. loaded: the stylesheet parsed (a defined .sheet, the
-// healthy state a browser exposes); media/disabled: the sweep's two gates.
+// when the test finishes: every test in this file shares one document, so a
+// leaked link is swept by every later watchdog test in this file. Never given an
+// href, so the browser has nothing to fetch and .sheet stays null -- exactly the
+// failed state the sweep keys on, reached without a network round trip.
+// loaded: the stylesheet parsed (a defined .sheet, the healthy state a browser
+// exposes); media/disabled: the sweep's two gates.
 function appendHeadStylesheet({
   media,
   disabled = false,
@@ -336,8 +335,10 @@ function appendHeadStylesheet({
   }
   document.head.appendChild(link);
   if (loaded) {
-    // happy-dom never loads a link it was given no resolvable href for, so set
-    // .sheet directly -- the same surface a browser exposes once it parses.
+    // Install a real CSSStyleSheet as an OWN property, shadowing the prototype
+    // accessor: the surface a browser exposes once it has parsed a stylesheet,
+    // and the only way to reach it here, since the fixture deliberately has no
+    // href to load.
     Object.defineProperty(link, "sheet", { value: new CSSStyleSheet(), configurable: true });
   }
   onTestFinished(() => {
@@ -361,13 +362,13 @@ function dispatchWindowError({ target, error }: { target?: unknown; error?: unkn
   window.dispatchEvent(event);
 }
 
-// Parse the SERVED index.html into a detached Document under this suite's single
-// fixture-read policy: the external stylesheet <link> is stripped first, because
-// happy-dom fetches a parsed document's stylesheet hrefs and would turn an
-// assertion over static markup into a real HTTP request.
+// Parse the SERVED index.html into a detached Document. A DOMParser document has
+// no browsing context, so nothing in it is fetched: the markup is inspected as
+// markup. (The <link rel="stylesheet"> used to be stripped here, because the DOM
+// emulator this suite ran under really did fetch a parsed document's stylesheet
+// hrefs; a browser does not, so the strip is gone with it.)
 function parseServedDocument(): Document {
-  const html = readStaticAsset("index.html").replace(/<link\b[^>]*rel=["']?stylesheet[^>]*>/gi, "");
-  return new DOMParser().parseFromString(html, "text/html");
+  return new DOMParser().parseFromString(indexHtml, "text/html");
 }
 
 // index.html's REAL body, scripts removed, mounted into the live document. The
@@ -375,9 +376,7 @@ function parseServedDocument(): Document {
 // a hand-built subset of it: a link, a button or a tabindex ADDED to that file
 // is precisely what it exists to catch, and a fabricated fixture can never grow
 // one. Scripts are stripped because the watchdog is evaluated deliberately
-// through evaluateWatchdog() and /app.js must not load in a unit test. The
-// stylesheet <link> is already gone: the document comes from
-// parseServedDocument(), which owns that policy for the whole suite.
+// through evaluateWatchdog() and /app.js must not load in a unit test.
 function mountServedBody(): void {
   const doc = parseServedDocument();
   for (const script of doc.querySelectorAll("script")) {
@@ -406,11 +405,11 @@ const FOCUSABLE_CANDIDATE_SELECTOR = [
 const TABBABLE_BY_DEFAULT = "a[href],button,input,select,textarea";
 
 // Whether Tab can actually land on a candidate. Computed explicitly here, and
-// that is not an oversight: happy-dom implements no sequential focus navigation
-// at all, and it models `inert` in exactly one place -- HTMLElementUtility.focus()
-// walks ancestors and refuses to focus into an inert tree -- which is a private
-// symbol-keyed path with no public "is this reachable" API and no bearing on a
-// static query. So the reachability rules live here, in the test's own helper.
+// that is not an oversight: no platform API answers it. Chromium implements
+// sequential focus navigation for real, but exposes no way to READ the resulting
+// order, and `inert` reachability is likewise only observable by trying to focus
+// into the tree. A static query cannot ask either question, so the reachability
+// rules live here, in the test's own helper.
 function isTabReachable(el: HTMLElement): boolean {
   // Script-focusable only; never in the tab order.
   if (el.getAttribute("tabindex") === "-1") {
@@ -477,19 +476,47 @@ function describeReachable(el: HTMLElement): string {
   return `${self} in ${host === null || host === undefined ? "<body>" : `#${host.id}`}`;
 }
 
+// Import app.ts and RUN its top-level bootstrap, once per call.
+//
+// The specifier carries a unique query, and that is load-bearing. Browser Mode
+// executes a dynamic import through the browser's own module map, which is keyed
+// by URL and holds evaluated modules for the life of the page: `vi.resetModules()`
+// clears the runner's registry but cannot evict an entry from that map, so a bare
+// `import("./app.js")` returns the instance a previous test already evaluated and
+// every assertion about the boot silently observes zero calls. A distinct query is
+// a distinct URL and therefore a fresh evaluation. `@vite-ignore` opts out of
+// Vite's variable-dynamic-import rewrite, which otherwise resolves the specifier
+// against a generated glob map that no query matches.
+//
+// The `.ts` extension is load-bearing too, and this is the one line here that
+// looks like a typo and is not. A statically-analyzable `import("./app.js")` is
+// rewritten to the resolved `app.ts` id at transform time, but this specifier is
+// built at runtime, so the URL the browser requests is the one written here --
+// and that URL is what v8 coverage reports. Written as `./app.js` every
+// evaluation is attributed to a file that does not exist, all nine of them are
+// discarded, and app.ts reports 0% while the suite stays green.
+//
+// The mocked dependencies are unaffected: they resolve through the mock registry
+// whatever query the importer carries, which is what the call-count assertions
+// below rely on.
+let bootCount = 0;
+function importApp(): Promise<unknown> {
+  return import(/* @vite-ignore */ `./app.ts?boot=${++bootCount}`);
+}
+
 describe("web-terminal-kiro bootstrap (app.ts)", () => {
   beforeEach(() => {
-    // resetModules so each dynamic import re-runs app.ts top-level code. Mock
-    // call history is cleared by the config's mockReset before each test
-    // (implementations given to vi.fn persist through mockReset).
-    vi.resetModules();
+    // Each test re-runs app.ts's top-level code through importApp(), whose unique
+    // query is what makes the re-evaluation happen (see there). Mock call history
+    // is cleared by the config's mockReset before each test (implementations given
+    // to vi.fn persist through mockReset).
     document.body.replaceChildren();
   });
 
   it("mounts by SELECTOR and passes the preset as a function, not a call", async () => {
     const root = appendTerminalRoot();
 
-    await import("./app.js");
+    await importApp();
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     // Both halves of this assertion are the reason this app no longer carries a
@@ -532,7 +559,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // is invisible until the origin quota fills.
     appendTerminalRoot();
 
-    await import("./app.js");
+    await importApp();
 
     expect(localScrollbackStorageMock).toHaveBeenCalledTimes(1);
     expect(localScrollbackStorageMock).toHaveBeenCalledWith();
@@ -544,7 +571,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     loading.id = "loading";
     document.body.appendChild(loading);
 
-    await import("./app.js");
+    await importApp();
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", {
@@ -561,7 +588,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // over unconditionally: an unresolvable one is a kernel-init failure that
     // lowers the overlay and renders the library's panel. The app's job is to
     // NOT get in the way of that.
-    await import("./app.js");
+    await importApp();
 
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(createTerminalMock).toHaveBeenCalledWith("#terminal", expect.anything());
@@ -580,7 +607,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     watchdogMessage.textContent = "Watchdog failure";
     overlay.replaceChildren(watchdogMessage);
 
-    await expect(import("./app.js")).rejects.toThrow(
+    await expect(importApp()).rejects.toThrow(
       "bootstrap watchdog already reported a fatal resource failure",
     );
 
@@ -599,7 +626,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
       throw new Error("kernel boom");
     });
 
-    await expect(import("./app.js")).rejects.toThrow("kernel boom");
+    await expect(importApp()).rejects.toThrow("kernel boom");
 
     // The app must NOT build a second dialog. Two recovery surfaces at once (the
     // kernel's and the app's) is the regression this pins, and deleting the
@@ -618,7 +645,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
       throw new Error("kernel boom no overlay");
     });
 
-    await expect(import("./app.js")).rejects.toThrow("kernel boom no overlay");
+    await expect(importApp()).rejects.toThrow("kernel boom no overlay");
     expect(createTerminalMock).toHaveBeenCalledTimes(1);
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
@@ -648,7 +675,12 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // test pins the load-bearing `, true` capture flag in index.html: with it
     // removed (bubble phase), the event never reaches the watchdog and this
     // test fails.
-    evaluateWatchdog(watchdogSource);
+    //
+    // `reload` is handed in here rather than spied on later because the Reload
+    // button's handler closes over the `window` of its evaluation; see
+    // windowWithObservableReload.
+    const reload = vi.fn();
+    evaluateWatchdog(watchdogSource, { reload });
     const scriptEl = document.createElement("script");
     document.body.appendChild(scriptEl);
     scriptEl.dispatchEvent(new Event("error"));
@@ -668,9 +700,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // the library's own fatal-panel tests pin for its Reload button. A
     // dead click listener would leave a dead-end recovery CTA on the only
     // actionable element left.
-    const reloadSpy = vi.spyOn(window.location, "reload").mockImplementation(() => undefined);
     overlay.querySelector("button")?.click();
-    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(reload).toHaveBeenCalledTimes(1);
   });
 
   // GUARDS A DELIBERATE DECISION -- read this before "fixing" a failure here.
@@ -881,7 +912,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     linkEl.href = "/style.css";
     dispatchWindowError({ target: linkEl });
 
-    await expect(import("./app.js")).rejects.toThrow(
+    await expect(importApp()).rejects.toThrow(
       "bootstrap watchdog already reported a fatal resource failure",
     );
 
@@ -902,7 +933,7 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     const overlay = appendPristineOverlay();
     overlay.setAttribute("data-bootstrap-fatal", "");
 
-    await expect(import("./app.js")).rejects.toThrow(
+    await expect(importApp()).rejects.toThrow(
       "bootstrap watchdog already reported a fatal resource failure",
     );
 
@@ -937,9 +968,10 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // healthy boot and a fatal dialog on EVERY page load: index.html's own
     // <link rel="stylesheet" href="/style.css"> is present on every load, so
     // dropping the `!link.sheet` clause converts a working terminal into
-    // "Terminal failed to start" for every user. happy-dom never loads a link
-    // it was given no resolvable href for, so .sheet is defined directly --
-    // the same surface a browser exposes once the stylesheet parses.
+    // "Terminal failed to start" for every user. The fixture link carries no
+    // href, so nothing is fetched and .sheet stays null; appendHeadStylesheet's
+    // `loaded` flag installs a real CSSStyleSheet instead -- the same surface a
+    // browser exposes once the stylesheet parses.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
     appendHeadStylesheet({ loaded: true });
@@ -952,9 +984,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("watchdog sweep ignores a disabled stylesheet", () => {
     // A disabled stylesheet is not applied, so a null .sheet is its normal
     // state rather than a load failure: index.html's sweep gates the
-    // re-dispatch on !link.disabled. happy-dom does not reflect the disabled
-    // content attribute onto the IDL property, so set the property directly --
-    // the same surface a browser exposes and scripts toggle.
+    // re-dispatch on !link.disabled. Set through the IDL property, which is the
+    // one the sweep reads and the one a script toggles.
     const root = appendTerminalRoot();
     const overlay = appendPristineOverlay();
     appendHeadStylesheet({ disabled: true });
@@ -1040,7 +1071,6 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
   it("declares one brand accent across app.ts, index.html and manifest.json", () => {
     expect(hslToHex(ACCENT_HSL)).toBe(ACCENT_HEX);
     expect(THEME["--accent"]).toBe(ACCENT_HSL);
-    const html = readStaticAsset("index.html");
     // The two declaration sites, asserted individually and bounded to their own
     // rule: a match COUNT cannot distinguish a declaration from the file's own
     // doc comment (which spells the same literal), so a single-site drift would
@@ -1051,66 +1081,22 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // overlay token now (page.css owns the overlay's appearance and derives the
     // bar and status text from it) rather than a local --accent, so this is the
     // one place the brand reaches the loading screen.
-    expect(html).toMatch(
+    expect(indexHtml).toMatch(
       new RegExp(`#loading\\s*\\{[^}]*--wt-loading-accent:\\s*${escapedAccent}\\s*;`),
     );
     // the no-JS fallback message:
-    expect(html).toMatch(
+    expect(indexHtml).toMatch(
       new RegExp(`\\.noscript-fallback\\s*\\{[^}]*color:\\s*${escapedAccent}\\s*;`),
     );
     // installed-PWA chrome: meta and manifest must agree, in hex form
-    expect(html).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
-    const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
+    expect(indexHtml).toContain(`<meta name="theme-color" content="${ACCENT_HEX}">`);
+    const manifest: unknown = JSON.parse(manifestJson);
     expect((manifest as { theme_color: string }).theme_color).toBe(ACCENT_HEX);
     // ...and the token name itself is the library's, not ours: the assertions
     // above only compare this app's four sites to each other, so a rename of
     // --wt-loading-accent in page.css would leave the first screen of every load
     // in the library's default blue with every one of them still green.
-    const pageCss = readFileSync(
-      resolve(fixtureRoot(), "node_modules/@cplieger/web-terminal-ui/css/page.css"),
-      "utf8",
-    );
     expect(pageCss).toContain("var(--wt-loading-accent)");
-  });
-
-  it("serves every icon index.html and manifest.json reference, at the declared size", () => {
-    // Nothing else checks these. The icons are referenced by NAME from two static
-    // files no compiler reads, the watchdog deliberately ignores a failed icon link
-    // (icon 404s must never raise the fatal dialog), and routes_test.go serves
-    // fstest fixtures rather than the real tree -- so a renamed or regenerated
-    // asset ships as a 404 favicon and an uninstallable PWA (a manifest icon that
-    // does not fetch invalidates the install prompt) with nothing failing.
-    // Only COMMITTED assets are checked: /style.css and /app.js are gitignored
-    // build outputs, absent from a fresh checkout.
-    const doc = parseServedDocument();
-    const linked = [
-      ...doc.querySelectorAll('link[rel~="icon"], link[rel~="apple-touch-icon"]'),
-    ].map((link) => ({
-      src: link.getAttribute("href") ?? "",
-      sizes: link.getAttribute("sizes"),
-    }));
-    const manifest: unknown = JSON.parse(readStaticAsset("manifest.json"));
-    const icons = (manifest as { icons: { src: string; sizes: string }[] }).icons;
-    // Neither list may be empty, or every assertion below is vacuous. Counts are
-    // deliberately not pinned: adding or dropping an icon is a legitimate edit.
-    expect(linked.length).toBeGreaterThan(0);
-    expect(icons.length).toBeGreaterThan(0);
-
-    for (const { src, sizes } of [...linked, ...icons]) {
-      const path = resolve(fixtureRoot(), `../static/${src.replace(/^\//, "")}`);
-      expect(
-        () => readFileSync(path),
-        `${src} is referenced but not present in static/`,
-      ).not.toThrow();
-      if (sizes === null || !src.endsWith(".png")) {
-        continue;
-      }
-      // The PNG IHDR width/height, so a regenerated asset cannot keep a stale
-      // declared size: an icon whose real pixels disagree with its `sizes` is
-      // rejected by some install prompts and rasterised wrong by others.
-      const header = readFileSync(path);
-      expect(`${header.readUInt32BE(16)}x${header.readUInt32BE(20)}`, `${src} pixels`).toBe(sizes);
-    }
   });
 
   it("keeps the served no-JS fallback wired to the class its critical CSS styles", () => {
@@ -1177,109 +1163,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // name is read from the library's own source here. If the kernel renames it, the
     // stand-down silently stops firing and a stray uncaught error converts an
     // already-lowered overlay into a dialog the kernel then removes.
-    const kernel = readFileSync(
-      resolve(fixtureRoot(), "node_modules/@cplieger/web-terminal-ui/src/kernel/kernel.ts"),
-      "utf8",
-    );
-    expect(kernel).toContain('classList.add("fade")');
+    expect(kernelSource).toContain('classList.add("fade")');
     expect(readWatchdogSource()).toContain('classList.contains("fade")');
-  });
-
-  it("declares an importmap entry for every bare specifier app.ts imports", () => {
-    // app.ts ships as a plain tsc emit -- no bundler rewrites its bare
-    // specifiers -- so the browser resolves every one of them through
-    // index.html's inline importmap alone. This suite mocks both packages and
-    // the image build only checks three hardcoded emit paths, so importing a
-    // subpath the importmap does not name compiles, ships, and then fails at
-    // module load for every visitor (the watchdog's own fatal dialog) with
-    // every test above still green.
-    const source = readFileSync(resolve(fixtureRoot(), "app.ts"), "utf8");
-    const specifiers = browserResolvedSpecifiers(source).filter(
-      (specifier) => !specifier.startsWith(".") && !specifier.startsWith("/"),
-    );
-    // Guard the extractor itself: an extractor that silently matched nothing
-    // would leave the loop below asserting over an empty list and passing forever.
-    expect(specifiers).toContain("@cplieger/web-terminal-ui");
-    expect(specifiers).toContain("@cplieger/web-terminal-ui/presets");
-    // ...and pin its reach against a fixture of every form tsc emits unchanged,
-    // so no supported import syntax can fall out of the extractor unnoticed. The
-    // quoted import name is the one a clause-shaped regex dropped; the type-only
-    // import is absent because tsc erases it, and the relative specifier is kept
-    // here (the bare-specifier filter above is the caller's, not the extractor's).
-    expect(
-      browserResolvedSpecifiers(
-        [
-          `import { "x" as x } from "@scope/quoted-name";`,
-          `import "@scope/side-effect";`,
-          `import def, { named } from "@scope/clause";`,
-          `import type { T } from "@scope/erased";`,
-          `void import("@scope/dynamic");`,
-          `import { local } from "./local.js";`,
-        ].join("\n"),
-      ),
-    ).toEqual([
-      "@scope/quoted-name",
-      "@scope/side-effect",
-      "@scope/clause",
-      "@scope/dynamic",
-      "./local.js",
-    ]);
-
-    const html = readStaticAsset("index.html");
-    const map = /<script\b[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script\s*>/i.exec(html);
-    const parsed: unknown = JSON.parse(map?.[1] ?? "null");
-    const keys = Object.keys((parsed as { imports?: Record<string, string> })?.imports ?? {});
-    for (const specifier of specifiers) {
-      // The browser's own resolution rule: an exact key, or a trailing-slash
-      // prefix key the specifier starts with -- so switching the map to prefix
-      // form stays green.
-      expect(
-        keys.some((key) => key === specifier || (key.endsWith("/") && specifier.startsWith(key))),
-        `no importmap entry in static/index.html resolves ${specifier}`,
-      ).toBe(true);
-    }
-  });
-
-  it("declares an importmap entry for every bare specifier the vendored graph imports", () => {
-    // The test above covers app.ts's OWN two specifiers. The browser also resolves
-    // the specifiers the VENDORED packages import: the Dockerfile compiles
-    // web-terminal-ui's and web-terminal-engine's TypeScript into static/vendor/
-    // with bare specifiers preserved (only relative "./*.js" paths resolve inside
-    // the vendored dirs). @cplieger/web-terminal-engine is imported by the UI's
-    // kernel/viewport/tabs modules and NEVER by app.ts, so deleting that importmap
-    // entry puts every visitor on the watchdog's fatal dialog while the
-    // app.ts-only check above stays green.
-    const specifiers = new Set<string>();
-    for (const pkg of ["@cplieger/web-terminal-ui", "@cplieger/web-terminal-engine"]) {
-      const src = resolve(fixtureRoot(), `node_modules/${pkg}/src`);
-      for (const entry of readdirSync(src, { recursive: true, encoding: "utf8" })) {
-        if (!entry.endsWith(".ts")) {
-          continue;
-        }
-        for (const specifier of browserResolvedSpecifiers(
-          readFileSync(resolve(src, entry), "utf8"),
-        )) {
-          if (!specifier.startsWith(".") && !specifier.startsWith("/")) {
-            specifiers.add(specifier);
-          }
-        }
-      }
-    }
-    // Guard the walk: the UI package imports the engine by bare specifier in
-    // several modules, so an engine-less set means the walk found nothing and the
-    // loop below would pass forever.
-    expect([...specifiers]).toContain("@cplieger/web-terminal-engine");
-
-    const html = readStaticAsset("index.html");
-    const map = /<script\b[^>]*type=["']importmap["'][^>]*>([\s\S]*?)<\/script\s*>/i.exec(html);
-    const parsed: unknown = JSON.parse(map?.[1] ?? "null");
-    const keys = Object.keys((parsed as { imports?: Record<string, string> })?.imports ?? {});
-    for (const specifier of specifiers) {
-      expect(
-        keys.some((key) => key === specifier || (key.endsWith("/") && specifier.startsWith(key))),
-        `no importmap entry in static/index.html resolves ${specifier}, which the vendored library graph imports`,
-      ).toBe(true);
-    }
   });
 
   it("overrides only theme tokens the UI package publicly supports", () => {
@@ -1360,9 +1245,8 @@ describe("web-terminal-kiro bootstrap (app.ts)", () => {
     // "index.html's pristine overlay satisfies the watchdog's stand-down guards"
     // test pins the same element's ARIA half.
     // mountServedBody() rather than a fresh DOMParser call: it applies the
-    // suite's shared policy for reading the served markup (stylesheet link and
-    // scripts stripped, because happy-dom fetches a parsed document's stylesheet
-    // hrefs and /app.js must not load in a unit test).
+    // suite's shared policy for reading the served markup (scripts stripped,
+    // because /app.js must not load in a unit test).
     mountServedBody();
     const overlay = document.getElementById("loading");
     expect(overlay).not.toBeNull();
@@ -1382,36 +1266,9 @@ describe("the attention icon variants app.ts opts into are actually served", () 
   // the consequence of breaking the promise is a BLANK tab icon, and this test is
   // the only thing standing between a renamed icon and that.
   //
-  // The variant names are derived here the same way the library derives them
-  // (insert -<variant> after the `favicon` token, keep the extension), rather than
-  // listed literally, so a test that passes cannot be reading a stale list.
-  const VARIANTS = ["input", "done", "alert"] as const;
-
-  function variantOf(href: string, variant: string): string {
-    return href.replace(/(^|\/)favicon(?=[-.])/, `$1favicon-${variant}`);
-  }
-
-  it("serves every variant of every icon link declared in index.html", () => {
-    const html = readStaticAsset("index.html");
-    const hrefs = [...html.matchAll(/<link\s+rel="icon"[^>]*href="([^"]+)"/g)].map((m) => m[1]!);
-    // Guard the guard: a regex that matched nothing would make this test vacuous
-    // and it would pass on a page with no icons at all.
-    expect(hrefs.length).toBeGreaterThanOrEqual(3);
-
-    const served = new Set(readdirSync(resolve(fixtureRoot(), "../static")));
-    for (const href of hrefs) {
-      const base = href.replace(/^\//, "");
-      expect(served, `base icon ${base}`).toContain(base);
-      for (const variant of VARIANTS) {
-        const name = variantOf(base, variant);
-        // A variant that equals its base means the rename convention did not
-        // apply, so the library would leave that link alone and the dot would
-        // silently never appear on it.
-        expect(name, `${base} -> ${variant}`).not.toBe(base);
-        expect(served, `variant ${name}`).toContain(name);
-      }
-    }
-  });
+  // This half pins the dot's COLOUR. Its sibling in app.node.test.ts pins that
+  // every derived variant file is actually served, which is a directory listing
+  // and therefore cannot run here.
 
   it("paints each variant's dot in this app's own themed colour", () => {
     // The SVG variants carry the colour as a literal, because a static asset
@@ -1425,8 +1282,13 @@ describe("the attention icon variants app.ts opts into are actually served", () 
       done: "#67d283",
       alert: THEME["--status-failed"],
     };
+    const svgOf: Record<string, string> = {
+      input: faviconInputSvg,
+      done: faviconDoneSvg,
+      alert: faviconAlertSvg,
+    };
     for (const [variant, colour] of Object.entries(expected)) {
-      const svg = readStaticAsset(`favicon-${variant}.svg`);
+      const svg = svgOf[variant] as string;
       expect(svg, variant).toContain(`fill="${colour}"`);
       // One dot, added on top of the base art rather than replacing it.
       expect(svg.match(/<circle /g), variant).toHaveLength(1);

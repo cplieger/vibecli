@@ -203,15 +203,37 @@ Frontend (from `static-src/`):
 
 ```sh
 npm run typecheck       # tsc -project tsconfig.json
-npm run test            # vitest --run (node + happy-dom; *.test.ts)
+npm run test            # vitest --run (headless Chromium + node; *.test.ts)
 npm run lint:eslint     # eslint .
 npm run lint:prettier   # prettier --check .
 npm run lint:knip       # unused-export / dependency check
 ```
 
-Vitest defaults to the `node` environment; add `// @vitest-environment
-happy-dom` at the top of a test file that needs `window`/`document`. Tests must
-assert at least once (`expect.requireAssertions`) and `.only` is forbidden.
+The unit suite runs in a REAL browser. Vitest is configured with two projects:
+everything named `*.test.ts` runs in headless Chromium (Browser Mode), and the
+`*.node.test.ts` suffix opts a file out into Node. There is no per-file
+environment pragma to add — Browser Mode is a runner, not an environment.
+
+Use the suffix only for a genuine Node capability. `app.node.test.ts` has it
+because it recursively walks two dependency `src` trees inside `node_modules` and
+TS-parses them, lists the served `../static` directory, and reads PNG header
+bytes; none of those has a Vite-import equivalent. A DOM test that needs a served
+asset imports it instead: `import indexHtml from "../static/index.html?raw"`,
+which is resolved at transform time and therefore fails to build when the asset
+is renamed. Tests must assert at least once (`expect.requireAssertions`) and
+`.only` is forbidden.
+
+The browser is installed once per machine with
+`npx --no-install playwright install chromium`; CI installs it with
+`--with-deps`.
+
+Two things about the browser project that look like mistakes and are not: the
+dynamic import in `app.test.ts` carries a `.ts` extension and a unique query
+(the browser's module map is keyed by URL, so that is the only way to re-run
+app.ts's top-level code per test, and the extension is what keeps v8 coverage
+attributed to the real file), and `window.location.reload` cannot be spied on
+because it is unforgeable in a real browser — the one test that needs it shadows
+the `window` identifier for a single evaluation.
 
 ## Conventions and gotchas
 

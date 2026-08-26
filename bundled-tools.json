@@ -1,0 +1,50 @@
+{
+  "_comment": [
+    "web-terminal-kiro's BUNDLED TOOLS: the tools this image ships because",
+    "its seeded manifest names them and no registry carries them.",
+    "",
+    "These are not a layer over the tool catalog. The catalog is a",
+    "REFERENCE -- every tool the mise and aqua registries can express,",
+    "translated, with no opinion about which ones matter -- and this file",
+    "is the small bundle this app adds to it. Deliberately small: the app",
+    "drives kiro-cli's TUI verbatim and consumes toolbelt HEADLESS, so",
+    "there is no Add-tool modal, no recommended set and no UI copy to own.",
+    "What is left is the four language servers the seed ships, each",
+    "installable from a package registry toolbelt already speaks.",
+    "",
+    "Everything else required-tools.txt names comes from the reference:",
+    "rust-analyzer and gh (through the github-cli entry's alias) are aqua",
+    "packages, node and go are mise core: backends the compiler translates,",
+    "uv is its own aqua entry, and the 14 linters in the borgcube migration",
+    "manifest are all registry-backed.",
+    "",
+    "Nothing here is marked essential. That flag means a product feature",
+    "stops working without the tool, and a language server is a convenience",
+    "in a terminal: the seed ships all four DISABLED, so a user removing",
+    "one is removing something they turned on themselves."
+  ],
+  "entries": {
+    "typescript": {
+      "source": "npm:typescript",
+      "description": "TypeScript compiler. Required by typescript-language-server."
+    },
+    "typescript-language-server": {
+      "source": "npm:typescript-language-server",
+      "lsp": true,
+      "requires": [
+        "typescript"
+      ],
+      "description": "TypeScript/JavaScript LSP."
+    },
+    "pyright": {
+      "source": "npm:pyright",
+      "lsp": true,
+      "description": "Python LSP (Pyright)."
+    },
+    "gopls": {
+      "source": "go:golang.org/x/tools/gopls",
+      "lsp": true,
+      "description": "Go LSP."
+    }
+  }
+}

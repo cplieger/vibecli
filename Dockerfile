@@ -427,8 +427,10 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # installs: node's official linux-x64 binaries link libatomic.so.1 from
 # v25 onward (measured — v24.18.0 does not, v26.7.0 does). It is listed
 # explicitly because the only reason this image had it was the homelab
-# compose passing `APT_PACKAGES: "gcc libc6-dev"`, where gcc pulls
-# libgcc-14-dev which depends on it. A deployment without that env got
+# compose installing gcc, which pulls libgcc-14-dev which depends on it.
+# That was an APT_PACKAGES value; it is an `apt:gcc` manifest entry now, and
+# the entry is per-deployment, so the dependency is even less reliable than
+# it was. A deployment without it got
 # sister app vibekit's failure instead: every npm-sourced tool dying with
 # `npm failed: exit status 127`.
 # hadolint ignore=DL3008
@@ -519,32 +521,33 @@ EXPOSE 9848
 # install, and only its PLACE changed.
 #
 # What the ordering changed is the shape of a probe DURING that work, and it moved
-# in the operator's favour. The entrypoint no longer installs anything: it hardens
-# /config, optionally installs APT_PACKAGES, prunes superseded kiro-cli agent
-# runtimes, writes the theme and execs the server, so the listener binds within
-# seconds on a boot with no APT_PACKAGES. The install then runs in the background,
+# in the operator's favour. The entrypoint no longer installs anything at all: it
+# hardens /config, repairs an interrupted dpkg transaction, prunes superseded
+# kiro-cli agent runtimes, writes the theme and execs the server, so the listener
+# binds within seconds. The install then runs in the background,
 # and a probe against it answers 503 with a reason (kiro-cli installing / install
 # retrying / unavailable) instead of being refused outright for want of a listener.
 # Health still only reports 200 once a version is active, so neither this budget
 # nor the smoke timeout got looser.
 #
 # FOREGROUND allowance-sum before the listener binds, explicit timeouts only:
-# APT_PACKAGES (apt-get update 300, +30 kill-after; apt-cache pkgnames 60, +10
-# kill-after; apt-get install 600, +30 kill-after) = 1030s with APT_PACKAGES, and
-# effectively zero without — every remaining step is untimed local work (directory
-# walks, stat/chmod, the agent-runtime prune, a small file write). That is a
-# ~4800s reduction against the pre-move sum, and it is why the container is now
-# observable during a first-boot download rather than connection-refused.
+# the interrupted-dpkg recovery (dpkg --audit 300, +30 kill-after;
+# dpkg --configure -a 300, +30 kill-after) = 660s worst case, and effectively
+# ZERO in the routine case — a healthy tree makes the audit a no-op and the
+# repair never runs. Every remaining step is untimed local work (directory walks,
+# stat/chmod, the agent-runtime prune, a small file write).
 #
-# The interrupted-dpkg recovery adds two more bounded steps to that sum
-# (dpkg --audit 300, +30 kill-after; dpkg --configure -a 300, +30 kill-after),
-# taking the worst case to 1690s — above this start-period. Those deadlines are
-# only REACHED on a boot following an APT_PACKAGES install that was killed
-# mid-transaction (a docker stop inside the install window), where apt state in
+# The three apt phases this sum used to carry (update 300, pkgnames 60, install
+# 600, +70 kill-after) are GONE with APT_PACKAGES: OS packages are the tools
+# engine's now, so they install in the BACKGROUND after the listener binds, where
+# a slow one shows up as a tools row rather than as a container nobody can reach.
+# So the routine foreground sum went from 1030s to ~0 and the worst case from
+# 1690s to 660s, both below this start-period rather than above it.
+#
+# Those 660s are only reached on a boot following an install killed
+# mid-transaction (a docker stop inside the install window), where dpkg state in
 # the container layer would otherwise refuse every later install for the
-# container's life. The audit probe is a no-op in the healthy case, so the 1030s
-# figure is the routine sum; the 1690s worst case is deliberately above the
-# budget for the same reason the download's is (see below).
+# container's life.
 #
 # BACKGROUND allowance-sum for one install attempt, all AFTER the bind: the
 # archive fetch (bounded by a 60s no-progress stall guard and a 20s handshake

@@ -46,8 +46,8 @@ stream. This guide covers the things the codebase won't tell you at a glance.
   background after the listener binds, session creation waits on that first
   pass (503 "tools installing"), and `/api/tools` is the library's REST
   projection admitted for loopback socket peers only (`loopbackOnly` in
-  routes.go). OS packages ride the `APT_PACKAGES` env in `entrypoint.sh`,
-  not the manifest.
+  routes.go). OS packages are the tools engine's too, as `apt:` manifest
+  entries.
 
 Web Terminal for Kiro is a thin consumer of the first-party web-terminal libraries: the
 terminal engine `web-terminal-engine` (`github.com/cplieger/web-terminal-engine/v5`

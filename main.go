@@ -384,6 +384,9 @@ func run() error {
 		configDir:   configMountDir,
 		toolsDir:    kiroToolsDir,
 		catalogPath: cmp.Or(envx.String("TOOL_CATALOG_PATH"), "/app/tool-catalog.json"),
+		bundledToolsPaths: []string{
+			cmp.Or(envx.String("BUNDLED_TOOLS_PATH"), "/app/bundled-tools.json"),
+		},
 		// The baked catalog above is only the first-boot/offline fallback; the
 		// engine fetches the published catalog at boot and every
 		// TOOL_CATALOG_REFRESH, re-verifying the embedded required-tools list
@@ -861,6 +864,12 @@ type baseTools struct {
 	toolsDir    string
 	catalogPath string
 	catalogURL  string
+	// bundledToolsPaths are this app's own bundled-tools files, applied by the
+	// engine over every catalog it loads. A missing file is a hard engine
+	// failure by design: the four language servers the seed names live only
+	// here, so running without it would leave every seeded template
+	// unresolvable at enable time with nothing saying why.
+	bundledToolsPaths []string
 	// refreshInterval is the engine refresh cadence under toolbelt's canonical
 	// policy (zero = schedule disabled, manual refresh stays available via the
 	// loopback tools API).
@@ -1220,14 +1229,22 @@ func startTools(ctx context.Context, cfg baseTools) toolsRuntime {
 	// the boot verdict.
 	status := newToolsStatus()
 	eng, err := toolbelt.New(&toolbelt.Config{
-		ConfigDir:    toolsRoot,
-		ToolsDir:     toolsRoot,
-		CatalogPath:  cfg.catalogPath,
-		Refresh:      refresh,
-		Seed:         toolbelt.DefaultSeed(),
-		System:       []string{"git", "jq", "curl", "unzip", "xz", "ssh", "tar", "bash"},
-		Logger:       slog.Default(),
-		OnJobChanged: status.observeJob,
+		ConfigDir:   toolsRoot,
+		ToolsDir:    toolsRoot,
+		CatalogPath: cfg.catalogPath,
+		// The tools this app BUNDLES, merged over every catalog the engine
+		// loads (baked, cached, fetched). The published catalog is a general
+		// reference and carries none of them: no registry packages gopls,
+		// typescript, typescript-language-server or pyright, and DefaultSeed
+		// below names all four, so without this the seeded templates would
+		// resolve to nothing at enable time. The image build gates the same
+		// file with `toolcatalog verify -overlay`.
+		CatalogOverlays: cfg.bundledToolsPaths,
+		Refresh:         refresh,
+		Seed:            toolbelt.DefaultSeed(),
+		System:          []string{"git", "jq", "curl", "unzip", "xz", "ssh", "tar", "bash"},
+		Logger:          slog.Default(),
+		OnJobChanged:    status.observeJob,
 		// Refuse to construct an engine over a managed root that is a symlink, is not a
 		// directory, is group/other-writable, or resolves outside the tree. The tree is an
 		// operator-controlled persistent volume, this process runs as root, and toolbelt's

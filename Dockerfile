@@ -122,7 +122,7 @@ RUN --mount=type=cache,target=/root/go/pkg/mod go mod download
 # Only the files the network-heavy steps below actually need are copied
 # before them, so a source edit doesn't invalidate the catalog compile,
 # font fetch, or npm vendor fetch layers. The full tree lands after.
-COPY required-tools.txt ./
+COPY required-tools.txt bundled-tools.json ./
 
 # Bake the published tool catalog as the first-boot/offline fallback.
 # The catalog (install knowledge for ~700 tools joined from the mise +
@@ -182,7 +182,8 @@ ARG TOOL_CATALOG_URL=https://github.com/cplieger/tool-catalog/releases/download/
 RUN --mount=type=cache,target=/root/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     curl --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --max-time 300 --retry 3 --retry-delay 5 -fsSL -o /tmp/tool-catalog.json "${TOOL_CATALOG_URL}" && \
     printf '%s  /tmp/tool-catalog.json\n' "$TOOL_CATALOG_SHA256" | sha256sum -c - && \
-    go tool toolcatalog verify -catalog /tmp/tool-catalog.json -require required-tools.txt
+    go tool toolcatalog verify -catalog /tmp/tool-catalog.json -require required-tools.txt \
+      -overlay bundled-tools.json
 
 # Fetch the Monaspace Neon NF webfonts for the monospace terminal display.
 #
@@ -495,6 +496,11 @@ RUN sed -i 's|^root:x:0:0:root:/root:|root:x:0:0:root:/config/home:|' /etc/passw
 
 COPY --from=builder /web-terminal-kiro /app/web-terminal-kiro
 COPY --from=builder /tmp/tool-catalog.json /app/tool-catalog.json
+# The bundled-tools file the engine merges over EVERY catalog it loads
+# (baked, cached, fetched), so this app's four language servers survive a
+# runtime catalog refresh. It is the same file the verify step above gates
+# against, so the build cannot ship a catalog its own required set fails.
+COPY bundled-tools.json /app/bundled-tools.json
 COPY --chmod=755 entrypoint.sh /opt/web-terminal-kiro/entrypoint.sh
 # The kiro-cli hook that reports which kiro session a tab is running. Executed by
 # kiro-cli (not by this image's entrypoint), which is why it ships as its own

@@ -167,21 +167,23 @@ grep -Eq 'enable_session_containment \|\| true' "$ENTRYPOINT" \
   && ok "the call site swallows a refusal (|| true)" \
   || no "the call site swallows a refusal" "a non-zero return could end boot"
 
-# --- 4. the drop happens BEFORE the apt phase ----------------------------------
+# --- 4. the drop happens BEFORE the server is exec'd ---------------------------
 # The whole point of re-execing early is to not hold CAP_SYS_ADMIN across a
-# network-fetched package install. If the exec ever moves below the apt block this
-# silently becomes a much wider capability window, with no functional symptom.
-# Every anchor below carries the same `^[^#]*` guard as the apt one: a PROSE mention
-# of the statement is not the statement. Adding a comment to entrypoint.sh that said
-# `exec setpriv` broke six assertions in this file at once (2026-08), because head -1
-# happily returned the comment's line number.
+# network-fetched install. The apt phase this used to anchor on is gone -- OS
+# packages are the tools engine's now -- but the property did not go with it:
+# the server this script execs downloads kiro-cli's archive and installs any
+# `apt:` tool entry, so the capability must be dropped before IT starts, not
+# merely before a block that no longer exists.
+#
+# Every anchor below carries the same `^[^#]*` guard: a PROSE mention of the
+# statement is not the statement. Adding a comment to entrypoint.sh that said
+# `exec setpriv` broke six assertions in this file at once (2026-08), because
+# head -1 happily returned the comment's line number.
 exec_line=$(grep -nE '^[^#]*exec setpriv' "$ENTRYPOINT" | head -1 | cut -d: -f1)
-# Match the real invocation, not the several comments that mention it: the command
-# runs under `timeout`, which no comment in this file does.
-apt_line=$(grep -nE '^[^#]*timeout .*apt-get update' "$ENTRYPOINT" | head -1 | cut -d: -f1)
-[ -n "$exec_line" ] && [ -n "$apt_line" ] && [ "$exec_line" -lt "$apt_line" ] \
-  && ok "the capability is dropped before the apt phase" \
-  || no "the capability is dropped before the apt phase" "exec at $exec_line, apt at $apt_line"
+server_line=$(grep -nE '^[^#]*exec .*/(web-terminal-kiro|app)' "$ENTRYPOINT" | tail -1 | cut -d: -f1)
+[ -n "$exec_line" ] && [ -n "$server_line" ] && [ "$exec_line" -lt "$server_line" ] \
+  && ok "the capability is dropped before the server is exec'd" \
+  || no "the capability is dropped before the server is exec'd" "setpriv at $exec_line, server at $server_line"
 
 # --- 4b. the function is DEFINED before it is CALLED ---------------------------
 # Regression: bash resolves a function at call time, so a call placed above the

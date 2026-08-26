@@ -65,7 +65,7 @@ esac
 # Asserted individually rather than as one blob: these are four independent
 # failures, and a rewrite that drops one silently makes that one unattributable
 # again. ssh is first because it is the only one with no workaround.
-for want in 'No user exists for uid' 'APT_PACKAGES' 'containment' 'chmod'; do
+for want in 'No user exists for uid' 'apt installs' 'containment' 'chmod'; do
   case "$out" in
     *"$want"*) ok "the warn names the '$want' consequence" ;;
     *) no "the warn names the '$want' consequence" "got: $out" ;;

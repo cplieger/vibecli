@@ -25,7 +25,7 @@
 # (the cplieger/pinstall library), so its failure branches are that library's own
 # Go tests. What stays here is
 # what the entrypoint still does — directory hardening, the KAS runtime prune,
-# the legacy tool-metadata notice, and the APT_PACKAGES validation.
+# and the legacy tool-metadata notice.
 #
 # Each *_test.sh is a separate process, so one test's stubs, traps and shell
 # options cannot leak into another's. All of them run even when an early one

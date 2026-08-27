@@ -380,7 +380,7 @@ func run() error {
 	// startTools falls back to <configDir>/tools.
 	kiroToolsDir := envx.String("KIRO_CLI_TOOLS_DIR")
 
-	tools := startTools(baseCtx, baseTools{
+	tools := startTools(baseCtx, &baseTools{
 		configDir:   configMountDir,
 		toolsDir:    kiroToolsDir,
 		catalogPath: cmp.Or(envx.String("TOOL_CATALOG_PATH"), "/app/tool-catalog.json"),
@@ -1177,7 +1177,7 @@ func logRootIntegrityFindings(err error) {
 // the engine's counted jobs for the rest of the run. After convergence an async
 // update pass refreshes unpinned tools, and a boot warning nudges when no language
 // server is enabled (kiro-cli scans PATH for LSPs at session start).
-func startTools(ctx context.Context, cfg baseTools) toolsRuntime {
+func startTools(ctx context.Context, cfg *baseTools) toolsRuntime {
 	// Three distinct outcomes, deliberately NOT collapsed: only a genuinely ABSENT
 	// directory is the intentionally-disabled out-of-container shape. A stat failure
 	// for any other reason, or a non-directory mounted at the config path, is a

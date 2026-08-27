@@ -215,8 +215,32 @@ fills in the rest:
 ```
 
 Sources cover `aqua:owner/repo` binaries (checksum-verified when upstream
-publishes checksums), `npm:`, `pip:`, `cargo:`, `go:` modules, and `manual`
-shell commands with `${VERSION}`/`${BIN}`/`${ARCH_*}` placeholders.
+publishes checksums), `release:github/owner/repo` GitHub release assets picked by
+matching your architecture, `apt:package` Debian packages, `npm:`, `pip:`,
+`cargo:`, `go:` modules, and `manual` shell commands with
+`${VERSION}`/`${BIN}`/`${ARCH_*}` placeholders.
+
+**`apt:` entries are the OS-package surface**, and they replace the
+`APT_PACKAGES` environment variable, which is gone and is not read at all —
+a clean break rather than a migration, so nothing is imported for you. Declare
+each package as its own entry:
+
+```jsonc
+"tools": {
+  "gcc":       { "source": "apt:gcc" },
+  "libc6-dev": { "source": "apt:libc6-dev" }
+}
+```
+
+What that buys over `apt-get install` in a session is the record: the entry is on
+the `/config` volume, so a container recreate reinstalls the package instead of
+losing it, and the row reports the installed version. Plain package names only —
+a version pin (`pkg=1.2`), `pkg:arch`, `pkg/release`, a trailing `-` (apt reads
+that as a removal), a name absent from the package index, and a pure virtual
+package such as `awk` (name a concrete provider such as `mawk`) are each refused
+with the reason. Removing the entry is a logged no-op rather than an uninstall:
+apt packages are shared, and the engine will not remove one it cannot prove
+nothing else needs.
 
 **From inside a session** (agents included), the same engine answers on
 loopback only:

@@ -231,7 +231,7 @@ func writeToolsManifest(t *testing.T, configDir, manifest string) {
 func TestStartTools_configDirMissing(t *testing.T) {
 	records := capture.Default(t)
 
-	rt := startTools(t.Context(), baseTools{
+	rt := startTools(t.Context(), &baseTools{
 		configDir:   filepath.Join(t.TempDir(), "absent"),
 		catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 	})
@@ -284,7 +284,7 @@ func TestStartTools_configDirUnusable(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			records := capture.Default(t)
 
-			rt := startTools(t.Context(), baseTools{
+			rt := startTools(t.Context(), &baseTools{
 				configDir:   tc.configDir,
 				catalogPath: filepath.Join(t.TempDir(), "absent-catalog.json"),
 			})
@@ -336,7 +336,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 	// is where a retired-format one has to be planted to be read at all.
 	writeToolsManifest(t, dir, `{"runtimes":{"node":{"enabled":false}}}`)
 
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 
 	if rt.engine != nil {
 		t.Fatal("engine is non-nil despite a failed toolbelt.New; want no engine (degraded-not-dead)")
@@ -384,7 +384,7 @@ func TestStartTools_engineStartFailure(t *testing.T) {
 // eventually-check on the atomic-backed funcs (race-free).
 func TestStartTools_bootConvergenceLiftsGate(t *testing.T) {
 	dir := t.TempDir()
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -429,7 +429,7 @@ func TestStartTools_toolsRootResolution(t *testing.T) {
 				wantRoot = exported
 			}
 
-			rt := startTools(t.Context(), baseTools{
+			rt := startTools(t.Context(), &baseTools{
 				configDir:   configDir,
 				toolsDir:    exported,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
@@ -516,7 +516,7 @@ func TestStartTools_rootIntegrityRefusalDegrades(t *testing.T) {
 			root := filepath.Join(configDir, "tools")
 			tc.unfit(t, root)
 
-			rt := startTools(t.Context(), baseTools{
+			rt := startTools(t.Context(), &baseTools{
 				configDir:   configDir,
 				catalogPath: filepath.Join(configDir, "absent-catalog.json"),
 			})
@@ -770,7 +770,7 @@ func TestStartTools_reconcileFailureLiftsGateDegraded(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{"no-such-tool-xyz":{}}}`)
 
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -796,7 +796,7 @@ func TestStartTools_emptyManifestSkipsGate(t *testing.T) {
 	dir := t.TempDir()
 	writeToolsManifest(t, dir, `{"version":2,"tools":{}}`)
 
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -1312,7 +1312,7 @@ func TestStartTools_toolsFieldRecoversLiveWithoutTouchingGates(t *testing.T) {
 		`}}`
 	writeToolsManifest(t, dir, manifest)
 
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}
@@ -2378,7 +2378,7 @@ func TestStartTools_logsTheGatedWindowOpening(t *testing.T) {
 	records := capture.Default(t)
 	dir := t.TempDir()
 
-	rt := startTools(t.Context(), baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
+	rt := startTools(t.Context(), &baseTools{configDir: dir, catalogPath: filepath.Join(dir, "absent-catalog.json")})
 	if rt.engine == nil {
 		t.Fatal("engine is nil for an existing config dir; want a running tools engine")
 	}

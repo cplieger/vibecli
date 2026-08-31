@@ -9,6 +9,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/web-terminal-kiro/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/web-terminal-kiro)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/web-terminal-kiro/releases)
 
+<!-- hub-overview BEGIN -->
 A minimal browser terminal for the **Kiro CLI**: run `kiro-cli` in a browser tab, on your desktop or your phone.
 
 ![Web Terminal for Kiro running kiro-cli in a browser tab, with more sessions open across tabs](docs/screenshot.png)
@@ -40,6 +41,7 @@ Each tab's newest 200 lines are kept in your browser's `localStorage`, so return
 - On a shared or borrowed device, use a private window, which keeps no storage at all.
 
 No setting turns this off.
+<!-- hub-overview END -->
 
 ## Run
 

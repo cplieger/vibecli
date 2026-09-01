@@ -50,21 +50,18 @@ func dockerfileUnderTest(t *testing.T) string {
 	return string(b)
 }
 
-// TestDockerfileInvokesTheGate pins the gate's only execution site. run()'s verdict
-// is worthless if nothing runs it: a stage restructure that drops OR COMMENTS OUT
-// the RUN leaves this package compiling and every test green while an incompatible
-// Go/TS pair ships and refuses every session at first connect (close 4002) behind a
-// green /api/health.
+// TestDockerfileInvokesTheGate pins the gate's only execution site. run()'s
+// verdict is worthless if nothing runs it: a stage restructure that drops OR
+// COMMENTS OUT the RUN leaves this package compiling and every test green
+// while an incompatible Go/TS pair ships and refuses every session at first
+// connect (close 4002) behind a green /api/health.
 func TestDockerfileInvokesTheGate(t *testing.T) {
-	// One LIVE line must build the gate and then invoke the BUILT binary with
-	// the manifest flag. A whole-file substring sweep would pass on a commented-out
-	// RUN (`#    /tmp/…/wirecheck …`) — the other half of the silent case this test
-	// exists for, and the likelier one during a stage restructure, since it is
-	// the reversible edit a person makes while debugging a build — and the prose
-	// block above the RUN already mentions scripts/wirecheck. Requiring the whole
-	// build-then-invoke shape on ONE uncommented logical line also proves the
-	// manifest flag is still attached to the gate invocation rather than surviving
-	// somewhere else in the file.
+	// One LIVE line must build the gate and then invoke the BUILT binary
+	// with the manifest flag. A whole-file substring sweep would pass on a
+	// commented-out RUN, since the prose block above it already mentions
+	// scripts/wirecheck. Requiring the whole build-then-invoke shape on ONE
+	// uncommented logical line also proves the manifest flag is still
+	// attached to the gate invocation rather than surviving somewhere else.
 	if !slices.ContainsFunc(dockerfileLogicalLines(dockerfileUnderTest(t)), lineInvokesTheGate) {
 		t.Error("Dockerfile has no un-commented `go build -o <path> ./scripts/wirecheck " +
 			"&& <path> -manifest ...` line; the " +

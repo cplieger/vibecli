@@ -39,16 +39,15 @@ func mustCIDR(t *testing.T, s string) *net.IPNet {
 }
 
 // TestParseTrustedProxies pins the TRUSTED_PROXIES parsing that feeds
-// webhttp.WithClientIP via the shared webhttp.ParseCIDRs helper. Four
-// contracts: an unset/blank var yields nil (so ClientIP ignores X-Forwarded-For
-// and logs the spoof-proof socket peer — the directly-exposed default), a valid
-// CIDR + bare-IP mix parses into containment-correct nets, a malformed entry
-// is warned count-only and skipped while the valid subset is kept, and a
-// SEMANTICALLY impossible entry (a default route, which parses cleanly and then
+// webhttp.WithClientIP via webhttp.ParseCIDRs. Four contracts: unset/blank
+// yields nil (ClientIP ignores X-Forwarded-For and logs the spoof-proof
+// socket peer); a valid CIDR + bare-IP mix parses into containment-correct
+// nets; a malformed entry is warned count-only and skipped while the valid
+// subset is kept; a SEMANTICALLY impossible entry (a default route, which
 // makes client_ip either the proxy itself or a value the caller forged) is
-// warned about by prefix class while still being kept — startup is
-// never aborted and never falls open. The warning cases mutate the
-// process-global default logger, so the subtests run serially (no t.Parallel).
+// warned about by prefix class while still being kept -- startup never
+// aborts and never falls open. The warning cases mutate the process-global
+// default logger, so the subtests run serially (no t.Parallel).
 func TestParseTrustedProxies(t *testing.T) {
 	t.Run("unset/empty yields nil (socket-peer default)", func(t *testing.T) {
 		t.Setenv("TRUSTED_PROXIES", "")
@@ -144,25 +143,24 @@ func TestParseTrustedProxies(t *testing.T) {
 		})
 	})
 
-	// A default route is syntactically perfect and semantically impossible: it
-	// makes every X-Forwarded-For hop of its own family "our own hop" (so ClientIP
-	// exhausts the walk and falls back to logging the PROXY), while an entry of the
-	// OTHER family is never skipped and is returned as the client — so an
-	// unauthenticated caller picks the client_ip recorded for its own request. The
-	// warning is the only signal an operator gets; today's parser is silent.
-	// Lenient by design: the set is NOT rejected, so this asserts the warning and
-	// the unchanged behavior together.
+	// A default route is syntactically perfect and semantically impossible:
+	// it makes every X-Forwarded-For hop of its own family "our own hop"
+	// (ClientIP exhausts the walk and falls back to logging the PROXY),
+	// while an entry of the OTHER family is never skipped and is returned
+	// as the client -- an unauthenticated caller picks the client_ip
+	// recorded for its own request. The warning is the only signal an
+	// operator gets. Lenient by design: this asserts the warning and the
+	// unchanged behavior together.
 	t.Run("a default route is warned about by prefix length, entries kept", func(t *testing.T) {
 		records := capture.Default(t)
-		// The sibling is a plausible real proxy address: the warning names the
-		// default-route CLASS in fixed wording, so what must be checked is that it
-		// never ENUMERATES the operator's own entries (any of which can be a
+		// The sibling is a plausible real proxy address: the warning names
+		// the default-route CLASS in fixed wording and must never ENUMERATE
+		// the operator's own entries (any of which can be a
 		// compose-interpolated credential, CWE-532).
 		const sibling = "198.51.100.7"
 		// TWO default routes, one per family: the parser warns ONCE per boot
-		// (main.go breaks out of the loop), so this fixture is what makes that
-		// `break` load-bearing -- with one entry the count assertion below
-		// cannot tell one-per-boot from one-per-entry.
+		// (main.go breaks out of the loop), so this fixture makes that
+		// `break` load-bearing.
 		t.Setenv("TRUSTED_PROXIES", "0.0.0.0/0,::/0,"+sibling)
 		nets := parseTrustedProxies()
 
@@ -241,12 +239,10 @@ func logContains(records *capture.Recorder, s string) bool {
 }
 
 // The two TRUSTED_PROXIES warning hints, duplicated verbatim from
-// parseTrustedProxies (main.go). Duplicating the prose is the point: these
-// records are the ONLY thing an operator sees about a rejected entry, and the
-// entries themselves can be compose-interpolated credentials (CWE-532), so the
-// hint must stay a FIXED string that cannot grow an input-derived tail. A
-// deliberate rewording updates both sides; anything else is the regression these
-// pins exist to fail.
+// parseTrustedProxies (main.go). Duplicating the prose is the point: the
+// entries can be compose-interpolated credentials (CWE-532), so the hint
+// must stay a FIXED string that cannot grow an input-derived tail. A
+// deliberate rewording updates both sides.
 const (
 	malformedProxyHint = "each entry must be a CIDR (e.g. 10.0.0.0/8) or a bare IP (e.g. 192.168.1.5)"
 	defaultRouteHint   = "list only the reverse proxy's own address(es), e.g. 10.0.0.0/8 or 192.0.2.10; leave TRUSTED_PROXIES unset to log the unspoofable socket peer"
@@ -257,42 +253,38 @@ const (
 // covers the value as well as the name.
 type attrCheck func(slog.Value) bool
 
-// wantString requires an attr's rendered value to equal want exactly. Exactness
-// is the point for a FIXED operator hint: an allowlist keyed on the name alone
-// stays green when a regression appends rejected content ("...unset to log the
-// unspoofable socket peer (rejected: <credential>)") to a key it already permits.
+// wantString requires an attr's rendered value to equal want exactly, for a
+// FIXED operator hint: an allowlist keyed on the name alone stays green when
+// a regression appends rejected content to a key it already permits.
 func wantString(want string) attrCheck {
 	return func(v slog.Value) bool { return v.String() == want }
 }
 
-// wantInt requires an attr to be an integer equal to want. Kind is checked too:
-// a count replaced by a STRING of the same digits is a different attribute, and
-// it is the shape a "log a sample of what we rejected" edit produces.
+// wantInt requires an attr to be an integer equal to want. Kind is checked
+// too: a count replaced by a STRING of the same digits is a different
+// attribute -- the shape a "log a sample of what we rejected" edit produces.
 func wantInt(want int) attrCheck {
 	return func(v slog.Value) bool { return v.Kind() == slog.KindInt64 && v.Int64() == int64(want) }
 }
 
-// isNotifyFingerprint requires exactly notifyFingerprintHexDigits lowercase hex
-// digits — the shape TestNotifyFingerprint pins for the keyed HMAC, checked here
-// because the production key is unreachable so the exact value is not computable
-// from a live session.
+// isNotifyFingerprint requires exactly notifyFingerprintHexDigits lowercase
+// hex digits -- the shape TestNotifyFingerprint pins, checked here because
+// the production key is unreachable so the exact value is not computable.
 func isNotifyFingerprint(v slog.Value) bool {
 	s := v.String()
 	return len(s) == notifyFingerprintHexDigits && strings.Trim(s, "0123456789abcdef") == ""
 }
 
-// assertAttrSchema pins the EXACT attribute set of the records at level whose
-// message contains msgSub: every attr must be in the schema (an unexpected key
-// fails), every attr's value must pass its check (a truncated or transformed
-// value under an ALLOWED key fails — the leak a key-only allowlist cannot see),
-// and every schema key must actually appear in EACH matching record (a required
-// attr disappearing is a regression too; the accounting is per record, so two
-// matching records cannot split the schema between them and pass on their union,
-// and a message that matched nothing at all fails on its own).
-// A needle sweep only catches content the test already knows; this catches
-// content under any name, of any length, in any shape. Shared by the package's
-// two credential boundaries (a rejected TRUSTED_PROXIES entry and a classifier
-// notification), so one implementation covers both.
+// assertAttrSchema pins the EXACT attribute set of the records at level
+// whose message contains msgSub: every attr must be in the schema (an
+// unexpected key fails), every attr's value must pass its check (a
+// truncated or transformed value under an ALLOWED key fails), and every
+// schema key must actually appear in EACH matching record (accounting is
+// per record, so two matching records cannot split the schema between
+// them and pass on their union). A needle sweep only catches content the
+// test already knows; this catches content under any name, of any length,
+// in any shape. Shared by the package's two credential boundaries (a
+// rejected TRUSTED_PROXIES entry and a classifier notification).
 func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level, msgSub string, schema map[string]attrCheck) {
 	t.Helper()
 	expected := slices.Sorted(maps.Keys(schema))
@@ -302,10 +294,8 @@ func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level,
 			continue
 		}
 		matched = true
-		// A FRESH map per matching record: accounting shared across records would let
-		// two of them split the schema between them and pass on their union, so a
-		// record carrying only invalid_count and another carrying only hint would
-		// satisfy a guarantee neither one meets.
+		// A FRESH map per matching record: accounting shared across records
+		// would let two of them split the schema and pass on their union.
 		seen := make(map[string]bool, len(schema))
 		r.Attrs(func(a slog.Attr) bool {
 			check, ok := schema[a.Key]
@@ -335,10 +325,8 @@ func assertAttrSchema(t *testing.T, records *capture.Recorder, level slog.Level,
 	}
 }
 
-// firstAttrValue returns the value of the first occurrence of key across the
-// captured records, and whether any record carried it. Attribute equality is
-// what an access-log field assertion needs; the rendered-line substring form
-// also accepts a value that merely STARTS with the expectation.
+// firstAttrValue returns the value of the first occurrence of key across
+// the captured records, and whether any record carried it.
 func firstAttrValue(records *capture.Recorder, key string) (string, bool) {
 	for _, r := range records.Records() {
 		var value string
@@ -360,26 +348,24 @@ func firstAttrValue(records *capture.Recorder, key string) (string, bool) {
 // captureTextLog swaps the process-global default logger for a text handler
 // writing into the returned buffer and restores the previous logger on
 // cleanup. buildHandler binds WithLogger(slog.Default()) at CONSTRUCTION, so
-// the capture must be installed before the handler is built; and because the
-// default logger is process-global, callers must not use t.Parallel.
+// the capture must be installed before the handler is built; the default
+// logger is process-global, so callers must not use t.Parallel.
 //
-// A TEXT handler at the DEFAULT level — slogx's, the same constructor main.go
-// installs through slogx.Setup — not the slogx/capture recorder this file uses
-// elsewhere, and that is load-bearing: two assertions here turn on level
-// FILTERING rather than on capture. TestBuildHandlerSkipsAccessLogForStreams
-// proves a HEALTHY /api/health probe never reaches the shipped stream, which is
-// only true because the handler drops the Debug record ProbeLogLevel demotes it
-// to; and TestBuildHandlerFailingProbeSurfaces reads the rendered level=ERROR.
-// A capture.Recorder keeps records at every level, so converting these tests to
-// it would make the healthy-probe line present and reduce that assertion to
-// "recorded at Debug" - a weaker claim that no longer pins the demotion.
+// A TEXT handler at the DEFAULT level -- not the slogx/capture recorder this
+// file uses elsewhere -- because two assertions here turn on level
+// FILTERING rather than capture: TestBuildHandlerSkipsAccessLogForStreams
+// proves a HEALTHY /api/health probe never reaches the shipped stream
+// (the handler drops the Debug record ProbeLogLevel demotes it to), and
+// TestBuildHandlerFailingProbeSurfaces reads the rendered level=ERROR. A
+// capture.Recorder keeps every level, which would weaken both to "recorded
+// at Debug".
 func captureTextLog(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
-	// The fleet-standard handler constructor main.go installs through
-	// slogx.Setup: text/logfmt, Info by default, UTC-normalized timestamps.
-	// The returned LevelVar is unused -- these tests assert against the
-	// DEFAULT level, which is what makes the probe-demotion drop observable.
+	// slogx.Setup's constructor: text/logfmt, Info by default, UTC-normalized
+	// timestamps. The returned LevelVar is unused -- these tests assert
+	// against the DEFAULT level, which is what makes the probe demotion
+	// observable.
 	handler, _ := slogx.NewHandler(slogx.Options{Output: &buf})
 	prev := slog.Default()
 	slog.SetDefault(slog.New(handler))
@@ -387,15 +373,15 @@ func captureTextLog(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-// TestBuildHandlerClientIPThreading proves the trusted-proxy set is threaded
-// into webhttp.WithClientIP and drives the access log's client_ip field
-// end-to-end through the production middleware chain (buildHandler). Two
-// contracts: with NO trusted proxies (unset default) the logged client_ip is the
+// TestBuildHandlerClientIPThreading proves the trusted-proxy set is
+// threaded into webhttp.WithClientIP and drives the access log's
+// client_ip field through the production middleware chain (buildHandler).
+// Two contracts: with NO trusted proxies the logged client_ip is the
 // unspoofable socket peer and a client-supplied X-Forwarded-For is ignored
-// (spoof-safe); with the socket peer inside the trusted set, client_ip resolves
-// to the real client from the trusted XFF. httptest.NewRequest gives a fixed
-// RemoteAddr of 192.0.2.1:1234, so the peer host is 192.0.2.1. This mutates the
-// process-global default logger, so it runs serially (no t.Parallel).
+// (spoof-safe); with the socket peer inside the trusted set, client_ip
+// resolves to the real client from the trusted XFF. httptest.NewRequest
+// gives a fixed RemoteAddr of 192.0.2.1:1234. Mutates the process-global
+// default logger, so it runs serially (no t.Parallel).
 func TestBuildHandlerClientIPThreading(t *testing.T) {
 	const (
 		peerIP = "192.0.2.1"   // httptest.NewRequest default RemoteAddr host
@@ -430,28 +416,25 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodGet, "/probe", http.NoBody)
 			req.Header.Set("X-Forwarded-For", xffIP)
-			// Synchronous ServeHTTP: the deferred access-log line fires before it
-			// returns, so the record is captured with no goroutine race. The CSP
-			// value is irrelevant to client-IP resolution; a fixed policy keeps the
-			// stack shape production-true.
+			// Synchronous ServeHTTP, so the deferred access-log line fires
+			// before it returns. The CSP value is irrelevant to client-IP
+			// resolution; a fixed policy keeps the stack shape production-true.
 			buildHandler(mux, tc.trusted, "default-src 'self'", nil).ServeHTTP(httptest.NewRecorder(), req)
 
 			got, ok := firstAttrValue(records, "client_ip")
 			if !ok {
 				t.Fatalf("no access-log record carries a client_ip attr; log = %q", records.Messages())
 			}
-			// EQUALITY, not containment: the field is the resolved HOST, so the old
-			// host:port "remote" form (or a value with the forwarded chain appended)
-			// has the expected IP as a PREFIX -- a substring check on the rendered
-			// line accepts both, and client_ip is the last attr on the line.
+			// EQUALITY, not containment: the old host:port "remote" form (or a
+			// value with the forwarded chain appended) has the expected IP as
+			// a PREFIX, which a substring check would accept.
 			if got != tc.wantIP {
 				t.Errorf("access log client_ip = %q, want exactly %q", got, tc.wantIP)
 			}
-			// The spoof-safe half, which the positive check cannot make: with
-			// nothing trusted, the client-supplied header value is
-			// attacker-controlled and must not appear in the record at all -- not as
-			// client_ip, and not as some extra forwarded-for attr a library bump
-			// starts recording (CWE-117).
+			// The spoof-safe half: with nothing trusted, the client-supplied
+			// header value is attacker-controlled and must not appear in the
+			// record at all -- not as client_ip, and not under some extra
+			// forwarded-for attr a library bump starts recording (CWE-117).
 			if tc.mustNotLog != "" && logContains(records, tc.mustNotLog) {
 				t.Errorf("access log = %q carries the untrusted X-Forwarded-For value %q; an attacker-supplied string must not enter the aggregated log stream", records.Messages(), tc.mustNotLog)
 			}
@@ -460,43 +443,34 @@ func TestBuildHandlerClientIPThreading(t *testing.T) {
 }
 
 // TestBuildHandlerSkipsAccessLogForStreams pins the access-log wiring in
-// buildHandler: the /api/sessions/events SSE stream must emit NO access-log line
-// (it is the one stream path still skipped by PATH, because SSE never switches
-// protocols and the response-based WithSkipUpgrades cannot cover it), while a
-// request to /ws that never becomes a stream — no upgrade headers (the classic
-// reverse-proxy misconfiguration, which the engine refuses with a 426 it logs
-// nowhere), or a non-GET carrying them — MUST be logged; a healthy /api/health
-// probe is suppressed at the default Info level while a failing probe still
-// emits at Warn/Error. The admitted-upgrade half of the contract cannot be shown
-// with a fake mux and lives in TestAccessLogSkipsOnlyCompletedUpgrades.
-// The token-bearing /api/sessions/ subtree must emit lines whose recorded path
-// is the token-free route template (a raw session id must never appear) for the
-// route shapes the server actually serves, and the "(unmatched)" marker for a
-// path under the subtree that routes nowhere, while normal requests still log
-// their real path. A regression dropping the SSE skip would flood the access
-// log with one misleading line per reconnect; a regression widening it to the
-// whole /ws path would re-hide the unlogged 426; a regression dropping
-// WithTemplatePathsUnder would leak live session tokens to log-read consumers;
-// all pass every other test. Serial: swaps the process-global default logger
-// (buildHandler binds WithLogger(slog.Default()) at construction).
+// buildHandler: /api/sessions/events SSE must emit NO access-log line (it
+// never switches protocols, so the response-based WithSkipUpgrades can't
+// cover it), while a request to /ws that never becomes a stream -- no
+// upgrade headers, or a non-GET carrying them -- MUST be logged; a healthy
+// /api/health probe is suppressed at the default Info level while a
+// failing probe still emits at Warn/Error (that admitted-upgrade half lives
+// in TestAccessLogSkipsOnlyCompletedUpgrades).
 //
-// It mounts the ENGINE's real session routes rather than hand-written stand-ins,
-// and that is the point: the recorded template now comes from the pattern the mux
-// actually matched, so this asserts the app agrees with the ENGINE's route table
-// instead of agreeing with its own copy of it. The app used to carry that table
-// as a local string-parsing transform, and this test used to register its own
-// literal paths — so an engine route added or renamed by a version bump would
-// have silently logged as the fail-closed placeholder with nothing failing here.
-// Mounting the real surface means the engine's table is the only copy, and a
-// change to it shows up in this test's output.
+// The token-bearing /api/sessions/ subtree must emit lines whose recorded
+// path is the token-free route template (a raw session id must never
+// appear) for the route shapes the server actually serves, and the
+// "(unmatched)" marker for a path that routes nowhere, while normal
+// requests still log their real path. Serial: swaps the process-global
+// default logger.
+//
+// It mounts the ENGINE's real session routes rather than hand-written
+// stand-ins, so this asserts the app agrees with the ENGINE's route table
+// instead of its own copy of it -- a version bump adding or renaming a
+// route now shows up here instead of silently logging the fail-closed
+// placeholder.
 func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	buf := captureTextLog(t)
 
 	mux := http.NewServeMux()
 	ok := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
 	// The engine's OWN route table, mounted the way routes.go mounts it. The
-	// factory is never invoked (nothing here creates a session), so no PTY is
-	// spawned; MountAPI only registers patterns.
+	// factory is never invoked (nothing here creates a session), so no PTY
+	// is spawned; MountAPI only registers patterns.
 	mgr := terminal.NewSessionManager(
 		func(terminal.SessionID) *terminal.Handler { return terminal.NewHandler([]string{"/bin/true"}) },
 		terminal.WithManagerLogger(slog.New(slog.DiscardHandler)),
@@ -507,19 +481,15 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 	mux.HandleFunc("/probe", ok)
 
 	h := buildHandler(mux, nil, "default-src 'self'", nil)
-	// Every session route the engine actually serves, with the METHOD each is
-	// registered under (the templates are method-scoped, so a GET at a PUT-only
-	// route would route nowhere and prove nothing). pinned-title carries both of
-	// its verbs: it is the vendored UI's tab-rename surface, and it had no
-	// coverage here at all while this test registered its own stand-in paths.
-	// The last entry is a subtree path matching NO engine route: it must not be
-	// reported as the legitimate {id}/title route, and its token must not leak.
-	// stream marks a route that only returns when the CLIENT disconnects. Now
-	// that the engine's real handlers are mounted, /api/sessions/events is the
-	// live SSE stream: driven with a background context it never returns, and the
-	// test hangs to its deadline (it did). An already-cancelled context is the
-	// disconnect, so the handler unwinds immediately and the assertion below --
-	// that a stream emits NO access line -- still exercises the real route.
+	// Every session route the engine actually serves, with the METHOD each
+	// is registered under (the templates are method-scoped, so a GET at a
+	// PUT-only route would route nowhere and prove nothing). pinned-title
+	// carries both of its verbs. The last entry is a subtree path matching
+	// NO engine route: it must not be reported as the legitimate
+	// {id}/title route, and its token must not leak. stream marks a route
+	// that only returns when the CLIENT disconnects -- driven with an
+	// already-cancelled context, so the handler unwinds immediately while
+	// still exercising the real SSE route.
 	for _, req := range []struct {
 		method, path string
 		stream       bool
@@ -543,22 +513,20 @@ func TestBuildHandlerSkipsAccessLogForStreams(t *testing.T) {
 		h.ServeHTTP(httptest.NewRecorder(),
 			httptest.NewRequestWithContext(ctx, req.method, req.path, http.NoBody))
 	}
-	// A COMPLETE upgrade attempt cannot be exercised here any more, and that is
-	// the adoption showing through: the skip is webhttp.WithSkipUpgrades, decided
-	// from the RESPONSE, and this mux has no /ws route to upgrade with — a 404 is
-	// not a stream, so it is correctly logged. The admitted-upgrade case moved to
-	// TestAccessLogSkipsOnlyCompletedUpgrades, which drives a real handshake
-	// against the engine. What stays here is the REFUSAL half, which this fake
-	// mux can still show.
+	// A COMPLETE upgrade attempt cannot be exercised here: the skip is
+	// webhttp.WithSkipUpgrades, decided from the RESPONSE, and this mux has
+	// no /ws route to upgrade with -- a 404 is not a stream, so it is
+	// correctly logged. The admitted-upgrade case is
+	// TestAccessLogSkipsOnlyCompletedUpgrades, which drives a real
+	// handshake against the engine; what stays here is the REFUSAL half.
 	//
 	// 16 zero bytes, base64: a structurally valid Sec-WebSocket-Key, so the
 	// refused request below is refused for its METHOD and nothing else.
 	const wsKey = "AAAAAAAAAAAAAAAAAAAAAA=="
 
-	// A request carrying the upgrade HEADERS that never becomes a stream keeps
-	// its access line. Here it is refused for its method; over a real engine
-	// Accept answers 405, and either way the recorded response is not a protocol
-	// switch — the same silence the no-upgrade-headers case exists to remove.
+	// A request carrying the upgrade HEADERS that never becomes a stream
+	// keeps its access line. Here it is refused for its method; over a
+	// real engine it answers 405 either way -- same silence removed.
 	badUpgrade := httptest.NewRequest(http.MethodPost, "/ws", http.NoBody)
 	badUpgrade.Header.Set("Upgrade", "websocket")
 	badUpgrade.Header.Set("Connection", "Upgrade")

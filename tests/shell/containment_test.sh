@@ -3,22 +3,18 @@
 #
 # Neither branch is reachable in a healthy image smoke: the remount succeeds only
 # with CAP_SYS_ADMIN and fails only without it, so the image test sees exactly one
-# of the two and never the other. That is what these cases cover.
+# of the two. The re-exec block matters most, because its failure mode is a
+# container that cannot boot, on every start, in an image whose public compose
+# example adds NO capability -- so its contract is "never fatal, whatever the
+# environment", asserted here against the real text of entrypoint.sh.
 #
-# The re-exec block carries more weight than the function, because it is the one
-# piece whose failure mode is a container that cannot boot: it runs before /config
-# is even checked, on every start, in an image whose public compose example adds NO
-# capability. Its contract is therefore "never fatal, whatever the environment",
-# and that is asserted here against the real text of entrypoint.sh rather than
-# against a description of it.
-# Lint directives, each against a stated guarantee rather than an assumption:
-#   SC2015 - the assertion form `[ cond ] && ok "..." || no "..."` cannot mis-fire,
-#     because lib.sh's ok/no return 0 unconditionally by design.
-#   SC2016 - the entrypoint-text assertions below must stay single-quoted: they
-#     compare the LITERAL text of the shipped script ("$0" / "$@" as written,
-#     unexpanded).
-#   SC2329 - the `mount` stubs below are invoked INDIRECTLY, by the extracted
-#     function they shadow, which shellcheck cannot see.
+# Lint directives, each against a stated guarantee:
+#   SC2015 - `[ cond ] && ok || no` cannot mis-fire: lib.sh's ok/no return 0
+#     unconditionally by design.
+#   SC2016 - the entrypoint-text assertions must stay single-quoted (literal
+#     text, "$0"/"$@" unexpanded).
+#   SC2329 - the `mount` stubs below are invoked INDIRECTLY by the extracted
+#     function, which shellcheck cannot see.
 # shellcheck disable=SC2015,SC2016,SC2329
 set -u
 
@@ -30,13 +26,11 @@ load_function logfmt_value
 load_function enable_session_containment
 
 # --- 1. the success path: a writable tree reports the REMOUNT, nothing more -----
-# `mount` is the only external command the function runs, so stubbing it is the
-# whole environment. The cgroup root is a PARAMETER (default /sys/fs/cgroup) purely
-# so this case can hand it a temp dir rather than depend on the CI runner's own
-# mount state. The function inspects nothing inside the tree: vacating the root and
-# enabling controllers belong to the server's NewContainment, whose verifyOwnRoot
-# REFUSES a root holding any non-"wt-" child directory -- so a leaf created here
-# would disable the very feature this line used to claim.
+# `mount` is the only external command the function runs. The cgroup root is a
+# PARAMETER so this case can hand it a temp dir. The function inspects nothing
+# inside the tree: vacating the root and enabling controllers belong to the
+# server's NewContainment, whose verifyOwnRoot REFUSES a root holding any
+# non-"wt-" child directory -- a leaf created here would disable containment.
 mount() { return 0; }
 mkdir -p "$WORK/cg"
 out=$(enable_session_containment "$WORK/cg" 2>&1)
@@ -47,11 +41,11 @@ case "$out" in
   *level=info*"remounted rw"*) ok "success logs the remount at info" ;;
   *) no "success logs the remount at info" "got: $out" ;;
 esac
-# The defect this pins is what shipped: the message claimed "per-session process
+# Pins the shipped defect: the message once claimed "per-session process
 # containment available" on the strength of the remount alone, while the server
-# failed with EBUSY on cgroup.subtree_control six seconds later (measured on
-# borgcube, image v2.7.7) and every session ran uncontained. This script proves the
-# MOUNT; only the server can report containment, and it does.
+# failed with EBUSY six seconds later (measured on borgcube, image v2.7.7) and
+# every session ran uncontained. This script proves the MOUNT; only the server
+# can report containment, and it does.
 case "$out" in
   *containment\ available*) no "the remount report must not claim containment is available" "got: $out" ;;
   *) ok "the remount report does not claim containment is available" ;;
@@ -62,9 +56,8 @@ case "$out" in
 esac
 
 # --- 2. the refusal path: warn, non-zero, and NEVER fatal -----------------------
-# A container without the capability takes this path on every single boot, so a
-# `fatal` here (or any exit) would be an unbootable image for every user of the
-# public compose example.
+# A container without the capability takes this path on every boot, so `fatal`
+# (or any exit) here would break the public compose example for every user.
 mount() { return 32; }
 out=$(enable_session_containment "$WORK/cg" 2>&1)
 rc=$?
@@ -78,24 +71,18 @@ case "$out" in
   *level=error* | *fatal*) no "refusal is never fatal" "the message escalates: $out" ;;
   *) ok "refusal is never fatal" ;;
 esac
-# The warn must name the remedy, since the operator cannot infer cap_add from a
-# mount failure.
 case "$out" in
   *SYS_ADMIN*) ok "the refusal warn names the capability to add" ;;
   *) no "the refusal warn names the capability" "got: $out" ;;
 esac
-# 2a. mount's message is the only text in this line the script did not author, and
-# the stubs above print nothing, so without this case every sanitization rule is
-# unexercised. All three assertions discriminate (red-checked: each fails with its
-# rule removed). A lone trailing backslash escapes the closing quote, after which a
-# logfmt reader swallows hint= -- the remedy this warn exists to name; a bare CR
-# splits or overwrites the record; an unescaped double quote closes the error field
-# early and lets mount's own text forge a logfmt key. An assertion that SYS_ADMIN is
-# merely PRESENT is deliberately not added: the substring survives a malformed field,
-# so it cannot fail for the reason it would claim.
+# 2a. mount's message is the only text in this line the script did not author;
+# each assertion here is red-checked (fails with its rule removed). A lone
+# trailing backslash escapes the closing quote and swallows hint=; a bare CR
+# splits/overwrites the record; an unescaped quote closes the error field early
+# and lets mount's text forge a logfmt key.
 #
-# shellcheck disable=SC1003  # the trailing \\ is a literal backslash for printf to
-# emit, which is the malformed value under test -- not an attempt to escape a quote.
+# shellcheck disable=SC1003  # the trailing \\ is a literal backslash for printf
+# to emit -- the malformed value under test, not an attempt to escape a quote.
 mount() {
   printf 'mount: /x: "denied" a\r\\' >&2
   return 32
@@ -109,11 +96,6 @@ case "$out" in
   *$'\r'*) no "a carriage return must not reach the log record" "got: $out" ;;
   *) ok "a carriage return is replaced, not passed through" ;;
 esac
-# Negative on purpose: the property is that mount's quote does not SURVIVE into the
-# record, not that it becomes an apostrophe specifically, so a later change of
-# replacement character does not fail it spuriously. `"denied"` appears nowhere else
-# in the line (neither msg= nor hint= contains the word), so the match cannot be
-# satisfied by unrelated text.
 case "$out" in
   *'"denied"'*) no "mount's own double quote must not reach the log record" "got: $out" ;;
   *) ok "a double quote is neutralized, so it cannot close the error field early" ;;
@@ -121,28 +103,18 @@ esac
 unset -f mount
 
 # --- 2b. the function creates NOTHING inside the cgroup root --------------------
-# This replaces a case that asserted a pid-count report the function no longer
-# makes, and it pins the reason that report is gone. An earlier fix here created an
-# `init` leaf and migrated the root's pids into it, to clear cgroup v2's
-# no-internal-process constraint before the server writes cgroup.subtree_control.
-# Read against the engine's terminal/containment_linux.go (unchanged in this respect
-# since containment landed, first tagged v3.4.0 -- do not re-anchor this to the current
-# go.mod pin, it moves on every Renovate bump), that is
-# both redundant and actively harmful: NewContainment's own vacateRoot (step 5)
-# already moves every pid into its "wt-server" leaf before delegating, and its
-# verifyOwnRoot (step 2, which runs FIRST) refuses the entire root the moment it
-# holds a child directory not prefixed "wt-" -- a foreign child being how it detects
-# a HOST cgroup root it must not reshape. So an `init` leaf here does not enable
-# containment, it disables it, on precisely the hosts where it would have worked.
+# An earlier fix created an `init` leaf and migrated the root's pids into it to
+# clear cgroup v2's no-internal-process constraint. Read against the engine's
+# terminal/containment_linux.go, that is both redundant AND harmful:
+# NewContainment's own vacateRoot already does this, and its verifyOwnRoot (which
+# runs first) refuses the whole root the moment it holds a child not prefixed
+# "wt-" -- so an `init` leaf disables containment on exactly the hosts where it
+# would have worked.
 mount() { return 0; }
 mkdir -p "$WORK/cg2"
 printf '1\n' >"$WORK/cg2/cgroup.procs"
-# Snapshot the tree RECURSIVELY, not just the root's own entries: the removed
-# migration wrote into $cg_root/init/cgroup.procs, so it created a path BELOW the
-# root that an `ls -A` of the root alone does not report. A content check on the
-# root's cgroup.procs cannot serve here at all -- only the kernel removes a pid from
-# a parent's file, so a plain temp file reads "1" whether the function migrated or
-# not, which is why that assertion is gone rather than kept alongside.
+# Snapshot recursively, not just the root's own entries: the removed migration
+# wrote below the root, which a flat `ls -A` would miss.
 before=$(find "$WORK/cg2" | sort)
 out=$(enable_session_containment "$WORK/cg2" 2>&1)
 rc=$?
@@ -151,8 +123,7 @@ rc=$?
 [ "$(find "$WORK/cg2" | sort)" = "$before" ] \
   && ok "the remount writes nothing below the cgroup root, so verifyOwnRoot cannot refuse it" \
   || no "the remount writes nothing below the cgroup root" "tree changed"
-# An occupied root is now ORDINARY -- the server vacates it -- so this function must
-# not warn about it, or every boot carries a warn for the expected state.
+# An occupied root is now ORDINARY (the server vacates it), so this must not warn.
 case "$out" in
   *level=warn*) no "an occupied root must not warn: the server vacates it" "got: $out" ;;
   *) ok "an occupied root does not warn; it is the expected pre-vacate state" ;;
@@ -160,25 +131,18 @@ esac
 unset -f mount
 
 # --- 3. the caller tolerates a refusal ------------------------------------------
-# The call site must not let a non-zero return end the script. `set -u` is on and
-# `set -e` is not, but a bare call inside an `if` chain could still propagate, so
-# assert the `|| true` is really there.
 grep -Eq 'enable_session_containment \|\| true' "$ENTRYPOINT" \
   && ok "the call site swallows a refusal (|| true)" \
   || no "the call site swallows a refusal" "a non-zero return could end boot"
 
 # --- 4. the drop happens BEFORE the server is exec'd ---------------------------
-# The whole point of re-execing early is to not hold CAP_SYS_ADMIN across a
-# network-fetched install. The apt phase this used to anchor on is gone -- OS
-# packages are the tools engine's now -- but the property did not go with it:
-# the server this script execs downloads kiro-cli's archive and installs any
-# `apt:` tool entry, so the capability must be dropped before IT starts, not
-# merely before a block that no longer exists.
+# The point of re-execing early is to not hold CAP_SYS_ADMIN across a
+# network-fetched install (kiro-cli's archive, any `apt:` tool entry), so the
+# capability must drop before the server starts.
 #
-# Every anchor below carries the same `^[^#]*` guard: a PROSE mention of the
-# statement is not the statement. Adding a comment to entrypoint.sh that said
-# `exec setpriv` broke six assertions in this file at once (2026-08), because
-# head -1 happily returned the comment's line number.
+# Every anchor below carries the `^[^#]*` guard: a PROSE mention is not the
+# statement. A comment saying `exec setpriv` once broke six assertions here at
+# once, because head -1 happily returned the comment's line number.
 exec_line=$(grep -nE '^[^#]*exec setpriv' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 server_line=$(grep -nE '^[^#]*exec .*/(web-terminal-kiro|app)' "$ENTRYPOINT" | tail -1 | cut -d: -f1)
 [ -n "$exec_line" ] && [ -n "$server_line" ] && [ "$exec_line" -lt "$server_line" ] \
@@ -186,11 +150,9 @@ server_line=$(grep -nE '^[^#]*exec .*/(web-terminal-kiro|app)' "$ENTRYPOINT" | t
   || no "the capability is dropped before the server is exec'd" "setpriv at $exec_line, server at $server_line"
 
 # --- 4b. the function is DEFINED before it is CALLED ---------------------------
-# Regression: bash resolves a function at call time, so a call placed above the
-# definition does not fail loudly. It reports "command not found", the `|| true`
-# swallows it, and the container boots with containment silently never enabled --
-# no error, no symptom, no containment. This exact mistake was made and caught
-# here, which is why the assertion is text-level rather than behavioral.
+# bash resolves a function at call time, so a call above the definition reports
+# "command not found", the `|| true` swallows it, and containment silently never
+# enables -- no error, no symptom. This exact mistake was made and caught here.
 def_line=$(grep -n '^enable_session_containment() {' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 call_line=$(grep -n 'enable_session_containment || true' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 [ -n "$def_line" ] && [ -n "$call_line" ] && [ "$def_line" -lt "$call_line" ] \
@@ -199,11 +161,10 @@ call_line=$(grep -n 'enable_session_containment || true' "$ENTRYPOINT" | head -1
     "def at ${def_line:-none}, call at ${call_line:-none}: the call would silently no-op"
 
 # --- 5. the drop is PRE-FLIGHTED, because it is an exec ------------------------
-# An `exec setpriv` that fails does not degrade, it ends the container. Two real
-# ways it fails on an image this repo does not fully control: setpriv absent, and
-# dropping from the BOUNDING set requiring CAP_SETPCAP, which a non-root or
-# capability-reduced container lacks. Both must be discovered by a throwaway
-# invocation BEFORE the exec, never by the exec itself.
+# An `exec setpriv` that fails ends the container. Two real failure modes on an
+# image this repo does not fully control: setpriv absent, or dropping from the
+# BOUNDING set needing CAP_SETPCAP, which a non-root/capability-reduced container
+# lacks. Both must be discovered by a throwaway invocation before the exec.
 grep -Eq '^[^#]*if setpriv .*--bounding-set=-sys_admin.* -- true' "$ENTRYPOINT" \
   && ok "the drop is pre-flighted before the exec" \
   || no "the drop is pre-flighted before the exec" "a failing setpriv would end the container"
@@ -211,14 +172,12 @@ preflight_line=$(grep -nE '^[^#]*setpriv .* -- true' "$ENTRYPOINT" | head -1 | c
 [ -n "$preflight_line" ] && [ "$preflight_line" -lt "$exec_line" ] \
   && ok "the pre-flight runs before the exec" \
   || no "the pre-flight runs before the exec" "preflight at ${preflight_line:-none}, exec at $exec_line"
-# When the drop is impossible, the two cases are NOT the same decision, and the
-# split is the security boundary:
-#   cap not held  -> nothing to drop; warn and continue (the public compose example
-#                    takes this path on every boot, so it must never be fatal).
-#   cap held      -> continuing would run the server AND every user terminal with
-#                    CAP_SYS_ADMIN for the container's life, which is the standing
+# When the drop is impossible, the two cases are NOT the same decision:
+#   cap not held  -> nothing to drop; warn and continue (the public compose
+#                    example's path on every boot; must never be fatal).
+#   cap held      -> continuing runs the server AND every terminal session with
+#                    CAP_SYS_ADMIN for the container's life -- the standing
 #                    privilege the re-exec exists to remove. Fail closed.
-# Asserted on the real text because neither branch is reachable in a healthy image.
 tail_block=$(awk -v s="$exec_line" 'NR>s && NR<s+22' "$ENTRYPOINT")
 printf '%s' "$tail_block" | grep -Eq 'CapEff' \
   && ok "the impossible-drop path inspects whether the capability is actually held" \
@@ -231,9 +190,9 @@ printf '%s' "$tail_block" | grep -Eq 'level=warn.*not held' \
   || no "not holding it warns and continues" "the default compose path must not be fatal"
 
 # --- 6. the re-exec cannot loop -------------------------------------------------
-# It re-runs this same script, so the marker is the only thing between one drop and
-# an infinite exec loop. Assert it is set BEFORE the exec, and exported (the child
-# is a fresh process, so an unexported marker would not survive).
+# It re-runs this same script, so the marker is the only thing between one drop
+# and an infinite exec loop. Must be set BEFORE the exec and exported (the child
+# is a fresh process).
 marker_line=$(grep -n 'CONTAINMENT_CAPS_DROPPED=1' "$ENTRYPOINT" | head -1 | cut -d: -f1)
 [ -n "$marker_line" ] && [ "$marker_line" -lt "$exec_line" ] \
   && ok "the loop marker is set before the exec" \
@@ -246,15 +205,13 @@ grep -Eq '\$\{CONTAINMENT_CAPS_DROPPED:-\}" != "1"' "$ENTRYPOINT" \
   || no "the guard tests the marker" "no marker test found"
 
 # --- 7. the re-exec preserves the script's arguments --------------------------
-# The server receives "$@" from this script; an exec that dropped them would change
-# behavior for any operator passing arguments through the image entrypoint.
 grep -Eq 'exec setpriv .* -- "\$0" "\$@"' "$ENTRYPOINT" \
   && ok "the re-exec forwards \$0 and \$@ intact" \
   || no "the re-exec forwards \$0 and \$@" "arguments would be lost across the drop"
 
 # --- 8. the drop names both capability sets -----------------------------------
-# Dropping from the inheritable set alone leaves it in the bounding set, so a later
-# setuid execve could regain it. Both are required for the drop to be real.
+# Dropping from the inheritable set alone leaves it in the bounding set, so a
+# later setuid execve could regain it. Both are required for the drop to be real.
 line=$(grep -m1 -E '^[^#]*exec setpriv' "$ENTRYPOINT")
 case "$line" in
   *--bounding-set=-sys_admin*--inh-caps=-sys_admin*) ok "the drop clears bounding AND inheritable" ;;

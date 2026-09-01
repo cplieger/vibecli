@@ -21,26 +21,23 @@ import (
 // This file covers the SEAM between the install manager and the server: the
 // per-session argv, the per-session PATH, the session-create gate and the
 // loopback repair hook. The pinstall library's own suite covers the manager;
-// nothing there can see whether main.go and routes.go actually consume it, and
-// every property below was silently breakable before these tests existed.
+// nothing there can see whether main.go and routes.go actually consume it.
 
 // TestSessionEnv_reachesSpawnedPTY proves the PATH overlay survives the whole
-// path from routeDeps to a live child process. The engine composes each child's
-// environment itself (os.Environ plus its TERM identity, with the consumer's
-// WithEnv appended LAST so it wins), so a dropped terminal.WithEnv option, or an
-// overlay the engine happened to apply before its own entries, would leave every
-// session resolving kiro-cli through whatever else is on PATH -- with no failing
-// test and no log line. The child reports the PATH it actually received.
+// path from routeDeps to a live child process. The engine composes each
+// child's environment itself (os.Environ plus its TERM identity, with the
+// consumer's WithEnv appended LAST so it wins), so a dropped terminal.WithEnv
+// option would leave every session resolving kiro-cli through whatever else
+// is on PATH, with no failing test and no log line. The child reports the
+// PATH it actually received.
 func TestSessionEnv_reachesSpawnedPTY(t *testing.T) {
 	versionDir := t.TempDir()
 	marker := filepath.Join(t.TempDir(), "path")
 	deps := newTestDeps(true)
-	// A literal overlay, not pinstall.Manager.PathEnv: the subject here is that
-	// whatever deps.sessionEnv returns reaches the child and wins over the engine's
-	// own entries. Composing it (lead with the version directory, append the
-	// inherited PATH only when there is one) is the library's rule and the library's
-	// tests own it -- production reads mgr.PathEnv, and this app no longer has a copy
-	// of that rule to pin.
+	// A literal overlay, not pinstall.Manager.PathEnv: the subject here is
+	// that whatever deps.sessionEnv returns reaches the child and wins over
+	// the engine's own entries. Composing it is the library's rule, owned by
+	// the library's own tests -- production reads mgr.PathEnv.
 	deps.sessionEnv = func() []string { return []string{"PATH=" + versionDir} }
 	deps.cmd = staticCmd("/bin/sh", "-c", `printf '%s' "$PATH" > '`+marker+`'; exec cat`)
 	mustStartSession(t, deps)
@@ -54,21 +51,18 @@ func TestSessionEnv_reachesSpawnedPTY(t *testing.T) {
 	}
 }
 
-// TestSessionCommand_pathReachesArgvOnlyAsDollarZero pins that the cli path enters
-// the argv ONLY as $0: the guard script text is invariant across version switches,
-// so a version change cannot rewrite the sign-in guard and no path is spliced into
-// shell text. That the argv is REBUILT per session (rather than snapshotted at
-// boot) is production wiring, and it is pinned through the real runtime by
-// TestStartKiroCLI_managedWiringActivatesAnInstalledVersion; a factory this test
-// builds itself cannot fail that way.
+// TestSessionCommand_pathReachesArgvOnlyAsDollarZero pins that the cli path
+// enters the argv ONLY as $0: the guard script text is invariant across
+// version switches, so a version change cannot rewrite the sign-in guard.
+// That the argv is REBUILT per session (rather than snapshotted at boot) is
+// pinned through the real runtime by
+// TestStartKiroCLI_managedWiringActivatesAnInstalledVersion.
 func TestSessionCommand_pathReachesArgvOnlyAsDollarZero(t *testing.T) {
 	const activePath = "/config/tools/kiro-cli-versions/2.14.2/kiro-cli"
 	// $0 is the argument after -c's script, so index 3 is the cli path.
 	const cliArg = 3
-	// ...and index 3 is the LAST element: exclusivity is a claim about the whole
-	// argv, so the length is asserted before anything is indexed. Without it an
-	// implementation that appends a second copy of the path after $0 passes every
-	// check below (and would hand kiro-cli a stray positional argument).
+	// ...and index 3 is the LAST element: an implementation that appends a
+	// second copy of the path after $0 would pass every check below.
 	const wantArgc = cliArg + 1
 	empty := sessionCommand("")
 	active := sessionCommand(activePath)
@@ -91,20 +85,20 @@ func TestSessionCommand_pathReachesArgvOnlyAsDollarZero(t *testing.T) {
 	}
 }
 
-// TestKiroReasonTextIsTheClientContract pins the four 503 reason literals and the
-// mapping that produces them. The install manager reports a TYPED reason
-// (pinstall.Reason) because the wording a consumer shows its own users is the
-// consumer's; these strings are THIS app's wording, and they are a published
-// contract in three directions: /api/health's reason field, the 503 body of
-// POST /api/sessions, and the repair hook's verdict — all read by an operator and
-// by a monitoring probe.
+// TestKiroReasonTextIsTheClientContract pins the four 503 reason literals and
+// the mapping that produces them. The install manager reports a TYPED
+// reason (pinstall.Reason) because the wording a consumer shows its own
+// users is the consumer's; these strings are a published contract in three
+// directions: /api/health's reason field, the 503 body of POST
+// /api/sessions, and the repair hook's verdict -- all read by an operator
+// and by a monitoring probe.
 //
-// The strings are spelled out here rather than compared against the constants,
-// which is the whole point: a test that reads `reasonInstalling` on both sides
-// passes after a rename and tells nobody that every operator-facing string changed.
-// It also pins that ReasonReady renders EMPTY, which every surface relies on to
-// omit the field, and that an unknown reason a future library version adds falls
-// back to the terminal wording rather than to "".
+// The strings are spelled out here rather than compared against the
+// constants: a test that reads `reasonInstalling` on both sides passes
+// after a rename and tells nobody that every operator-facing string
+// changed. It also pins that ReasonReady renders EMPTY, and that an
+// unknown reason a future library version adds falls back to the terminal
+// wording rather than to "".
 func TestKiroReasonTextIsTheClientContract(t *testing.T) {
 	cases := []struct {
 		why  pinstall.Reason
@@ -130,13 +124,13 @@ func TestKiroReasonTextIsTheClientContract(t *testing.T) {
 	}
 }
 
-// TestSessionCreateGate_kiroReasonPerState pins the create gate's kiro-cli layer
-// and the reason it reports, per install state. Three separate regressions hide
-// here: the layer not being composed at all (creation proceeds and every tab dies
-// instantly with a false broken-install alert per tab), the layer replacing the
-// tools layer instead of composing with it, and the layer collapsing every state
-// to one reason (an operator cannot tell a first-boot download from an exhausted
-// retry budget, which call for opposite responses).
+// TestSessionCreateGate_kiroReasonPerState pins the create gate's kiro-cli
+// layer and the reason it reports, per install state. Three regressions
+// hide here: the layer not being composed at all (creation proceeds and
+// every tab dies instantly), the layer replacing the tools layer instead
+// of composing with it, and the layer collapsing every state to one
+// reason (an operator cannot tell a first-boot download from an exhausted
+// retry budget).
 func TestSessionCreateGate_kiroReasonPerState(t *testing.T) {
 	for _, reason := range []string{
 		reasonInstalling,
@@ -170,23 +164,22 @@ func TestSessionCreateGate_kiroReasonPerState(t *testing.T) {
 	}
 }
 
-// TestSessionCreateGate_kiroComposesWithTools pins that the two blocking layers
-// registerRoutes composes are BOTH there and are checked kiro-first. It drives the
-// real mux, because the composition order is registerRoutes' own: with the gate
-// rebuilt locally, swapping the two `if` blocks in registerRoutes left this test
-// green while every "both blocked" 503 started naming the tools layer instead.
+// TestSessionCreateGate_kiroComposesWithTools pins that the two blocking
+// layers registerRoutes composes are BOTH there and checked kiro-first. It
+// drives the real mux, because the composition order is registerRoutes'
+// own: with the gate rebuilt locally, swapping the two `if` blocks left
+// this test green while every "both blocked" 503 started naming the tools
+// layer instead.
 //
-// Each layer must be able to refuse alone, a ready kiro-cli plus converged tools
-// must reach the inner chain (so adding the kiro layer did not replace the tools
-// one, nor permanently close the gate), and when both are blocked the reported
-// reason must be kiro-cli's -- the dependency a session cannot start without at
-// all, and the more specific answer for an operator.
+// Each layer must be able to refuse alone, a ready kiro-cli plus converged
+// tools must reach the inner chain, and when both are blocked the reported
+// reason must be kiro-cli's -- the more specific answer for an operator.
 func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 	var toolsSyncing, kiroUnready atomic.Bool
-	// Unready deps plus a trivial command: the one pass-through case creates a
-	// real session, and the factory's fast-death Warn keys on readiness, so an
-	// unready handler keeps a stray broken-install line out of a later test's
-	// log capture (the same shape TestCreateRateLimit uses).
+	// Unready deps plus a trivial command: the one pass-through case creates
+	// a real session, and the factory's fast-death Warn keys on readiness,
+	// so an unready handler keeps a stray broken-install line out of a
+	// later test's log capture.
 	deps := newTestDeps(false)
 	deps.cmd = staticCmd("/bin/true")
 	deps.toolsSyncing = toolsSyncing.Load
@@ -221,18 +214,16 @@ func TestSessionCreateGate_kiroComposesWithTools(t *testing.T) {
 	}
 }
 
-// TestKiroRescan_loopbackOnlyAndPostOnly pins the repair hook's admission, which
-// is the only thing standing between an unauthenticated port and a route that
-// spawns subprocesses. It is admitted exactly like the tools API: the SOCKET PEER
-// and the Host header must both be loopback, a proxy/browser provenance header
-// refuses even when both loopback legs pass, forwarded headers can never ADMIT,
-// and the POST method pattern keeps a GET from driving an install.
+// TestKiroRescan_loopbackOnlyAndPostOnly pins the repair hook's admission,
+// the only thing standing between an unauthenticated port and a route that
+// spawns subprocesses. It is admitted exactly like the tools API: the
+// SOCKET PEER and the Host header must both be loopback, a proxy/browser
+// provenance header refuses even when both loopback legs pass, and the
+// POST method pattern keeps a GET from driving an install.
 //
-// A GET answers 405 (Allow: POST) rather than reaching the handler: the app also
-// registers the catch-all "/" static pattern, which matches the path for any
-// method and would otherwise silence ServeMux's own 405 synthesis, so the
-// method-agnostic mount beside the POST one is what makes the mismatch legible.
-// What the contract needs is that a GET never REACHES the handler.
+// A GET answers 405 (Allow: POST) rather than reaching the handler: the app
+// also registers the catch-all "/" static pattern, which matches any
+// method and would otherwise silence ServeMux's own 405 synthesis.
 func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	newMux := func(t *testing.T, rescan func(context.Context) (bool, error)) *http.ServeMux {
 		t.Helper()
@@ -243,7 +234,7 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 		return mux
 	}
 	// The documented consumer -- kiro-cli's ! escape running curl inside the
-	// container -- sends no proxy or browser provenance header at all.
+	// container -- sends no proxy or browser provenance header.
 	call := func(mux *http.ServeMux, method, remote, host string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, kiroRescanPath, http.NoBody)
 		req.RemoteAddr = remote
@@ -253,11 +244,10 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 		return rec
 	}
 	// The same call carrying a forwarded header. It can only ever REFUSE: a
-	// remote caller cannot use it to gain admission, and a request that already
-	// satisfies both loopback legs loses admission because the header is
-	// positive evidence it did not originate inside the container (the
-	// same-loopback reverse-proxy shape, whose Host nginx and Apache rewrite to
-	// the upstream address by default).
+	// remote caller cannot use it to gain admission, and a request that
+	// already satisfies both loopback legs loses admission because the
+	// header is positive evidence it did not originate inside the
+	// container (the same-loopback reverse-proxy shape).
 	callProxied := func(mux *http.ServeMux, method, remote, host string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, kiroRescanPath, http.NoBody)
 		req.RemoteAddr = remote
@@ -274,10 +264,9 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusOK {
 		t.Errorf("loopback POST: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
 	}
-	// No provenance header: the 403 can only come from the SOCKET-PEER leg, which
-	// is otherwise unpinned now that a forwarded header refuses on its own. Verified
-	// against a mutant with the peer conjunct dropped from loopbackOnly: without this
-	// row the whole package stays green.
+	// No provenance header: the 403 can only come from the SOCKET-PEER leg.
+	// Verified against a mutant with the peer conjunct dropped from
+	// loopbackOnly: without this row the whole package stays green.
 	if rec := call(mux, http.MethodPost, "192.168.1.9:5555", "localhost:9848"); rec.Code != http.StatusForbidden {
 		t.Errorf("remote peer POST: status = %d, want 403 -- the socket-peer leg alone must refuse a remote caller driving an install", rec.Code)
 	}
@@ -290,10 +279,9 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	if rec := call(mux, http.MethodPost, "127.0.0.1:5555", "webterm.example.com"); rec.Code != http.StatusForbidden {
 		t.Errorf("loopback peer with a non-loopback Host: status = %d, want 403 (the DNS-rebound-page shape)", rec.Code)
 	}
-	// The exact response contract, not merely "not 200": the method-agnostic mount
-	// exists so a GET answers 405 with Allow: POST instead of the catch-all static
-	// handler's bare 404, and a not-200 assertion is green after that mount is
-	// reverted.
+	// The exact response contract, not merely "not 200": the method-agnostic
+	// mount exists so a GET answers 405 with Allow: POST instead of the
+	// catch-all static handler's bare 404.
 	if rec := call(mux, http.MethodGet, "127.0.0.1:5555", "localhost:9848"); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("loopback GET: status = %d, want 405 -- a rescan changes state, so a GET must not drive one, and the mount must say so rather than 404ing as static", rec.Code)
 	} else if got := rec.Header().Get("Allow"); got != http.MethodPost {
@@ -304,12 +292,12 @@ func TestKiroRescan_loopbackOnlyAndPostOnly(t *testing.T) {
 	}
 }
 
-// TestKiroRescan_reportsVerdictNotErrorText pins the repair hook's two outcomes:
-// 200 when a version is active afterwards, and 503 carrying the manager's own
-// readiness reason when none is -- the same verdict /api/health will serve, so a
-// caller gets its answer without polling. The error text deliberately stays out
-// of the body: it can name a filesystem path, and this response is not the place
-// to widen what an unauthenticated-port caller learns about the volume.
+// TestKiroRescan_reportsVerdictNotErrorText pins the repair hook's two
+// outcomes: 200 when a version is active afterwards, and 503 carrying the
+// manager's own readiness reason when none is -- the same verdict
+// /api/health serves. The error text deliberately stays out of the body:
+// it can name a filesystem path, and this response is not the place to
+// widen what an unauthenticated-port caller learns about the volume.
 func TestKiroRescan_reportsVerdictNotErrorText(t *testing.T) {
 	deps := newTestDeps(true)
 	deps.kiroRescan = func(context.Context) (bool, error) {
@@ -465,27 +453,23 @@ func TestStartKiroCLI_managedWiringActivatesAnInstalledVersion(t *testing.T) {
 	}
 }
 
-// TestStartKiroCLI_readinessReasonIsThisAppsWording pins the last unguarded step
-// of the reason contract: that the MANAGED runtime renders the library's typed
-// reason through kiroReasonText rather than serving pinstall's own wording.
-// TestKiroReasonTextIsTheClientContract pins the function in isolation and the
-// unusable-pin shape reports a hardcoded literal, so replacing the managed
-// closure's kiroReasonText(why) with why.String() changes what /api/health, the
-// 503 body of POST /api/sessions and the repair hook all serve -- "required
-// assertion not enforced" instead of "kiro-cli required settings not enforced" --
-// with the whole suite green.
+// TestStartKiroCLI_readinessReasonIsThisAppsWording pins the last unguarded
+// step of the reason contract: the MANAGED runtime renders the library's
+// typed reason through kiroReasonText rather than serving pinstall's own
+// wording. Replacing the managed closure's kiroReasonText(why) with
+// why.String() changes what /api/health, the 503 body of POST
+// /api/sessions, and the repair hook all serve, with the whole suite
+// green.
 //
-// It reaches a non-ready managed verdict with no download: the pinned version is
-// already complete on the volume, its dispatchers answer --version with the pin
-// (so selection accepts them) and fail every settings call, which is exactly the
-// required-assertion state.
+// It reaches a non-ready managed verdict with no download: the pinned
+// version is already complete on the volume, its dispatchers answer
+// --version with the pin (so selection accepts them) and fail every
+// settings call -- the required-assertion state.
 func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
-	// One definition of the complete-version layout and this app's required set
-	// (kirocli_namespace_test.go's plantOwnVersion), then the ONE deviation this
-	// test is about: dispatchers that answer --version with the pin and FAIL every
-	// settings call. Hand-building the fixture again is what l-f4 removed from this
-	// file, and it would reintroduce the divergence that made a required-set change
-	// fail a readiness poll without naming the missing dispatcher.
+	// One definition of the complete-version layout and this app's required
+	// set (kirocli_namespace_test.go's plantOwnVersion), then the ONE
+	// deviation this test is about: dispatchers that answer --version with
+	// the pin and FAIL every settings call.
 	fixture := newNSEnv(t)
 	dir := fixture.plantOwnVersion()
 	for _, name := range []string{nsTool, nsTool + "-chat"} {
@@ -499,29 +483,26 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 		sha256ARM64: strings.Repeat("b", 64),
 		toolsDir:    fixture.tools,
 	})
-	// stop() CANCELS the bind-first install goroutine; it does not JOIN it, and the
-	// tail of an in-flight Ensure -- the state record and the convenience symlink --
-	// is not context-guarded. A cancel alone therefore leaves that goroutine still
-	// writing into the tools tree while t.TempDir's RemoveAll walks it, and the
-	// removal fails with "directory not empty" AFTER every assertion below has
-	// already passed. That is what made this test flaky under load, and it is the
-	// only way it has been observed to fail (measured: 4 failures in 240 runs with
-	// the machine loaded, all four the cleanup, none the readiness poll below).
+	// stop() CANCELS the bind-first install goroutine; it does not JOIN it,
+	// and the tail of an in-flight Ensure -- the state record and the
+	// convenience symlink -- is not context-guarded. A cancel alone
+	// therefore leaves that goroutine still writing into the tools tree
+	// while t.TempDir's RemoveAll walks it, which is what made this test
+	// flaky under load (measured: 4 failures in 240 runs, all four the
+	// cleanup, none the readiness poll below).
 	//
-	// Rescan takes the manager's own operation semaphore, so it cannot return until
-	// the in-flight Ensure has released it, and after a cancel no further attempt is
-	// ever started (EnsureWithRetry breaks on ctx.Err() and an Ensure that has not
-	// yet acquired the slot returns at once). Joining on it is what orders the
-	// cleanup instead of leaving it to the scheduler. Cleanups run LIFO, so this one
-	// runs before the TempDir removal newNSEnv registered.
+	// Rescan takes the manager's own operation semaphore, so it cannot
+	// return until the in-flight Ensure has released it, and after a
+	// cancel no further attempt starts. Joining on it orders the cleanup
+	// instead of leaving it to the scheduler; cleanups run LIFO, so this
+	// one runs before the TempDir removal newNSEnv registered.
 	//
-	// The join needs a context of its OWN: t.Context() is cancelled just before the
-	// first cleanup runs, and the slot acquire is deliberately cancellable, so
-	// handing it t.Context() returns context.Canceled without waiting at all --
-	// a join that no-ops in precisely the case it exists for, the slot still held by
-	// the goroutine we are trying to order against. The check below is what keeps
-	// that regression from going quiet again: a cancelled join reports itself here
-	// instead of resurfacing as an unexplained RemoveAll failure under load.
+	// The join needs a context of its OWN: t.Context() is cancelled just
+	// before the first cleanup runs, so handing it t.Context() returns
+	// context.Canceled without waiting at all -- a join that no-ops in
+	// precisely the case it exists for. The check below catches that
+	// regression instead of it resurfacing as an unexplained RemoveAll
+	// failure under load.
 	t.Cleanup(func() {
 		rt.stop()
 		if rt.rescan == nil {
@@ -559,17 +540,18 @@ func TestStartKiroCLI_readinessReasonIsThisAppsWording(t *testing.T) {
 	}
 }
 
-// TestKiroSettings_preserveScrollbackIsAssertedOff pins the one setting in this
-// app's list where DROPPING the entry is not the same as setting it false, which
-// is the whole reason a value the caller could "clean up" as a redundant default
-// is written explicitly on every boot.
+// TestKiroSettings_preserveScrollbackIsAssertedOff pins the one setting in
+// this app's list where DROPPING the entry is not the same as setting it
+// false, which is why a value the caller could "clean up" as a redundant
+// default is written explicitly on every boot.
 //
-// kiro-cli's own default is false, so an absent key looks equivalent. It is not:
-// the key is persisted in the Kiro home on the /config volume, so a deployment
-// that recorded true once keeps it for the container's whole future life, and
-// nothing else in this process ever writes it back. Removing the assertion
-// therefore repairs a FRESH volume and leaves every already-affected one broken,
-// silently, with the duplicated-scrollback defect intact (Kiro#10939).
+// kiro-cli's own default is false, so an absent key looks equivalent. It
+// is not: the key is persisted in the Kiro home on the /config volume, so
+// a deployment that recorded true once keeps it for the container's whole
+// future life, and nothing else in this process ever writes it back.
+// Removing the assertion therefore repairs a FRESH volume and leaves every
+// already-affected one broken, silently, with the duplicated-scrollback
+// defect intact (Kiro#10939).
 //
 // A refactor that deletes the line, or a Renovate-adjacent edit that restores the
 // upstream-recommended true, both fail here rather than in a user's history.

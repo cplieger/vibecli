@@ -6,34 +6,18 @@ import (
 )
 
 // FuzzNotifyFingerprint is the coverage-guided half of the log-redaction cover.
-// notifyFingerprinter is the only place in this app where arbitrary CHILD output
-// is shaped for the log stream: a program run in the terminal can emit any
-// `ESC ] 9 ; <text>`, the engine's sanitizeNotification guarantees only
-// integrity (unsafe runes dropped, 256-rune cap) and redacts NOTHING, and
-// whatever this function returns is written to a store Loki retains far longer
-// than PTY scrollback. Redaction is therefore a security property of untrusted
-// input, and the invariants below keep it checked against inputs no table
-// enumerates.
+// notifyFingerprinter is the only place in this app that shapes arbitrary CHILD
+// output for the log stream: the engine's sanitizeNotification guarantees only
+// integrity (unsafe runes dropped, 256-rune cap) and redacts nothing, and this
+// function's output is written to a store Loki retains far longer than PTY
+// scrollback.
 //
-// The key is injected here (the production key is drawn per classifier and
-// never logged), which also makes the KEYING itself fuzzable: the same input
-// under a second key must not reproduce the first identifier, the invariant that
-// fails if the HMAC is ever "simplified" back to a plain digest of low-entropy
-// child output.
-//
-// The invariants are deliberately stronger than crash-only, and each is the
-// redaction property stated a different way: the output is a fixed number of
-// lowercase hex digits (so neither the length nor the alphabet of the input can
-// show through), it is stable for equal input under one key (the correlation
-// property the Warn and Debug records rely on), a one-bit change to the input
-// changes it (so distinct wordings never collapse into one record), a hex-only
-// input is not returned as its own prefix (the truncate-instead-of-hash
-// regression that would still pass the alphabet check), and it depends on the
-// key (no offline guessing oracle for a short token or device code). The seed
-// corpus is the durable coverage here -- the weekly coverage-guided run starts
-// from these seeds every time and keeps nothing -- so the seeds carry the empty,
-// hex-looking, device-code-shaped, Bidi-control, multi-byte and invalid-UTF-8
-// cases directly.
+// The key is injected here (production draws it per classifier and never logs
+// it), so the invariants below cover keying too: a hex-only fixed-width output
+// (so neither input length nor alphabet shows through), stable per key (the
+// correlation the Warn/Debug pair relies on), sensitive to a one-bit change (so
+// distinct wordings never collapse), never its own prefix (rules out
+// truncate-instead-of-hash), and key-dependent (no offline guessing oracle).
 func FuzzNotifyFingerprint(f *testing.F) {
 	fp := notifyFingerprinter{key: []byte("fuzz-key-one-0123456789abcdef0123")}
 	otherKey := notifyFingerprinter{key: []byte("fuzz-key-two-0123456789abcdef0123")}
@@ -56,10 +40,7 @@ func FuzzNotifyFingerprint(f *testing.F) {
 			t.Fatalf("fingerprint(%q) is unstable (%q then %q); the Warn and its Debug twin would no longer correlate", msg, got, again)
 		}
 		// Metamorphic: a one-bit change to the notification must change the
-		// fingerprint. This is what rules out the degenerate implementations the
-		// width/alphabet checks above accept -- a constant, or a fingerprint
-		// derived from the length alone -- which would silently conflate every
-		// unrecognized wording into one.
+		// fingerprint, ruling out a constant or length-derived degenerate.
 		if len(msg) > 0 {
 			mutated := []byte(msg)
 			mutated[0] ^= 0x01
@@ -68,15 +49,13 @@ func FuzzNotifyFingerprint(f *testing.F) {
 			}
 		}
 		// Truncation, not hashing, is the regression that would still look
-		// hex-ish: a hex-only notification longer than the width would come back
-		// as its own leading characters.
+		// hex-ish.
 		if strings.Trim(msg, "0123456789abcdef") == "" && len(msg) > notifyFingerprintHexDigits && got == msg[:notifyFingerprintHexDigits] {
 			t.Fatalf("fingerprint(%q) = %q, its own prefix; the notification must be hashed, not truncated", msg, got)
 		}
-		// Keying: the identifier must not be reproducible from the notification
-		// alone. An unkeyed digest -- the shape this replaced -- would return the
-		// same value here, which is exactly the offline oracle that makes a short
-		// token or device code recoverable from the log.
+		// Keying: an unkeyed digest -- the shape this replaced -- would return
+		// the same value under a different key, the offline oracle that makes a
+		// short token or device code recoverable from the log.
 		if underOther := otherKey.fingerprint(msg); underOther == got {
 			t.Fatalf("fingerprint(%q) = %q under two different keys; a log reader could enumerate candidates offline and confirm the text", msg, got)
 		}

@@ -4,4 +4,4 @@
 // mechanism as web-terminal-engine's nested ignore module.
 module static-src-ignore
 
-go 1.27.0
+go 1.27.1

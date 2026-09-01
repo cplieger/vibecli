@@ -26,13 +26,10 @@ import (
 )
 
 // TestDebugRoutesNotExposed pins the route surface of registerRoutes: the
-// engine's terminal.MountAPI wires exactly its documented four routes (/ws,
-// /api/sessions + subtree, /api/sessions/events), so no diagnostic or
-// engine-internal path may ever answer on this unauthenticated surface. The
-// /debug/* probes are canaries for that contract: the pinned engine exports no
-// such routes today, and if any version ever grows one, MountAPI's
-// release-noted route-set contract plus this test keep it from appearing here
-// silently.
+// engine's terminal.MountAPI wires exactly its documented four routes
+// (/ws, /api/sessions + subtree, /api/sessions/events), so no diagnostic
+// or engine-internal path may ever answer on this unauthenticated
+// surface.
 func TestDebugRoutesNotExposed(t *testing.T) {
 	mux, _, _ := mustRegisterRoutes(t, newTestDeps(false))
 
@@ -41,11 +38,11 @@ func TestDebugRoutesNotExposed(t *testing.T) {
 		t.Errorf("/ws routed to pattern %q, want %q", pat, "/ws")
 	}
 
-	// /debug/* must NOT be registered. Assert the POSITIVE observable — both probes
-	// resolve to the "/" file-server catch-all — rather than `pat != p`: ServeMux
-	// reports a SUBTREE registration by its pattern, so a handler registered at
-	// "/debug/" would answer /debug/raw while pat ("/debug/") still differs from the
-	// requested path, and the old assertion passed over an exposed debug handler.
+	// /debug/* must NOT be registered. Assert the POSITIVE observable --
+	// both probes resolve to the "/" file-server catch-all -- rather than
+	// `pat != p`: ServeMux reports a SUBTREE registration by its pattern,
+	// so a handler at "/debug/" would answer /debug/raw while pat still
+	// differs from the requested path.
 	for _, path := range []string{"/debug/raw", "/debug/screen"} {
 		if _, pat := mux.Handler(httptest.NewRequest(http.MethodGet, path, http.NoBody)); pat != "/" {
 			t.Errorf("%s routed to pattern %q, want the static catch-all %q; /debug routes must not be exposed", path, pat, "/")
@@ -77,14 +74,13 @@ func TestHealthEndpoint_reflectsReadiness(t *testing.T) {
 	}
 }
 
-// TestHealthEndpoint_reflectsKiroCliReadiness pins the kiro-cli readiness gate
-// added for the deferred readiness-decoupled-from-kiro-cli finding. When the
-// server owns the install (main.go hands it the manager's Ready), /api/health
-// returns 503 while no version is active and 200 once one is — reflecting
-// web-terminal-kiro's core dependency from in-memory state, never launching
-// kiro-cli. Out-of-container runs (tests, a bare `go run` with no pins) get the
-// composition root's permissive (true, "") default instead of a nil policy, so
-// they keep pure-listener readiness.
+// TestHealthEndpoint_reflectsKiroCliReadiness pins the kiro-cli readiness
+// gate: when the server owns the install (main.go hands it the manager's
+// Ready), /api/health returns 503 while no version is active and 200 once
+// one is -- reflecting readiness from in-memory state, never launching
+// kiro-cli. Out-of-container runs get the composition root's permissive
+// (true, "") default instead of a nil policy, so they keep pure-listener
+// readiness.
 func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 	newMux := func(verdict func() (bool, string)) *http.ServeMux {
 		deps := newTestDeps(true)
@@ -104,10 +100,10 @@ func TestHealthEndpoint_reflectsKiroCliReadiness(t *testing.T) {
 		t.Errorf("no active version: status = %d, want %d", code, http.StatusServiceUnavailable)
 	}
 
-	// A version active with its required settings asserted -> ready -> 200. This
-	// is also the unmanaged (no-pins) shape: main.go's unmanagedKiroRuntime
-	// supplies exactly this permissive (true, "") default, so the route layer has
-	// no nil case to disable a gate for.
+	// A version active with its required settings asserted -> ready ->
+	// 200. Also the unmanaged (no-pins) shape: main.go's
+	// unmanagedKiroRuntime supplies exactly this permissive (true, "")
+	// default, so the route layer has no nil case to disable a gate for.
 	if code := status(newMux(func() (bool, string) { return true, "" })); code != http.StatusOK {
 		t.Errorf("version active: status = %d, want %d", code, http.StatusOK)
 	}
@@ -1765,21 +1761,12 @@ func TestKiroRescan_reportsUnreadyOnlyWhenAVerdictWasReached(t *testing.T) {
 	}
 }
 
-// The two tests that used to sit here pinned this app's OWN admission gate and
-// its context.WithoutCancel wrapper: that an abandoned queued caller never
-// entered pinstall, and that an admitted rescan survived a client disconnect.
-// Both behaviours are now the LIBRARY's (pinstall >= v1.1.0 makes waiting for its
-// operation slot cancellable and runs an admitted rescan detached), and they are
-// pinned there by TestRescanQueuedCallerCanAbandon and
-// TestAdmittedRescanIgnoresCallerCancellation, which exercise the real manager.
-// These app-level versions drove a FAKE kiroRescan, so after the move they could
-// only ever assert that the fake had no gate — a test of the stub, not the app.
-//
-// What is still this app's to get wrong is the one line below, and it is the
-// reason this test exists rather than nothing: the handler must hand the REQUEST
-// context to the manager unchanged. Re-detaching it here (the shape that was
-// correct before the bump) would defeat the library's cancellable wait, silently
-// restoring the unbounded-queue hazard the gate was written for.
+// The cancellable-wait and detached-rescan behaviors are pinstall's own
+// (pinned there by TestRescanQueuedCallerCanAbandon and
+// TestAdmittedRescanIgnoresCallerCancellation). What is still this app's to get
+// wrong is the one line below: the handler must hand the REQUEST context to the
+// manager unchanged. Detaching it here would defeat the library's cancellable
+// wait, silently restoring the unbounded-queue hazard the gate was written for.
 func TestKiroRescan_PassesTheRequestContextThrough(t *testing.T) {
 	seen := make(chan context.Context, 1)
 	deps := newTestDeps(true)

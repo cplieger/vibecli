@@ -18,14 +18,14 @@ import (
 	"github.com/cplieger/web-terminal-engine/v5/terminal"
 )
 
-// fakeSetter records what the syncer pushed onto the engine's client title rung,
-// and can report a session as gone (the manager's false return).
+// fakeSetter records what the syncer pushed onto the engine's client title
+// rung, and can report a session as gone (the manager's false return).
 type fakeSetter struct {
 	calls   []string // "id=title" in call order, so a repeat push is visible
 	missing map[terminal.SessionID]bool
-	// live is the tab set List reports, i.e. what the engine's session manager
-	// still holds. pass() reclaims any mapping whose tab is not in it, so a test
-	// that expects a push has to name its tab here.
+	// live is the tab set List reports. pass() reclaims any mapping whose
+	// tab is not in it, so a test that expects a push has to name its tab
+	// here.
 	live []terminal.SessionID
 }
 
@@ -42,8 +42,9 @@ func (f *fakeSetter) List() []terminal.SessionInfo {
 	return out
 }
 
-// titleFixture builds a syncer over temp dirs plus helpers to plant the two inputs
-// the real system produces: the hook's mapping file and kiro-cli's session record.
+// titleFixture builds a syncer over temp dirs plus helpers to plant the two
+// inputs the real system produces: the hook's mapping file and kiro-cli's
+// session record.
 type titleFixture struct {
 	t    *testing.T
 	sync *sessionTitleSync
@@ -52,11 +53,11 @@ type titleFixture struct {
 
 func newTitleFixture(t *testing.T) *titleFixture {
 	t.Helper()
-	// The state root is a CHILD of the temp dir, so both levels are created --
-	// and mode-tightened -- by ensureStateDir itself: a filesystem whose
-	// inheritable ACL widens fresh directories (the ZFS nfs4acl case the
-	// production comment measures) then cannot make the fixture's own root read
-	// as a pre-existing widened level and refuse every test in this file.
+	// The state root is a CHILD of the temp dir, so both levels are created
+	// -- and mode-tightened -- by ensureStateDir itself: a filesystem whose
+	// inheritable ACL widens fresh directories then cannot make the
+	// fixture's own root read as a pre-existing widened level and refuse
+	// every test in this file.
 	root, home := filepath.Join(t.TempDir(), "state"), t.TempDir()
 	s := newSessionTitleSync(root, home)
 	if err := s.ensureStateDir(); err != nil {
@@ -65,10 +66,9 @@ func newTitleFixture(t *testing.T) *titleFixture {
 	return &titleFixture{t: t, sync: s, home: home}
 }
 
-// mapping plants what the hook writes: a file named for the tab's TITLE HANDLE,
-// holding kiro's id. The handle comes from the real minting path, so a test joins
-// the two identities the same way the poller does rather than fabricating a filename
-// production would never produce.
+// mapping plants what the hook writes: a file named for the tab's TITLE
+// HANDLE, holding kiro's id. The handle comes from the real minting path,
+// so a test joins the two identities the same way the poller does.
 func (f *titleFixture) mapping(tabID terminal.SessionID, kiroID string) {
 	f.t.Helper()
 	path := filepath.Join(f.sync.stateDir, f.handle(tabID))
@@ -77,15 +77,17 @@ func (f *titleFixture) mapping(tabID terminal.SessionID, kiroID string) {
 	}
 }
 
-// handle mints (or returns) one tab's title handle, which is what a test must use to
-// name anything in the state directory: the mapping file is named for the handle and
-// never for the tab, because a tab id is the /ws capability token.
+// handle mints (or returns) one tab's title handle, which is what a test
+// must use to name anything in the state directory: the mapping file is
+// named for the handle and never for the tab, because a tab id is the /ws
+// capability token.
 func (f *titleFixture) handle(tabID terminal.SessionID) string {
 	f.t.Helper()
 	return titleHandleFor(f.t, f.sync, tabID)
 }
 
-// titleHandleFor is the fixture-free form, for the tests that build a syncer directly.
+// titleHandleFor is the fixture-free form, for tests that build a syncer
+// directly.
 func titleHandleFor(t *testing.T, s *sessionTitleSync, tabID terminal.SessionID) string {
 	t.Helper()
 	handle, err := s.titleHandle(tabID)
@@ -95,8 +97,9 @@ func titleHandleFor(t *testing.T, s *sessionTitleSync, tabID terminal.SessionID)
 	return handle
 }
 
-// session plants a kiro session record under a per-workspace hash directory, which
-// is the level the syncer has to scan because the hash is kiro's private business.
+// session plants a kiro session record under a per-workspace hash
+// directory, which is the level the syncer has to scan because the hash is
+// kiro's private business.
 func (f *titleFixture) session(hash, kiroID, body string) {
 	f.t.Helper()
 	dir := filepath.Join(f.home, ".kiro", "sessions", hash, kiroID)
@@ -116,14 +119,13 @@ func quote(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
 }
 
-// TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel pins the distinction the
-// created flag exists for: a level this process created is tightened to 0700 and
-// accepted (a filesystem with an inheritable group-write ACL widens os.Mkdir's
-// requested mode, and refusing our own directory would disable tab titles for the
-// container's life), while a level that was ALREADY group/other-writable is refused
-// -- that refusal is pinned through the gate by
-// TestEnableSessionTitlesGatesBothConsumersOnTheVerdict, which plants the same
-// widened shape and asserts the verdict withholds both consumers.
+// TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel pins the
+// distinction the created flag exists for: a level this process created is
+// tightened to 0700 and accepted (a filesystem with an inheritable
+// group-write ACL widens os.Mkdir's requested mode, and refusing our own
+// directory would disable tab titles for the container's life), while a
+// level that was ALREADY group/other-writable is refused -- pinned through
+// the gate by TestEnableSessionTitlesGatesBothConsumersOnTheVerdict.
 func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 	t.Run("a level we created is tightened, not refused", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "state")
@@ -142,15 +144,14 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 		}
 	})
 	t.Run("a level created off-mode is tightened to 0700", func(t *testing.T) {
-		// umask is process-wide: this subtest must NOT call t.Parallel, and it
-		// restores the mask before any assertion can fail. A umask of 0o200 makes
-		// os.Mkdir(0o700) yield 0o500, which is exactly the shape the created flag
-		// exists for -- a level WE created whose mode is not what was asked for --
-		// and it is the only seam that reaches the chmod-tighten branch on a
-		// filesystem that does not widen modes (the ZFS nfs4acl case the code
-		// comment measures). The temp parents are made BEFORE the mask changes, so
-		// only the two levels ensureStateDir creates are born off-mode. Without
-		// the chmod-tighten branch the levels stay 0500 and this fails.
+		// umask is process-wide: this subtest must NOT call t.Parallel, and
+		// it restores the mask before any assertion can fail. A umask of
+		// 0o200 makes os.Mkdir(0o700) yield 0o500 -- a level WE created
+		// whose mode is not what was asked for -- and it is the only seam
+		// that reaches the chmod-tighten branch on a filesystem that does
+		// not widen modes. The temp parents are made BEFORE the mask
+		// changes, so only the two levels ensureStateDir creates are born
+		// off-mode.
 		parent, home := t.TempDir(), t.TempDir()
 		root := filepath.Join(parent, "state")
 		s := newSessionTitleSync(root, home)
@@ -173,21 +174,20 @@ func TestEnsureStateDirRefusesOnlyAPreExistingWidenedLevel(t *testing.T) {
 }
 
 // TestEnsureStateDirRefusesAForeignOwnedLevel pins the ownership arm of the custody
-// check, which ensureStateLevel's own comment says nothing else covers: a level at
-// mode 0700 that is a real directory passes the type check, the created check and
-// the group/other-writable check, so OWNERSHIP is the only thing standing between a
-// level another local user controls and pass()/forget() sweeping it with os.ReadDir
-// and os.Remove every titlePollInterval. Deleting the two Uid lines compiles and
-// leaves the rest of this suite green, because every other level any test builds is
-// owned by the test process.
+// check, which ensureStateLevel's own comment says nothing else covers: a
+// level at mode 0700 that is a real directory passes the type check, the
+// created check and the group/other-writable check, so OWNERSHIP is the
+// only thing standing between a level another local user controls and
+// pass()/forget() sweeping it with os.ReadDir and os.Remove every
+// titlePollInterval.
 //
-// The foreign owner is the point rather than the mode: its holder can rename the
-// checked path or replace it with a symlink AFTER the verdict, which is the
-// post-check window the mode test cannot see.
+// The foreign owner is the point rather than the mode: its holder can
+// rename the checked path or replace it with a symlink AFTER the verdict,
+// a post-check window the mode test cannot see.
 //
-// Requires the privilege to give a directory away, which this app has by design
-// (the image runs as root) and an unprivileged CI runner does not, so the test
-// skips there rather than failing for the environment.
+// Requires the privilege to give a directory away, which this app has by
+// design (the image runs as root) and an unprivileged CI runner does not,
+// so the test skips there.
 func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 	const foreignUID, foreignGID = 65534, 65534 // nobody:nogroup, present on the Debian base
 
@@ -195,21 +195,21 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatalf("make the level: %v", err)
 	}
-	// os.Mkdir's mode is a REQUEST -- the same fact ensureStateLevel is built around
-	// -- so ASK for the bait mode rather than assuming it: an inheritable group-write
-	// ACL widens the created level to 0770 and the fixture stops being bait. Chmod is
-	// the call that SETS the mode and it is exact even on the dataset that widens the
-	// mkdir (measured: mkdir(0o700) -> 0770, chmod(0o700) -> 0700, and chown leaves
-	// the perm bits alone), so this is what keeps the ownership arm RUNNING there
-	// instead of skipping past it.
+	// os.Mkdir's mode is a REQUEST -- the same fact ensureStateLevel is
+	// built around -- so ASK for the bait mode rather than assuming it: an
+	// inheritable group-write ACL widens the created level to 0770 and the
+	// fixture stops being bait. Chmod SETS the mode exactly even on the
+	// dataset that widens the mkdir, which is what keeps the ownership arm
+	// RUNNING there instead of skipping past it.
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatalf("tighten the level to the bait mode: %v", err)
 	}
 	if err := os.Chown(root, foreignUID, foreignGID); err != nil {
 		t.Skipf("cannot give a directory away here, so a foreign-owned level cannot be built: %v", err)
 	}
-	// Everything except ownership is exactly what the check wants, so this fixture
-	// is only bait if the mode really is 0700 and the path really is a directory.
+	// Everything except ownership is what the check wants, so this
+	// fixture is only bait if the mode really is 0700 and the path really
+	// is a directory.
 	fi, err := os.Lstat(root)
 	if err != nil {
 		t.Fatalf("lstat the level: %v", err)
@@ -218,12 +218,10 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 		t.Fatalf("fixture is not a directory (mode %#o): os.Mkdir reported success, so this is a real anomaly rather than an environment limit", fi.Mode())
 	}
 	if perm := fi.Mode().Perm(); perm != 0o700 {
-		// Not a defect in the code under test: the chmod above ASKED for the bait mode
-		// and this filesystem still would not store it, and a widened level would be
-		// refused for its MODE, so the ownership arm this test exists for would never
-		// be the reason it failed. Skip like the Chown guard above rather than
-		// reporting the filesystem as a failure of the check. A dataset that merely
-		// widens the mkdir does NOT land here -- the chmod covers that one.
+		// Not a defect in the code under test: the chmod above ASKED for
+		// the bait mode and this filesystem still would not store it, so
+		// a level that passes every check but the ownership one cannot be
+		// built here. Skip like the Chown guard above.
 		t.Skipf("this filesystem stored mode %#o even after a chmod to 0o700, so a level that passes every check but the ownership one cannot be built here", perm)
 	}
 
@@ -232,16 +230,13 @@ func TestEnsureStateDirRefusesAForeignOwnedLevel(t *testing.T) {
 	}
 }
 
-// TestEnsureStateDirRefusesAPlantedPath pins the planted-path arm of the custody
-// check -- the CWE-59 shape ensureStateDir's comment is mostly about -- and with
-// it the load-bearing syscall choice: each level must be inspected with Lstat,
-// never Stat. Swapping the two compiles and changes no other test's outcome (the
-// widened- and created-level cases never involve a link), while silently
-// re-opening the planted-symlink delete loop: Stat follows the link to a
-// directory this process owns at mode 0700, every remaining check passes, and
-// pass()/forget() then ReadDir and Remove through the link every tick. The
-// symlink subtest fails under exactly that swap; the plain-file subtest covers
-// the other planted shape at the other level.
+// TestEnsureStateDirRefusesAPlantedPath pins the planted-path arm of the
+// custody check (the CWE-59 shape ensureStateDir's comment is mostly about)
+// and with it the load-bearing syscall choice: each level must be
+// inspected with Lstat, never Stat. Swapping the two silently re-opens the
+// planted-symlink delete loop: Stat follows the link to a directory this
+// process owns at mode 0700, every remaining check passes, and
+// pass()/forget() then ReadDir and Remove through the link every tick.
 func TestEnsureStateDirRefusesAPlantedPath(t *testing.T) {
 	t.Run("a symlink planted at the state root is refused, not followed", func(t *testing.T) {
 		target := t.TempDir()
@@ -272,37 +267,31 @@ func TestEnsureStateDirRefusesAPlantedPath(t *testing.T) {
 	})
 }
 
-// TestEnforceLevelModeRefusesToRepairThroughAPlantedPath pins the two open flags
-// that make repairing a level by NAME safe, neither of which any other test
-// reaches: O_NOFOLLOW, so a symlink swapped in after os.Mkdir reported success is
-// refused instead of having the mode of its TARGET rewritten to 0700, and
-// O_DIRECTORY, so a plain file under the same name is refused rather than
-// fchmod'ed. Dropping either flag compiles and changes no other test's outcome --
-// every level the suite creates is a real directory this process just made -- while
-// handing a local user who wins the boot race a chmod on a path of their choosing,
-// the CWE-59 window ensureStateLevel's own comment says the handle-based sequence
-// closes.
+// TestEnforceLevelModeRefusesToRepairThroughAPlantedPath pins the two open
+// flags that make repairing a level by NAME safe: O_NOFOLLOW, so a symlink
+// swapped in after os.Mkdir reported success is refused instead of having
+// the mode of its TARGET rewritten to 0700, and O_DIRECTORY, so a plain
+// file under the same name is refused rather than fchmod'ed. Dropping
+// either flag hands a local user who wins the boot race a chmod on a path
+// of their choosing.
 //
-// Each planted case asserts the victim's mode is UNCHANGED, not merely that an
-// error came back: an implementation that followed the name and then reported some
-// later failure would still have performed the write the refusal exists to prevent,
-// and the mode is the only observable that separates the two. The errno is
-// deliberately not asserted -- the kernel returns ENOTDIR for a symlink under
-// O_DIRECTORY|O_NOFOLLOW but ELOOP without O_DIRECTORY, and both are refusals, so
-// pinning one would fail a still-safe implementation.
+// Each planted case asserts the victim's mode is UNCHANGED, not merely
+// that an error came back: an implementation that followed the name and
+// then reported some later failure would still have performed the write
+// the refusal exists to prevent. The errno is deliberately not asserted --
+// the kernel returns ENOTDIR for a symlink under O_DIRECTORY|O_NOFOLLOW
+// but ELOOP without O_DIRECTORY, and both are refusals.
 func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 	t.Run("a symlink is refused and its target is not chmod'ed", func(t *testing.T) {
 		target := filepath.Join(t.TempDir(), "victim")
 		if err := os.Mkdir(target, 0o750); err != nil {
 			t.Fatalf("make the victim directory: %v", err)
 		}
-		// The mode the filesystem STORED, not the one os.Mkdir asked for: an
-		// inheritable group-write ACL widens a created mode (the case
-		// ensureStateLevel's own comment measures, 0770 from a 0o700 mkdir on a ZFS
-		// nfs4acl dataset), and the property under test is that the victim is
-		// UNCHANGED -- a comparison against whatever it started as, never against
-		// the literal, or the refusal that WORKED is reported as a repair through
-		// the link.
+		// The mode the filesystem STORED, not the one os.Mkdir asked for:
+		// an inheritable group-write ACL can widen a created mode, and the
+		// property under test is that the victim is UNCHANGED -- compared
+		// against whatever it started as, never against the literal, or a
+		// refusal that WORKED would read as a repair through the link.
 		before, err := os.Lstat(target)
 		if err != nil {
 			t.Fatalf("lstat the victim before the refusal: %v", err)
@@ -365,14 +354,14 @@ func TestEnforceLevelModeRefusesToRepairThroughAPlantedPath(t *testing.T) {
 	})
 }
 
-// TestEnableSessionTitlesGatesBothConsumersOnTheVerdict pins that ensureStateDir's
-// refusal is AUTHORITATIVE rather than merely logged. Both of the subsystem's sinks
-// hang off this one call, and a warn-only refusal left both pointed at the rejected
-// path: the hook still received WT_TITLE_STATE_DIR (so a directory another local
-// user can read discloses tab ids, which are /ws capability tokens) and the poller
-// still swept it with os.ReadDir + os.Remove. The nil-env half of the contract is
-// pinned downstream by TestChildEnvComposesBothOverlays, which asserts routeDeps
-// contributes nothing when sessionTitleEnv is nil.
+// TestEnableSessionTitlesGatesBothConsumersOnTheVerdict pins that
+// ensureStateDir's refusal is AUTHORITATIVE rather than merely logged.
+// Both of the subsystem's sinks hang off this one call, and a warn-only
+// refusal left both pointed at the rejected path: the hook still received
+// WT_TITLE_STATE_DIR (so a directory another local user can read discloses
+// tab ids, which are /ws capability tokens) and the poller still swept it
+// with os.ReadDir + os.Remove. The nil-env half is pinned downstream by
+// TestChildEnvComposesBothOverlays.
 func TestEnableSessionTitlesGatesBothConsumersOnTheVerdict(t *testing.T) {
 	t.Run("a refused level yields no env and no poller", func(t *testing.T) {
 		root := filepath.Join(t.TempDir(), "state")
@@ -486,22 +475,24 @@ func TestSessionTitleNoMappingIsSilent(t *testing.T) {
 	}
 }
 
-// TestSessionTitleForgetsClosedTabs pins the cleanup: a tab closed while the poller
-// was reading returns false from the manager, and its mapping file must go so a
-// long-lived container does not accumulate dead pairings.
+// TestSessionTitleForgetsClosedTabs pins the cleanup: a tab closed while
+// the poller was reading returns false from the manager, and its mapping
+// file must go so a long-lived container does not accumulate dead
+// pairings.
 func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	f := newTitleFixture(t)
 	id := "sess_11111111-2222-3333-4444-555555555555"
 	f.mapping("gonetab", id)
 	f.session("hash0", id, titleJSON("a real title"))
-	// Capture the handle BEFORE the sweep: forget drops it from the index, so
-	// asking afterwards would mint a fresh one and stat a name that was never
-	// written -- an assertion that passes however broken the reclaim is.
+	// Capture the handle BEFORE the sweep: forget drops it from the index,
+	// so asking afterwards would mint a fresh one and stat a name that was
+	// never written.
 	mappingPath := filepath.Join(f.sync.stateDir, f.handle("gonetab"))
 
-	// The tab is still in the manager's list at snapshot time and disappears at the
-	// push, which is the within-sweep race this arm exists for -- not the ordinary
-	// close, which pass() now reclaims before syncOne is reached at all.
+	// The tab is still in the manager's list at snapshot time and
+	// disappears at the push -- the within-sweep race this arm exists
+	// for, not the ordinary close, which pass() now reclaims before
+	// syncOne is reached at all.
 	set := &fakeSetter{missing: map[terminal.SessionID]bool{"gonetab": true}, live: []terminal.SessionID{"gonetab"}}
 	f.sync.pass(t.Context(), set)
 
@@ -510,34 +501,34 @@ func TestSessionTitleForgetsClosedTabs(t *testing.T) {
 	}
 }
 
-// TestSessionTitleReclaimsAMappingWhoseTabIsGone pins pass()'s liveness sweep, which
-// is the reclaim path production actually takes: an ordinary close leaves the tab's
-// session.json title FROZEN, so syncOne's `s.pushed[tabID] == title` memo returns
-// before the SetSessionTitle-false probe and that probe never fires again. The manager
-// no longer lists the tab, which is the only signal that does not depend on a title
-// still changing. TestSessionTitleForgetsClosedTabs covers the other arm (still listed
-// at snapshot time, gone at the push), so without this case deleting the whole
-// liveness branch leaves the suite green while the mapping file, its pushed entry and
-// its per-tick ReadDir + session.json read survive for the container's life.
+// TestSessionTitleReclaimsAMappingWhoseTabIsGone pins pass()'s liveness
+// sweep, the reclaim path production actually takes: an ordinary close
+// leaves the tab's session.json title FROZEN, so syncOne's
+// `s.pushed[tabID] == title` memo returns before the SetSessionTitle-false
+// probe ever fires again. The manager no longer listing the tab is the
+// only signal that does not depend on a title still changing.
+// TestSessionTitleForgetsClosedTabs covers the other arm (still listed at
+// snapshot time, gone at the push).
 func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	f := newTitleFixture(t)
 	id := "sess_11111111-2222-3333-4444-555555555555"
 	f.mapping("closedtab", id)
 	f.session("hash0", id, titleJSON("a real title"))
-	// Captured before the reclaim: the handle leaves the index with the mapping, so
-	// resolving it afterwards would mint a new one and stat a path nothing wrote.
+	// Captured before the reclaim: the handle leaves the index with the
+	// mapping, so resolving it afterwards would mint a new one.
 	mappingPath := filepath.Join(f.sync.stateDir, f.handle("closedtab"))
 
-	// First sweep with the tab live: the title is pushed and memoized, which is the
-	// state that used to hide the dead tab from the reclaim.
+	// First sweep with the tab live: the title is pushed and memoized,
+	// which is the state that used to hide the dead tab from the reclaim.
 	set := &fakeSetter{live: []terminal.SessionID{"closedtab"}}
 	f.sync.pass(t.Context(), set)
 	if len(set.calls) != 1 {
 		t.Fatalf("first pass pushed %v, want exactly one push before the tab closes", set.calls)
 	}
 
-	// The tab closes. The title never changes again, so only the manager's list can
-	// report it: the mapping file must go, and no further push may be attempted.
+	// The tab closes. The title never changes again, so only the
+	// manager's list can report it: the mapping file must go, and no
+	// further push may be attempted.
 	set.live = nil
 	f.sync.pass(t.Context(), set)
 
@@ -552,27 +543,24 @@ func TestSessionTitleReclaimsAMappingWhoseTabIsGone(t *testing.T) {
 	}
 }
 
-// TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted pins the arm the
-// handle reshape made necessary: entry names are TITLE HANDLES and handles live only
-// in this process's index, so a file left behind by a PREVIOUS server run in the same
-// container (/tmp is container-layer and survives a restart) resolves to no tab at all
-// -- a state the old tab-id key could not produce, because a stale tab id was simply
-// not live. Every other test in this file names its entries through the fixture's
-// handle helper, so all of them take the `known` path and this arm reports zero hits
-// in the coverage profile; dropping its forget call leaves the whole suite green while
-// every previous run's mappings stay on disk for the container's life, growing the
-// per-tick ReadDir, and every failure path here is Debug-only so nothing says so.
+// TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted pins
+// the arm the handle reshape made necessary: entry names are TITLE
+// HANDLES and handles live only in this process's index, so a file left
+// behind by a PREVIOUS server run in the same container (/tmp is
+// container-layer and survives a restart) resolves to no tab at all -- a
+// state the old tab-id key could not produce, since a stale tab id was
+// simply not live.
 func TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted(t *testing.T) {
 	f := newTitleFixture(t)
-	// A well-formed handle from a previous run: the right alphabet and length, just
-	// not in this process's index.
+	// A well-formed handle from a previous run: the right alphabet and
+	// length, just not in this process's index.
 	const stale = "0123456789abcdef0123456789abcdef"
 	stalePath := filepath.Join(f.sync.stateDir, stale)
 	if err := os.WriteFile(stalePath, []byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
 		t.Fatalf("plant a previous run's mapping: %v", err)
 	}
-	// A live tab whose own handle IS known, so the sweep is not trivially empty and
-	// an over-broad reclaim shows up as a missing push.
+	// A live tab whose own handle IS known, so the sweep is not trivially
+	// empty and an over-broad reclaim shows up as a missing push.
 	kiroID := "sess_22222222-3333-4444-5555-666666666666"
 	f.mapping("tab1", kiroID)
 	f.session("hash0", kiroID, titleJSON("a real title"))
@@ -592,13 +580,12 @@ func TestSessionTitleReclaimsAMappingWhoseHandleThisProcessNeverMinted(t *testin
 	}
 }
 
-// TestSessionTitleKeepsTheHooksInFlightTemps pins the reclaim's POPULATION: the hook
-// writes each mapping through a dot-prefixed temp (".<handle>.$$" in
-// hooks/session-title.sh) and renames it into place, so a temp caught mid-write by a
-// sweep has to survive. Without the dot skip the reclaim deletes it, the hook's mv then
-// fails, `|| rm -f` runs, and that prompt's re-point is lost with no record anywhere.
-// No other test in this file plants a dot-prefixed entry, so deleting the skip keeps the
-// whole suite green.
+// TestSessionTitleKeepsTheHooksInFlightTemps pins the reclaim's
+// POPULATION: the hook writes each mapping through a dot-prefixed temp
+// (".<handle>.$$" in hooks/session-title.sh) and renames it into place,
+// so a temp caught mid-write by a sweep has to survive. Without the dot
+// skip the reclaim deletes it, the hook's mv then fails, `|| rm -f` runs,
+// and that prompt's re-point is lost with no record anywhere.
 func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
 	f := newTitleFixture(t)
 	tmp := filepath.Join(f.sync.stateDir, "."+f.handle("tab1")+".4242")
@@ -617,22 +604,22 @@ func TestSessionTitleKeepsTheHooksInFlightTemps(t *testing.T) {
 	}
 }
 
-// TestSessionTitleRejectsHostileIdentifiers is the security half for the one
-// identifier this package validates: the kiro session id read OUT of a mapping
-// file, which a hostile writer chooses freely and which becomes a path component
-// under the kiro session store. The mapping file's NAME needs no predicate — since
-// the handle reshape it is a title handle, every production value is an os.ReadDir
-// basename of the state dir, and pass() resolves it through tabForHandle before
-// anything reads it — so only the kiro id is gated at the Go boundary, and that
-// gate is checked here independently of the hook's own.
+// TestSessionTitleRejectsHostileIdentifiers is the security half for the
+// one identifier this package validates: the kiro session id read OUT of
+// a mapping file, chosen freely by a hostile writer and becoming a path
+// component under the kiro session store. The mapping file's NAME needs
+// no predicate -- since the handle reshape it is a title handle, every
+// production value is an os.ReadDir basename of the state dir, and
+// pass() resolves it through tabForHandle before anything reads it -- so
+// only the kiro id is gated at the Go boundary.
 func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 	t.Run("kiro id must look like a kiro session id", func(t *testing.T) {
 		for _, bad := range []string{
 			"../../../etc", "sess_../..", "sess_", "", "notasession",
 			"sess_" + strings.Repeat("a", 200), "sess_abc/def",
-			// Uppercase past F. The hex arm accepts A-F, so a widening of that arm
-			// admits the rest of the alphabet as a path component, and no other case
-			// here carries an uppercase letter at all.
+			// Uppercase past F. The hex arm accepts A-F, so a widening
+			// of that arm admits the rest of the alphabet as a path
+			// component.
 			"sess_ZZZZZZZZ-0000-1111-2222-333333333333",
 		} {
 			if validKiroSessionID(bad) {
@@ -642,20 +629,16 @@ func TestSessionTitleRejectsHostileIdentifiers(t *testing.T) {
 		if !validKiroSessionID("sess_11111111-2222-3333-4444-555555555555") {
 			t.Error("a real kiro session id was rejected")
 		}
-		// Uppercase hex, which the predicate accepts on purpose: a UUID rendered in
-		// upper case is still a kiro session id, and every other id in this file is
-		// lower case, so narrowing the A-F arm would refuse one with the suite green.
+		// Uppercase hex, which the predicate accepts on purpose: a UUID
+		// rendered in upper case is still a kiro session id.
 		if !validKiroSessionID("sess_ABCDEF01-2345-6789-ABCD-EF0123456789") {
 			t.Error("an uppercase-hex kiro session id was rejected; the A-F arm exists to accept it")
 		}
 	})
 	t.Run("the length cap is inclusive", func(t *testing.T) {
-		// The id becomes a path component, so its length is bounded at 128. Only a
-		// pair either side of that number can tell an inclusive bound from an
-		// exclusive one, and the 200-character case above sits far enough past it to
-		// be satisfied by both -- so a cap that rejected every id AT the limit would
-		// leave the whole suite green while refusing ids kiro-cli can legitimately
-		// mint.
+		// The id becomes a path component, so its length is bounded at
+		// 128. Only a pair either side of that number can tell an
+		// inclusive bound from an exclusive one.
 		atLimit := "sess_" + strings.Repeat("a", 123)
 		if len(atLimit) != 128 {
 			t.Fatalf("the fixture is %d characters, want 128: this case no longer sits on the boundary it exists to pin", len(atLimit))
@@ -698,12 +681,13 @@ func TestSessionTitleBoundsFileReads(t *testing.T) {
 	}
 }
 
-// TestSessionTitleEnvNamesWhatTheHookReads is the contract between the Go side and
-// the shell hook: the hook reads exactly these two variable names, so a rename here
-// silently stops every tab from being named. hooks/session-title.sh is the other
-// half and this asserts they agree. The handle VALUE is the subject of
-// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey; this leg pins the names, and
-// that the value shipped under the handle name is the one the syncer will join on.
+// TestSessionTitleEnvNamesWhatTheHookReads is the contract between the Go
+// side and the shell hook: the hook reads exactly these two variable
+// names, so a rename here silently stops every tab from being named.
+// hooks/session-title.sh is the other half and this asserts they agree.
+// The handle VALUE is the subject of
+// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey; this leg pins the
+// names.
 func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 	f := newTitleFixture(t)
 	env := f.sync.sessionEnv("tab42")
@@ -738,24 +722,24 @@ func TestSessionTitleEnvNamesWhatTheHookReads(t *testing.T) {
 			t.Errorf("hooks/session-title.sh does not mention %s; the hook and the server disagree on the variable name, so no tab would ever be named", k)
 		}
 	}
-	// The retired name must not linger anywhere in the hook: it used to carry the
-	// tab id, so a leftover reference would either be dead or -- worse -- a second
-	// writer naming files after a /ws capability token again.
+	// The retired name must not linger anywhere in the hook: it used to
+	// carry the tab id, so a leftover reference would either be dead or
+	// -- worse -- a second writer naming files after a /ws capability
+	// token again.
 	if strings.Contains(string(script), "WT_SESSION_ID") {
 		t.Error("hooks/session-title.sh still references WT_SESSION_ID; the tab id is the /ws capability token and no longer travels to the hook")
 	}
 }
 
-// TestSessionTitleHookWriteFormatReachesThePoller is the OTHER half of the
-// cross-language contract: TestSessionTitleEnvNamesWhatTheHookReads pins the two
-// variable NAMES, this one pins the FILE FORMAT by running the shipped script and
-// letting the real poller consume what it wrote. Nothing else executes
-// hooks/session-title.sh — every other test fabricates the mapping file itself, so
-// without this leg the agreement that the file is named for the tab's TITLE HANDLE
-// and holds a bare `sess_...` line is asserted only against the consumer's own idea
-// of it. Both sides fail SILENTLY by construction (the hook exits 0 on every failure
-// path because a non-zero exit can block the user's prompt, and the poller says
-// nothing when the name or location is wrong), so a drift would surface only as tabs
+// TestSessionTitleHookWriteFormatReachesThePoller is the OTHER half of
+// the cross-language contract: TestSessionTitleEnvNamesWhatTheHookReads
+// pins the two variable NAMES, this one pins the FILE FORMAT by running
+// the shipped script and letting the real poller consume what it wrote.
+// Nothing else executes hooks/session-title.sh -- every other test
+// fabricates the mapping file itself. Both sides fail SILENTLY by
+// construction (the hook exits 0 on every failure path since a non-zero
+// exit can block the user's prompt, and the poller says nothing when the
+// name or location is wrong), so a drift would surface only as tabs
 // quietly reverting to the engine's automatic cwd label.
 func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	sh, err := exec.LookPath("/bin/sh")
@@ -766,10 +750,8 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	const title = "Kopia audit: landed"
 
 	f := newTitleFixture(t)
-	// Run the REAL hook the image ships, in the environment the session factory
-	// injects -- built by the real sessionEnv, so the handle the hook names the file
-	// after is the one the poller will look for -- with the payload kiro-cli hands a
-	// hook on stdin.
+	// Run the REAL hook the image ships, in the environment the session
+	// factory injects, with the payload kiro-cli hands a hook on stdin.
 	cmd := exec.Command(sh, "hooks/session-title.sh")
 	cmd.Env = append(os.Environ(), f.sync.sessionEnv("tab42")...)
 	cmd.Stdin = strings.NewReader(`{"session_id":"` + kiroID + `"}`)
@@ -777,9 +759,9 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 		t.Fatalf("hook: %v (output %q)", err, out)
 	}
 
-	// The hook chose the filename from its environment; assert it chose the handle,
-	// because a poller that scans by handle and a hook that writes by anything else
-	// agree on nothing and say nothing about it.
+	// The hook chose the filename from its environment; assert it chose
+	// the handle, because a poller that scans by handle and a hook that
+	// writes by anything else agree on nothing.
 	if _, err := os.Stat(filepath.Join(f.sync.stateDir, f.handle("tab42"))); err != nil {
 		t.Fatalf("stat the mapping the hook wrote = %v, want it named for the tab's title handle", err)
 	}
@@ -795,18 +777,13 @@ func TestSessionTitleHookWriteFormatReachesThePoller(t *testing.T) {
 	}
 }
 
-// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey pins the invariant the whole
-// handle mechanism exists for, in all three places this feature writes an
-// identifier: the hook's environment, the mapping FILENAME (a directory under
-// world-writable /tmp that neither this app nor kiro-cli owns), and every log
-// attribute. A tab id is the /ws attach+resume capability token -- the credential
-// the engine attaches and resumes with -- so none of the three may carry it, whole
-// or truncated.
-//
-// Every other test in this file names state-directory entries through the fixture's
-// handle helper, so re-keying the mapping on the tab id (the shape this replaced)
-// leaves the entire suite green while a live credential is written to disk under a
-// name any local reader can list, and logged again on every adopted title.
+// TestSessionTitleNeverExposesTheTabIDAsTheJoinKey pins the invariant the
+// whole handle mechanism exists for, in all three places this feature
+// writes an identifier: the hook's environment, the mapping FILENAME (a
+// directory under world-writable /tmp that neither this app nor kiro-cli
+// owns), and every log attribute. A tab id is the /ws attach+resume
+// capability token, so none of the three may carry it, whole or
+// truncated.
 //
 // slog.Default is process-global, so this test must not call t.Parallel.
 func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
@@ -832,8 +809,8 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	if handle == string(tabID) {
 		t.Fatal("the title handle IS the tab id; minting exists precisely so it is not")
 	}
-	// 128 bits of hex, the engine's own shape: unguessable on purpose even though
-	// the handle authenticates nothing, so forgery resistance is unchanged.
+	// 128 bits of hex, the engine's own shape: unguessable on purpose
+	// even though the handle authenticates nothing.
 	if raw, err := hex.DecodeString(handle); err != nil || len(raw) != 16 {
 		t.Errorf("handle %q decoded to %d bytes (err %v), want 16 bytes of hex", handle, len(raw), err)
 	}
@@ -852,10 +829,11 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 		t.Errorf("mapping file is named %q, want the title handle %q: a filename in this directory must not be a capability token", name, handle)
 	}
 
-	// 3. Every log attribute. The sync path emits TWO records about a mapping -- the
-	// adopted title and an unusable mapping -- and the reclaim emits none, because
-	// forget logs only when os.Remove fails. The third pass below is therefore here to
-	// prove the reclaim adds no record naming the tab id, not to observe one.
+	// 3. Every log attribute. The sync path emits TWO records about a
+	// mapping -- the adopted title and an unusable mapping -- and the
+	// reclaim emits none, since forget logs only when os.Remove fails.
+	// The third pass below proves the reclaim adds no record naming the
+	// tab id.
 	var logged strings.Builder
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -872,9 +850,9 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	if strings.Contains(out, string(tabID)) {
 		t.Errorf("the tab id reached a log attribute whole; output was:\n%s", out)
 	}
-	// The truncating form too: `terminal.LogID(tabID)` is what a reviewer re-adding
-	// a "session" attribute would reach for, and 8 hex characters of a capability
-	// token is still 8 characters of one.
+	// The truncating form too: `terminal.LogID(tabID)` is what a reviewer
+	// re-adding a "session" attribute would reach for, and 8 hex
+	// characters of a capability token is still 8 characters of one.
 	if truncated := terminal.LogID(tabID); strings.Contains(out, truncated) {
 		t.Errorf("the tab id reached a log attribute as %q; the handle is the diagnostic identifier for this feature, output was:\n%s", truncated, out)
 	}
@@ -883,21 +861,17 @@ func TestSessionTitleNeverExposesTheTabIDAsTheJoinKey(t *testing.T) {
 	}
 }
 
-// TestSessionTitleScansEveryWorkspaceHashDir pins the reason readTitle loops over
-// the hash level at all: kiro-cli files each session under a per-workspace hash
-// directory, a /config volume accumulates one per workspace path it has ever
-// seen, and os.ReadDir returns them sorted -- so a tab's session is routinely NOT
-// under the first entry. Every other test in this file plants exactly one hash
-// directory holding exactly the session under test, so collapsing the scan to the
-// first entry (turning the read-miss continue into a return, or breaking out of
-// the loop) keeps the whole suite green while every tab whose session lives under
-// a later hash silently keeps the engine's automatic cwd label.
+// TestSessionTitleScansEveryWorkspaceHashDir pins the reason readTitle
+// loops over the hash level at all: kiro-cli files each session under a
+// per-workspace hash directory, a /config volume accumulates one per
+// workspace path it has ever seen, and os.ReadDir returns them sorted --
+// so a tab's session is routinely NOT under the first entry.
 func TestSessionTitleScansEveryWorkspaceHashDir(t *testing.T) {
 	f := newTitleFixture(t)
 	id := "sess_abcdef01-2345-6789-abcd-ef0123456789"
 	f.mapping("tab1", id)
-	// Two earlier-sorting hash directories that do not hold this session: one
-	// belonging to another workspace, one with no sessions in it at all.
+	// Two earlier-sorting hash directories that do not hold this session:
+	// one belonging to another workspace, one with no sessions at all.
 	f.session("hash0", "sess_00000000-0000-0000-0000-000000000000", titleJSON("another workspace"))
 	if err := os.MkdirAll(filepath.Join(f.home, ".kiro", "sessions", "hash1"), 0o750); err != nil {
 		t.Fatalf("mkdir a hash directory with no sessions in it: %v", err)
@@ -913,13 +887,10 @@ func TestSessionTitleScansEveryWorkspaceHashDir(t *testing.T) {
 	}
 }
 
-// TestSessionTitleSanitizesUntrustedTitle pins the rune policy readTitle applies
-// before the title reaches either sink it does not own: the slog attribute in
-// syncOne and the engine's client title rung, whose own sanitizer drops only C0 +
-// DEL. The other title tests cover blank, placeholder, malformed JSON and ordinary
-// text, so replacing the sanitizer with a bare strings.TrimSpace keeps them green
-// while bidi overrides, C1 controls and line separators from a kiro session record
-// reach the browser tab label and the structured log verbatim.
+// TestSessionTitleSanitizesUntrustedTitle pins the rune policy readTitle
+// applies before the title reaches either sink it does not own: the slog
+// attribute in syncOne and the engine's client title rung, whose own
+// sanitizer drops only C0 + DEL.
 func TestSessionTitleSanitizesUntrustedTitle(t *testing.T) {
 	f := newTitleFixture(t)
 	id := "sess_11111111-2222-3333-4444-555555555555"
@@ -935,14 +906,12 @@ func TestSessionTitleSanitizesUntrustedTitle(t *testing.T) {
 	}
 }
 
-// TestSessionTitleClearsTheRungWhenTheTabIsRepointed pins the /chat and /tangent
-// switch: the hook re-points a live tab from one kiro session to another and the new
-// conversation has no usable title yet. Without the clear the tab keeps displaying the
-// PREVIOUS conversation's title -- forever if the new session never gains one --
-// because the engine retains clientTitle until something replaces it. This is the only
-// input that distinguishes the mapping-identity memo from the title-only memo it
-// replaced, so without this case the whole re-point branch can be deleted and every
-// other title test stays green.
+// TestSessionTitleClearsTheRungWhenTheTabIsRepointed pins the /chat and
+// /tangent switch: the hook re-points a live tab from one kiro session to
+// another and the new conversation has no usable title yet. Without the
+// clear the tab keeps displaying the PREVIOUS conversation's title --
+// forever if the new session never gains one -- because the engine
+// retains clientTitle until something replaces it.
 func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	f := newTitleFixture(t)
 	const first = "sess_11111111-2222-3333-4444-555555555555"
@@ -956,9 +925,10 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 		t.Fatalf("first pass pushed %v, want [%q]", set.calls, want)
 	}
 
-	// The hook re-points the tab. The new session's record exists but holds kiro's own
-	// placeholder, which readTitle reads as "no title" -- the case that used to strand
-	// the first conversation's title on the tab.
+	// The hook re-points the tab. The new session's record exists but
+	// holds kiro's own placeholder, which readTitle reads as "no title"
+	// -- the case that used to strand the first conversation's title on
+	// the tab.
 	f.mapping("tab1", second)
 	f.session("hash0", second, titleJSON(placeholderTitle))
 	f.sync.pass(t.Context(), set)
@@ -979,12 +949,12 @@ func TestSessionTitleClearsTheRungWhenTheTabIsRepointed(t *testing.T) {
 	}
 }
 
-// TestSessionTitleRepointWithATitleReplacesWithoutClearing pins the OTHER half of the
-// re-point branch, the one this cycle reshaped: when the new conversation already has a
-// usable title the tab is re-labelled in ONE store and never blanked in between (the
-// intermediate clear was removed from this arm), and the memo follows the new kiro
-// session even when the two titles are identical strings -- otherwise the memo keeps
-// pointing at the previous conversation forever.
+// TestSessionTitleRepointWithATitleReplacesWithoutClearing pins the OTHER
+// half of the re-point branch: when the new conversation already has a
+// usable title the tab is re-labelled in ONE store and never blanked in
+// between, and the memo follows the new kiro session even when the two
+// titles are identical strings -- otherwise the memo keeps pointing at
+// the previous conversation forever.
 func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
 	f := newTitleFixture(t)
 	const first = "sess_11111111-2222-3333-4444-555555555555"
@@ -1008,9 +978,9 @@ func TestSessionTitleRepointWithATitleReplacesWithoutClearing(t *testing.T) {
 		t.Fatalf("memo kiroID = %q, want %q", got.kiroID, second)
 	}
 
-	// A re-point whose new title happens to equal the old one still has to be pushed and
-	// memoized: the memo is keyed on the PAIR, so a title-only comparison would strand it
-	// on the previous session's id.
+	// A re-point whose new title happens to equal the old one still has
+	// to be pushed and memoized: the memo is keyed on the PAIR, so a
+	// title-only comparison would strand it on the previous session's id.
 	f.mapping("tab1", third)
 	f.session("hash0", third, titleJSON("the second conversation"))
 	f.sync.pass(t.Context(), set)
@@ -1037,17 +1007,14 @@ func capturedLog(t *testing.T) *strings.Builder {
 }
 
 // TestSessionTitleZeroMappingRecordNamesItsDiscriminator pins the sweep's
-// no-mapping diagnosis: which sweeps produce it, and the attribute that tells its
-// two causes apart. This record is the only thing that explains a container whose
-// tabs all kept the engine's automatic cwd label, and state_entries is what sends
-// the reader to the right half -- 0 means no mapping-shaped name was in the
-// directory at all, so the hook never ran, while non-zero means names were there
-// and every one belonged to a tab that is gone. Neither shape pushes a title, so no
-// other test in this file can see this branch fire on the wrong sweep or carry the
-// wrong count.
+// no-mapping diagnosis: which sweeps produce it, and the attribute that
+// tells its two causes apart. state_entries is what sends the reader to
+// the right half -- 0 means no mapping-shaped name was in the directory
+// at all (the hook never ran), while non-zero means names were there and
+// every one belonged to a tab that is gone.
 func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
-	// A fragment of the message, not all of it: the hint attribute beside it carries
-	// prose a whole-message match would make brittle for no gain.
+	// A fragment of the message, not all of it: the hint attribute beside
+	// it carries prose a whole-message match would make brittle.
 	const record = "no live tab has a kiro session mapping"
 
 	t.Run("a live tab and an empty state dir reports zero entries", func(t *testing.T) {
@@ -1058,7 +1025,7 @@ func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
 
 		out := logged.String()
 		if !strings.Contains(out, record) {
-			t.Errorf("pass() with one live tab and nothing in the state dir logged %q, want a record naming %q: that tab keeps the automatic name ladder and nothing else says why", out, record)
+			t.Errorf("pass() with one live tab and nothing in the state dir logged %q, want a record naming %q", out, record)
 		}
 		if !strings.Contains(out, "state_entries=0") {
 			t.Errorf("pass() logged %q, want state_entries=0: an empty directory is the hook-never-ran half of the diagnosis", out)
@@ -1067,9 +1034,9 @@ func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
 
 	t.Run("a live tab and one stale name reports one entry", func(t *testing.T) {
 		f := newTitleFixture(t)
-		// A well-formed handle from a previous run: the right alphabet and length, but
-		// no tab in this process answers to it, so the sweep reclaims it and leaves the
-		// live tab unmapped.
+		// A well-formed handle from a previous run: the right alphabet
+		// and length, but no tab in this process answers to it, so the
+		// sweep reclaims it and leaves the live tab unmapped.
 		if err := os.WriteFile(filepath.Join(f.sync.stateDir, "0123456789abcdef0123456789abcdef"),
 			[]byte("sess_11111111-2222-3333-4444-555555555555\n"), 0o600); err != nil {
 			t.Fatalf("plant a previous run's mapping: %v", err)
@@ -1083,7 +1050,7 @@ func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
 			t.Errorf("pass() with one live tab and one stale name logged %q, want a record naming %q", out, record)
 		}
 		if !strings.Contains(out, "state_entries=1") {
-			t.Errorf("pass() logged %q, want state_entries=1: a name WAS present and belonged to no live tab, which is the opposite diagnosis from an empty directory and sends an operator to the other half of the system", out)
+			t.Errorf("pass() logged %q, want state_entries=1: a name WAS present and belonged to no live tab, the opposite diagnosis from an empty directory", out)
 		}
 	})
 
@@ -1094,7 +1061,7 @@ func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
 		f.sync.pass(t.Context(), &fakeSetter{})
 
 		if out := logged.String(); strings.Contains(out, record) {
-			t.Errorf("pass() with no live tab logged %q, want no record naming %q: with no tabs open there is no tab wearing the wrong label, and an idling container would emit this every two seconds forever", out, record)
+			t.Errorf("pass() with no live tab logged %q, want no record naming %q: with no tabs open there is no tab wearing the wrong label", out, record)
 		}
 	})
 
@@ -1108,18 +1075,19 @@ func TestSessionTitleZeroMappingRecordNamesItsDiscriminator(t *testing.T) {
 		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
 
 		if out := logged.String(); strings.Contains(out, record) {
-			t.Errorf("pass() over a tab whose mapping resolved logged %q, want no record naming %q: that tab is named from its kiro session, so nothing is degraded", out, record)
+			t.Errorf("pass() over a tab whose mapping resolved logged %q, want no record naming %q", out, record)
 		}
 	})
 }
 
-// TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile pins the gate on the
-// unusable-mapping record. A mapping file the hook has created but not yet filled is
-// the ordinary shape of a tab between spawn and first prompt, and the sweep re-reads
-// it every two seconds for as long as that lasts -- so a record for an EMPTY file is
-// a per-tick line about a state that is not a fault, while a record for a file
-// holding something that is not a kiro session id is the only signal that a hook is
-// writing garbage. Neither pushes a title, so the log is the whole difference.
+// TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile pins the gate on
+// the unusable-mapping record. A mapping file the hook has created but
+// not yet filled is the ordinary shape of a tab between spawn and first
+// prompt, and the sweep re-reads it every two seconds for as long as that
+// lasts -- so a record for an EMPTY file is a per-tick line about a state
+// that is not a fault, while a record for a file holding something that
+// is not a kiro session id is the only signal that a hook is writing
+// garbage.
 func TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile(t *testing.T) {
 	const record = "mapping file holds no usable session id"
 
@@ -1131,7 +1099,7 @@ func TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile(t *testing.T) {
 		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
 
 		if out := logged.String(); !strings.Contains(out, record) {
-			t.Errorf("pass() over a mapping holding \"not-a-session-id\" logged %q, want a record naming %q: a hook writing an unusable value is otherwise indistinguishable from one that has not written yet", out, record)
+			t.Errorf("pass() over a mapping holding %q logged %q, want a record naming %q", "not-a-session-id", out, record)
 		}
 	})
 
@@ -1143,18 +1111,17 @@ func TestSessionTitleUnusableMappingRecordSkipsAnEmptyFile(t *testing.T) {
 		f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"tab1"}})
 
 		if out := logged.String(); strings.Contains(out, record) {
-			t.Errorf("pass() over an empty mapping logged %q, want no record naming %q: an unfilled file is the ordinary state before a tab's first prompt, and the sweep re-reads it every two seconds until then", out, record)
+			t.Errorf("pass() over an empty mapping logged %q, want no record naming %q: an unfilled file is the ordinary state before a tab's first prompt", out, record)
 		}
 	})
 }
 
-// TestSessionTitleReclaimIsSilentWhenItSucceeds pins the gate on forget's failure
-// record. The reclaim is routine -- every closed tab and every file a previous run
-// left behind goes through it -- so a record on the SUCCESS path is one line per
-// reclaim describing nothing wrong, and it buries the case the record exists for: a
-// mapping the sweep cannot remove, which it then re-reads and re-reclaims on every
-// tick forever. The reclaim's own effect is asserted by the two reclaim tests above;
-// only the log separates a removal that worked from one that did not.
+// TestSessionTitleReclaimIsSilentWhenItSucceeds pins the gate on forget's
+// failure record. The reclaim is routine -- every closed tab and every
+// file a previous run left behind goes through it -- so a record on the
+// SUCCESS path is one line per reclaim describing nothing wrong, and it
+// buries the case the record exists for: a mapping the sweep cannot
+// remove, which it then re-reads and re-reclaims on every tick forever.
 func TestSessionTitleReclaimIsSilentWhenItSucceeds(t *testing.T) {
 	const record = "could not drop a stale mapping"
 
@@ -1164,22 +1131,20 @@ func TestSessionTitleReclaimIsSilentWhenItSucceeds(t *testing.T) {
 	f.session("hash0", id, titleJSON("a real title"))
 	logged := capturedLog(t)
 
-	// The manager no longer lists closedtab, so the sweep reclaims its mapping, and
-	// the file is present and removable -- the ordinary close.
+	// The manager no longer lists closedtab, so the sweep reclaims its
+	// mapping, and the file is present and removable -- the ordinary close.
 	f.sync.pass(t.Context(), &fakeSetter{live: []terminal.SessionID{"othertab"}})
 
 	if out := logged.String(); strings.Contains(out, record) {
-		t.Errorf("a reclaim that removed the file logged %q, want no record naming %q: it would fire once per reclaim on a healthy container and bury the mapping that genuinely cannot be removed", out, record)
+		t.Errorf("a reclaim that removed the file logged %q, want no record naming %q", out, record)
 	}
 }
 
 // TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome pins the constructor's one
-// diagnostic. With HOME blank, filepath.Join("", ".kiro", "sessions") is RELATIVE,
-// so every title read resolves against the server's working directory and fails; the
-// feature degrades to the automatic name ladder either way, and this record is the
-// only thing that says why. It is equally a record that must not fire on an ordinary
-// boot -- the image always sets HOME, so a warning there is noise on every container
-// start.
+// diagnostic. With HOME blank, filepath.Join("", ".kiro", "sessions") is
+// RELATIVE, so every title read resolves against the server's working
+// directory and fails; the feature degrades to the automatic name ladder
+// either way, and this record is the only thing that says why.
 func TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome(t *testing.T) {
 	const record = "HOME is empty"
 
@@ -1189,7 +1154,7 @@ func TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome(t *testing.T) {
 		newSessionTitleSync(t.TempDir(), "")
 
 		if out := logged.String(); !strings.Contains(out, record) {
-			t.Errorf("newSessionTitleSync with a blank home logged %q, want a record naming %q: every session read then resolves against the process working directory and nothing downstream reports that", out, record)
+			t.Errorf("newSessionTitleSync with a blank home logged %q, want a record naming %q", out, record)
 		}
 	})
 
@@ -1199,18 +1164,15 @@ func TestNewSessionTitleSyncWarnsOnlyOnAnEmptyHome(t *testing.T) {
 		newSessionTitleSync(t.TempDir(), t.TempDir())
 
 		if out := logged.String(); strings.Contains(out, record) {
-			t.Errorf("newSessionTitleSync with a real home logged %q, want silence: the image always sets HOME, so this record would fire on every ordinary boot", out)
+			t.Errorf("newSessionTitleSync with a real home logged %q, want silence: the image always sets HOME", out)
 		}
 	})
 }
 
-// TestSessionTitleRunStopsWithItsContext pins Run's whole contract: it sweeps until
-// its context is cancelled and then RETURNS. main starts it as a goroutine for the
-// life of the process, so nothing else in this file reaches it -- every other test
-// drives pass() directly -- and both halves of the loop are invisible without it.
-// A poll interval that failed to be a positive duration takes the ticker
-// constructor down at the first sweep, which on a real boot is a panic in the
-// server's own goroutine.
+// TestSessionTitleRunStopsWithItsContext pins Run's whole contract: it
+// sweeps until its context is cancelled and then RETURNS. main starts it
+// as a goroutine for the life of the process, so nothing else in this
+// file reaches it -- every other test drives pass() directly.
 func TestSessionTitleRunStopsWithItsContext(t *testing.T) {
 	f := newTitleFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -1225,6 +1187,6 @@ func TestSessionTitleRunStopsWithItsContext(t *testing.T) {
 	select {
 	case <-returned:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return after its context was cancelled; the poller outlives the server it was started for, holding its ticker and re-reading the state dir for the life of the process")
+		t.Fatal("Run did not return after its context was cancelled; the poller outlives the server it was started for, holding its ticker and re-reading the state dir")
 	}
 }

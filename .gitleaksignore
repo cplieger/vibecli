@@ -1,0 +1,11 @@
+# Historical test fixtures: the RFC 6455 documentation example Sec-WebSocket-Key
+# (dGhlIHNhbXBsZSBub25jZQ==, base64 of "the sample nonce") set on two handshake
+# test requests in routes_test.go at commit 11502ab3. A WebSocket handshake
+# nonce is not a credential; the value is published in the spec itself.
+#
+# The full-history scan (gitleaks git, advisory) fingerprints per commit, so it
+# cannot honour the // gitleaks:allow the working tree carries. Without these
+# entries it re-mints two code-scanning alerts on every run, which is why the
+# same two findings have been dismissed four times under different numbers.
+11502ab3efbec051485efcd24db21327433ba249:routes_test.go:generic-api-key:422
+11502ab3efbec051485efcd24db21327433ba249:routes_test.go:generic-api-key:468

@@ -163,18 +163,24 @@ export default defineConfig({
     // across both projects, so the thresholds below are the whole suite's.
     coverage: {
       provider: "v8",
-      include: ["*.ts"],
-      // vitest 4 ships NO built-in coverage exclusions -- coverageConfigDefaults
-      // .exclude is [] in the pinned 4.1.10, because v4 moved the responsibility to
-      // coverage.include (the "*.ts" above). So unlike test.exclude, which spreads a
+      include: ["**/*.ts"],
+      // vitest ships NO built-in coverage exclusions -- coverageConfigDefaults
+      // .exclude is [] in both 4.1.11 and 5.0.0, because v4 moved the responsibility to
+      // coverage.include (the "**/*.ts" above). So unlike test.exclude, which spreads a
       // genuinely non-empty configDefaults.exclude, this array IS the whole set and
       // every entry has to be spelled here.
+      // The "**/" prefixes are load-bearing on vitest 5: it matches these against the
+      // root-relative path without picomatch's `contains`, so a bare "*.test.ts" stops
+      // reaching e2e/boot.e2e.test.ts and v8 would report that Playwright spec at 0%.
+      // "node_modules/**" is equally load-bearing -- this list feeds tinyglobby's
+      // `ignore` for untested-file discovery, and "**/*.ts" without it walks the
+      // dependency tree.
       // "*.test.ts" also covers "*.node.test.ts", which still ends in ".test.ts".
-      // "*.config.ts" covers playwright.config.ts, which include: ["*.ts"] matched and
+      // "*.config.ts" covers playwright.config.ts, which the include matched and
       // v8 reported at 0%, holding the 90% thresholds permanently red.
-      // "*.d.ts" is not covered by anything else: a root-level ambient declaration file
-      // matches "*.ts" too, and would re-red the thresholds the same way.
-      exclude: ["*.test.ts", "*.d.ts", "*.config.ts"],
+      // "*.d.ts" is not covered by anything else: an ambient declaration file
+      // matches the include too, and would re-red the thresholds the same way.
+      exclude: ["node_modules/**", "**/*.test.ts", "**/*.d.ts", "**/*.config.ts"],
       reportOnFailure: true,
       reporter: ["text", "text-summary", "lcov"],
       thresholds: {
